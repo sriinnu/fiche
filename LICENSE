@@ -19,3 +19,30 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+FORK NOTICE
+
+This tree is a fork of pxpipe, not an official release from Steven or
+teamchong.
+
+- Upstream: https://github.com/teamchong/pxpipe
+- Imported tag: v0.16.0 (commit 9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3)
+- Upstream author: Steven (https://github.com/teamchong)
+- The MIT license and copyright notice above are the upstream license and
+  are kept intact.
+
+Additional changes in this fork (hybrid PAKT pipeline, ChatGPT Codex
+prompt_cache_breakpoint fix, MCP server) are copyright (c) 2026 Srinivas
+Pendela.
+
+This fork also ships a dependency on PAKT (Pipe-Aligned Kompact Text),
+package @sriinnu/pakt, MIT license, copyright Srinivas Pendela.
+
+- PAKT: https://github.com/sriinnu/clipforge-PAKT
+- Author: Srinivas Pendela (https://github.com/sriinnu)
+
+PAKT's L1 syntax is inspired by TOON Format (https://github.com/toon-format/spec)
+by Nicholas Charlton (https://github.com/nichochar), as credited by the PAKT
+project.

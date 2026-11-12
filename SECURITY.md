@@ -1,5 +1,15 @@
 # Security Policy
 
+This fork is not maintained by Steven or teamchong. Do not file fork-specific
+vulnerabilities on https://github.com/teamchong/pxpipe. Issues that exist in
+the imported pxpipe v0.16.0 code can still be reported upstream. This fork
+does not yet have a separate private tracker: keep secrets, prompts, and
+exploit details out of public issues either way.
+
+The MCP server and the proxy do not store request bodies. `health` and
+`stats` return counters and version strings only. L4 (lossy) PAKT is off
+unless a tool call sets `lossy: true` and a positive `semanticBudget`.
+
 ## Supported versions
 
 Security fixes are applied to the latest released version of pxpipe. Users

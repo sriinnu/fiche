@@ -141,6 +141,13 @@ export interface TransformOptions {
    *  for every block rendered to images. Off by default (entries inflate `info`;
    *  only a stateful harness can use them). */
   emitRecoverable?: boolean;
+  /**
+   * Inject OpenAI `prompt_cache_breakpoint` on Responses text parts when the
+   * model profile asks for it. Default true (api.openai.com). Set false for
+   * ChatGPT Codex (`chatgpt.com/backend-api/codex/responses`), which answers
+   * 400 `prompt_cache_breakpoint is not supported on this model`.
+   */
+  explicitPromptCacheBreakpoints?: boolean;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -168,6 +175,7 @@ const DEFAULTS: Required<TransformOptions> = {
   collapseHistory: true,
   gptHistory: {},
   model: '',
+  explicitPromptCacheBreakpoints: true,
 };
 
 /**
@@ -591,6 +599,13 @@ export interface EnvFields {
 export interface TransformInfo {
   compressed: boolean;
   reason?: string;
+  /** Fork hybrid (PAKT text and/or images). Absent when the pre-pass did not run. */
+  hybrid?: {
+    readerTier: 'image' | 'pakt-text';
+    paktBlocks: number;
+    paktSavedTokens: number;
+    imaged: boolean;
+  };
   /** Exact UTF-8 byte length of the final serialized provider request. */
   serializedRequestBytes?: number;
   /** Result of the profile-level serialized request guard. */

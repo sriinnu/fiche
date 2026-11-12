@@ -27,8 +27,9 @@ function baseModelId(model: string): string {
 let runtimeModelBases: readonly string[] | null = null;
 
 /** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Opus 5.5, and every Gemini model.
- *  Opus 5.5 is on at the spaced 5x8 profile: 93/98 gist, 0/16 confabulations,
- *  100/100 arithmetic (CLAUDE_SPACED_PROFILE).
+ *  This fork still lists Opus 5.5 so the chip stays visible, but the proxy
+ *  routes Claude 5.5 and Grok to lossless PAKT text instead of images
+ *  unless PXPIPE_FORCE_IMAGES=1. Fable and Gemini still image.
  *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).

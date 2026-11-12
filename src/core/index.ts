@@ -34,6 +34,10 @@ export {
   type RecoverableBlock,
 } from './transform.js';
 export { transformOpenAIChatCompletions, transformOpenAIResponses, resolveVisionCost, openAIVisionTokens } from './openai.js';
+export { hybridTransform, prepassRequest, countBillable } from './hybrid.js';
+export { readerTier } from './reader-tier.js';
+export { supportsExplicitPromptCacheBreakpoint, scrubPromptCacheBreakpoint } from './codex-cache.js';
+export { packStructured } from './pakt-stage.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
 export {
   createProviderRouter,

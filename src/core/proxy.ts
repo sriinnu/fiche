@@ -25,6 +25,8 @@ import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
 import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
+import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint } from './codex-cache.js';
+import { prefersPaktText } from './reader-tier.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -1445,6 +1447,29 @@ function resolveGoogleUpstream(
 }
 
 /** Build the proxy fetch handler. */
+let hybridLoader: Promise<typeof import('./hybrid.js') | null> | undefined;
+
+function loadHybrid(): Promise<typeof import('./hybrid.js') | null> {
+  hybridLoader ??= import('./hybrid.js').catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[pxpipe] hybrid prepass unavailable: ${message}`);
+    return null;
+  });
+  return hybridLoader;
+}
+
+async function prepareHybridBody(body: Uint8Array, model: string | undefined): Promise<{
+  body: Uint8Array;
+  tier: 'image' | 'pakt-text';
+  blocks: number;
+  savedTokens: number;
+}> {
+  const hybrid = await loadHybrid();
+  if (!hybrid) return { body, tier: 'image', blocks: 0, savedTokens: 0 };
+  const pre = hybrid.prepassRequest(body, model);
+  return { body: pre.body, tier: pre.tier, blocks: pre.blocks, savedTokens: pre.savedTokens };
+}
+
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
   const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
@@ -1759,9 +1784,6 @@ let responseContentType: string | undefined;
         if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
           requestModel = effectiveModel;
         }
-        const effectiveOpts = modelOk
-          ? transformOpts
-          : { ...transformOpts, compress: false };
         const bridgeBody = bridgedGptMessages
           ? (() => {
               const bridged = JSON.parse(new TextDecoder().decode(
@@ -1773,21 +1795,50 @@ let responseContentType: string | undefined;
           : bridgedChatMessages
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
+        const routeModel = effectiveModel ?? model ?? undefined;
+        const allowBreakpoints = supportsExplicitPromptCacheBreakpoint({
+          pathname: url.pathname,
+          upstream: openAIUpstream,
+        });
+        // PAKT runs for every JSON body. Weak readers (Claude 5.5, Grok, …)
+        // stop here; strong readers continue into the image transform.
+        const pre = await prepareHybridBody(bridgeBody, routeModel);
+        // Allowlisted models image, except Claude 5.5 and Grok, which stay on
+        // PAKT text until PXPIPE_FORCE_IMAGES. Opus 5 still images once named.
+        const imageThisRequest = modelOk && !prefersPaktText(routeModel);
+        const effectiveOpts = imageThisRequest
+          ? { ...transformOpts, explicitPromptCacheBreakpoints: allowBreakpoints }
+          : { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
         // Local render+encode cost only. The Google branch below issues upstream
         // count_tokens probes, so the timer closes here rather than after them —
         // otherwise network latency would be charged to our own CPU.
         const tTransform = Date.now();
         let r = isGoogle
-          ? await transformGoogleGenerateContent(bodyIn, model!, effectiveOpts)
+          ? await transformGoogleGenerateContent(pre.body, model!, effectiveOpts)
           : isMessages
             ? bridgedGptMessages
-              ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
+              ? await transformOpenAIResponses(pre.body, effectiveOpts)
               : bridgedChatMessages
-                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformRequest(bodyIn, { ...effectiveOpts, model: effectiveModel ?? undefined })
+                ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
+                : await transformRequest(pre.body, { ...effectiveOpts, model: effectiveModel ?? undefined })
             : isOpenAIChat
-              ? await transformOpenAIChatCompletions(bodyIn, effectiveOpts)
-              : await transformOpenAIResponses(bodyIn, effectiveOpts);
+              ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
+              : await transformOpenAIResponses(pre.body, effectiveOpts);
+        if (!allowBreakpoints && (isOpenAIResponses || bridgedGptMessages)) {
+          r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
+        }
+        if (pre.blocks > 0) {
+          r.info.hybrid = {
+            readerTier: pre.tier,
+            paktBlocks: pre.blocks,
+            paktSavedTokens: pre.savedTokens,
+            imaged: imageThisRequest && (r.info.imageCount ?? 0) > 0,
+          };
+          if (!imageThisRequest) {
+            r.info.compressed = true;
+            r.info.reason = 'pakt_text';
+          }
+        }
         transformMs = Date.now() - tTransform;
         if (isGoogle && r.info.compressed) {
           const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
@@ -1824,7 +1875,7 @@ let responseContentType: string | undefined;
             r.info.baselineProbeStatus = 'failed';
           }
         }
-        if (!modelOk) r.info.reason = 'unsupported_model';
+        if (!modelOk && r.info.reason !== 'pakt_text') r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;

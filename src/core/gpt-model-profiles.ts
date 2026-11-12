@@ -620,7 +620,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
       vision: isValidVision(p.vision) ? p.vision : base.vision,
       cacheReadRate: rate(p.cacheReadRate, base.cacheReadRate),
       cacheWriteRate: rate(p.cacheWriteRate, base.cacheWriteRate ?? 1),
-      cacheBreakpoints: base.cacheBreakpoints,
+      // `false` must stick. Keeping the built-in `true` made PXPIPE_GPT_PROFILES
+      // unable to stop explicit breakpoint injection (ChatGPT Codex 400).
+      cacheBreakpoints: typeof p.cacheBreakpoints === 'boolean' ? p.cacheBreakpoints : base.cacheBreakpoints,
       outputRate: rate(p.outputRate, base.outputRate),
       stripCols: posInt(p.stripCols, base.stripCols),
       maxHeightPx: posInt(p.maxHeightPx, base.maxHeightPx),

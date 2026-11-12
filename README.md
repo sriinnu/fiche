@@ -1,4 +1,222 @@
-# pxpipe
+# pxpipe-fork
+
+Fork of [pxpipe](https://github.com/teamchong/pxpipe) (Steven / [teamchong](https://github.com/teamchong), MIT, imported at **v0.16.0** `9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`) plus [PAKT](https://github.com/sriinnu/clipforge-PAKT) (Srinivas Pendela / [sriinnu](https://github.com/sriinnu), `@sriinnu/pakt@0.10.0`, MIT). This is not an official teamchong release and not a separate company. The npm name is `pxpipe-fork` so it cannot be installed over upstream `pxpipe-proxy` 0.16.0. A public product name comes later.
+
+**PAKT for structured text. Images only when the model can read them.**
+
+Lossless PAKT (L1–L3) rewrites JSON, YAML, CSV, and markdown data blocks before anything is rasterized. Gemini, Fable 5 (including 5.1/5.2), and Sol 5.6/6.1 then take the usual pxpipe images. Claude 5.5 (Opus, Sonnet, Haiku) and Grok stay on the PAKT text, which those models can read, instead of dense glyphs they cannot. L4 stays off unless a caller passes `lossy: true` and a positive `semanticBudget`. A packed string is kept only when `decompress` restores the original values: PAKT 0.10.0's delta encoding can corrupt cyclic integers, and this fork drops those results.
+
+`pxpipe` still starts the proxy. `pxpipe-fork` is the same command. `pxpipe-mcp` is the MCP server.
+
+## What is better than upstream, on one fixture
+
+Not a universal 90%. This is one repetitive agent log (360 monotonic JSON rows plus a short system prompt), counted with `gpt-4o` / o200k after base64 is removed and vision tokens are added back. Reproduce with `pnpm exec tsx scripts/measure-hybrid.mts`.
+
+| path | pages | billable tokens | vs 17,705 raw |
+| --- | ---: | ---: | ---: |
+| Raw JSON | 0 | 17,705 | — |
+| Upstream-style images only (Fable 5) | 4 | 3,875 | 78.1% fewer |
+| Hybrid, Fable 5 (PAKT, then one image) | 1 | 564 | 96.8% fewer |
+| Hybrid, Claude Sonnet 5.5 (PAKT text, no images) | 0 | 939 | 94.7% fewer |
+| Hybrid, Grok 4.7 (PAKT text, no images) | 0 | 936 | 94.7% fewer |
+
+On this fixture the hybrid is also cheaper than imaging alone (564 vs 3,875 billable tokens, one page instead of four) and the weak-reader path round-trips through `decompress`. Prose with no repetition is left alone. A deeply nested config can expand; the negative-savings guard keeps the original. Cyclic counters that fail the round-trip guard are kept as JSON. No live Grok or Claude 5.5 API call was made here. Upstream's published read-accuracy numbers still apply when `PXPIPE_FORCE_IMAGES=1` turns images back on: Grok's forced-image profile is the upstream JetBrains Mono 14px / 84-column page, and Claude 5.5's is the upstream Spleen 5×8 page with +2px rows. Those pages are still weak on dense hex. PAKT text is the default because of that, not because a new font was measured.
+
+## Run the proxy
+
+```bash
+pnpm install
+pnpm test
+pnpm typecheck
+pnpm exec tsx src/node.ts
+```
+
+Proxy listens on `127.0.0.1:47821`. After `pnpm build`, `node dist/node.js` is the same server. The `pxpipe` bin still works; `pxpipe-fork` is the fork name.
+
+```bash
+# Claude Code, images for Fable, PAKT text for Opus 5.5
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+
+# ChatGPT Codex. Do not point this at api.openai.com.
+# The fork omits prompt_cache_breakpoint on this route.
+PORT=47821 OPENAI_UPSTREAM=https://chatgpt.com \
+  PXPIPE_MODELS=gpt-5.6-sol \
+  pnpm exec tsx src/node.ts
+
+# Grok stays PAKT text. Name it to opt in; images stay off.
+PXPIPE_MODELS=claude-fable-5,gemini,grok-4.7 pnpm exec tsx src/node.ts
+# Warp the xAI host yourself:
+# pxpipe-fork warp --route 'api.x.ai/v1/*=http://127.0.0.1:47821' -- <grok-cli>
+```
+
+Codex `~/.codex/config.toml` provider (the proxy, not the MCP server):
+
+```toml
+model = "gpt-5.6-sol"
+model_provider = "pxpipe-fork"
+
+[model_providers.pxpipe-fork]
+name = "pxpipe-fork"
+base_url = "http://127.0.0.1:47821/backend-api/codex"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+```
+
+`PXPIPE_FORCE_IMAGES=1` images Claude 5.5 and Grok anyway. It does not put `prompt_cache_breakpoint` back on chatgpt.com.
+
+## MCP for every agent
+
+One server. Stdio is the default. Streamable HTTP is stateless `POST /mcp` on loopback (no SSE session; `GET` returns 405).
+
+```bash
+pnpm build
+node dist/node.js mcp                 # stdio
+node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
+```
+
+`npx -y pxpipe-fork mcp` is the same binary after this package is installed. It is not the upstream `pxpipe-proxy` package. Until you publish or `npm install` this checkout, point clients at `node` and the `dist/node.js` path below.
+
+Tools (all `readOnlyHint`, not destructive, idempotent, `openWorldHint: false`):
+
+| tool | what it does |
+| --- | --- |
+| `compress_text` | Lossless PAKT on one string. L4 only if `lossy` and `semanticBudget` > 0. |
+| `inspect_savings` | Token counts and which route a model would take. |
+| `transform_request` | Full hybrid on a request object. Pass `upstream: "https://chatgpt.com"` or `pathname: "/backend-api/codex/responses"` to strip `prompt_cache_breakpoint`. |
+| `health` | Version, upstream commit, PAKT version. No payloads. |
+| `stats` | Process counters only. |
+
+Example stdio exchange after `initialize`:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"compress_text","arguments":{"text":"{\"events\":[{\"id\":1,\"status\":\"ok\"},{\"id\":2,\"status\":\"ok\"}]}","model":"claude-sonnet-5-5"}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"transform_request","arguments":{"model":"grok-4.7","wire":"anthropic","request":{"model":"grok-4.7","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":"<json>"}]}]}}}}
+```
+
+Replace `<checkout>` with the absolute path of this repo.
+
+### Claude Code and Claude Desktop
+
+`.mcp.json` (Claude Code, project) or `claude_desktop_config.json` (`mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "pxpipe-fork": {
+      "command": "node",
+      "args": ["<checkout>/dist/node.js", "mcp"]
+    }
+  }
+}
+```
+
+### OpenAI Codex CLI
+
+`~/.codex/config.toml`. This block starts the MCP server. It does not send `prompt_cache_breakpoint`; the proxy fix and the tool both refuse that field on chatgpt.com.
+
+```toml
+[mcp_servers.pxpipe_fork]
+command = "node"
+args = ["<checkout>/dist/node.js", "mcp"]
+
+[mcp_servers.pxpipe_fork.env]
+PXPIPE_FORCE_IMAGES = "0"
+```
+
+Streamable HTTP, after `node dist/node.js mcp --http 47823`:
+
+```toml
+[mcp_servers.pxpipe_fork]
+url = "http://127.0.0.1:47823/mcp"
+```
+
+### Pi
+
+Pi reads `~/.pi/agent/mcp.json` and `.pi/mcp.json` using the same `mcpServers` shape as Claude. Stdio and Streamable HTTP are both supported. From a shell:
+
+```bash
+pi mcp add pxpipe-fork -- node <checkout>/dist/node.js mcp
+pi mcp add pxpipe-fork-http --url http://127.0.0.1:47823/mcp
+pi mcp list
+```
+
+Or paste the Claude JSON entry into `~/.pi/agent/mcp.json`.
+
+### Cursor
+
+`.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "pxpipe-fork": {
+      "command": "node",
+      "args": ["<checkout>/dist/node.js", "mcp"]
+    }
+  }
+}
+```
+
+### Grok Bot
+
+Add a custom MCP server (Cursor's Add MCP Server uses the same command and args):
+
+- command: `node`
+- args: `<checkout>/dist/node.js` `mcp`
+
+HTTP URL, if the client asks for one: `http://127.0.0.1:47823/mcp`
+
+### Ribhu
+
+Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subprocess from an extension JSON `mcp` block. User scope is `~/.ribhu/agent/extensions/pxpipe-fork.json`. A trusted repo can use `<git-root>/.ribhu/extensions/pxpipe-fork.json`. Restart after install; `/mcp` lists it. Tools show up as `mcp__pxpipe__<tool>`.
+
+```json
+{
+  "slash": "/pxpipe",
+  "description": "Lossless PAKT plus pxpipe hybrid context tools",
+  "prompt": "Use the pxpipe-fork MCP tools to compress structured context before answering. {args}",
+  "mcp": {
+    "command": "node",
+    "args": ["<checkout>/dist/node.js", "mcp"]
+  }
+}
+```
+
+`/mcp` also lists `.mcp.json`. If that file is how your Ribhu build takes servers, use the Claude `mcpServers` entry above.
+
+### Anything else (OpenCode and other stdio clients)
+
+```json
+{
+  "mcp": {
+    "pxpipe-fork": {
+      "type": "local",
+      "command": ["node", "<checkout>/dist/node.js", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+OpenCode's remote form is `"type": "remote"` and a `url` of `http://127.0.0.1:47823/mcp`. Generic stdio is the same `command` / `args` pair as Claude.
+
+## Codex breakpoint
+
+pxpipe 0.16.0 injects `prompt_cache_breakpoint: { mode: "explicit" }` for Sol and GPT-6 profiles. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. This fork does not inject that field when the path is `/backend-api/codex/responses` or the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` now actually turns it off. PAKT is not asked for a cache-breakpoint hint, and any `prompt_cache_breakpoint` key on a Codex response is stripped before the bytes leave the proxy.
+
+---
+
+## Inherited upstream guide
+
+The rest of this file is the pxpipe v0.16.0 README. Where it says Opus 5.5 is imaged by default, this fork sends Claude 5.5 and Grok through PAKT text instead. Commands that say `npx pxpipe-proxy` mean the upstream package; use `pnpm exec tsx src/node.ts` or `node dist/node.js` here.
+
+
+### Upstream pxpipe README
+
 
 **Cut coding-agent input tokens by rendering bulky context as images — the same system prompt, tool docs, and history, in a fraction of the tokens.**
 

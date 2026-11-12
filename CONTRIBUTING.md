@@ -1,3 +1,13 @@
+# Contributing to this fork
+
+This repository is a fork of [pxpipe](https://github.com/teamchong/pxpipe)
+(Steven / teamchong, MIT) with [PAKT](https://github.com/sriinnu/clipforge-PAKT)
+(Srinivas Pendela / sriinnu, MIT). It is not the upstream project. Do not open
+fork-only bugs, security reports, or pull requests on teamchong/pxpipe.
+
+`pnpm test` and `pnpm typecheck` are the local bar. The notes below are the
+upstream contributing guide, kept so the inherited workflow stays visible.
+
 # Contributing to pxpipe
 
 Small PRs with receipts merge fast.

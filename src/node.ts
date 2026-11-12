@@ -8,6 +8,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createWarpRuntime } from './warp/index.js';
+import { runMcpCommand } from './mcp/cli.js';
 import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -279,6 +280,7 @@ function printHelp(): void {
 Usage:
   pxpipe                run the proxy (no flags)
   pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
+  pxpipe mcp [--http PORT]     MCP server for every agent (stdio, or Streamable HTTP)
   pxpipe warp [--route PATTERN=TARGET]... -- CMD
                         run CMD behind the proxy without a custom base URL, so
                         client-side first-party gates (/remote-control,
@@ -323,9 +325,12 @@ Environment:
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
-  PXPIPE_MODELS           comma-separated model bases to image (Claude/Gemini/GPT/Grok);
-                          default claude-fable-5,gemini (every Gemini; Sol/Opus/GPT-5.5/Grok opt-in);
-                          off disables
+  PXPIPE_MODELS           comma-separated model bases allowed to image
+                          (default claude-fable-5,claude-opus-5-5,gemini).
+                          This fork still routes Claude 5.5 and Grok to lossless
+                          PAKT text unless PXPIPE_FORCE_IMAGES=1.
+  PXPIPE_FORCE_IMAGES     1 images weak readers too (Claude 5.5, Grok). Does not
+                          re-enable prompt_cache_breakpoint on ChatGPT Codex.
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}
   PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
@@ -1123,6 +1128,10 @@ async function runExport(argv: string[]): Promise<void> {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
+  if (argv[0] === 'mcp') {
+    await runMcpCommand(argv.slice(1));
+    return;
+  }
   if (argv[0] === 'export') {
     await runExport(argv.slice(1));
     return; // server never starts

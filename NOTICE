@@ -1,0 +1,24 @@
+pxpipe-fork
+===========
+
+This is a fork of pxpipe for Srinivas Pendela. It is not official teamchong
+software and it is not a new company.
+
+Upstream pxpipe
+  Project:  https://github.com/teamchong/pxpipe
+  Author:   Steven (https://github.com/teamchong)
+  License:  MIT (see LICENSE, original copyright notice)
+  Import:   tag v0.16.0, commit 9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3
+  Package:  the upstream npm name is pxpipe-proxy. This fork's package name
+            is pxpipe-fork so the two cannot be confused.
+
+PAKT
+  Project:  https://github.com/sriinnu/clipforge-PAKT
+  Package:  @sriinnu/pakt@0.10.0
+  Author:   Srinivas Pendela (https://github.com/sriinnu)
+  License:  MIT
+  Role:     lossless structured-text compression (L1–L3) used before any
+            image rendering. L4 stays off unless a caller opts in.
+
+Fork-specific code in this repository is copyright (c) 2026 Srinivas Pendela
+and is released under the same MIT license.

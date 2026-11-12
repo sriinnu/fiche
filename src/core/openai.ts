@@ -198,9 +198,17 @@ interface ResponsesRequest {
   [k: string]: unknown;
 }
 
-function responsesCacheBreakpoint(req: ResponsesRequest, profile: GptModelProfile): Record<string, unknown> {
+function responsesCacheBreakpoint(
+  req: ResponsesRequest,
+  profile: GptModelProfile,
+  allowExplicit: boolean,
+): Record<string, unknown> {
+  // ChatGPT Codex rejects this field on every model that 0.16.0 started
+  // marking cacheBreakpoints. api.openai.com still receives it when the
+  // profile asks and the caller did not already pick a non-implicit mode.
+  if (!allowExplicit || profile.cacheBreakpoints !== true) return {};
   const mode = (req.prompt_cache_options as { mode?: string } | undefined)?.mode;
-  return profile.cacheBreakpoints && (mode === undefined || mode === 'implicit')
+  return mode === undefined || mode === 'implicit'
     ? { prompt_cache_breakpoint: { mode: 'explicit' } }
     : {};
 }
@@ -298,6 +306,8 @@ interface OpenAIResolvedOptions {
   reflow: boolean;
   collapseHistory: boolean;
   gptHistory?: Partial<GptHistoryOptions>;
+  /** See TransformOptions.explicitPromptCacheBreakpoints. Default on. */
+  explicitPromptCacheBreakpoints: boolean;
 }
 
 const DEFAULTS: OpenAIResolvedOptions = {
@@ -308,6 +318,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
   reflow: true,
   collapseHistory: true,
+  explicitPromptCacheBreakpoints: true,
 };
 
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
@@ -320,6 +331,7 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     reflow: opts.reflow ?? DEFAULTS.reflow,
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
     gptHistory: opts.gptHistory,
+    explicitPromptCacheBreakpoints: opts.explicitPromptCacheBreakpoints !== false,
   };
 }
 
@@ -1059,7 +1071,7 @@ async function applyResponsesHistoryCollapse(
         for (const token of extractFactSheetTokens(sheet)) coveredSheetTokens.add(token);
       }
     }
-    content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile) });
+    content.push({ type: 'input_text', text: outro, ...responsesCacheBreakpoint(req, profile, o.explicitPromptCacheBreakpoints) });
     info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
       + gptTextTokens(intro + sheet + outro);
     replacements.set(segment.insertAt, { role: 'user', content });
@@ -1505,7 +1517,7 @@ export async function transformOpenAIResponses(
   info.imageSourceTexts = images.map(() => info.imageSourceText);
 
   const imagePartsResp: ResponsesInputImagePart[] = images.map((img) => responsesImagePart(img, req.model));
-  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile) };
+  const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile, o.explicitPromptCacheBreakpoints) };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
   const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);
   const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet

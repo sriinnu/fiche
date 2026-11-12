@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.17.0-fork.1
+
+Fork of pxpipe v0.16.0 (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`) for
+Srinivas Pendela. Not an official teamchong release. Package name is
+`pxpipe-fork` so it cannot be mistaken for `pxpipe-proxy` 0.16.0.
+
+- Hybrid pipeline: lossless PAKT L1–L3 (`@sriinnu/pakt@0.10.0`) on structured
+  tool results, then pxpipe images only for readers that can use them.
+  Claude 5.5 and Grok stay on PAKT text unless `PXPIPE_FORCE_IMAGES=1`.
+  Packed output is kept only when `decompress` restores the original values
+  (PAKT 0.10.0 delta encoding can corrupt cyclic integers).
+- ChatGPT Codex (`chatgpt.com`, `/backend-api/codex/responses`) no longer
+  receives `prompt_cache_breakpoint`. api.openai.com still does when the
+  profile asks. `PXPIPE_GPT_PROFILES` `cacheBreakpoints: false` is honored.
+- MCP server (`pxpipe-fork mcp`, also `pxpipe-mcp`) over stdio and stateless
+  Streamable HTTP. Tools: `compress_text`, `inspect_savings`,
+  `transform_request`, `health`, `stats`.
+
+## Upstream 0.16.0
+
+The sections below are the upstream changelog, unmodified in substance.
+
 All notable changes to pxpipe are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0: minor = features /
 behavioral changes, patch = fixes).

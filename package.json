@@ -1,10 +1,12 @@
 {
-  "name": "pxpipe-proxy",
-  "version": "0.16.0",
-  "description": "Token-saving proxy for Claude Code: renders bulky context (system prompt, tool docs, old history) as dense PNGs to cut input tokens. Runs on Node and Cloudflare Workers.",
+  "name": "pxpipe-fork",
+  "version": "0.17.0-fork.1",
+  "description": "Fork of teamchong/pxpipe (Steven) plus @sriinnu/pakt. Lossless PAKT for structured text, pxpipe images only for readers that can see them. Not an official teamchong release.",
   "type": "module",
   "bin": {
-    "pxpipe": "bin/cli.js"
+    "pxpipe": "bin/cli.js",
+    "pxpipe-fork": "bin/cli.js",
+    "pxpipe-mcp": "bin/mcp.js"
   },
   "exports": {
     ".": {
@@ -43,6 +45,7 @@
     "assets/*LICENSE.txt",
     "README.md",
     "SECURITY.md",
+    "NOTICE",
     "docs/SECURITY_MODEL.md",
     "LICENSE"
   ],
@@ -69,7 +72,9 @@
     "token-optimization",
     "prompt-cache",
     "vision-tokens",
-    "cloudflare-workers"
+    "cloudflare-workers",
+    "pakt",
+    "mcp"
   ],
   "engines": {
     "node": ">=20.19"
@@ -94,6 +99,7 @@
     "wrangler": "^4.93.0"
   },
   "dependencies": {
+    "@sriinnu/pakt": "0.10.0",
     "gpt-tokenizer": "^4.0.0"
   },
   "repository": {
@@ -101,7 +107,18 @@
     "url": "git+https://github.com/teamchong/pxpipe.git"
   },
   "homepage": "https://github.com/teamchong/pxpipe#readme",
-  "bugs": {
-    "url": "https://github.com/teamchong/pxpipe/issues"
+  "pxpipeUpstream": {
+    "repo": "https://github.com/teamchong/pxpipe",
+    "author": "Steven (https://github.com/teamchong)",
+    "version": "0.16.0",
+    "commit": "9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3",
+    "license": "MIT"
+  },
+  "pakt": {
+    "package": "@sriinnu/pakt",
+    "version": "0.10.0",
+    "repo": "https://github.com/sriinnu/clipforge-PAKT",
+    "author": "Srinivas Pendela (https://github.com/sriinnu)",
+    "license": "MIT"
   }
 }
