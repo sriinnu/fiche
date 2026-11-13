@@ -16,16 +16,16 @@
 
 ## What it is
 
-Inkling is a context-compression proxy and MCP server for coding agents. It is a fork of [pxpipe](https://github.com/teamchong/pxpipe) by Steven ([teamchong](https://github.com/teamchong)), imported at **v0.16.0** (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`), combined with [PAKT](https://github.com/sriinnu/clipforge-PAKT) (`@sriinnu/pakt@0.10.0`) by Srinivas Pendela ([sriinnu](https://github.com/sriinnu)).
+Inkling is a context-compression proxy and the `inkling-mcp` server for coding agents. The image proxy is a fork of [pxpipe](https://github.com/teamchong/pxpipe) by Steven ([teamchong](https://github.com/teamchong)), imported at **v0.16.0** (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`). [PAKT](https://github.com/sriinnu/clipforge-PAKT) (`@sriinnu/pakt@0.10.0`), the routing in front of that proxy, and `inkling-mcp` are ours.
 
 - **Lossless PAKT first.** JSON, YAML, CSV, and markdown data blocks are rewritten with PAKT L1–L3 before anything is rasterized. A packed string is kept only when `decompress` restores the original values.
 - **Images only for strong vision readers.** Gemini, Fable 5 (including 5.1/5.2), and Sol 5.6/6.1 get the usual pxpipe image pages. Claude 5.5 (Opus, Sonnet, Haiku) and Grok stay on PAKT text, which they read reliably, instead of dense glyphs they do not.
 - **ChatGPT Codex fix.** `prompt_cache_breakpoint` is not sent to `chatgpt.com` / `/backend-api/codex/responses`, which reject it with HTTP 400.
-- **One MCP server for every agent.** `compress_text`, `inspect_savings`, `transform_request`, `health`, and `stats` over stdio or Streamable HTTP.
+- **`inkling-mcp`.** `compress_text`, `inspect_savings`, `transform_request`, `health`, and `stats` over stdio or Streamable HTTP. This server is ours. It is not part of the pxpipe import.
 
 L4 (lossy) stays off unless a caller passes `lossy: true` and a positive `semanticBudget`. PAKT 0.10.0's delta encoding can corrupt cyclic integers; Inkling drops those results and keeps the original JSON.
 
-Inkling is not an official teamchong release. The npm package name is still `pxpipe-fork` (so it cannot be installed over upstream `pxpipe-proxy`), and the bins are `pxpipe`, `pxpipe-fork`, and `pxpipe-mcp`.
+Inkling is not an official teamchong release. The npm package name is still `pxpipe-fork` (so it cannot be installed over upstream `pxpipe-proxy`). The proxy bins are `pxpipe` and `pxpipe-fork`. The MCP bin is `inkling-mcp`.
 
 ## Status
 
@@ -55,14 +55,14 @@ node dist/node.js mcp                 # stdio
 node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
 ```
 
-`bin/mcp.js` (the `pxpipe-mcp` bin) starts the same stdio server. Replace `<checkout>` with the absolute path of your clone.
+`bin/mcp.js` (the `inkling-mcp` bin) starts the same stdio server. The process reports its name as `inkling-mcp`. Replace `<checkout>` with the absolute path of your clone.
 
 Claude Code (`.mcp.json`) and Cursor (`.cursor/mcp.json`):
 
 ```json
 {
   "mcpServers": {
-    "inkling": {
+    "inkling-mcp": {
       "command": "node",
       "args": ["<checkout>/dist/node.js", "mcp"]
     }
@@ -73,7 +73,7 @@ Claude Code (`.mcp.json`) and Cursor (`.cursor/mcp.json`):
 Codex CLI (`~/.codex/config.toml`):
 
 ```toml
-[mcp_servers.inkling]
+[mcp_servers."inkling-mcp"]
 command = "node"
 args = ["<checkout>/dist/node.js", "mcp"]
 ```
@@ -160,7 +160,7 @@ node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
 The package name on npm is `pxpipe-fork`, and it is not published. `npx -y inkling` is a different package. This checkout installs from git with:
 
 ```bash
-npx --yes --package github:sriinnu/inkling pxpipe-mcp
+npx --yes --package github:sriinnu/inkling inkling-mcp
 ```
 
 `prepare` builds `dist/node.js` on that install. A local checkout can still use `node dist/node.js mcp` after `pnpm build`. Claude Code can also load this repo as a plugin: `.claude-plugin/plugin.json` plus `.mcp.json`, and `.claude-plugin/marketplace.json` is the marketplace manifest (`claude plugin marketplace add sriinnu/inkling`). The HTTP proxy, not these tools, is what reduces the provider bill. A tool call sends the text in as an argument and gets a result back, so the turn that calls it is larger, and the tool list itself is extra cached prefix.
@@ -194,7 +194,7 @@ Replace `<checkout>` with the absolute path of this repo.
 ```json
 {
   "mcpServers": {
-    "pxpipe-fork": {
+    "inkling-mcp": {
       "command": "node",
       "args": ["<checkout>/dist/node.js", "mcp"]
     }
@@ -207,18 +207,18 @@ Replace `<checkout>` with the absolute path of this repo.
 `~/.codex/config.toml`. This block starts the MCP server. It does not send `prompt_cache_breakpoint`; the proxy fix and the tool both refuse that field on chatgpt.com.
 
 ```toml
-[mcp_servers.pxpipe_fork]
+[mcp_servers."inkling-mcp"]
 command = "node"
 args = ["<checkout>/dist/node.js", "mcp"]
 
-[mcp_servers.pxpipe_fork.env]
+[mcp_servers."inkling-mcp".env]
 PXPIPE_FORCE_IMAGES = "0"
 ```
 
 Streamable HTTP, after `node dist/node.js mcp --http 47823`:
 
 ```toml
-[mcp_servers.pxpipe_fork]
+[mcp_servers."inkling-mcp"]
 url = "http://127.0.0.1:47823/mcp"
 ```
 
@@ -227,8 +227,8 @@ url = "http://127.0.0.1:47823/mcp"
 Pi reads `~/.pi/agent/mcp.json` and `.pi/mcp.json` using the same `mcpServers` shape as Claude. Stdio and Streamable HTTP are both supported. From a shell:
 
 ```bash
-pi mcp add pxpipe-fork -- node <checkout>/dist/node.js mcp
-pi mcp add pxpipe-fork-http --url http://127.0.0.1:47823/mcp
+pi mcp add inkling-mcp -- node <checkout>/dist/node.js mcp
+pi mcp add inkling-mcp-http --url http://127.0.0.1:47823/mcp
 pi mcp list
 ```
 
@@ -239,7 +239,7 @@ Or paste the Claude JSON entry into `~/.pi/agent/mcp.json`.
 `.cursor/mcp.json` is the same `mcpServers` object as Claude Code. One-click install, which prompts before it writes `~/.cursor/mcp.json`:
 
 ```text
-cursor://anysphere.cursor-deeplink/mcp/install?name=inkling&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyItLXllcyIsIi0tcGFja2FnZSIsImdpdGh1Yjpzcmlpbm51L2lua2xpbmciLCJweHBpcGUtbWNwIl19
+cursor://anysphere.cursor-deeplink/mcp/install?name=inkling-mcp&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyItLXllcyIsIi0tcGFja2FnZSIsImdpdGh1Yjpzcmlpbm51L2lua2xpbmciLCJpbmtsaW5nLW1jcCJdfQ
 ```
 
 Paste that link into a browser. Cursor prompts before it writes `~/.cursor/mcp.json`. The config is the git `npx` command above, not a local path.
@@ -251,9 +251,9 @@ Paste that link into a browser. Cursor prompts before it writes `~/.cursor/mcp.j
 ```json
 {
   "mcpServers": {
-    "inkling": {
+    "inkling-mcp": {
       "command": "npx",
-      "args": ["--yes", "--package", "github:sriinnu/inkling", "pxpipe-mcp"]
+      "args": ["--yes", "--package", "github:sriinnu/inkling", "inkling-mcp"]
     }
   }
 }
@@ -263,24 +263,24 @@ Gemini's HTTP field is `httpUrl`, not `url`: `"httpUrl": "http://127.0.0.1:47823
 
 ### Grok CLI
 
-`~/.grok/config.toml`, or `grok mcp add inkling -- npx --yes --package github:sriinnu/inkling pxpipe-mcp`:
+`~/.grok/config.toml`, or `grok mcp add inkling-mcp -- npx --yes --package github:sriinnu/inkling inkling-mcp`:
 
 ```toml
-[mcp_servers.inkling]
+[mcp_servers."inkling-mcp"]
 command = "npx"
-args = ["--yes", "--package", "github:sriinnu/inkling", "pxpipe-mcp"]
+args = ["--yes", "--package", "github:sriinnu/inkling", "inkling-mcp"]
 ```
 
 This is the grok CLI. It is not Cursor's Add MCP dialog.
 
 ### Ribhu
 
-Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subprocess from an extension JSON `mcp` block. User scope is `~/.ribhu/agent/extensions/pxpipe-fork.json`. A trusted repo can use `<git-root>/.ribhu/extensions/pxpipe-fork.json`. Restart after install; `/mcp` lists it. Tools show up as `mcp__pxpipe__<tool>`.
+Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subprocess from an extension JSON `mcp` block. User scope is `~/.ribhu/agent/extensions/inkling-mcp.json`. A trusted repo can use `<git-root>/.ribhu/extensions/inkling-mcp.json`. Restart after install; `/mcp` lists it.
 
 ```json
 {
-  "slash": "/pxpipe",
-  "description": "Lossless PAKT plus pxpipe hybrid context tools",
+  "slash": "/inkling-mcp",
+  "description": "inkling-mcp: PAKT packing and route estimates",
   "prompt": "Use inkling's inspect_savings when you need an estimate. Do not call compress_text on text already in the conversation; that adds tokens. The proxy is what saves them. {args}",
   "mcp": {
     "command": "node",
@@ -296,7 +296,7 @@ Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subpr
 ```json
 {
   "mcp": {
-    "pxpipe-fork": {
+    "inkling-mcp": {
       "type": "local",
       "command": ["node", "<checkout>/dist/node.js", "mcp"],
       "enabled": true
