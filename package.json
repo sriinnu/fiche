@@ -102,11 +102,15 @@
     "@sriinnu/pakt": "0.10.0",
     "gpt-tokenizer": "^4.0.0"
   },
+  "author": "Srinivas Pendela (https://github.com/sriinnu)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/teamchong/pxpipe.git"
+    "url": "git+https://github.com/sriinnu/inkling.git"
   },
-  "homepage": "https://github.com/teamchong/pxpipe#readme",
+  "homepage": "https://github.com/sriinnu/inkling#readme",
+  "bugs": {
+    "url": "https://github.com/sriinnu/inkling/issues"
+  },
   "pxpipeUpstream": {
     "repo": "https://github.com/teamchong/pxpipe",
     "author": "Steven (https://github.com/teamchong)",
