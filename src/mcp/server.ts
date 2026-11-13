@@ -13,6 +13,8 @@ import { supportsExplicitPromptCacheBreakpoint } from '../core/codex-cache.js';
 export const MCP_PROTOCOL = '2025-03-26';
 export const SERVER_NAME = 'pxpipe-fork';
 export const SERVER_VERSION = '0.17.0-fork.1';
+/** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
+export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
 const ANNOTATIONS = {
   readOnlyHint: true,
@@ -144,6 +146,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
   if (name === 'compress_text') {
     const text = args.text;
     if (typeof text !== 'string') return textResult({ error: 'text must be a string' }, true);
+    if (text.length > MCP_MAX_BYTES) return textResult({ error: `text exceeds ${MCP_MAX_BYTES} bytes` }, true);
     stats.compressCalls += 1;
     const packed = packStructuredOrOriginal(text, {
       model: typeof args.model === 'string' ? args.model : undefined,
@@ -167,6 +170,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
   if (name === 'inspect_savings') {
     const text = args.text;
     if (typeof text !== 'string') return textResult({ error: 'text must be a string' }, true);
+    if (text.length > MCP_MAX_BYTES) return textResult({ error: `text exceeds ${MCP_MAX_BYTES} bytes` }, true);
     stats.inspectCalls += 1;
     const model = typeof args.model === 'string' ? args.model : 'gpt-4o';
     const packed = packStructuredOrOriginal(text, { model });
@@ -197,16 +201,17 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const wire = (typeof args.wire === 'string' ? args.wire : 'auto') as HybridWire;
     const upstream = typeof args.upstream === 'string' ? args.upstream : undefined;
     const pathname = typeof args.pathname === 'string' ? args.pathname : undefined;
-    const previous = process.env.PXPIPE_FORCE_IMAGES;
-    if (args.forceImages === true) process.env.PXPIPE_FORCE_IMAGES = '1';
-    else if (args.forceImages === false) delete process.env.PXPIPE_FORCE_IMAGES;
+    const body = new TextEncoder().encode(JSON.stringify({ ...request, ...(model ? { model } : {}) }));
+    if (body.byteLength > MCP_MAX_BYTES) {
+      return textResult({ error: `request exceeds ${MCP_MAX_BYTES} bytes` }, true);
+    }
     try {
-      const body = new TextEncoder().encode(JSON.stringify({ ...request, ...(model ? { model } : {}) }));
       const result = await hybridTransform(body, {
         model,
         wire,
         lossy: args.lossy === true,
         semanticBudget: typeof args.semanticBudget === 'number' ? args.semanticBudget : undefined,
+        forceImages: args.forceImages === true ? true : args.forceImages === false ? false : undefined,
         route: { upstream, pathname },
         explicitPromptCacheBreakpoints: supportsExplicitPromptCacheBreakpoint({ upstream, pathname }),
       });
@@ -221,9 +226,8 @@ async function callTool(name: string, args: Record<string, unknown>) {
         request: transformed,
         report: result.report,
       });
-    } finally {
-      if (previous === undefined) delete process.env.PXPIPE_FORCE_IMAGES;
-      else process.env.PXPIPE_FORCE_IMAGES = previous;
+    } catch (err) {
+      return textResult({ error: err instanceof Error ? err.message : 'transform failed' }, true);
     }
   }
   return textResult({ error: `unknown tool ${name}` }, true);
@@ -267,25 +271,36 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
 }
 
 /** Newline-delimited JSON, plus LSP Content-Length frames if a client sends them. */
-export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message: unknown) => void): string {
+export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message: unknown, framed: boolean) => void): string {
   let rest = buffer + chunk;
   while (rest.length > 0) {
+    // Only a leading header is framing. A JSON payload that mentions
+    // "Content-Length:" must not flip the session into LSP mode.
     if (rest.startsWith('Content-Length:')) {
       const headerEnd = rest.indexOf('\r\n\r\n');
       const alt = headerEnd >= 0 ? headerEnd : rest.indexOf('\n\n');
       if (alt < 0) break;
       const header = rest.slice(0, alt);
       const match = /Content-Length:\s*(\d+)/i.exec(header);
+      const sep = headerEnd >= 0 ? 4 : 2;
       if (!match) {
-        rest = rest.slice(alt + (headerEnd >= 0 ? 4 : 2));
+        rest = rest.slice(alt + sep);
         continue;
       }
       const length = Number(match[1]);
-      const bodyStart = alt + (headerEnd >= 0 ? 4 : 2);
+      if (!Number.isFinite(length) || length > MCP_MAX_BYTES) {
+        onMessage({
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: `frame exceeds ${MCP_MAX_BYTES} bytes` },
+        }, true);
+        return '';
+      }
+      const bodyStart = alt + sep;
       if (rest.length < bodyStart + length) break;
       const json = rest.slice(bodyStart, bodyStart + length);
       rest = rest.slice(bodyStart + length);
-      try { onMessage(JSON.parse(json)); } catch { /* ignore a bad frame */ }
+      try { onMessage(JSON.parse(json), true); } catch { /* ignore a bad frame */ }
       continue;
     }
     const nl = rest.indexOf('\n');
@@ -293,7 +308,7 @@ export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message:
     const line = rest.slice(0, nl).replace(/\r$/, '').trim();
     rest = rest.slice(nl + 1);
     if (!line) continue;
-    try { onMessage(JSON.parse(line)); } catch { /* ignore */ }
+    try { onMessage(JSON.parse(line), false); } catch { /* ignore */ }
   }
   return rest;
 }
@@ -312,10 +327,13 @@ export async function runStdioServer(): Promise<void> {
   };
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk: string) => {
-    if (chunk.includes('Content-Length:')) framed = true;
-    buffer = pushMcpChunk(buffer, chunk, (message) => {
+    buffer = pushMcpChunk(buffer, chunk, (message, messageFramed) => {
+      if (messageFramed) framed = true;
       void handleMcpMessage(message).then((response) => {
         if (response) write(response);
+      }).catch((err: unknown) => {
+        const messageText = err instanceof Error ? err.message : 'internal error';
+        write({ jsonrpc: '2.0', id: null, error: { code: -32603, message: messageText } });
       });
     });
   });
@@ -325,22 +343,40 @@ export async function runStdioServer(): Promise<void> {
   });
 }
 
+function loopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+}
+
 function originAllowed(origin: string | undefined): boolean {
   if (!origin) return true;
   try {
-    const url = new URL(origin);
-    return url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '[::1]';
+    return loopbackHost(new URL(origin).hostname);
   } catch {
     return false;
   }
 }
 
+/** DNS rebinding sends Host: attacker.example while connecting to 127.0.0.1. */
+export function hostHeaderAllowed(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false;
+  let hostname = hostHeader.trim();
+  if (hostname.startsWith('[')) {
+    const end = hostname.indexOf(']');
+    hostname = end >= 0 ? hostname.slice(1, end) : hostname;
+  } else {
+    hostname = hostname.replace(/:\d+$/, '');
+  }
+  return loopbackHost(hostname);
+}
+
 export function startHttpServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const origin = req.headers.origin;
-    if (typeof origin === 'string' && !originAllowed(origin)) {
+    const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
+    if ((typeof origin === 'string' && !originAllowed(origin)) || !hostHeaderAllowed(host)) {
       res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'origin not allowed' }));
+      res.end(JSON.stringify({ error: 'loopback only' }));
       return;
     }
     if (req.method === 'GET' || req.method === 'DELETE') {
@@ -354,25 +390,49 @@ export function startHttpServer(port: number): Promise<{ port: number; close: ()
       return;
     }
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let received = 0;
+    let rejected = false;
+    req.on('data', (chunk: Buffer) => {
+      if (rejected) return;
+      received += chunk.length;
+      if (received > MCP_MAX_BYTES) {
+        rejected = true;
+        res.writeHead(413, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'body too large' } }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('error', () => {
+      if (!res.writableEnded) res.destroy();
+    });
     req.on('end', () => {
+      if (rejected) return;
       void (async () => {
-        let message: unknown;
         try {
-          message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        } catch {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }));
-          return;
+          let message: unknown;
+          try {
+            message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          } catch {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }));
+            return;
+          }
+          const response = await handleMcpMessage(message);
+          if (!response) {
+            res.writeHead(202);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(response));
+        } catch (err) {
+          if (res.writableEnded) return;
+          const messageText = err instanceof Error ? err.message : 'internal error';
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: messageText } }));
         }
-        const response = await handleMcpMessage(message);
-        if (!response) {
-          res.writeHead(202);
-          res.end();
-          return;
-        }
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(response));
       })();
     });
   });

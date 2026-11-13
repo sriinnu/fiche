@@ -51,6 +51,8 @@ export interface HybridTransformOptions extends TransformOptions {
   /** L4. Proxy and MCP default this off. */
   lossy?: boolean;
   semanticBudget?: number;
+  /** Per-call override. Does not read or write PXPIPE_FORCE_IMAGES. */
+  forceImages?: boolean;
 }
 
 const enc = new TextEncoder();
@@ -105,29 +107,32 @@ function rewriteNode(value: unknown, stats: WalkStats, model: string | undefined
 }
 
 function insertLegend(root: Record<string, unknown>): void {
+  // Append. Claude Code classifies subscription traffic by the first system
+  // block; a legend in front of that identity is an opaque 429 (#149). A
+  // `role: "system"` message is also illegal on the Anthropic Messages API,
+  // so when there is no system/instructions field the legend is skipped.
   const marker = 'Pipe-Aligned Kompact Text';
   if (typeof root.instructions === 'string') {
-    if (!root.instructions.includes(marker)) root.instructions = `${PAKT_LEGEND}\n\n${root.instructions}`;
+    if (!root.instructions.includes(marker)) root.instructions = `${root.instructions}\n\n${PAKT_LEGEND}`;
     return;
   }
   if (typeof root.system === 'string') {
-    if (!root.system.includes(marker)) root.system = `${PAKT_LEGEND}\n\n${root.system}`;
+    if (!root.system.includes(marker)) root.system = `${root.system}\n\n${PAKT_LEGEND}`;
     return;
   }
   if (Array.isArray(root.system)) {
     const already = root.system.some((block) => JSON.stringify(block).includes(marker));
-    if (!already) root.system.unshift({ type: 'text', text: PAKT_LEGEND });
-    return;
-  }
-  if (Array.isArray(root.messages)) {
-    const already = root.messages.some((message) => JSON.stringify(message).includes(marker));
-    if (!already) root.messages.unshift({ role: 'system', content: PAKT_LEGEND });
+    if (!already) root.system.push({ type: 'text', text: PAKT_LEGEND });
   }
 }
 
 /** Rewrite structured strings inside a JSON request. Non-JSON bodies pass through. */
-export function prepassRequest(body: Uint8Array, model?: string, options: { lossy?: boolean; semanticBudget?: number } = {}): HybridPrepass {
-  const tier = readerTier(model);
+export function prepassRequest(
+  body: Uint8Array,
+  model?: string,
+  options: { lossy?: boolean; semanticBudget?: number; forceImages?: boolean } = {},
+): HybridPrepass {
+  const tier = readerTier(model, options.forceImages);
   const base: HybridPrepass = {
     body,
     changed: false,
@@ -206,7 +211,11 @@ export async function hybridTransform(
   options: HybridTransformOptions = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo; report: HybridReport }> {
   const model = options.model;
-  const pre = prepassRequest(body, model, { lossy: options.lossy, semanticBudget: options.semanticBudget });
+  const pre = prepassRequest(body, model, {
+    lossy: options.lossy,
+    semanticBudget: options.semanticBudget,
+    forceImages: options.forceImages,
+  });
   const allow = allowBreakpoints(options);
   const wire = detectWire(pre.body, options.wire);
   const imageTier = pre.tier === 'image' && options.compress !== false;

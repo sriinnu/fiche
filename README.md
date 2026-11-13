@@ -63,7 +63,7 @@ requires_openai_auth = true
 supports_websockets = false
 ```
 
-`PXPIPE_FORCE_IMAGES=1` images Claude 5.5 and Grok anyway. It does not put `prompt_cache_breakpoint` back on chatgpt.com.
+`PXPIPE_FORCE_IMAGES=1` lifts the PAKT-text veto for a model that is already in scope. Opus 5.5 is in the default scope, so the flag images it. Sonnet 5.5, Haiku 5.5, and Grok also need to be named in `PXPIPE_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
 
 ## MCP for every agent
 

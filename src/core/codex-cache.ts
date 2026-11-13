@@ -32,7 +32,8 @@ export function supportsExplicitPromptCacheBreakpoint(route: PromptCacheRoute = 
 }
 
 /** Drop injected or hinted breakpoint objects. Does not touch other cache fields
- *  such as OpenAI's prompt_cache_key. */
+ *  such as OpenAI's prompt_cache_key. Bodies that do not contain the key are
+ *  returned unchanged so a Codex passthrough stays byte-identical. */
 export function scrubPromptCacheBreakpoint(body: Uint8Array): Uint8Array {
   let parsed: unknown;
   try {
@@ -40,17 +41,22 @@ export function scrubPromptCacheBreakpoint(body: Uint8Array): Uint8Array {
   } catch {
     return body;
   }
-  const scrubbed = stripKey(parsed);
+  let removed = false;
+  const scrubbed = stripKey(parsed, () => { removed = true; });
+  if (!removed) return body;
   return new TextEncoder().encode(JSON.stringify(scrubbed));
 }
 
-function stripKey(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stripKey);
+function stripKey(value: unknown, onRemove: () => void): unknown {
+  if (Array.isArray(value)) return value.map((item) => stripKey(item, onRemove));
   if (!value || typeof value !== 'object') return value;
   const out: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (key === 'prompt_cache_breakpoint') continue;
-    out[key] = stripKey(child);
+    if (key === 'prompt_cache_breakpoint') {
+      onRemove();
+      continue;
+    }
+    out[key] = stripKey(child, onRemove);
   }
   return out;
 }

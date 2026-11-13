@@ -26,7 +26,7 @@ import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerat
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint } from './codex-cache.js';
-import { prefersPaktText } from './reader-tier.js';
+import { shouldImageModel } from './reader-tier.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -1463,11 +1463,18 @@ async function prepareHybridBody(body: Uint8Array, model: string | undefined): P
   tier: 'image' | 'pakt-text';
   blocks: number;
   savedTokens: number;
+  changed: boolean;
 }> {
   const hybrid = await loadHybrid();
-  if (!hybrid) return { body, tier: 'image', blocks: 0, savedTokens: 0 };
+  if (!hybrid) return { body, tier: 'image', blocks: 0, savedTokens: 0, changed: false };
   const pre = hybrid.prepassRequest(body, model);
-  return { body: pre.body, tier: pre.tier, blocks: pre.blocks, savedTokens: pre.savedTokens };
+  return {
+    body: pre.body,
+    tier: pre.tier,
+    blocks: pre.blocks,
+    savedTokens: pre.savedTokens,
+    changed: pre.changed,
+  };
 }
 
 export function createProxy(config: ProxyConfig = {}) {
@@ -1804,8 +1811,9 @@ let responseContentType: string | undefined;
         // stop here; strong readers continue into the image transform.
         const pre = await prepareHybridBody(bridgeBody, routeModel);
         // Allowlisted models image, except Claude 5.5 and Grok, which stay on
-        // PAKT text until PXPIPE_FORCE_IMAGES. Opus 5 still images once named.
-        const imageThisRequest = modelOk && !prefersPaktText(routeModel);
+        // PAKT text until PXPIPE_FORCE_IMAGES. That flag does not itself add a
+        // model to the allowlist. Opus 5 still images once named.
+        const imageThisRequest = shouldImageModel(routeModel, modelOk);
         const effectiveOpts = imageThisRequest
           ? { ...transformOpts, explicitPromptCacheBreakpoints: allowBreakpoints }
           : { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
@@ -1824,7 +1832,7 @@ let responseContentType: string | undefined;
             : isOpenAIChat
               ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
               : await transformOpenAIResponses(pre.body, effectiveOpts);
-        if (!allowBreakpoints && (isOpenAIResponses || bridgedGptMessages)) {
+        if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
           r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
         }
         if (pre.blocks > 0) {
@@ -1857,14 +1865,26 @@ let responseContentType: string | undefined;
           ]);
           if (baseline !== null && transformed !== null) {
             if (transformed >= baseline) {
+              // Drop the images. Keep a PAKT rewrite that already paid for
+              // itself; reverting all the way to bodyIn would throw that away.
               r = {
-                body: bodyIn,
+                body: pre.changed ? pre.body : bodyIn,
                 info: revertedGoogleInfo(
                   r.info,
                   `not_profitable (${transformed} >= ${baseline} tokens)`,
                   'ok',
                 ),
               };
+              if (pre.changed) {
+                r.info.compressed = true;
+                r.info.reason = 'pakt_text';
+                r.info.hybrid = {
+                  readerTier: pre.tier,
+                  paktBlocks: pre.blocks,
+                  paktSavedTokens: pre.savedTokens,
+                  imaged: false,
+                };
+              }
             } else {
               r.info.baselineTokens = baseline;
               r.info.baselineProbeStatus = 'ok';

@@ -38,16 +38,26 @@ const PAKT_ONLY = [
   /(?:^|\/)grok(?:-|$)/,
 ];
 
-export function prefersPaktText(model: string | null | undefined): boolean {
-  if (forceImagesEnabled()) return false;
+export function prefersPaktText(model: string | null | undefined, forceImages?: boolean): boolean {
+  if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return false;
   const ids = modelIds(model);
   return ids.some((id) => PAKT_ONLY.some((re) => re.test(id)));
 }
 
-export function readerTier(model: string | null | undefined): ReaderTier {
-  if (forceImagesEnabled()) return 'image';
+export function readerTier(model: string | null | undefined, forceImages?: boolean): ReaderTier {
+  if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return 'image';
   const ids = modelIds(model);
   if (ids.length === 0) return 'pakt-text';
   if (ids.some((id) => PAKT_ONLY.some((re) => re.test(id)))) return 'pakt-text';
   return ids.some((id) => IMAGE_READER.some((re) => re.test(id))) ? 'image' : 'pakt-text';
+}
+
+/**
+ * Imaging requires the model allowlist (`PXPIPE_MODELS` / default scope) AND
+ * a reader that is not PAKT-only. `PXPIPE_FORCE_IMAGES` lifts the PAKT-only
+ * veto. It does not add a model to the allowlist: Grok, Sonnet 5.5, and Haiku
+ * stay text until they are also named in `PXPIPE_MODELS`.
+ */
+export function shouldImageModel(model: string | null | undefined, allowed: boolean, forceImages?: boolean): boolean {
+  return allowed && !prefersPaktText(model, forceImages);
 }
