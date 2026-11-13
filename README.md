@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/inkling-logo.svg" alt="Inkling" width="420">
+</p>
+
 # pxpipe-fork
 
 Fork of [pxpipe](https://github.com/teamchong/pxpipe) (Steven / [teamchong](https://github.com/teamchong), MIT, imported at **v0.16.0** `9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`) plus [PAKT](https://github.com/sriinnu/clipforge-PAKT) (Srinivas Pendela / [sriinnu](https://github.com/sriinnu), `@sriinnu/pakt@0.10.0`, MIT). This is not an official teamchong release and not a separate company. The npm name is `pxpipe-fork` so it cannot be installed over upstream `pxpipe-proxy` 0.16.0. A public product name comes later.
