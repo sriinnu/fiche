@@ -1,26 +1,11 @@
-# Contributing to this fork
-
-This repository is a fork of [pxpipe](https://github.com/teamchong/pxpipe)
-(Steven / teamchong, MIT) with [PAKT](https://github.com/sriinnu/clipforge-PAKT)
-(Srinivas Pendela / sriinnu, MIT). It is not the upstream project. Do not open
-fork-only bugs, security reports, or pull requests on teamchong/pxpipe.
-
-`pnpm test` and `pnpm typecheck` are the local bar. The notes below are the
-upstream contributing guide, kept so the inherited workflow stays visible.
-
-# Contributing to pxpipe
+# Contributing to inkling
 
 Small PRs with receipts merge fast.
-
-I built pxpipe over a weekend and maintain it part-time. Review may be
-slow. I need help maintaining it; see
-[Becoming a maintainer](#becoming-a-maintainer).
 
 ## Rules
 
 - One root cause per PR. Split unrelated fixes.
-- Rebase on current `main` before opening. A few files churn constantly;
-  stale branches conflict with them almost immediately.
+- Rebase on current `main` before opening.
 - Redaction: no raw prompts, credentials, session files, API keys, or machine
   identifiers (hostnames, usernames, absolute home paths) in PR descriptions,
   issues, test fixtures, or committed logs. Use made-up repro data instead.
@@ -30,8 +15,11 @@ slow. I need help maintaining it; see
 
 - Claims about model behaviour (readability, savings, guard flags, refusals)
   include: model id, date, client version, render geometry, sample size, and
-  failure categories. The same standard I hold the README to.
+  failure categories. The README is held to the same standard.
 - Provider pricing carries a source URL and a date.
+- Changes to the PAKT stage include a test through `createProxy`, not only
+  `hybridTransform`. The proxy has its own wiring, and a unit test alone has
+  passed against a broken proxy before.
 - Security reports go through [SECURITY.md](SECURITY.md), not the public
   issue tracker.
 
@@ -47,22 +35,6 @@ more serious.
 ## What tends to stall
 
 - Claims about model behaviour that would need testing on every model to
-  verify. Ship what a test can check; leave the judgment call to me.
+  verify. Ship what a test can check.
 - PRs that touch files unrelated to the stated root cause.
 - New opt-in flags with no caller.
-
-## Becoming a maintainer
-
-First disbelieved, then called a temp hack. I want to find out if context
-as images becomes the new normal, and this repo is where that gets tested.
-
-Help I want most:
-
-- Eval results: per-model readability and savings runs on your hardware
-  and providers, with the evidence fields above. This is the work that
-  stalls PRs today.
-- Issue triage: repro, label, close duplicates.
-- Review: a second pair of eyes on render and transform PRs.
-
-If you want to help maintain this, tell me. I grant commit access on
-track record: a few good PRs plus useful issue triage. No formal process.

@@ -1,10 +1,10 @@
 /**
- * Routes re-point a matching request at a different upstream, so pxpipe can
+ * Routes re-point a matching request at a different upstream, so inkling can
  * transform it without the agent ever seeing a non-first-party base URL.
  *
  * That indirection is the whole point. Claude Code hides /remote-control the
  * moment ANTHROPIC_BASE_URL is custom (and gates connectors on the same
- * "firstParty" check), so pointing the agent at pxpipe directly costs you the
+ * "firstParty" check), so pointing the agent at inkling directly costs you the
  * feature. Under warp the agent still talks to api.anthropic.com; only the one
  * path we rewrite is diverted, and auth, telemetry and the control plane go to
  * the real host untouched.

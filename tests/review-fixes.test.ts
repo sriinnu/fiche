@@ -20,13 +20,13 @@ function repetitiveJson(): string {
 }
 
 describe('review fixes', () => {
-  const prev = process.env.PXPIPE_FORCE_IMAGES;
+  const prev = process.env.INKLING_FORCE_IMAGES;
   afterEach(() => {
-    if (prev === undefined) delete process.env.PXPIPE_FORCE_IMAGES;
-    else process.env.PXPIPE_FORCE_IMAGES = prev;
+    if (prev === undefined) delete process.env.INKLING_FORCE_IMAGES;
+    else process.env.INKLING_FORCE_IMAGES = prev;
   });
 
-  it('appends the PAKT legend after the Claude Code identity, never in front of it', () => {
+  it('leaves the system prompt and Claude Code identity untouched and puts the legend in the tool result', () => {
     const body = enc.encode(JSON.stringify({
       model: 'claude-opus-5-5',
       system: [
@@ -44,9 +44,12 @@ describe('review fixes', () => {
       system: Array<{ text: string }>;
       messages: Array<{ role?: string }>;
     };
-    expect(out.system[0]!.text).toBe(CLAUDE_CODE_OAUTH_IDENTITY);
-    expect(out.system.at(-1)!.text).toContain('Pipe-Aligned Kompact Text');
+    expect(out.system).toEqual([
+      { type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY },
+      { type: 'text', text: 'Follow the repository conventions.' },
+    ]);
     expect(out.messages.some((message) => message.role === 'system')).toBe(false);
+    expect(JSON.stringify(out.messages)).toContain('Pipe-Aligned Kompact Text');
   });
 
   it('does not reserialize a Codex body that has no breakpoint', () => {
@@ -73,7 +76,7 @@ describe('review fixes', () => {
   });
 
   it('keeps FORCE_IMAGES from imaging a model that is not allowlisted', () => {
-    delete process.env.PXPIPE_FORCE_IMAGES;
+    delete process.env.INKLING_FORCE_IMAGES;
     expect(shouldImageModel('claude-fable-5', true)).toBe(true);
     expect(shouldImageModel('claude-opus-5', true)).toBe(true);
     expect(shouldImageModel('claude-opus-5-5', true)).toBe(false);
@@ -86,8 +89,8 @@ describe('review fixes', () => {
     expect(shouldImageModel('gpt-5.6-sol', true)).toBe(true);
   });
 
-  it('does not write PXPIPE_FORCE_IMAGES while transforming one MCP-style call', async () => {
-    delete process.env.PXPIPE_FORCE_IMAGES;
+  it('does not write INKLING_FORCE_IMAGES while transforming one MCP-style call', async () => {
+    delete process.env.INKLING_FORCE_IMAGES;
     await hybridTransform(enc.encode(JSON.stringify({
       model: 'claude-sonnet-5-5',
       messages: [{ role: 'user', content: 'hi' }],
@@ -97,7 +100,7 @@ describe('review fixes', () => {
       compress: false,
       forceImages: true,
     });
-    expect(process.env.PXPIPE_FORCE_IMAGES).toBeUndefined();
+    expect(process.env.INKLING_FORCE_IMAGES).toBeUndefined();
   });
 
   it('rejects a non-loopback Host and an oversized HTTP body', async () => {

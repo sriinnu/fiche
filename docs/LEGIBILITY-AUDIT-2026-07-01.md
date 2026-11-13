@@ -1,6 +1,6 @@
 # Imaged-text legibility audit — 2026-07-01
 
-Motivated by a demo failure: the pxpipe arm of `demo/effective-context` read all
+Motivated by a demo failure: the inkling arm of `demo/effective-context` read all
 files but could not report the `AUDIT-ZX9` line count, and hedged that imaged text
 was uncertain. This audit measured **why**, with data, and shipped the fixes that
 follow from it.
@@ -32,7 +32,7 @@ follow from it.
 ## Method
 
 `count_tokens` sweep (claude-sonnet-4-5) on synthetic PNGs at controlled dims;
-14,935-row regression on real proxy traffic (`~/.pxpipe/events.jsonl`) for the
+14,935-row regression on real proxy traffic (`~/.inkling/events.jsonl`) for the
 unresized slope; pixel-level Hamming matrix over the Spleen 5×8 atlas; and a 24-token
 blind read where transcriptions were committed *before* revealing ground truth.
 

@@ -3,7 +3,7 @@
 # Grok 4.6 quality results
 
 Model: `grok-4.6` through the Codex Responses provider, `reasoning.effort=high`.
-Image calls bypassed pxpipe (`OPENAI_BASE_URL` upstream, port 47821 rejected)
+Image calls bypassed inkling (`OPENAI_BASE_URL` upstream, port 47821 rejected)
 and used the **live production profile** resolved by `resolveGptProfile('grok-4.6')`.
 
 ## Native 14px / 84 cols / maxH 512, reasoning high (2026-08-13)

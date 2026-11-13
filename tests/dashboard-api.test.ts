@@ -11,7 +11,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { DashboardState, dashboardPath, dashboardHostLabel } from '../src/dashboard.js';
-import { getAllowedModelBases, isPxpipeSupportedModel, setAllowedModelBases } from '../src/core/applicability.js';
+import { getAllowedModelBases, isInklingSupportedModel, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
@@ -22,7 +22,7 @@ import {
 } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inkling-dashapi-'));
   return {
     eventsFile: path.join(dir, 'events.jsonl'),
     sidecarDir: path.join(dir, '4xx-bodies'),
@@ -116,10 +116,10 @@ describe('serveSessionsJson', () => {
 
   it('respects ?project filtering', async () => {
     writeEvents(tmp, [
-      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pxpipe' }),
+      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/inkling' }),
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
-    const res = await dash.serveSessionsJson({ project: 'pxpipe' });
+    const res = await dash.serveSessionsJson({ project: 'inkling' });
     const body = await res.json();
     expect(body.count).toBe(1);
     expect(body.sessions[0].id).toBe('aaaaaaaa');
@@ -183,14 +183,14 @@ describe('serveFragment', () => {
   });
 
   it('renders opt-in GPT 5.5/5.6 chips and mutates the single model scope', async () => {
-    const prev = process.env.PXPIPE_MODELS;
+    const prev = process.env.INKLING_MODELS;
     try {
-      delete process.env.PXPIPE_MODELS;
+      delete process.env.INKLING_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
       expect(off).toContain('Image OpenAI Responses models');
       expect(off).not.toContain('<div class="models" style="display:none">');
-      // PXPIPE_MODELS textbox mirrors the live scope as CSV.
+      // INKLING_MODELS textbox mirrors the live scope as CSV.
       expect(off).toContain('name="list"');
       expect(off).toContain('value="claude-fable-5,claude-opus-5-5,gemini"');
       expect(off).toContain('GPT 5.6 Sol</button>');
@@ -220,18 +220,18 @@ describe('serveFragment', () => {
       const geminiOff = await (await dash.serveFragment('models', url, 1234)).text();
       expect(geminiOff).toContain('Gemini (all versions)</button>');
       expect(getAllowedModelBases()).not.toContain('gemini');
-      expect(isPxpipeSupportedModel('gemini-4')).toBe(false);
+      expect(isInklingSupportedModel('gemini-4')).toBe(false);
     } finally {
       setAllowedModelBases(null);
-      if (prev === undefined) delete process.env.PXPIPE_MODELS;
-      else process.env.PXPIPE_MODELS = prev;
+      if (prev === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prev;
     }
   });
 
-  it('replaces the whole scope from the PXPIPE_MODELS textbox CSV', async () => {
-    const prev = process.env.PXPIPE_MODELS;
+  it('replaces the whole scope from the INKLING_MODELS textbox CSV', async () => {
+    const prev = process.env.INKLING_MODELS;
     try {
-      delete process.env.PXPIPE_MODELS;
+      delete process.env.INKLING_MODELS;
       dash.handleModelsSet(' claude-fable-5 , grok-4.5 ,');
       expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'grok-4.5']);
       const html = await (await dash.serveFragment('models', url, 1234)).text();
@@ -244,15 +244,15 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toEqual([]);
     } finally {
       setAllowedModelBases(null);
-      if (prev === undefined) delete process.env.PXPIPE_MODELS;
-      else process.env.PXPIPE_MODELS = prev;
+      if (prev === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prev;
     }
   });
 
   it('invokes the host persistence hook on scope mutations', () => {
-    const prev = process.env.PXPIPE_MODELS;
+    const prev = process.env.INKLING_MODELS;
     try {
-      delete process.env.PXPIPE_MODELS;
+      delete process.env.INKLING_MODELS;
       setAllowedModelBases(null);
       const saved: string[][] = [];
       const persisting = new DashboardState(tmp, async () => new Map(), (bases) => {
@@ -281,8 +281,8 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('grok-4.5');
     } finally {
       setAllowedModelBases(null);
-      if (prev === undefined) delete process.env.PXPIPE_MODELS;
-      else process.env.PXPIPE_MODELS = prev;
+      if (prev === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prev;
     }
   });
 
@@ -381,14 +381,14 @@ describe('serveFragment', () => {
 describe('dashboard host label', () => {
   it('names the host in the title and topbar so two hosts are distinguishable', () => {
     const html = renderPage(47821, 'ber-dev-lm-ai');
-    expect(html).toContain('<title>ber-dev-lm-ai · pxpipe dashboard</title>');
+    expect(html).toContain('<title>ber-dev-lm-ai · inkling dashboard</title>');
     expect(html).toContain('class="hostchip"');
     expect(html).toContain('>ber-dev-lm-ai<');
   });
 
   it('renders the unlabelled page when no host label is given', () => {
     const html = renderPage(47821);
-    expect(html).toContain('<title>pxpipe — live dashboard</title>');
+    expect(html).toContain('<title>inkling — live dashboard</title>');
     expect(html).not.toContain('class="hostchip"');
   });
 
@@ -398,19 +398,19 @@ describe('dashboard host label', () => {
     expect(html).toContain('&lt;img src=x');
   });
 
-  it('prefers PXPIPE_DASH_LABEL and shortens an FQDN hostname', () => {
-    const prev = process.env.PXPIPE_DASH_LABEL;
+  it('prefers INKLING_DASH_LABEL and shortens an FQDN hostname', () => {
+    const prev = process.env.INKLING_DASH_LABEL;
     try {
-      process.env.PXPIPE_DASH_LABEL = 'edi-prod';
+      process.env.INKLING_DASH_LABEL = 'edi-prod';
       expect(dashboardHostLabel()).toBe('edi-prod');
       // An explicitly empty override opts out of the chip entirely.
-      process.env.PXPIPE_DASH_LABEL = '';
+      process.env.INKLING_DASH_LABEL = '';
       expect(dashboardHostLabel()).toBe('');
-      delete process.env.PXPIPE_DASH_LABEL;
+      delete process.env.INKLING_DASH_LABEL;
       expect(dashboardHostLabel()).toBe(os.hostname().split('.')[0]);
     } finally {
-      if (prev === undefined) delete process.env.PXPIPE_DASH_LABEL;
-      else process.env.PXPIPE_DASH_LABEL = prev;
+      if (prev === undefined) delete process.env.INKLING_DASH_LABEL;
+      else process.env.INKLING_DASH_LABEL = prev;
     }
   });
 });
@@ -422,7 +422,7 @@ describe('dashboard page help UI', () => {
     expect(html).toContain('content: attr(data-tip)');
   });
 
-  it('compares imaged requests with their own without-pxpipe counterfactual', () => {
+  it('compares imaged requests with their own without-inkling counterfactual', () => {
     const html = renderHeaderFragment({
       compressed_paid_requests: 600,
       compressed_actual_usd: 96.42,
@@ -435,8 +435,8 @@ describe('dashboard page help UI', () => {
     } as StatsPayload, 47821);
 
     expect(html).toContain('$0.1607');
-    expect(html).toContain('vs $0.4854 without pxpipe');
-    expect(html).not.toContain('vs $0.0722 without pxpipe');
+    expect(html).toContain('vs $0.4854 without inkling');
+    expect(html).not.toContain('vs $0.0722 without inkling');
     expect(html).toContain('same paid imaged requests');
   });
 });
@@ -848,8 +848,8 @@ describe('Gemini savings split', () => {
 describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
   // The text path is warm when the actual request read cache (cr>0), or when a
   // same-session prior with the same system + tools hash completed inside the
-  // TTL. The second case covers pxpipe busting its own image cache: the text
-  // request would still have hit its prefix, so that miss is pxpipe's cost.
+  // TTL. The second case covers inkling busting its own image cache: the text
+  // request would still have hit its prefix, so that miss is inkling's cost.
   function antEvt(
     usage: {
       input_tokens: number;
@@ -917,26 +917,26 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
         'warmsess',
         'stable-system',
         undefined,
-        'px-b', // pxpipe sent a different image prefix → its own bust
+        'px-b', // inkling sent a different image prefix → its own bust
       ) as never,
     );
 
     const recent = (await dash.serveRecent().json()) as RecentPayload;
     const miss = recent.recent.at(-1)!;
 
-    // pxpipe's image really did miss — it paid the cold create this turn.
+    // inkling's image really did miss — it paid the cold create this turn.
     expect(miss.cache_read).toBe(0);
 
-    // actual = 100 + 20000×1.25 = 25100 (what pxpipe actually paid this turn).
+    // actual = 100 + 20000×1.25 = 25100 (what inkling actually paid this turn).
     expect(miss.actual_input).toBe(25100);
 
     // Warm text baseline: 20000×0.1 reused + 10000 tail = 12000. The re-create
-    // is charged to pxpipe instead of being booked as savings.
+    // is charged to inkling instead of being booked as savings.
     expect(miss.baseline_input).toBe(12000);
     expect(miss.session_saved_so_far_delta).toBe(-13100);
   });
 
-  it('keeps text cold on cache_read=0 when pxpipe re-sent the same prefix (server eviction)', async () => {
+  it('keeps text cold on cache_read=0 when inkling re-sent the same prefix (server eviction)', async () => {
     const usageWarm = {
       input_tokens: 100,
       output_tokens: 50,
@@ -1030,7 +1030,7 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
         duration_ms: 7502,
         compressed: true,
         model: 'claude-opus-5-5',
-        cache_prefix_sha8: '58d9b560', // real log: pxpipe changed its prefix
+        cache_prefix_sha8: '58d9b560', // real log: inkling changed its prefix
         first_user_sha8: 'c4fa7142',
         system_sha8: '8d36a7a6',
         cache_prefix_tools_sha8: '80a31dc9',
@@ -1176,7 +1176,7 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
 
   it('prices a warm read warm even with NO prior warmth state (post-restart)', async () => {
     // The cache is already warm on Anthropic's side (cr>0), but this process has
-    // never seen the session — exactly the first turn after a pxpipe restart or a
+    // never seen the session — exactly the first turn after a inkling restart or a
     // SESSION_CAP eviction. The OLD code required
     // an in-memory warmthPrev entry, so it fell through to the COLD branch and
     // billed the known-cached prefix the 1.25× CREATE rate — fabricating the

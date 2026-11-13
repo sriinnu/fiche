@@ -3,7 +3,7 @@
 # GPT-6 Astra quality results
 
 2026-09-05, `gpt-6-astra` through the configured direct Codex Responses upstream,
-not pxpipe. Reasoning **low**, image detail **original**, text verbosity low.
+not inkling. Reasoning **low**, image detail **original**, text verbosity low.
 Same N and table columns as the other model evaluations; no parameter sweep.
 
 ## Results

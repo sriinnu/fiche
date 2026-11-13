@@ -9,7 +9,7 @@
  * see src/core/session-state.ts:sessionAnchorText). Within a single
  * Claude Code session that hash is stable across every turn; across two
  * different sessions it is virtually never the same. That makes it a
- * better-than-good-enough session key without coupling pxpipe to Claude
+ * better-than-good-enough session key without coupling inkling to Claude
  * Code's internal file layout for *correctness*.
  *
  * We *do* read `~/.claude/projects/` opportunistically (see `claudeCodeMap`)
@@ -19,8 +19,8 @@
  *
  * ## File layout we manage
  *
- * - `~/.pxpipe/events.jsonl` — append-only JSONL written by FileTracker
- * - `~/.pxpipe/4xx-bodies/${iso-ts}-${sha8}.json.gz` — gzipped failure
+ * - `~/.inkling/events.jsonl` — append-only JSONL written by FileTracker
+ * - `~/.inkling/4xx-bodies/${iso-ts}-${sha8}.json.gz` — gzipped failure
  *   bodies referenced from JSONL rows via `req_body_sample_path`
  */
 
@@ -87,7 +87,7 @@ export interface SessionsPaths {
 export function defaultPaths(): SessionsPaths {
   const home = os.homedir();
   const eventsFile =
-    process.env.PXPIPE_LOG ?? path.join(home, '.pxpipe', 'events.jsonl');
+    process.env.INKLING_LOG ?? path.join(home, '.inkling', 'events.jsonl');
   // The sidecar directory is `4xx-bodies` next to the events file, matching
   // what src/node.ts writes.
   const sidecarDir = path.join(path.dirname(eventsFile), '4xx-bodies');
@@ -98,7 +98,7 @@ export function defaultPaths(): SessionsPaths {
 
 /** Lazily stream events.jsonl line by line. Yields parsed TrackEvents plus
  *  the raw line (we need byte length for jsonlBytes accounting). Malformed
- *  lines are silently dropped — matches `pxpipe stats` behavior. */
+ *  lines are silently dropped — matches `inkling stats` behavior. */
 export async function* readEvents(
   eventsFile: string,
 ): AsyncGenerator<{ ev: TrackEvent; rawBytes: number }> {
@@ -176,7 +176,7 @@ export async function aggregateSessions(
     // rare and the first cwd is the most stable identifier.
     if (s.project === undefined && ev.cwd) s.project = ev.cwd;
     // Real per-session savings, cache-aware. See src/core/baseline.ts for the
-    // full derivation: pxpipe is credited only for token reduction, never for
+    // full derivation: inkling is credited only for token reduction, never for
     // caching. The imagined text baseline is warm when cr>0, or when a
     // same-prefix prior completed within the TTL (see deriveBaselineWarmth).
     // Events missing either probe stay out of the rollup — no estimation.
@@ -618,7 +618,7 @@ export function decodeClaudeProjectDir(name: string): string {
 /**
  * Best-effort scan of `~/.claude/projects/*.jsonl`. Returns a map keyed by
  * the same `first_user_sha8` the proxy emits. If `~/.claude/projects/` is
- * missing, returns an empty map without throwing — pxpipe must keep
+ * missing, returns an empty map without throwing — inkling must keep
  * working for non-Claude-Code clients.
  *
  * This is O(number_of_sessions) file opens. On a heavy user's machine

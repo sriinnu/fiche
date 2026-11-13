@@ -12,7 +12,7 @@ export const CACHE_READ_RATE = 0.1;
 /** Effective cache-write rate for this request. Older usage payloads do not
  * expose the tier split; preserve the historical/conservative 5-minute rate
  * in that case. The text counterfactual uses the same observed tier mix as
- * the transformed request because pxpipe relocates, rather than invents, the
+ * the transformed request because inkling relocates, rather than invents, the
  * caller's cache-control markers. */
 function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
   if (!(cc > 0)) return CACHE_CREATE_RATE;
@@ -46,7 +46,7 @@ export interface BaselineWarmthPrev {
   /** cache_prefix_tools_sha8 of that turn. A changed tool list busts the text
    *  prefix too; missing on either side is treated as unknown (don't care). */
   toolsSha?: string;
-  /** cache_prefix_sha8 pxpipe actually sent (post-transform). */
+  /** cache_prefix_sha8 inkling actually sent (post-transform). */
   pxPrefixSha?: string;
   /** Model of that turn; prompt cache does not cross models. */
   model?: string;
@@ -59,8 +59,8 @@ export interface BaselineWarmthPrev {
  *  - this session has a prior row that completed less than `ttlSec` before
  *    this request started, with the same `system_sha8` (both known) and the
  *    same tools hash (or either unknown). The text request would have read
- *    that prefix from cache even if the image path missed — pxpipe busting its
- *    own cache is a real cost of pxpipe, not something text would have paid;
+ *    that prefix from cache even if the image path missed — inkling busting its
+ *    own cache is a real cost of inkling, not something text would have paid;
  *  - or the actual request reports `cr > 0`, which is server proof of a warm read.
  *
  * Otherwise the text baseline is priced cold. When warm, reused =
@@ -101,25 +101,25 @@ export function deriveBaselineWarmth(
     || prev.toolsSha === toolsSha;
   // A same-prefix prior that completed inside the TTL means the TEXT request
   // would have found its own prefix cached, even when the image path missed
-  // (cr === 0 because pxpipe re-rendered and busted its own cache). Requires a
+  // (cr === 0 because inkling re-rendered and busted its own cache). Requires a
   // positive system match — an unknown system hash can't vouch for the prefix.
   const provenSystem = prev !== undefined
     && prev.prefixSha !== undefined
     && prefixSha !== undefined
     && prev.prefixSha === prefixSha;
   if (!(cr > 0)) {
-    // Self-bust exception: only when pxpipe PROVABLY changed what it sent.
+    // Self-bust exception: only when inkling PROVABLY changed what it sent.
     //  - prompt cache is per model: a model switch means text would miss too;
-    //  - the outgoing cache_prefix_sha8 must differ from the prior's. If pxpipe
+    //  - the outgoing cache_prefix_sha8 must differ from the prior's. If inkling
     //    sent the same prefix and still got cr === 0, the server evicted it and
-    //    text would have missed as well — not pxpipe's fault, not text's gain.
+    //    text would have missed as well — not inkling's fault, not text's gain.
     const sameModel = prev?.model !== undefined
       && opts?.model !== undefined
       && prev.model === opts.model;
-    const pxpipeBusted = prev?.pxPrefixSha !== undefined
+    const inklingBusted = prev?.pxPrefixSha !== undefined
       && opts?.pxPrefixSha !== undefined
       && prev.pxPrefixSha !== opts.pxPrefixSha;
-    if (fresh && provenSystem && sameTools && sameModel && pxpipeBusted) {
+    if (fresh && provenSystem && sameTools && sameModel && inklingBusted) {
       return { warm: true, prevCacheable: prev!.cacheable };
     }
     return { warm: false, prevCacheable: 0 };
@@ -145,7 +145,7 @@ export function deriveBaselineWarmth(
  *   warm turn (a prior turn cached the prefix within TTL):
  *     text append-caches ⇒ reused×CACHE_READ_RATE + grown×CACHE_CREATE_RATE + coldTail×1.0
  *     where reused = min(prevCacheable, cacheable), grown = cacheable − reused.
- *     This is what TEXT pays regardless of whether pxpipe's image busted its
+ *     This is what TEXT pays regardless of whether inkling's image busted its
  *     own cache on a growth turn — so the real growth loss is preserved.
  *
  * Saving = baseline_eff − actual_eff; can be negative (honestly reported, not floored).
@@ -204,7 +204,7 @@ export function computeBaselineInputEffWithCacheTier(
   return cacheable * createRate + coldTail * 1.0;
 }
 
-/** Weighted input cost pxpipe actually paid this turn. */
+/** Weighted input cost inkling actually paid this turn. */
 export function computeActualInputEff(
   inputTokens: number,
   cc: number,

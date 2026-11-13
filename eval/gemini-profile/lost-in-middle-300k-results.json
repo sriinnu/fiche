@@ -14,43 +14,43 @@
     "byDepth": {
       "0.1": {
         "raw_reasoning_acc": 1,
-        "pxpipe_reasoning_acc": 1,
+        "inkling_reasoning_acc": 1,
         "raw_multihop_acc": 1,
-        "pxpipe_multihop_acc": 1,
+        "inkling_multihop_acc": 1,
         "raw_avg_ms": 7862,
-        "pxpipe_avg_ms": 17562
+        "inkling_avg_ms": 17562
       },
       "0.3": {
         "raw_reasoning_acc": 1,
-        "pxpipe_reasoning_acc": 1,
+        "inkling_reasoning_acc": 1,
         "raw_multihop_acc": 1,
-        "pxpipe_multihop_acc": 1,
+        "inkling_multihop_acc": 1,
         "raw_avg_ms": 6566,
-        "pxpipe_avg_ms": 13473
+        "inkling_avg_ms": 13473
       },
       "0.5": {
         "raw_reasoning_acc": 1,
-        "pxpipe_reasoning_acc": 0.5,
+        "inkling_reasoning_acc": 0.5,
         "raw_multihop_acc": 1,
-        "pxpipe_multihop_acc": 0.5,
+        "inkling_multihop_acc": 0.5,
         "raw_avg_ms": 7003,
-        "pxpipe_avg_ms": 18619
+        "inkling_avg_ms": 18619
       },
       "0.7": {
         "raw_reasoning_acc": 1,
-        "pxpipe_reasoning_acc": 1,
+        "inkling_reasoning_acc": 1,
         "raw_multihop_acc": 1,
-        "pxpipe_multihop_acc": 1,
+        "inkling_multihop_acc": 1,
         "raw_avg_ms": 8747,
-        "pxpipe_avg_ms": 23961
+        "inkling_avg_ms": 23961
       },
       "0.9": {
         "raw_reasoning_acc": 1,
-        "pxpipe_reasoning_acc": 1,
+        "inkling_reasoning_acc": 1,
         "raw_multihop_acc": 1,
-        "pxpipe_multihop_acc": 0,
+        "inkling_multihop_acc": 0,
         "raw_avg_ms": 4963,
-        "pxpipe_avg_ms": 15264
+        "inkling_avg_ms": 15264
       }
     }
   },
@@ -93,7 +93,7 @@
         },
         "text": "{\n  \"target_cluster\": \"gamma\",\n  \"primary_status\": \"maintenance\",\n  \"backup_status\": \"disabled\",\n  \"final_route\": \"blackhole_sink\",\n  \"status_code\": 503,\n  \"mutation_token\": \"MUTATION_GAMMA_81042\"\n}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "gamma",
@@ -170,7 +170,7 @@
         },
         "text": "{\"target_cluster\":\"epsilon\",\"primary_status\":\"maintenance\",\"backup_status\":\"disabled\",\"final_route\":\"blackhole_sink\",\"status_code\":503,\"mutation_token\":\"MUTATION_EPSILON_66409\"}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "epsilon",
@@ -254,7 +254,7 @@
         },
         "text": "{\n  \"target_cluster\": \"epsilon\",\n  \"primary_status\": \"maintenance\",\n  \"backup_status\": \"disabled\",\n  \"final_route\": \"blackhole_sink\",\n  \"status_code\": 503,\n  \"mutation_token\": \"MUTATION_EPSILON_14306\"\n}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "epsilon",
@@ -331,7 +331,7 @@
         },
         "text": "{\n  \"target_cluster\": \"delta\",\n  \"primary_status\": \"maintenance\",\n  \"backup_status\": \"disabled\",\n  \"final_route\": \"blackhole_sink\",\n  \"status_code\": 503,\n  \"mutation_token\": \"MUTATION_DELTA_89673\"\n}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "delta",
@@ -408,7 +408,7 @@
         },
         "text": "{\"target_cluster\": \"theta\", \"primary_status\": \"maintenance\", \"backup_status\": \"disabled\", \"final_route\": \"blackhole_sink\", \"status_code\": 503, \"mutation_token\": \"MUTATION_THETA_37570\"}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "theta",
@@ -485,7 +485,7 @@
         },
         "text": "{\"target_cluster\":\"zeta\",\"primary_status\":\"maintenance\",\"backup_status\":\"disabled\",\"final_route\":\"blackhole_sink\",\"status_code\":503,\"mutation_token\":\"MUTATION_ZETA_22937\"}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "zeta",
@@ -562,7 +562,7 @@
         },
         "text": "{\"target_cluster\":\"zeta\",\"primary_status\":\"maintenance\",\"backup_status\":\"disabled\",\"final_route\":\"blackhole_sink\",\"status_code\":503,\"mutation_token\":\"MUTATION_ZETA_48130\"}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "zeta",
@@ -639,7 +639,7 @@
         },
         "text": "{\"target_cluster\":\"epsilon\",\"primary_status\":\"maintenance\",\"backup_status\":\"disabled\",\"final_route\":\"blackhole_sink\",\"status_code\":503,\"mutation_token\":\"MUTATION_EPSILON_46201\"}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "epsilon",
@@ -723,7 +723,7 @@
         },
         "text": "{\n  \"target_cluster\": \"omega\",\n  \"primary_status\": \"maintenance\",\n  \"backup_status\": \"disabled\",\n  \"final_route\": \"blackhole_sink\",\n  \"status_code\": 503,\n  \"mutation_token\": \"MUTATION_OMEGA_71394\"\n}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "omega",
@@ -800,7 +800,7 @@
         },
         "text": "{\"target_cluster\": \"theta\", \"primary_status\": \"maintenance\", \"backup_status\": \"disabled\", \"final_route\": \"blackhole_sink\", \"status_code\": 503, \"mutation_token\": \"MUTATION_THETA_56761\"}"
       },
-      "pxpipe": {
+      "inkling": {
         "score": {
           "parsed": {
             "target_cluster": "theta",

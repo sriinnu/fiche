@@ -1,4 +1,4 @@
-# GSM8K: text baseline vs pxpipe-rendered-image, both solved by `claude -p`.
+# GSM8K: text baseline vs inkling-rendered-image, both solved by `claude -p`.
 # The image arm gets ONLY the PNG (problem text not in the prompt), so it must
 # read the image to answer. Exact-match on the final integer.
 import json, subprocess, re, os, sys
@@ -40,7 +40,7 @@ def extract(out):
     if not nums: return None
     NO_MARKER.append(1)
     return nums[-1]
-# Trials must bypass the pxpipe proxy. If ANTHROPIC_BASE_URL points at the local
+# Trials must bypass the inkling proxy. If ANTHROPIC_BASE_URL points at the local
 # proxy, each trial's context gets imaged and the measurement is invalid (reads as
 # a near-zero score). Mirrors the guard already present in eval/gist-recall/run.py
 # and eval/verbatim-15/run.py, which strip this var the same way.
@@ -70,7 +70,7 @@ bc = sum(1 for r in res if r[0]); ic = sum(1 for r in res if r[1])
 bu = sum(1 for r in res if r[3] is None); iu = sum(1 for r in res if r[4] is None)
 print(f"N={N} (offset {OFF}, model {MODEL})")
 print(f"  baseline (text)   = {bc}/{N} = {100*bc/N:.1f}%  (no answer at all: {bu}/{N})")
-print(f"  pxpipe (image) = {ic}/{N} = {100*ic/N:.1f}%  (no answer at all: {iu}/{N})")
+print(f"  inkling (image) = {ic}/{N} = {100*ic/N:.1f}%  (no answer at all: {iu}/{N})")
 # Provenance of the scores above. Trials with no ANSWER: marker were scored by
 # taking the last number in the transcript, which cannot distinguish "computed
 # the answer" from "echoed the problem". Publish nothing from a run where this

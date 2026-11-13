@@ -7,9 +7,9 @@
  *    route could match and blindly tunnels the rest. Under warp the agent
  *    believes it is talking straight to api.anthropic.com, so the less we
  *    terminate, the fewer ways that belief can break.
- *  - wardex owns its listener; warp attaches to the proxy server pxpipe is
+ *  - wardex owns its listener; warp attaches to the proxy server inkling is
  *    already running. CONNECT is a distinct event from a normal request, so one
- *    port serves both the origin-form traffic pxpipe handles and the
+ *    port serves both the origin-form traffic inkling handles and the
  *    absolute-form/CONNECT traffic a forward proxy handles.
  */
 
@@ -57,7 +57,7 @@ export interface WarpHandlers {
 }
 
 /**
- * A CONNECT handler reachable off-host is an open relay, and pxpipe's HOST env
+ * A CONNECT handler reachable off-host is an open relay, and inkling's HOST env
  * var permits a non-loopback bind. The dashboard already refuses non-loopback
  * callers; the proxy duty needs the same guard for the same reason.
  */
@@ -187,7 +187,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
         return;
       }
       res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end(`pxpipe warp: upstream error: ${err.message}`);
+      res.end(`inkling warp: upstream error: ${err.message}`);
     });
     // An SSE completion only ends when the model stops. If the agent is killed
     // mid-stream nothing else cancels the upstream: the response keeps draining
@@ -280,7 +280,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const handleAbsoluteForm = (req: IncomingMessage, res: ServerResponse): void => {
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
       res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end('pxpipe warp: forward proxy is loopback-only');
+      res.end('inkling warp: forward proxy is loopback-only');
       return;
     }
     let target: URL;
@@ -288,12 +288,12 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       target = new URL(req.url ?? '');
     } catch {
       res.writeHead(400, { 'content-type': 'text/plain' });
-      res.end('pxpipe warp: bad absolute URI');
+      res.end('inkling warp: bad absolute URI');
       return;
     }
     if (target.protocol !== 'http:' && target.protocol !== 'https:') {
       res.writeHead(400, { 'content-type': 'text/plain' });
-      res.end('pxpipe warp: unsupported scheme');
+      res.end('inkling warp: unsupported scheme');
       return;
     }
     // A pattern that names a port is matched against "host:port", and the

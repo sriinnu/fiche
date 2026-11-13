@@ -1,5 +1,5 @@
 /**
- * MCP server for the pxpipe-fork hybrid (stdio and stateless Streamable HTTP).
+ * MCP server for the inkling hybrid (stdio and stateless Streamable HTTP).
  * One tool surface for every client. Tools are local, deterministic, and do
  * not send the payload anywhere.
  */
@@ -11,8 +11,8 @@ import { hybridTransform, countBillable, type HybridWire } from '../core/hybrid.
 import { supportsExplicitPromptCacheBreakpoint } from '../core/codex-cache.js';
 
 export const MCP_PROTOCOL = '2025-03-26';
-export const SERVER_NAME = 'pxpipe-fork';
-export const SERVER_VERSION = '0.17.0-fork.1';
+export const SERVER_NAME = 'inkling';
+export const SERVER_VERSION = '0.17.0';
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -86,7 +86,7 @@ export const MCP_TOOLS = [
   ),
   tool(
     'transform_request',
-    'Run the hybrid pipeline on an LLM request JSON object: lossless PAKT on structured tool results, schemas, JSON, YAML, and CSV, then pxpipe images only if the model is a strong page reader (Gemini, Fable 5, Sol 5.6/6.1). Claude 5.5 and Grok stay on PAKT text. Set upstream to https://chatgpt.com or wire path /backend-api/codex/responses to force-strip prompt_cache_breakpoint.',
+    'Run the hybrid pipeline on an LLM request JSON object: lossless PAKT on structured tool results, schemas, JSON, YAML, and CSV, then inkling images only if the model is a strong page reader (Gemini, Fable 5, Sol 5.6/6.1). Claude 5.5 and Grok stay on PAKT text. Set upstream to https://chatgpt.com or wire path /backend-api/codex/responses to force-strip prompt_cache_breakpoint.',
     {
       request: { type: 'object', description: 'Provider request JSON (Anthropic messages, OpenAI responses, chat completions, or Gemini).' },
       model: { type: 'string', description: 'Model id. Overrides request.model when set.' },
@@ -132,9 +132,6 @@ async function callTool(name: string, args: Record<string, unknown>) {
       name: SERVER_NAME,
       version: SERVER_VERSION,
       protocol: MCP_PROTOCOL,
-      forkOf: 'https://github.com/teamchong/pxpipe',
-      upstreamVersion: '0.16.0',
-      upstreamCommit: '9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3',
       pakt: '@sriinnu/pakt@0.10.0',
       paktRepo: 'https://github.com/sriinnu/clipforge-PAKT',
       legend: PAKT_LEGEND,
@@ -180,7 +177,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       model,
       readerTier: tier,
       route: tier === 'image'
-        ? 'PAKT on structured leaves, then pxpipe images for bulky context'
+        ? 'PAKT on structured leaves, then inkling images for bulky context'
         : 'PAKT text only; dense images stay off because this reader is weak',
       originalTokens,
       paktTokens: packed.applied ? packed.packedTokens : originalTokens,
@@ -253,7 +250,7 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: 'pxpipe-fork hybrid: lossless PAKT for structured text, pxpipe images only for Gemini, Fable 5, and Sol. Claude 5.5 and Grok get PAKT text. L4 is opt-in. This server does not store prompts.',
+        instructions: 'inkling hybrid: lossless PAKT for structured text, inkling images only for Gemini, Fable 5, and Sol. Claude 5.5 and Grok get PAKT text. L4 is opt-in. This server does not store prompts.',
       },
     };
   }
@@ -296,10 +293,12 @@ export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message:
         }, true);
         return '';
       }
+      // Content-Length counts UTF-8 bytes, not UTF-16 code units.
       const bodyStart = alt + sep;
-      if (rest.length < bodyStart + length) break;
-      const json = rest.slice(bodyStart, bodyStart + length);
-      rest = rest.slice(bodyStart + length);
+      const bytes = Buffer.from(rest.slice(bodyStart), 'utf8');
+      if (bytes.length < length) break;
+      const json = bytes.subarray(0, length).toString('utf8');
+      rest = bytes.subarray(length).toString('utf8');
       try { onMessage(JSON.parse(json), true); } catch { /* ignore a bad frame */ }
       continue;
     }

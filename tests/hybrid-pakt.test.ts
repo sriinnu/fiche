@@ -1,3 +1,4 @@
+import { PAKT_LEGEND } from '../src/core/pakt-stage.js';
 import { afterEach, describe, expect, it } from 'vitest';
 import { decompress } from '@sriinnu/pakt';
 import { packStructured } from '../src/core/pakt-stage.js';
@@ -14,7 +15,7 @@ function events(n: number, ms: (i: number) => number) {
       user: 'octocat',
       status: 'ok',
       path: 'src/core/hybrid.ts',
-      service: 'pxpipe-fork',
+      service: 'inkling',
       ms: ms(i),
       note: 'static slab cache hit on the system prompt',
     })),
@@ -64,10 +65,10 @@ describe('PAKT stage', () => {
 });
 
 describe('reader tier', () => {
-  const prev = process.env.PXPIPE_FORCE_IMAGES;
+  const prev = process.env.INKLING_FORCE_IMAGES;
   afterEach(() => {
-    if (prev === undefined) delete process.env.PXPIPE_FORCE_IMAGES;
-    else process.env.PXPIPE_FORCE_IMAGES = prev;
+    if (prev === undefined) delete process.env.INKLING_FORCE_IMAGES;
+    else process.env.INKLING_FORCE_IMAGES = prev;
   });
 
   it('images strong readers and keeps Claude 5.5 and Grok on PAKT text', () => {
@@ -79,7 +80,7 @@ describe('reader tier', () => {
     for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'grok-4.5', 'grok-4.6', 'grok-4.7', 'claude-opus-5']) {
       expect(readerTier(model), model).toBe('pakt-text');
     }
-    process.env.PXPIPE_FORCE_IMAGES = '1';
+    process.env.INKLING_FORCE_IMAGES = '1';
     expect(readerTier('claude-opus-5-5')).toBe('image');
   });
 });
@@ -115,8 +116,10 @@ describe('hybrid pipeline', () => {
     const match = packed.match(/@from json[\s\S]*$/);
     expect(match).toBeTruthy();
     // The tool result itself still decompresses. Pull the packed block back out.
+    // The first packed leaf carries the legend; the PAKT body after it decompresses.
     const tool = JSON.parse(packed).messages[2].content[0].content as string;
-    expect(decompress(tool, 'json').data).toEqual(JSON.parse(raw));
+    expect(tool.startsWith(PAKT_LEGEND)).toBe(true);
+    expect(decompress(tool.slice(PAKT_LEGEND.length).trimStart(), 'json').data).toEqual(JSON.parse(raw));
     expect(result.report.promptCacheBreakpoint).toBe(false);
   });
 });

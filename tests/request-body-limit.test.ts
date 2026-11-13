@@ -11,7 +11,7 @@
  * a wrong value costs nothing to send, so these tests drive the honest case, the
  * silent case and the lying case, and require the same answer from all three.
  *
- * Routes pxpipe only labels are held to a different contract: they carry uploads
+ * Routes inkling only labels are held to a different contract: they carry uploads
  * and audio, so they must never be rejected, and their body must reach the
  * upstream byte-for-byte even though a bounded prefix was read off it.
  *
@@ -20,14 +20,14 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createProxy, DEFAULT_MAX_REQUEST_BYTES, type ProxyConfig, type ProxyEvent } from '../src/core/proxy.js';
 
-let ambientPxpipeModels: string | undefined;
+let ambientInklingModels: string | undefined;
 beforeAll(() => {
-  ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  process.env.PXPIPE_MODELS = 'claude-fable-5';
+  ambientInklingModels = process.env.INKLING_MODELS;
+  process.env.INKLING_MODELS = 'claude-fable-5';
 });
 afterAll(() => {
-  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
-  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+  if (ambientInklingModels === undefined) delete process.env.INKLING_MODELS;
+  else process.env.INKLING_MODELS = ambientInklingModels;
 });
 
 interface Upstream {
@@ -229,7 +229,7 @@ describe('label-only routes are bounded but never rejected', () => {
   it('streams an oversized upload through untouched', async () => {
     const up = mockUpstream();
     try {
-      // Four times the ceiling on a route pxpipe does not transform. Rejecting it
+      // Four times the ceiling on a route inkling does not transform. Rejecting it
       // would break uploads; buffering it would be the same defect under a
       // different route name.
       const payload = 'y'.repeat(LIMIT * 4);

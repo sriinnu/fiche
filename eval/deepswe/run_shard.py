@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run one shard of DeepSWE v1.1 through Claude Code + pxpipe, on a Max subscription.
+"""Run one shard of DeepSWE v1.1 through Claude Code + inkling, on a Max subscription.
 
 Wiring, and why it is not just ANTHROPIC_BASE_URL=http://127.0.0.1:47821:
 
-  agent container -> squid -> host:80 -> socat -> host:47821 (pxpipe) -> upstream
+  agent container -> squid -> host:80 -> socat -> host:47821 (inkling) -> upstream
 
 Pier seals the agent container on an `internal: true` network and gives it exactly
 one exit: a squid sidecar whose ACL is derived from the hostname of
@@ -14,8 +14,8 @@ ANTHROPIC_BASE_URL. Two constraints fall out of squid's generated config:
 
 so the base URL must land on port 80 (plain HTTP, no CONNECT, no CA to install),
 and the container cannot reach 127.0.0.1 at all. Hence host.docker.internal and
-the socat shim publishing host port 80 -> pxpipe. Publishing 80 through Docker
-needs no sudo; binding it directly from pxpipe would.
+the socat shim publishing host port 80 -> inkling. Publishing 80 through Docker
+needs no sudo; binding it directly from inkling would.
 
 Auth reuses the host's own subscription the way cci does: the macOS keychain item
 holds an sk-ant-oat01 access token, and pier already forwards
@@ -47,8 +47,8 @@ TASKS = Path(os.environ.get(
 RESULTS = Path(os.environ.get("DEEPSWE_RESULTS", HERE / "results"))
 MANIFEST = RESULTS / "manifest.jsonl"
 
-PXPIPE_PORT = int(os.environ.get("PXPIPE_PORT", "47821"))
-SHIM_NAME = "pxpipe-deepswe-80"
+INKLING_PORT = int(os.environ.get("INKLING_PORT", "47821"))
+SHIM_NAME = "inkling-deepswe-80"
 BASE_URL = "http://host.docker.internal"  # port 80 by squid's Safe_ports
 MODEL = os.environ.get("DEEPSWE_MODEL", "claude-opus-5")
 NO_PROXY = False  # set by --no-proxy; control arm talks to api.anthropic.com
@@ -63,7 +63,7 @@ EFFORT = "high"  # low | medium | high | max
 # Every DeepSWE task.toml gives the agent the same budget. Nothing reads the
 # file; this is the number to change if the task set ever ships a different one.
 AGENT_BUDGET_S = 5400.0
-# pxpipe renders history to PNGs, which costs wall clock that the 5400s never
+# inkling renders history to PNGs, which costs wall clock that the 5400s never
 # accounted for: measured 22.6 s/turn against 9.5 s bare. Scale the agent's
 # budget rather than the verifier's, and document it in the PR.
 AGENT_TIMEOUT_MULTIPLIER = 2.0
@@ -83,7 +83,7 @@ BUDGET_MIN = 270.0
 # The proxy re-reads this per request, so the bearer the container froze at
 # startup stops mattering. Shared by all shards: one writer, one credential.
 TOKEN_FILE = Path(os.environ.get(
-    "ANTHROPIC_OAUTH_TOKEN_FILE", Path.home() / ".pxpipe-deepswe-token"))
+    "ANTHROPIC_OAUTH_TOKEN_FILE", Path.home() / ".inkling-deepswe-token"))
 
 
 def sh(cmd, **kw):
@@ -134,7 +134,7 @@ def oauth_token(min_valid_s=900):
     if c and c["expiresAt"] / 1000 - time.time() > min_valid_s:
         return c["accessToken"]
     # Refresh must reach api.anthropic.com; inheriting ANTHROPIC_BASE_URL sends
-    # it into pxpipe, which answers fine and never rotates anything.
+    # it into inkling, which answers fine and never rotates anything.
     clean = {k: v for k, v in os.environ.items()
              if k not in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
                           "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")}
@@ -181,41 +181,41 @@ def token_refresher():
     threading.Thread(target=loop, daemon=True).start()
 
 
-def pxpipe_serve_has_token_file():
-    """True if the proxy holding PXPIPE_PORT already has the env var wired.
+def inkling_serve_has_token_file():
+    """True if the proxy holding INKLING_PORT already has the env var wired.
 
-    Shards run 4-up and each calls pxpipe_up(), so restarting unconditionally
+    Shards run 4-up and each calls inkling_up(), so restarting unconditionally
     would drop the other shards' in-flight requests.
 
     Ask the port who owns it rather than matching argv: a proxy started as
-    `pnpm run restart` is `node bin/cli.js`, which no 'pxpipe serve' pattern
+    `pnpm run restart` is `node bin/cli.js`, which no 'inkling serve' pattern
     matches, so argv matching reports "no token file" for a perfectly good
     proxy and we spawn a duplicate that cannot bind.
     """
-    for pid in sh(f"lsof -nP -iTCP:{PXPIPE_PORT} -sTCP:LISTEN -t").stdout.split():
+    for pid in sh(f"lsof -nP -iTCP:{INKLING_PORT} -sTCP:LISTEN -t").stdout.split():
         if "ANTHROPIC_OAUTH_TOKEN_FILE=" in sh(f"ps eww {pid}").stdout:
             return True
     return False
 
 
-def pxpipe_up():
+def inkling_up():
     """Bind non-loopback: the shim container dials host.docker.internal."""
     probe = (
         "docker run --rm --add-host host.docker.internal:host-gateway alpine/socat "
-        f"-T2 - TCP:host.docker.internal:{PXPIPE_PORT} </dev/null"
+        f"-T2 - TCP:host.docker.internal:{INKLING_PORT} </dev/null"
     )
     if sh(probe).returncode == 0:
-        if pxpipe_serve_has_token_file():
+        if inkling_serve_has_token_file():
             return True
         # Up, but from before the token file existed: it would forward the
         # container's frozen bearer and expire mid-task. Nothing is in flight
         # yet at shard start, so a restart here is cheap.
-        sh("pkill -f 'pxpipe serve'")
+        sh("pkill -f 'inkling serve'")
         time.sleep(2)
-    log = RESULTS / "pxpipe.log"
+    log = RESULTS / "inkling.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     subprocess.Popen(
-        ["pxpipe", "serve", "--port", str(PXPIPE_PORT)],
+        ["inkling", "serve", "--port", str(INKLING_PORT)],
         env=dict(os.environ, HOST="0.0.0.0",
                  ANTHROPIC_OAUTH_TOKEN_FILE=str(TOKEN_FILE)),
         stdout=log.open("a"), stderr=subprocess.STDOUT, start_new_session=True,
@@ -240,7 +240,7 @@ def state_dir():
 
     Per results dir, so the two arms cannot claim each other's tasks.
     """
-    d = Path.home() / ".pxpipe-deepswe-state" / RESULTS.name
+    d = Path.home() / ".inkling-deepswe-state" / RESULTS.name
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -344,13 +344,13 @@ def preflight():
             "no usable subscription token: keychain item missing or expired and "
             "a host refresh call did not renew it. Run `claude` once and retry."
         )
-    if not NO_PROXY and not pxpipe_up():
-        problems.append(f"pxpipe did not come up on 0.0.0.0:{PXPIPE_PORT}")
+    if not NO_PROXY and not inkling_up():
+        problems.append(f"inkling did not come up on 0.0.0.0:{INKLING_PORT}")
     return problems
 
 
 def shim_up():
-    """Publish host:80 -> pxpipe. Idempotent."""
+    """Publish host:80 -> inkling. Idempotent."""
     running = lambda: bool(sh(f"docker ps -q -f name=^{SHIM_NAME}$").stdout.strip())
     if running():
         return
@@ -360,7 +360,7 @@ def shim_up():
     r = sh(
         f"docker run -d --name {SHIM_NAME} -p 80:80 "
         f"--add-host host.docker.internal:host-gateway alpine/socat "
-        f"TCP-LISTEN:80,fork,reuseaddr TCP:host.docker.internal:{PXPIPE_PORT}"
+        f"TCP-LISTEN:80,fork,reuseaddr TCP:host.docker.internal:{INKLING_PORT}"
     )
     if r.returncode != 0:
         for _ in range(10):
@@ -395,7 +395,7 @@ def run_task(task, timeout_s):
         "-o", str(out),
         "--job-name", task,
         "-n", "1",  # 8 GB + 2 cpu per task; this host has 10 GB total
-        # pxpipe renders history to PNGs, which costs wall clock the task.toml
+        # inkling renders history to PNGs, which costs wall clock the task.toml
         # budget never accounted for: measured 22.6 s/turn vs 9.5 s bare. Scale
         # the agent budget rather than the verifier's, and record it in the PR.
         "--agent-timeout-multiplier", str(AGENT_TIMEOUT_MULTIPLIER),
@@ -433,13 +433,13 @@ def main():
                          f"{AGENT_TIMEOUT_MULTIPLIER:g}, plus verifier slack")
     ap.add_argument("--list", action="store_true", help="print the shard and exit")
     ap.add_argument("--no-proxy", action="store_true",
-                    help="control arm: bypass pxpipe, hit api.anthropic.com")
+                    help="control arm: bypass inkling, hit api.anthropic.com")
     ap.add_argument("--results-dir",
                     help="results tree; use a separate one per arm so resume "
                          "does not treat the other arm's rewards as done")
     args = ap.parse_args()
 
-    # `pxpipe warp` exports HTTP_PROXY=http://127.0.0.1:<ephemeral> to its
+    # `inkling warp` exports HTTP_PROXY=http://127.0.0.1:<ephemeral> to its
     # children. docker forwards that into builds, where 127.0.0.1 is the
     # container itself, so every fetch dies once the warp session that owned the
     # port exits. The container reaches the API at host.docker.internal, never
@@ -471,7 +471,7 @@ def main():
         return
 
     if not NO_PROXY:
-        # Publish before preflight: pxpipe_up() may start the proxy, and the
+        # Publish before preflight: inkling_up() may start the proxy, and the
         # proxy is useless as a token source until this file exists.
         if not write_token_file():
             sys.exit("no usable subscription token to publish for the proxy")

@@ -44,9 +44,9 @@ for (const model of [
   });
 }
 test('runtime profile overrides propagate without separate eval geometry', async () => {
-  const old = process.env.PXPIPE_GPT_PROFILES;
+  const old = process.env.INKLING_GPT_PROFILES;
   try {
-    process.env.PXPIPE_GPT_PROFILES = JSON.stringify({ 'gpt-6-astra': {
+    process.env.INKLING_GPT_PROFILES = JSON.stringify({ 'gpt-6-astra': {
       stripCols: 90, maxHeightPx: 512, style: { font: 'jetbrains-mono-14' }, factSheetFormat: 'full',
       history: { reflow: false },
     } });
@@ -57,7 +57,7 @@ test('runtime profile overrides propagate without separate eval geometry', async
     assert.equal(got.provenance.recipe.reflow, false);
     assert.equal(got.provenance.recipe.factSheetFormat, 'full');
   } finally {
-    if (old === undefined) delete process.env.PXPIPE_GPT_PROFILES; else process.env.PXPIPE_GPT_PROFILES = old;
+    if (old === undefined) delete process.env.INKLING_GPT_PROFILES; else process.env.INKLING_GPT_PROFILES = old;
   }
 });
 test('shared source fixture has 15 unique unmarked targets at varying depths', () => {

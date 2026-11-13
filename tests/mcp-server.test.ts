@@ -33,7 +33,7 @@ describe('MCP server', () => {
     }));
     const initBody = init as { result: { protocolVersion: string; serverInfo: { name: string } } };
     expect(initBody.result.protocolVersion).toBe('2025-03-26');
-    expect(initBody.result.serverInfo.name).toBe('pxpipe-fork');
+    expect(initBody.result.serverInfo.name).toBe('inkling');
     expect(await handleMcpMessage({ jsonrpc: '2.0', method: 'notifications/initialized' })).toBeNull();
 
     const listed = await handleMcpMessage(rpc('tools/list'));
@@ -109,7 +109,7 @@ describe('MCP server', () => {
       });
       expect(res.status).toBe(200);
       const json = await res.json() as { result: { structuredContent: { name: string; pakt: string } } };
-      expect(json.result.structuredContent.name).toBe('pxpipe-fork');
+      expect(json.result.structuredContent.name).toBe('inkling');
       expect(json.result.structuredContent.pakt).toContain('@sriinnu/pakt');
       const denied = await fetch(`http://127.0.0.1:${http.port}/mcp`, {
         method: 'POST',

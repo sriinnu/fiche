@@ -2,7 +2,7 @@ export function responsesEndpoint() {
   const base = (process.env.OPENAI_BASE_URL || '').replace(/\/$/, '');
   if (!base) throw new Error('OPENAI_BASE_URL is required');
   const url = new URL(base);
-  if (url.port === '47821') throw new Error('refuse pxpipe');
+  if (url.port === '47821') throw new Error('refuse inkling');
   return base.endsWith('/responses') ? base : `${base}/responses`;
 }
 

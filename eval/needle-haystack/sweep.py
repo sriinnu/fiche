@@ -12,7 +12,7 @@ MODEL = os.environ.get("EVAL_MODEL")
 if not MODEL:
     sys.exit("sweep.py: EVAL_MODEL is not set — refusing to guess a model.\n"
              "  EVAL_MODEL=claude-opus-5 python3 eval/needle-haystack/sweep.py")
-W, H = 1568, 1276          # pxpipe-equivalent dims -> ~2668 image tokens
+W, H = 1568, 1276          # inkling-equivalent dims -> ~2668 image tokens
 IMG_TOKENS = round(W*H/750)
 
 FILLER = ("the quick brown fox jumps over the lazy dog while the cache layer "

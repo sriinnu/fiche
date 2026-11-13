@@ -1,5 +1,5 @@
 services:
-  pxpipe:
+  inkling:
     build:
       context: .
     restart: unless-stopped
@@ -10,11 +10,11 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "127.0.0.1:${PXPIPE_PORT:-47821}:47821"
+      - "127.0.0.1:${INKLING_PORT:-47821}:47821"
     environment:
-      - PXPIPE_MODELS
-      - PXPIPE_DISABLE
-      - PXPIPE_UPSTREAM
+      - INKLING_MODELS
+      - INKLING_DISABLE
+      - INKLING_UPSTREAM
       - ANTHROPIC_UPSTREAM
       - OPENAI_UPSTREAM
       - OPENAI_API_KEY
@@ -22,14 +22,14 @@ services:
       - CLOUDFLARE_MODELS
       - CLOUDFLARE_ACCOUNT_ID
       - CLOUDFLARE_API_TOKEN
-      - PXPIPE_PROVIDER
-      - PXPIPE_GATEWAY_BASE_URL
-      - PXPIPE_GATEWAY_HEADERS
-      - PXPIPE_GPT_PROFILES
-      - PXPIPE_DUMP_DIR
-      - PXPIPE_DEBUG_CAPTURE_4XX
+      - INKLING_PROVIDER
+      - INKLING_GATEWAY_BASE_URL
+      - INKLING_GATEWAY_HEADERS
+      - INKLING_GPT_PROFILES
+      - INKLING_DUMP_DIR
+      - INKLING_DEBUG_CAPTURE_4XX
     volumes:
-      - pxpipe-data:/data
+      - inkling-data:/data
 
 volumes:
-  pxpipe-data:
+  inkling-data:

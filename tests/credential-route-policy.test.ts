@@ -1,7 +1,7 @@
 /**
  * Which credential reaches which upstream.
  *
- * pxpipe sits on the wire with every request's authorization header in hand, so
+ * inkling sits on the wire with every request's authorization header in hand, so
  * the rule for what it forwards has to be a rule, not a side effect of which
  * branch a route fell into. Before this policy existed, two behaviours followed
  * from the same `if`:
@@ -30,14 +30,14 @@ import {
   type ProxyConfig,
 } from '../src/core/proxy.js';
 
-let ambientPxpipeModels: string | undefined;
+let ambientInklingModels: string | undefined;
 beforeAll(() => {
-  ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  process.env.PXPIPE_MODELS = 'off';
+  ambientInklingModels = process.env.INKLING_MODELS;
+  process.env.INKLING_MODELS = 'off';
 });
 afterAll(() => {
-  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
-  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+  if (ambientInklingModels === undefined) delete process.env.INKLING_MODELS;
+  else process.env.INKLING_MODELS = ambientInklingModels;
 });
 
 /** A structurally valid JWT. Contents are inert: header `{"alg":"none"}`. */

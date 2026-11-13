@@ -1,12 +1,11 @@
 {
-  "name": "pxpipe-fork",
-  "version": "0.17.0-fork.1",
-  "description": "Fork of teamchong/pxpipe (Steven) plus @sriinnu/pakt. Lossless PAKT for structured text, pxpipe images only for readers that can see them. Not an official teamchong release.",
+  "name": "@sriinnu/inkling",
+  "version": "0.17.0",
+  "description": "LLM context proxy. Lossless PAKT for structured tool results, images only for models that can read them.",
   "type": "module",
   "bin": {
-    "pxpipe": "bin/cli.js",
-    "pxpipe-fork": "bin/cli.js",
-    "pxpipe-mcp": "bin/mcp.js"
+    "inkling": "bin/cli.js",
+    "inkling-mcp": "bin/mcp.js"
   },
   "exports": {
     ".": {
@@ -104,16 +103,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/teamchong/pxpipe.git"
+    "url": "git+https://github.com/sriinnu/inkling.git"
   },
-  "homepage": "https://github.com/teamchong/pxpipe#readme",
-  "pxpipeUpstream": {
-    "repo": "https://github.com/teamchong/pxpipe",
-    "author": "Steven (https://github.com/teamchong)",
-    "version": "0.16.0",
-    "commit": "9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3",
-    "license": "MIT"
-  },
+  "homepage": "https://github.com/sriinnu/inkling#readme",
   "pakt": {
     "package": "@sriinnu/pakt",
     "version": "0.10.0",

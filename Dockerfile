@@ -19,15 +19,15 @@ RUN pnpm run build
 
 FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432d679c54fbfd AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/teamchong/pxpipe" \
+LABEL org.opencontainers.image.source="https://github.com/sriinnu/inkling" \
       org.opencontainers.image.description="Token-saving proxy for vision-capable LLMs" \
       org.opencontainers.image.licenses="MIT"
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=47821
-ENV PXPIPE_CONFIG=/data/config.json
-ENV PXPIPE_LOG=/data/events.jsonl
+ENV INKLING_CONFIG=/data/config.json
+ENV INKLING_LOG=/data/events.jsonl
 
 WORKDIR /app
 

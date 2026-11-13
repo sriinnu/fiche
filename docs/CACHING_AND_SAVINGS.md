@@ -2,8 +2,8 @@
 
 This doc answers two questions:
 
-1. How pxpipe stays aligned with Anthropic prompt caching when it rewrites bulky context into images.
-2. How pxpipe reports savings without counting the provider cache discount as a pxpipe win.
+1. How inkling stays aligned with Anthropic prompt caching when it rewrites bulky context into images.
+2. How inkling reports savings without counting the provider cache discount as a inkling win.
 
 Source of truth in code: `src/core/transform.ts` for the cache-aligned rewrite and `src/core/baseline.ts` for the accounting.
 
@@ -28,7 +28,7 @@ Pricing relative to base input rate:
 | `cache_read_input_tokens` (`cr`) | cache read | `0.1x` |
 | output | model reply | `5x` input on Fable 5 |
 
-A stable prefix is cheap after it is cached, but a prefix that changes every turn repeatedly pays the write premium. pxpipe's cache-alignment work exists to keep the image prefix stable.
+A stable prefix is cheap after it is cached, but a prefix that changes every turn repeatedly pays the write premium. inkling's cache-alignment work exists to keep the image prefix stable.
 
 ---
 
@@ -36,11 +36,11 @@ A stable prefix is cheap after it is cached, but a prefix that changes every tur
 
 Claude Code sends a large stable prefix: system prompt, tool docs, reminders, and older history. It also sends a small per-turn tail: the current user message and dynamic runtime context.
 
-pxpipe rewrites only the bulky, cacheable parts into images. The dynamic parts stay as text so they do not pollute the image cache key.
+inkling rewrites only the bulky, cacheable parts into images. The dynamic parts stay as text so they do not pollute the image cache key.
 
 The key invariant:
 
-> pxpipe does not add new cache-control markers. It relocates the caller's existing marker onto the last image block produced from the same logical content.
+> inkling does not add new cache-control markers. It relocates the caller's existing marker onto the last image block produced from the same logical content.
 
 That keeps the breakpoint at the end of the rewritten stable content. The provider then caches the image prefix exactly as it would have cached the text prefix, just with fewer input tokens under that cache entry.
 
@@ -66,7 +66,7 @@ Images must be placed in a user message because Anthropic does not accept images
 
 The raw compression gate compares image token cost with text token cost. For Anthropic, image cost is estimated from pixel area and text cost comes from the configured chars/token estimate for the relevant bucket.
 
-Switching modes can also burn a warm cache. If a text prefix is warm and pxpipe flips to images, the first image turn may pay a cache write. If an image prefix is warm and pxpipe flips back to text, the text path may pay the write. The symmetric burn terms model that cost:
+Switching modes can also burn a warm cache. If a text prefix is warm and inkling flips to images, the first image turn may pay a cache write. If an image prefix is warm and inkling flips back to text, the text path may pay the write. The symmetric burn terms model that cost:
 
 ```text
 burnImageSide = priorWarmTokens      * (1.25 - 0.10)
@@ -81,14 +81,14 @@ This is separate from dashboard savings. The gate decides whether to transform. 
 
 ## Savings Accounting
 
-The cache discount is provider behavior, not pxpipe savings. To avoid counting cache as savings, both sides use the same observed cache state:
+The cache discount is provider behavior, not inkling savings. To avoid counting cache as savings, both sides use the same observed cache state:
 
 - If the actual request has `cr > 0`, the imagined text baseline is priced warm too.
 - If the actual request has `cr === 0`, the imagined text baseline is still priced warm when a same-session prior proves the text prefix would have been cached: that prior completed less than `CACHE_TTL_SEC` (300 s) before this request started, its `system_sha8` matches this row's, and its `cache_prefix_tools_sha8` matches this row's (or either side has none). Without such a prior, the text baseline is priced cold too.
 
-pxpipe does not infer a warm text baseline from wall-clock TTL alone. A request whose image path missed the cache (`cr === 0`) after a fresh same-prefix prior is pxpipe busting its own image cache. The text request would have read its unchanged prefix, so that miss is a real cost of pxpipe, not a saving. A changed system or tools hash means the text request would have missed too, so those rows stay cold.
+inkling does not infer a warm text baseline from wall-clock TTL alone. A request whose image path missed the cache (`cr === 0`) after a fresh same-prefix prior is inkling busting its own image cache. The text request would have read its unchanged prefix, so that miss is a real cost of inkling, not a saving. A changed system or tools hash means the text request would have missed too, so those rows stay cold.
 
-For each `/v1/messages` request, pxpipe records three measurements:
+For each `/v1/messages` request, inkling records three measurements:
 
 1. Actual upstream usage from the transformed request: `input_tokens`, `cc`, `cr`, and output.
 2. `baseline_tokens`: `/count_tokens` on the original body before compression.
@@ -122,7 +122,7 @@ grown  = cacheable - reused
 baseline_eff = reused * 0.10 + grown * observed_write_rate + coldTail
 ```
 
-`observed_write_rate` is the request's server-reported mix of 5-minute writes at `1.25x` and 1-hour writes at `2x`. If the API omits the tier split, pxpipe falls back to `1.25x` for backward compatibility. When `cr > 0` proves a warm read, `prevCacheable` refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, pxpipe assumes full reuse for the text baseline: `prevCacheable = cacheable`. When `cr === 0` and the warmth comes from a fresh prior, `reused = min(prevCacheable, cacheable)` uses that prior's real size. That is conservative for savings because it makes the text baseline cheaper.
+`observed_write_rate` is the request's server-reported mix of 5-minute writes at `1.25x` and 1-hour writes at `2x`. If the API omits the tier split, inkling falls back to `1.25x` for backward compatibility. When `cr > 0` proves a warm read, `prevCacheable` refines how much of the text baseline was reused vs newly grown. If there is no completed same-session prior with the same static-prefix hash, inkling assumes full reuse for the text baseline: `prevCacheable = cacheable`. When `cr === 0` and the warmth comes from a fresh prior, `reused = min(prevCacheable, cacheable)` uses that prior's real size. That is conservative for savings because it makes the text baseline cheaper.
 
 Replay uses request start time (`ts - duration_ms`) to avoid overlapping requests refining each other's `prevCacheable` split before the earlier request had completed.
 
@@ -140,7 +140,7 @@ Rows without a trustworthy cacheable-prefix probe contribute zero savings rather
 
 ## Worked Examples
 
-Assume a request whose original text baseline is `30,000` input tokens. Of those, `28,000` are before the cache-control marker, so `coldTail = 2,000`. pxpipe renders that prefix to `3,000` image tokens.
+Assume a request whose original text baseline is `30,000` input tokens. Of those, `28,000` are before the cache-control marker, so `coldTail = 2,000`. inkling renders that prefix to `3,000` image tokens.
 
 ### Warm Request
 
@@ -178,13 +178,13 @@ Actual image request:
 Savings = 37000 - 5750 = 31250
 ```
 
-Both sides are cold. pxpipe is not credited for cache; it is credited because the cold image write is much smaller than the cold text write.
+Both sides are cold. inkling is not credited for cache; it is credited because the cold image write is much smaller than the cold text write.
 
 ---
 
 ## Reproducing The Dashboard Math
 
-Every row in `~/.pxpipe/events.jsonl` carries the fields needed to reproduce the input-side savings:
+Every row in `~/.inkling/events.jsonl` carries the fields needed to reproduce the input-side savings:
 
 - `baseline_tokens`
 - `baseline_cacheable_tokens`
@@ -223,7 +223,7 @@ maxHeightPx, slotText)` — the glyph atlases are decoded at module init and
 never mutated — so identical inputs can return identical pages. The cache lives
 in `src/core/render.ts` and wraps `renderTextToPngsWithCharLimit`.
 
-**Budget.** `PXPIPE_RENDER_CACHE_BYTES` bounds total retained bytes. Defaults
+**Budget.** `INKLING_RENDER_CACHE_BYTES` bounds total retained bytes. Defaults
 differ by runtime: **64 MiB on Node**, **8 MiB on Workers**, where the isolate
 has ~128 MiB for the request body, the atlases, the framebuffers and the
 compressor as well. `0` disables it. Eviction is LRU. Worker bindings are not
@@ -256,14 +256,14 @@ log directory.
 
 ## Summary
 
-pxpipe stays cache-aligned by replacing stable text context with stable image context and relocating the caller's existing cache marker to the end of the rewritten content. Savings are measured by comparing the real transformed request with a `/count_tokens` text counterfactual under the same observed cache state. If the actual request read cache, both sides are warm. If it did not, both sides are cold. Therefore the provider cache discount is not counted as pxpipe savings; the reported savings are only the token reduction from text to images.
+inkling stays cache-aligned by replacing stable text context with stable image context and relocating the caller's existing cache marker to the end of the rewritten content. Savings are measured by comparing the real transformed request with a `/count_tokens` text counterfactual under the same observed cache state. If the actual request read cache, both sides are warm. If it did not, both sides are cold. Therefore the provider cache discount is not counted as inkling savings; the reported savings are only the token reduction from text to images.
 
 ---
 
 ## OpenAI / Responses Path (Codex And Friends)
 
 Codex is supported. The wire protocol is `/v1/responses` (and, when present,
-chat-completions-shaped OpenAI paths). pxpipe images the same two buckets as
+chat-completions-shaped OpenAI paths). inkling images the same two buckets as
 on Anthropic: the static slab (system + tool docs + large stable context) and,
 when the closed history prefix clears a token floor and the profitability gate,
 older history.
@@ -281,7 +281,7 @@ baseline_eff = actual_eff + (baseline_imaged_tokens - image_tokens)
 
 `cache_read_rate` is model-based on the shared Responses path (Claude 0.1,
 gpt-5 0.1, Grok 0.25). The provider cache discount is applied to both sides, so
-it is never counted as a pxpipe win.
+it is never counted as a inkling win.
 
 ### What actually drives savings
 

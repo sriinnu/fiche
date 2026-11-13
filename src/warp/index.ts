@@ -1,10 +1,10 @@
 /**
- * `pxpipe warp -- <agent-command>`
+ * `inkling warp -- <agent-command>`
  *
  * Runs the agent behind a CONNECT proxy that decrypts api.anthropic.com and
- * re-points only /v1/messages at the local pxpipe proxy. The agent never sees a
+ * re-points only /v1/messages at the local inkling proxy. The agent never sees a
  * custom ANTHROPIC_BASE_URL, so the client-side "firstParty" checks that hide
- * /remote-control (and disable claude.ai connectors) still pass, while pxpipe
+ * /remote-control (and disable claude.ai connectors) still pass, while inkling
  * gets the one path it transforms.
  *
  * Compare the manual equivalent, which needs two extra tools and a CA trusted
@@ -25,7 +25,7 @@ import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
 
 export interface WarpRuntimeOptions {
-  /** Port the pxpipe proxy is already serving on: where matches are sent. */
+  /** Port the inkling proxy is already serving on: where matches are sent. */
   port: number;
   /**
    * Extra PATTERN=TARGET rules, in priority order ahead of the default
@@ -65,7 +65,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     ...(options.routes ?? []).map((spec) => parseRoute(spec)),
     ...defaultRoutes(port),
   ];
-  const ca = CertificateAuthority.loadOrCreate(join(homedir(), '.pxpipe'));
+  const ca = CertificateAuthority.loadOrCreate(join(homedir(), '.inkling'));
 
   const handlers = createWarpHandlers({
     routes,
@@ -76,14 +76,14 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // silent when a human is looking at the agent. events.jsonl records the
     // request either way.
     onDivert: (host, path, target) => {
-      if (!process.stdout.isTTY) console.error(`[pxpipe] warp: ${host}${path} → ${target}`);
+      if (!process.stdout.isTTY) console.error(`[inkling] warp: ${host}${path} → ${target}`);
     },
   });
 
   // warp's own listener, and the only reason a port is involved at all: the
   // child is configured through HTTPS_PROXY, which can only name a host:port.
   // The kernel picks it, nothing else needs to know it, so there is nothing to
-  // collide with a pxpipe already running.
+  // collide with a inkling already running.
   const proxy = createServer(handlers.handleAbsoluteForm);
   proxy.on('connection', (socket) => socket.setNoDelay(true));
   proxy.on('connect', handlers.handleConnect);
@@ -137,7 +137,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     const aliasWord = alias?.split(/\s+/)[0] ?? '';
     const aliasUsable = alias !== null && (aliasWord.includes('=') || isRunnable(aliasWord, env));
     if (alias !== null && !aliasUsable) {
-      console.error(`[pxpipe] warp: ignoring stale alias ${command[0]} → ${aliasWord} (not executable)`);
+      console.error(`[inkling] warp: ignoring stale alias ${command[0]} → ${aliasWord} (not executable)`);
     }
     if (!aliasUsable && isRunnable(command[0]!, env)) {
       return spawn(command[0]!, command.slice(1), direct);
@@ -147,7 +147,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       // than a misleading one for a shell that was never there.
       return spawn(command[0]!, command.slice(1), direct);
     }
-    console.error(`[pxpipe] warp: resolving ${command[0]} via interactive shell fallback`);
+    console.error(`[inkling] warp: resolving ${command[0]} via interactive shell fallback`);
     // The command word is deliberately left unquoted: a shell only expands
     // aliases on unquoted words, so quoting it would defeat the entire point of
     // this fallback. Arguments are still quoted — they are data, never aliases.
@@ -221,16 +221,16 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     const die = (err: unknown): void => {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (typeof code === 'string' && NET_ERRNO.has(code)) {
-        console.error(`[pxpipe] warp: connection error ${code} (continuing)`);
+        console.error(`[inkling] warp: connection error ${code} (continuing)`);
         return;
       }
-      console.error(`[pxpipe] warp: ${err instanceof Error ? err.stack : String(err)}`);
+      console.error(`[inkling] warp: ${err instanceof Error ? err.stack : String(err)}`);
       process.exit(1);
     };
     process.on('uncaughtException', die);
     process.on('unhandledRejection', die);
     child.on('error', (err) => {
-      console.error(`[pxpipe] warp: cannot run ${command[0]}: ${err.message}`);
+      console.error(`[inkling] warp: cannot run ${command[0]}: ${err.message}`);
       process.exit(127);
     });
     // SIGHUP and SIGQUIT matter as much as the interactive two: closing the
@@ -257,33 +257,33 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
 
   const launch = (command: string[]): void => {
     if (command.length === 0) {
-      console.error('[pxpipe] warp: nothing to run — usage: pxpipe warp -- <command> [args...]');
+      console.error('[inkling] warp: nothing to run — usage: inkling warp -- <command> [args...]');
       process.exit(2);
     }
     // Startup banner goes to stderr: stdout belongs to the child, so a caller
     // piping the agent's output gets the agent's bytes and nothing of ours.
     for (const route of routes) {
-      console.error(`[pxpipe] warp route → ${route.pattern} → ${routeDestination(route)}`);
+      console.error(`[inkling] warp route → ${route.pattern} → ${routeDestination(route)}`);
     }
-    console.error(`[pxpipe] warp CA → ${ca.certPath}`);
+    console.error(`[inkling] warp CA → ${ca.certPath}`);
     if (ca.systemRootsPath) {
-      console.error(`[pxpipe] warp CA bundle → ${ca.bundlePath} (+ system roots from ${ca.systemRootsPath})`);
+      console.error(`[inkling] warp CA bundle → ${ca.bundlePath} (+ system roots from ${ca.systemRootsPath})`);
     } else {
       console.error(
-        `[pxpipe] warp CA bundle → ${ca.bundlePath} (no system root bundle found; ` +
-          `non-pxpipe HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
+        `[inkling] warp CA bundle → ${ca.bundlePath} (no system root bundle found; ` +
+          `non-inkling HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
       );
     }
-    console.error(`[pxpipe] warp exec → ${command.join(' ')}`);
+    console.error(`[inkling] warp exec → ${command.join(' ')}`);
 
     proxy.on('error', (err) => {
-      console.error(`[pxpipe] warp: proxy listener failed: ${err.message}`);
+      console.error(`[inkling] warp: proxy listener failed: ${err.message}`);
       process.exit(1);
     });
     proxy.listen(0, '127.0.0.1', () => {
       const address = proxy.address();
       const proxyUrl = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
-      console.error(`[pxpipe] warp proxy → ${proxyUrl} (child only)`);
+      console.error(`[inkling] warp proxy → ${proxyUrl} (child only)`);
       spawnChild(command, proxyUrl);
     });
   };

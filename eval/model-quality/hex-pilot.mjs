@@ -15,12 +15,12 @@ const folder = join(dirname(fileURLToPath(import.meta.url)), 'pilot-local'); mkd
 const count = countTokens, part = text => ({ type: 'input_text', text });
 const fixture = hexFixtures();
 const cases = [fixture.trials[0], fixture.trials.at(-1)].map(t => ({ ...t, id: t.gold, source: fixture.pages[t.page] })), variants = ['native', 'high', 'original', 'compact-native'];
-const tasks = [], oldEnv = process.env.PXPIPE_GPT_PROFILES, overrides = JSON.parse(oldEnv || '{}');
+const tasks = [], oldEnv = process.env.INKLING_GPT_PROFILES, overrides = JSON.parse(oldEnv || '{}');
 try {
   for (let c = 0; c < cases.length; c++) for (let a = 0; a < variants.length; a++) {
     const f = cases[c], variant = variants[(a + c) % variants.length];
     const question = `For dur_ms=${f.dur}, return only its record id: 12 lowercase hex characters.`;
-    process.env.PXPIPE_GPT_PROFILES = JSON.stringify({ ...overrides, [model]: { ...(overrides[model] || {}), imageDetail: variant === 'original' ? 'original' : 'high' } });
+    process.env.INKLING_GPT_PROFILES = JSON.stringify({ ...overrides, [model]: { ...(overrides[model] || {}), imageDetail: variant === 'original' ? 'original' : 'high' } });
     let content, rendering, estimatedInput;
     if (variant === 'native' || variant === 'compact-native') {
       const source = variant === 'native' ? f.source : compactJsonl(f.source).text;
@@ -34,7 +34,7 @@ try {
     tasks.push({ id: `case-${c + 1}-${variant}`, variant, page: f.page, dur: f.dur, gold: f.id, sourceHash: sha256(f.source),
       requestHash: sha256(JSON.stringify(content)), content, rendering: rendering?.provenance, estimatedInput, maxOutputTokens: 768 });
   }
-} finally { if (oldEnv === undefined) delete process.env.PXPIPE_GPT_PROFILES; else process.env.PXPIPE_GPT_PROFILES = oldEnv; }
+} finally { if (oldEnv === undefined) delete process.env.INKLING_GPT_PROFILES; else process.env.INKLING_GPT_PROFILES = oldEnv; }
 for (let c = 1; c <= 2; c++) {
   const high = tasks.find(t => t.id === `case-${c}-high`), original = tasks.find(t => t.id === `case-${c}-original`);
   assert.deepEqual(high.content, original.content.map(p => p.type === 'input_image' ? { ...p, detail: 'high' } : p));

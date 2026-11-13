@@ -31,7 +31,7 @@ for i, g in enumerate(json.load(open('$DIR/golds.json'))):
 run_one() {
   local i=$1 page=$2 dur=$3 gold=$4
   local ans
-  # env -u ANTHROPIC_BASE_URL: the eval MUST bypass the pxpipe proxy. Left in,
+  # env -u ANTHROPIC_BASE_URL: the eval MUST bypass the inkling proxy. Left in,
   # the proxy images the sub-session's whole context -- the model then reads a
   # re-render of the page instead of the page, and every model scores ~0/15.
   # Same guard as eval/gist-recall/run.py:11.

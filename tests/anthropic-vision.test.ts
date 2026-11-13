@@ -17,7 +17,7 @@ describe('patchTokens — raw 28-px patch count', () => {
     expect(patchTokens(28, 28)).toBe(1);
     expect(patchTokens(29, 29)).toBe(4); // ⌈29/28⌉² = 2² = 4
     expect(patchTokens(1000, 1000)).toBe(1296); // 36² (docs worked example)
-    expect(patchTokens(1568, 728)).toBe(1456); // 56×26 — pxpipe's full dense page
+    expect(patchTokens(1568, 728)).toBe(1456); // 56×26 — inkling's full dense page
     expect(patchTokens(1928, 1928)).toBe(4761); // 69² (old page, high-res)
   });
 });
@@ -88,7 +88,7 @@ describe('anthropicVisionTokens — documented cost with resize', () => {
   });
 
   it('charges the raw patch count when the image already fits', () => {
-    // pxpipe's full dense page (1568×728) fits BOTH tiers unchanged.
+    // inkling's full dense page (1568×728) fits BOTH tiers unchanged.
     expect(anthropicVisionTokens(HI, 1568, 728)).toBe(1456);
     expect(anthropicVisionTokens(STD, 1568, 728)).toBe(1456);
     // High-res leaves 1928² and 1568² unchanged; standard shrinks them to 1521.

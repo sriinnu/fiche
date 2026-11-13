@@ -43,7 +43,7 @@ latency, and scoring are retained in `results.json` and `raw/`.
 ## Production-profile benchmark results (2026-07-17)
 
 The production 5×8 Spleen profile was evaluated through the direct Responses
-upstream, not pxpipe:
+upstream, not inkling:
 
 | test | text | production image | notes |
 |---|---:|---:|---|
@@ -78,7 +78,7 @@ receipt links are in [`RESULTS.md`](./RESULTS.md).
 
 **Policy decision:** Sol is now off by default. Its exact profile remains
 available through the dashboard or explicit
-`PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol`. It should not return to the built-in
+`INKLING_MODELS=claude-fable-5,gpt-5.6-sol`. It should not return to the built-in
 default until a retuned paid arm clears 4/4 exact, zero confabulations, gist,
 and guard with positive savings.
 
@@ -107,11 +107,11 @@ verbatim in the rendered fixture. A wrong but visible distractor is an exact-rea
 failure, not an invention. Any factual answer to the unstated guard is a
 confabulation.
 
-## Raw path, not pxpipe
+## Raw path, not inkling
 
 Live requests post directly to the OpenAI-compatible `/v1/responses` endpoint
 from `OPENAI_BASE_URL` (or the eval-only `SOL_PROFILE_BASE_URL`). Image parts use
-`detail: "original"`. The harness rejects the known pxpipe listener port 47821,
+`detail: "original"`. The harness rejects the known inkling listener port 47821,
 so it cannot recursively transform its own evaluation input.
 
 ## Run

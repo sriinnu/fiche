@@ -31,7 +31,7 @@ for i, g in enumerate(json.load(open('$DIR/golds.json'))):
 run_one() {
   local i=$1 page=$2 dur=$3 gold=$4
   local ans
-  # env -u ANTHROPIC_BASE_URL: bypass the pxpipe proxy, else it re-renders the
+  # env -u ANTHROPIC_BASE_URL: bypass the inkling proxy, else it re-renders the
   # sub-session context and the model reads a re-render instead of the page.
   ans=$(env -u ANTHROPIC_BASE_URL "$CLAUDE" -p --model "$MODEL" "Read the image at $DIR/$IMG. Find the JSON line whose dur_ms is exactly ${dur} and report ONLY its 'id' field value (12 hex chars), nothing else. Read it visually from the image; do not use code." 2>/dev/null \
         | tr -d '[:space:]' | grep -oE '[0-9a-f]{12}' | head -1)

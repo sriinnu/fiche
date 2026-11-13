@@ -34,7 +34,7 @@ describe('Antigravity CloudCode PA inference routing', () => {
         systemInstruction: {
           parts: [{ text: 'System instruction text for testing Antigravity transformer. '.repeat(300) }],
         },
-        contents: [{ role: 'user', parts: [{ text: 'Explain how pxpipe works.' }] }],
+        contents: [{ role: 'user', parts: [{ text: 'Explain how inkling works.' }] }],
       },
     };
 

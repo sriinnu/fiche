@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Restart the local pxpipe proxy. Runs on Windows, macOS and Linux.
+// Restart the local inkling proxy. Runs on Windows, macOS and Linux.
 //
 // What this does, in order:
-//   1. Discover every running pxpipe proxy by scanning the process table for
+//   1. Discover every running inkling proxy by scanning the process table for
 //      a node process whose command line references `bin/cli.js`, and list
 //      them. If multiple are running (orphans from a prior crashed session),
 //      kill all of them — there's no "right" oldest in a graceful restart, we
@@ -76,7 +76,7 @@ export class RestartError extends Error {
 }
 
 // --- Flags ----------------------------------------------------------------
-// --no-build only — pxpipe itself takes none.
+// --no-build only — inkling itself takes none.
 export function parseArgs(argv) {
   let doBuild = true;
   for (const arg of argv) {
@@ -86,7 +86,7 @@ export function parseArgs(argv) {
     }
     throw new RestartError(
       `unknown argument: ${arg}\n` +
-        '[restart] this script only accepts --no-build (pxpipe takes no flags)',
+        '[restart] this script only accepts --no-build (inkling takes no flags)',
       2,
     );
   }
@@ -323,7 +323,7 @@ export async function runRestart({
   // --- 1. Discover running proxies ---
   const pids = findPids();
   if (pids.length > 0) {
-    log(`[restart] found running pxpipe proxy PID(s): ${pids.join(' ')}`);
+    log(`[restart] found running inkling proxy PID(s): ${pids.join(' ')}`);
 
     // --- 2. Ask all of them to terminate ---
     const asked = [];
@@ -372,7 +372,7 @@ export async function runRestart({
     const holder = portHolder(port);
     logError(`[restart] ERROR: port ${port} on ${host} is still in use.`);
     if (holder) logError(`    ${holder.split('\n').join('\n    ')}`);
-    logError("  Hint: if that's a pxpipe proxy our shutdown should have cleared,");
+    logError("  Hint: if that's a inkling proxy our shutdown should have cleared,");
     logError('  it may have been started outside this repo. Free the port and rerun.');
     return 1;
   }

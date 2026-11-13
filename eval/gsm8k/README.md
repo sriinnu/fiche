@@ -1,6 +1,6 @@
-# reading-fidelity eval — does the model actually *read* pxpipe's image?
+# reading-fidelity eval — does the model actually *read* inkling's image?
 
-Solve a math problem given as **text** vs. as a **pxpipe-rendered PNG**
+Solve a math problem given as **text** vs. as a **inkling-rendered PNG**
 (its real `renderTextToPngs`), exact-match the final number. The image arm gets
 *only* the image, so it must read it. Each model reads renders produced under
 **its own** profile, so the arms below are per-model and not pixel-identical.
@@ -18,11 +18,11 @@ so any wrong answer is a **misread**.
 | arm | accuracy |
 |---|---|
 | baseline (text) | **100%** |
-| pxpipe (image) | **93%** |
+| inkling (image) | **93%** |
 | delta | **−7pp** (real reading tax) |
 
 Misses are genuine misreads (`10200`→`9400`, `7873`→`7793`) or unreadable. So the
-model *does* read pxpipe's render on short content — but at a real ~7% cost.
+model *does* read inkling's render on short content — but at a real ~7% cost.
 
 ### `claude-opus-5` (current profile)
 
@@ -33,7 +33,7 @@ but reading renders produced under opus-5's **current** profile
 
 | arm | accuracy |
 |---|---|
-| pxpipe (image) | **100/100** |
+| inkling (image) | **100/100** |
 | missing `ANSWER:` marker | 0/100 |
 
 Zero misreads on this arm — the −7pp reading tax seen on the opus-4-8 profile does
@@ -54,7 +54,7 @@ pred/gold pairs), [`novel.jsonl`](novel.jsonl) (dataset).
 | arm | accuracy |
 |---|---|
 | baseline (text) | 97% |
-| pxpipe (image) | 96% |
+| inkling (image) | 96% |
 
 GSM8K *looks* near-lossless (−1pp) but that's memory inflating the image arm by
 ~3pp vs. the clean novel number. Don't trust it alone.

@@ -16,15 +16,15 @@ function solBody() {
   return enc.encode(JSON.stringify({
     model: 'gpt-5.6-sol',
     instructions: INSTRUCTIONS,
-    input: [{ role: 'user', content: 'Reply with exactly: pxpipe OK' }],
+    input: [{ role: 'user', content: 'Reply with exactly: inkling OK' }],
   }));
 }
 
 describe('ChatGPT Codex prompt_cache_breakpoint', () => {
-  const prev = process.env.PXPIPE_GPT_PROFILES;
+  const prev = process.env.INKLING_GPT_PROFILES;
   afterEach(() => {
-    if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
-    else process.env.PXPIPE_GPT_PROFILES = prev;
+    if (prev === undefined) delete process.env.INKLING_GPT_PROFILES;
+    else process.env.INKLING_GPT_PROFILES = prev;
   });
 
   it('treats the Codex path and chatgpt.com as incapable, and api.openai.com as capable', () => {
@@ -57,7 +57,7 @@ describe('ChatGPT Codex prompt_cache_breakpoint', () => {
       const body = enc.encode(JSON.stringify({
         model,
         instructions: INSTRUCTIONS,
-        input: [{ role: 'user', content: 'Reply with exactly: pxpipe OK' }],
+        input: [{ role: 'user', content: 'Reply with exactly: inkling OK' }],
       }));
       const result = await transformOpenAIResponses(body, {
         charsPerToken: 1,
@@ -68,9 +68,9 @@ describe('ChatGPT Codex prompt_cache_breakpoint', () => {
     }
   });
 
-  it('honors cacheBreakpoints: false in PXPIPE_GPT_PROFILES', async () => {
+  it('honors cacheBreakpoints: false in INKLING_GPT_PROFILES', async () => {
     expect(resolveGptProfile('gpt-5.6-sol').cacheBreakpoints).toBe(true);
-    process.env.PXPIPE_GPT_PROFILES = JSON.stringify({ 'gpt-5.6-sol': { cacheBreakpoints: false } });
+    process.env.INKLING_GPT_PROFILES = JSON.stringify({ 'gpt-5.6-sol': { cacheBreakpoints: false } });
     expect(resolveGptProfile('gpt-5.6-sol').cacheBreakpoints).toBe(false);
     const result = await transformOpenAIResponses(solBody(), { charsPerToken: 1, minCompressChars: 1 });
     expect(bodyHasPromptCacheBreakpoint(result.body)).toBe(false);

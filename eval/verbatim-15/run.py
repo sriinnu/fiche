@@ -14,7 +14,7 @@ Supersedes run_v2.sh / run.sh. Three reasons the bash versions are retired:
      for ~6 min against the wrong model. ThreadPoolExecutor is in-process --
      the workers cannot outlive this script.
 
-  3. They inherited ANTHROPIC_BASE_URL, so trials went through the pxpipe
+  3. They inherited ANTHROPIC_BASE_URL, so trials went through the inkling
      proxy, which imaged each sub-session's whole context. The model then read
      a re-render of the page rather than the page, and every model scored ~0/15.
      The bypass on line 11 of gist-recall/run.py is the established guard.

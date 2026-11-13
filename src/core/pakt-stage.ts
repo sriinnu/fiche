@@ -96,16 +96,97 @@ function roundTrips(original: string, packed: string, format: PaktFormat | 'mark
   }
 }
 
-export function structuredFormat(text: string): 'json' | 'yaml' | 'csv' | 'markdown' | null {
+const NUMBER_RE = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+const STRING_RE = /"(?:[^"\\\u0000-\u001f]|\\.)*"/y;
+
+/**
+ * True when `JSON.parse` keeps every value of `text` exactly. The round-trip
+ * guard compares parsed values, so anything parse itself loses would pass it:
+ * integers past 2^53, non-canonical numbers (`1.0`, `1e3`, `-0`) and duplicate
+ * keys. Those inputs are not packed.
+ */
+export function jsonLosslessUnderParse(text: string): boolean {
+  let i = 0;
+  const ws = () => { while (i < text.length && ' \t\n\r'.includes(text[i]!)) i += 1; };
+  const str = (): string | null => {
+    STRING_RE.lastIndex = i;
+    const m = STRING_RE.exec(text);
+    if (!m) return null;
+    i += m[0].length;
+    return m[0];
+  };
+  const value = (depth: number): boolean => {
+    if (depth > 512) return false;
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i += 1;
+      const keys = new Set<string>();
+      ws();
+      if (text[i] === '}') { i += 1; return true; }
+      for (;;) {
+        ws();
+        const key = str();
+        if (key === null) return false;
+        const decoded = JSON.parse(key) as string;
+        if (keys.has(decoded)) return false;
+        keys.add(decoded);
+        ws();
+        if (text[i] !== ':') return false;
+        i += 1;
+        if (!value(depth + 1)) return false;
+        ws();
+        if (text[i] === ',') { i += 1; continue; }
+        if (text[i] === '}') { i += 1; return true; }
+        return false;
+      }
+    }
+    if (c === '[') {
+      i += 1;
+      ws();
+      if (text[i] === ']') { i += 1; return true; }
+      for (;;) {
+        if (!value(depth + 1)) return false;
+        ws();
+        if (text[i] === ',') { i += 1; continue; }
+        if (text[i] === ']') { i += 1; return true; }
+        return false;
+      }
+    }
+    if (c === '"') return str() !== null;
+    for (const lit of ['true', 'false', 'null']) {
+      if (text.startsWith(lit, i)) { i += lit.length; return true; }
+    }
+    NUMBER_RE.lastIndex = i;
+    const m = NUMBER_RE.exec(text);
+    if (!m) return false;
+    i += m[0].length;
+    return String(Number(m[0])) === m[0];
+  };
+  try {
+    if (!value(0)) return false;
+    ws();
+    return i === text.length;
+  } catch {
+    return false;
+  }
+}
+
+export function structuredFormat(text: string): 'json' | 'yaml' | 'markdown' | null {
   const trimmed = text.trim();
   if (trimmed.length < MIN_CHARS) return null;
   if (trimmed.startsWith('@from ') || trimmed.includes('data:image/')) return null;
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (parsed && typeof parsed === 'object') return 'json';
+      parsed = JSON.parse(trimmed) as unknown;
     } catch {
-      // not json
+      parsed = undefined;
+    }
+    if (parsed && typeof parsed === 'object') {
+      // Valid JSON is also valid YAML, so an unsafe document must stop here
+      // rather than fall through to the YAML path.
+      return jsonLosslessUnderParse(trimmed) ? 'json' : null;
     }
   }
   let detected: string;
@@ -114,7 +195,9 @@ export function structuredFormat(text: string): 'json' | 'yaml' | 'csv' | 'markd
   } catch {
     return null;
   }
-  if (detected === 'json' || detected === 'yaml' || detected === 'csv') return detected;
+  // CSV is detected but not packed: PAKT 0.10.0's CSV decompress returns CRLF
+  // rows with `~` cells unexpanded, so no CSV result survives the round trip.
+  if (detected === 'json' || detected === 'yaml') return detected;
   if (detected === 'markdown' && trimmed.includes('```')) return 'markdown';
   return null;
 }

@@ -27,7 +27,7 @@ Evaluated `gemini-4-argon` (`GEMINI_PROFILE`, 312-col Spleen 5×8, pure images w
 
 | model & arm | planted hex IDs | planted numbers | Korean `prose_ko` (hex + num) | unplanted log `req=` IDs | unplanted JSON + log numbers |
 |---|---:|---:|---:|---:|---:|
-| **`gemini-4-argon` (pxpipe pure image, no factsheet)** | **28/30 (93%)** | **27/30 (90%)** | **10/10 (100%)** | **4/5 (80%)** | **7/10 (70%)** |
+| **`gemini-4-argon` (inkling pure image, no factsheet)** | **28/30 (93%)** | **27/30 (90%)** | **10/10 (100%)** | **4/5 (80%)** | **7/10 (70%)** |
 | `claude-opus-5-5` (images only, published) | 14/60 (23%) | 29/60 (48%) | 0/20 (0%) | 1/20 (5%) | 12/20 (60%) |
 | `claude-sonnet-5-5` (images only, published) | 12/60 (20%) | 20/60 (33%) | 1/20 (5%) | 2/20 (10%) | 6/20 (30%) |
 | `claude-fable-5-1` (images only, published) | 3/60 (5%) | 6/60 (10%) | 5/20 (25%) | 0/20 (0%) | 0/20 (0%) |
@@ -44,9 +44,9 @@ Per-document breakdown on `gemini-4-argon` (pure image, 1,120 image tokens/doc v
 
 ## Production-history positional retrieval
 
-To explore whether pxpipe could help with Lost-in-the-Middle behavior, Gemini
+To explore whether inkling could help with Lost-in-the-Middle behavior, Gemini
 3.6 Flash was evaluated on a deliberately demanding archived-case lookup task
-at 5%, 25%, 50%, 75%, and 95% record depth. The paired raw/pxpipe sweep used
+at 5%, 25%, 50%, 75%, and 95% record depth. The paired raw/inkling sweep used
 2,000, 6,000, and 10,000 records with two generated datasets per size.
 
 Unlike the superseded line-table pilot, this harness sends the raw request
@@ -56,7 +56,7 @@ text, and the factsheet is omitted so the probe tests rendered history rather
 than the text factsheet. The model was asked to return JSON only and the prompt
 covered none of the probed target fields.
 
-| measure | raw text | pxpipe |
+| measure | raw text | inkling |
 |---|---:|---:|
 | says target exists | **29/30** | **29/30** |
 | rejects matched absent key | **29/30** | **29/30** |
@@ -64,10 +64,10 @@ covered none of the probed target fields.
 | recognizes row (region + status) | **13/30** | **11/30** |
 | exact row (region + status + reference) | **3/30** | **3/30** |
 
-At 50% depth alone (`N=6`), raw/pxpipe row localization was 2/6 versus 4/6,
+At 50% depth alone (`N=6`), raw/inkling row localization was 2/6 versus 4/6,
 recognition was 2/6 versus 1/6, and exact retrieval was 0/6 for both.
 
-This production-faithful run does not show a clear overall winner. Pxpipe
+This production-faithful run does not show a clear overall winner. Inkling
 slightly improved row localization, raw text slightly improved semantic status
 recognition, and exact retrieval tied. Both representations struggled with the
 synthetic table, especially at middle depth. With only two trials per

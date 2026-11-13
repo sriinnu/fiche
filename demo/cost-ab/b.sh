@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RIGHT column = pxpipe (through the compress proxy, default :47824). Launches an INTERACTIVE
+# RIGHT column = inkling (through the compress proxy, default :47824). Launches an INTERACTIVE
 # Claude session with the task prompt already submitted — you watch it work in
 # the real CLI. Run `bash demo/cost-ab/setup.sh` first.
 set -uo pipefail
@@ -22,17 +22,17 @@ PROMPT='This project has a failing test suite. Read SPEC.md and the source, then
 # `setup.sh <model>` and then a bare `b.sh`:
 #   ./b.sh              → the model setup.sh armed
 #   ./b.sh opus         → unique substring match against the shipping model list
-#   ./b.sh claude-...   → any full id, verbatim   (also: PXPIPE_DEMO_MODEL=... ./b.sh)
-# Hard-fails when the proxy's compress scope does not cover the model: pxpipe would
-# pass it through uncompressed and the arm would look like a pxpipe result while
+#   ./b.sh claude-...   → any full id, verbatim   (also: INKLING_DEMO_MODEL=... ./b.sh)
+# Hard-fails when the proxy's compress scope does not cover the model: inkling would
+# pass it through uncompressed and the arm would look like a inkling result while
 # measuring nothing.
 DEMO_NAME=cost-ab
-: "${PXPIPE_DEMO_VARIANT:=[1m]}"   # large-context variant; scope keys ignore [tags]
+: "${INKLING_DEMO_VARIANT:=[1m]}"   # large-context variant; scope keys ignore [tags]
 . "$(dirname "$0")/../models.sh"
 demo_resolve_column_model "$DEMO_NAME" "${1:-}" || exit 1
 demo_require_scope "$DEMO_NAME" "$DEMO_MODEL_BASE" || exit 1
 
-echo "RIGHT = pxpipe (:$DEMO_PORT_ON), model=$DEMO_MODEL_ID. Launching interactive Claude with the task..."
+echo "RIGHT = inkling (:$DEMO_PORT_ON), model=$DEMO_MODEL_ID. Launching interactive Claude with the task..."
 # Run in $DIR via a subshell so your terminal stays in the original dir afterward.
 ( cd "$DIR" && exec env ANTHROPIC_BASE_URL="http://127.0.0.1:$DEMO_PORT_ON" \
   "$CB" "$PROMPT" --model "$DEMO_MODEL_ID" --setting-sources project --strict-mcp-config --no-chrome --dangerously-skip-permissions )

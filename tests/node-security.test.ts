@@ -51,7 +51,7 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   eventsFile: string;
   configFile: string;
 }> {
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-node-security-'));
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inkling-node-security-'));
   const port = await freePort();
   const upstreamPort = await freePort();
   upstream = createServer((req, res) => {
@@ -79,12 +79,12 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
       ...process.env,
       PORT: String(port),
       HOST: '127.0.0.1',
-      PXPIPE_LOG: eventsFile,
-      PXPIPE_CONFIG: configFile,
-      // Session state persists to ~/.pxpipe/session-state.json by default; keep
+      INKLING_LOG: eventsFile,
+      INKLING_CONFIG: configFile,
+      // Session state persists to ~/.inkling/session-state.json by default; keep
       // test children off the developer's real file.
-      PXPIPE_SESSION_STATE: 'off',
-      PXPIPE_MODELS: 'claude-fable-5',
+      INKLING_SESSION_STATE: 'off',
+      INKLING_MODELS: 'claude-fable-5',
       ANTHROPIC_UPSTREAM: `http://127.0.0.1:${upstreamPort}`,
       ...extraEnv,
     },
@@ -96,7 +96,7 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   await new Promise<void>((resolve, reject) => {
     const deadline = setTimeout(() => reject(new Error(output.join(''))), 10_000);
     const poll = () => {
-      if (output.join('').includes('[pxpipe] listening on')) {
+      if (output.join('').includes('[inkling] listening on')) {
         clearTimeout(deadline);
         resolve();
         return;
@@ -176,8 +176,8 @@ describe('Node dashboard security', () => {
   });
 
   it('creates rendered PNG dumps with private permissions', async () => {
-    const dumpDir = path.join(os.tmpdir(), `pxpipe-dumps-${process.pid}-${Date.now()}`);
-    const { base } = await startNode({ PXPIPE_DUMP_DIR: dumpDir });
+    const dumpDir = path.join(os.tmpdir(), `inkling-dumps-${process.pid}-${Date.now()}`);
+    const { base } = await startNode({ INKLING_DUMP_DIR: dumpDir });
     await fetch(`${base}/v1/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': 'test' },

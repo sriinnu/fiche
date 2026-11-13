@@ -1,6 +1,6 @@
-# FINDINGS — pxpipe (text→PNG token compression)
+# FINDINGS — inkling (text→PNG token compression)
 
-**Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows pxpipe is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
+**Status:** ⚠️ **VERDICT REVERSED — see correction below.** Originally ruled "dead"; live measurement shows inkling is a working *lossy gist-compressor* saving ~68% on real (dense) Claude Code traffic, with a known verbatim-recall gap.
 **Date:** 2026-05-28 (original) · 2026-05-29 (correction) · 2026-06-09 (Fable 5 update) · 2026-06-10 (gist-recall A/B, SWE-bench pilot) · 2026-06-12 (field observation, n=1) · 2026-06-23 (reframe: correct baseline = /compact) · 2026-07-09 (GPT-5.6 Sol raw-recall pilot) · 2026-07-19 (K/H glyph-surgery model-level A/B) · 2026-10-25 (Gemini 4 Argon factsheet-removal A/B on 6-document TokenSave corpus)
 **Models tested:** `claude-opus-4-5` (original run), `claude-opus-4-8` (re-test after a model bump), `claude-fable-5` (2026-06-09), `gpt-5.6-sol` (2026-07-09 raw-image pilot), `claude-opus-5` (2026-07-20 default-scope evaluation), `gemini-4-argon` (2026-10-17 / 2026-10-25)
 **Model scope (current):** Fable 5 (`claude-fable-5`), Opus 5.5 (`claude-opus-5-5`), and every Gemini model (`gemini`, including 3.6/3.7/3.8 Flash and Gemini 4). Opus 5, Sonnet 5.5, Sol, GPT 5.5, and Grok remain explicit opt-ins.
@@ -21,7 +21,7 @@
 
 | Model & Arm | Planted Hex IDs | Planted Numbers | Korean `prose_ko` (Hex + Num) | Unplanted Log `req=` IDs | Unplanted JSON + Log Numbers |
 |---|---:|---:|---:|---:|---:|
-| **`gemini-4-argon` (pxpipe pure image, no factsheet)** | **28/30 (93.3%)** | **27/30 (90.0%)** | **10/10 (100%)** | **4/5 (80%)** | **7/10 (70%)** |
+| **`gemini-4-argon` (inkling pure image, no factsheet)** | **28/30 (93.3%)** | **27/30 (90.0%)** | **10/10 (100%)** | **4/5 (80%)** | **7/10 (70%)** |
 | `claude-opus-5-5` (images only, published) | 14/60 (23.3%) | 29/60 (48.3%) | 0/20 (0%) | 1/20 (5%) | 12/20 (60%) |
 | `claude-sonnet-5-5` (images only, published) | 12/60 (20.0%) | 20/60 (33.3%) | 1/20 (5%) | 2/20 (10%) | 6/20 (30%) |
 | `claude-fable-5-1` (images only, published) | 3/60 (5.0%) | 6/60 (10.0%) | 5/20 (25%) | 0/20 (0%) | 0/20 (0%) |
@@ -52,12 +52,12 @@ Inspecting the 12 pure-image misses on `gemini-4-argon` shows why the factsheet 
 2. **Visual Context on Gemini 3.7 vs 3.6**:
    - **Gemini 3.6 Flash**: Stacking 32 dense images (1M chars) suffered from visual attention dilution in early/middle pages (0%–50% reasoning).
    - **Gemini 3.7 Flash**: Upgraded visual attention successfully recovered the state mutations across the image stack, scoring **100% reasoning at 10%, 30%, 50% (middle), and 90% depth at 1,000,000 characters**.
-3. **Core Tradeoff**: pxpipe is an **economic and latency multiplier** (compressing 407k tokens to ~35k vision tokens, −75% token cost), with Gemini 3.7 Flash sustaining reasoning fidelity through 1M character visual histories.
+3. **Core Tradeoff**: inkling is an **economic and latency multiplier** (compressing 407k tokens to ~35k vision tokens, −75% token cost), with Gemini 3.7 Flash sustaining reasoning fidelity through 1M character visual histories.
 
 ### Benchmark Data: Gemini 3.7 Flash
 
 #### A. 300,000 Characters (~123k Text Tokens vs ~21k Vision Tokens)
-| Depth | Raw Text Reasoning | pxpipe Visual Reasoning | Raw Multihop Recall | pxpipe Multihop Recall |
+| Depth | Raw Text Reasoning | inkling Visual Reasoning | Raw Multihop Recall | inkling Multihop Recall |
 |:---:|:---:|:---:|:---:|:---:|
 | **10%** (30k) | **100%** | **100%** | **100%** | **100%** |
 | **30%** (90k) | **100%** | **100%** | **100%** | **100%** |
@@ -66,7 +66,7 @@ Inspecting the 12 pure-image misses on `gemini-4-argon` shows why the factsheet 
 | **90%** (270k) | **100%** | 0% | **100%** | 0% |
 
 #### B. 1,000,000 Characters (~407k Text Tokens vs ~103k Total Tokens with 32 Images)
-| Depth | Raw Text Reasoning | pxpipe Visual Reasoning | Raw Multihop Recall | pxpipe Multihop Recall |
+| Depth | Raw Text Reasoning | inkling Visual Reasoning | Raw Multihop Recall | inkling Multihop Recall |
 |:---:|:---:|:---:|:---:|:---:|
 | **10%** (100k) | **100%** | **100%** | **100%** | **100%** |
 | **30%** (300k) | **100%** | **100%** | **100%** | 0% |
@@ -81,7 +81,7 @@ Receipts preserved in `eval/gemini-profile/lost-in-middle-*-results.json`.
 ## Update (2026-07-20) — `claude-opus-5` promoted to default scope
 
 **Verdict: ship it as a default, with the recall gap stated up front. Opus 5 is
-measurably worse than Fable 5 at recall. It is good enough for the job pxpipe
+measurably worse than Fable 5 at recall. It is good enough for the job inkling
 actually does, and it buys a very long session before `/compact`.**
 
 ### Scores, side by side
@@ -108,7 +108,7 @@ to copy back an exact string of dense characters, Fable 5 gets 13 of 15 and
 Opus 5 gets 2 of 15. At the character level, Opus 5 often cannot tell our glyphs
 apart at the density we render them.
 
-**But it is good enough for what pxpipe is for.** It scores 100/100 on maths it
+**But it is good enough for what inkling is for.** It scores 100/100 on maths it
 could only do by reading the numbers off the image, it never invented a fact
 that wasn't on the page (0 of 16), and it summarises correctly 94 times out of
 98. Summarising, navigating, and recalling the gist all work.
@@ -156,7 +156,7 @@ So the `src/core/render.ts` change merges as **tidying, not an improvement**.
 ## Update (2026-07-19) — Spleen 5×8 K/H glyph surgery validated at model level (PR #127)
 
 Paired before/after benchmark of the `K` glyph repaint, read by `claude-fable-5`
-via direct API (`env -u ANTHROPIC_BASE_URL`, pxpipe fully bypassed). Arms: base
+via direct API (`env -u ANTHROPIC_BASE_URL`, inkling fully bypassed). Arms: base
 `b754d95295f34772eee385ea5e1bdc62c2f98ee8` (origin/main) vs PR head
 `ab063f268482ef7cb28f88370bf1b2c9780ffa29`. Identical seeded fixtures rendered
 with each atlas: 2 arms × 8 pages × 3 reps = 48 reads; pages 0–5 differ only by
@@ -209,7 +209,7 @@ The exact production model id is `gpt-5.6-sol`. Production telemetry showed
 that real Sol requests reached the Responses path and retained positive
 estimated savings, but token rows are not reader-quality evidence. A separate
 paid pilot therefore sent deterministic rendered terminal fixtures directly to
-the Responses endpoint with `detail: original`, bypassing pxpipe.
+the Responses endpoint with `detail: original`, bypassing inkling.
 
 ### What was actually tested
 
@@ -253,7 +253,7 @@ Grok: silent image rewriting requires positive recall evidence, not merely
 positive savings. Its exact profile and suffix aliases remain available for
 explicit operator opt-in:
 
-    PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
+    INKLING_MODELS=claude-fable-5,gpt-5.6-sol
 
 The larger 2026-07-11 evaluation changed Sol's profile to 5×8, but broader
 recall still kept it opt-in.
@@ -313,7 +313,7 @@ recalled the hash wrong" are the same mechanism.
 Same thesis, opposite mechanism, different era. DeepSeek-OCR trained a
 dedicated optical encoder (~380M) plus a ~3B decoder to compress text as
 images, reporting ~97% decoding precision below 10× compression and ~60%
-near 20×. pxpipe trains nothing; the reader is the stock production model,
+near 20×. inkling trains nothing; the reader is the stock production model,
 and the margin comes from the channel's real per-token density (image
 tokens are priced by pixel area; dense text packs more per token). The reason
 this repo could not have existed when that paper shipped: no production
@@ -321,7 +321,7 @@ frontier model then read dense renders at profitable density. The sweep
 dates the crossing inside one vendor generation: Opus 4.8 reads the 5×8
 production cell at 10% exact, while Fable 5 reads production density at
 13/15 verbatim and 100/100 on novel arithmetic (N=100). The new thing is
-the capability; pxpipe is a consumer of it, and that same
+the capability; inkling is a consumer of it, and that same
 trajectory is the reason to park rather than out-engineer the encoder
 (below).
 
@@ -365,7 +365,7 @@ is superseded and can retire.
 
 ### The wrong bar we were using
 
-Every previous entry here — including the "verdict reversed" correction — implicitly compared pxpipe against perfect verbatim recall. That was the wrong baseline. The status quo users already accept is `/compact`: a lossy, mostly irreversible LLM prose summary of everything older than the working window. Users work → hit the limit → `/compact` → continue; they can't retrieve their earlier exact prompts or tool outputs either. Holding pxpipe to a higher standard than the alternative people already use is the wrong bar.
+Every previous entry here — including the "verdict reversed" correction — implicitly compared inkling against perfect verbatim recall. That was the wrong baseline. The status quo users already accept is `/compact`: a lossy, mostly irreversible LLM prose summary of everything older than the working window. Users work → hit the limit → `/compact` → continue; they can't retrieve their earlier exact prompts or tool outputs either. Holding inkling to a higher standard than the alternative people already use is the wrong bar.
 
 ### How open-source harnesses compact (codex, opencode)
 
@@ -379,27 +379,27 @@ The baseline is a spectrum from a single prompt to a full reducer. Claude Code's
 
 ### compact vs our gist: same job, opposite loss profiles
 
-Both keep a recent text tail; they differ only on the old region (`/compact` → prose, pxpipe → images). `/compact` loses **content** but keeps **fidelity** (accurate text, model knows its limits); pxpipe loses **fidelity** but keeps **content** (it's all in the pixels, just not exactly readable).
+Both keep a recent text tail; they differ only on the old region (`/compact` → prose, inkling → images). `/compact` loses **content** but keeps **fidelity** (accurate text, model knows its limits); inkling loses **fidelity** but keeps **content** (it's all in the pixels, just not exactly readable).
 
-Where pxpipe ties or beats `/compact`:
+Where inkling ties or beats `/compact`:
 - **Recoverable, not discarded.** Bytes are in the PNGs — near-verbatim on Fable (13/15 exact, 2026-06-11 n=15 expansion; 3/4 on 06-09), and even on Opus a harness can re-OCR/re-fetch. `/compact` replaces the raw in-context.
 - **Slope, not cliff**, and no re-summarizing-a-summary compounding (codex's own code warns of that).
 - **No summarization inference**, and ~68% input saved on dense traffic.
-- **Gist parity, measured:** at the gist tier `/compact` targets, pxpipe is 98/98 (zero loss, 2026-06-10) and SWE-bench 10/10 on both arms at half cost ($27 vs $53).
+- **Gist parity, measured:** at the gist tier `/compact` targets, inkling is 98/98 (zero loss, 2026-06-10) and SWE-bench 10/10 on both arms at half cost ($27 vs $53).
 
-Where pxpipe-on-Opus is worse — the one real difference:
-- **Failure shape.** `/compact` degrades gracefully (accurate text → abstains). pxpipe-on-Opus degrades into **confident confabulation** — detail looks present in the image, so it misreads and asserts (0/15 Opus haystack; 7/10 exact in the 2026-06-12 field session, 4 char-level errors / 120 chars). This is why Opus was disabled. Fix = abstention prompting ("images are recognition-only; re-fetch for exact bytes") → then Opus degrades like `/compact`.
+Where inkling-on-Opus is worse — the one real difference:
+- **Failure shape.** `/compact` degrades gracefully (accurate text → abstains). inkling-on-Opus degrades into **confident confabulation** — detail looks present in the image, so it misreads and asserts (0/15 Opus haystack; 7/10 exact in the 2026-06-12 field session, 4 char-level errors / 120 chars). This is why Opus was disabled. Fix = abstention prompting ("images are recognition-only; re-fetch for exact bytes") → then Opus degrades like `/compact`.
 
-Net: on **Fable**, pxpipe-gist beats `/compact` for gist-tolerant work; on **Opus** it's peer-or-worse until abstention prompting is added. Neither gives verbatim of the old region.
+Net: on **Fable**, inkling-gist beats `/compact` for gist-tolerant work; on **Opus** it's peer-or-worse until abstention prompting is added. Neither gives verbatim of the old region.
 
 ### Connection to the agent-memory direction
 
-Codex's rollout-trace proves the principled path is buildable: an event-sourced reducer folding typed events into a derived state graph with verbatim payload preservation and deterministic replay. It maps onto the pxpipe agent-memory direction — the reducer decides what gets imaged (gist-bulk) vs kept as text (IDs, paths, values); image = cheap recoverable gist store, text = source of truth. Codex builds it for diagnostics only; pxpipe's compression ratio is the argument for making it the live memory.
+Codex's rollout-trace proves the principled path is buildable: an event-sourced reducer folding typed events into a derived state graph with verbatim payload preservation and deterministic replay. It maps onto the inkling agent-memory direction — the reducer decides what gets imaged (gist-bulk) vs kept as text (IDs, paths, values); image = cheap recoverable gist store, text = source of truth. Codex builds it for diagnostics only; inkling's compression ratio is the argument for making it the live memory.
 
 **Caveats (honest scope):**
-- pxpipe behavioral claims (Opus failure shape, field session) are n=1; gist 98/98 and SWE-bench 10/10 are controlled evals with receipts; the abstention fix is not yet measured.
+- inkling behavioral claims (Opus failure shape, field session) are n=1; gist 98/98 and SWE-bench 10/10 are controlled evals with receipts; the abstention fix is not yet measured.
 - Net session tokens on long Opus sessions still need checking — the re-read loop can claw back per-request savings (out-of-proxy-scope for GPT; Opus+abstention unmeasured).
-- Some users want the explicit `/compact` checkpoint as a workflow signal; pxpipe's gradual slope isn't a drop-in for that.
+- Some users want the explicit `/compact` checkpoint as a workflow signal; inkling's gradual slope isn't a drop-in for that.
 
 ---
 
@@ -498,7 +498,7 @@ narrowed the production gate from Opus 4.7+ to `claude-fable-5` only.
 | arm | opus-4-8 | fable-5 |
 |---|---:|---:|
 | text baseline | 100/100 | 100/100 |
-| pxpipe image | 93/100 | **100/100** |
+| inkling image | 93/100 | **100/100** |
 
 The ~7% Opus read tax — the main per-read cost of imaging — is gone on Fable.
 
@@ -528,7 +528,7 @@ that must round-trip byte-exact stays text.
 
 **4. Economics.** Fable is $10/$50 per MTok (2× Opus 4.8). Token-for-token
 savings are identical (same tokenizer), so every saved token is worth 2× the
-dollars — pxpipe is more valuable on Fable in absolute terms.
+dollars — inkling is more valuable on Fable in absolute terms.
 
 **Decision:** support Fable 5 only. Opus 4.7/4.8 disabled — with a tax-free
 reader available, shipping a known 7% misread rate is the wrong default.
@@ -543,22 +543,22 @@ The "Dead" verdict below rested on three stacked mistakes. Naming them, because 
 
 1. **Wrong cost model.** The economics were computed on English prose (~3.5 chars/token), where images lose. Real Claude Code traffic is token-*dense* — JSON, code, tool output, hashes at ~1 char/token (this repo's own `MEMORY.md` recorded a 1.17 char/token median and warned against the prose default; I pasted that warning in as a caveat and then used prose anyway). On a live, multi-session run the proxy measured **856k → 277k input tokens (~68% fewer)**, at **3.1 chars per image-token vs ~1.0 as text** — images win ~3× on the real workload.
 
-2. **Generalized the worst case to the whole product.** The 0/15 needle eval is the single hardest thing you can ask a lossy gist compressor: exact recovery of a random 12-char hex. That is not pxpipe's job — its job is letting the model skim bulk history by gist. The worst-case sub-task failing was a real finding; calling the *product* dead from it was not.
+2. **Generalized the worst case to the whole product.** The 0/15 needle eval is the single hardest thing you can ask a lossy gist compressor: exact recovery of a random 12-char hex. That is not inkling's job — its job is letting the model skim bulk history by gist. The worst-case sub-task failing was a real finding; calling the *product* dead from it was not.
 
 3. **Never checked it was actually running.** The investigation theorized "if you sent this to Opus…" while a successful, transparent A/B was running underneath the whole time (`ANTHROPIC_BASE_URL=127.0.0.1:47821`; event log showing `compressed:true, 152 images/request`). I asserted the interactive session bypassed the proxy without looking. It didn't.
 
 **What still stands (unchanged, and the important caveat):** verbatim retrieval is **0/15** on both model generations, and the failure mode is **silent confabulation** — imaged content returns a plausible *wrong* value, not an error. Therefore:
 
-* pxpipe is a **lossy, recency-graded gist tier**: recent turns stay text, older bulk history becomes images. Safe to navigate by gist; **unsafe as the sole copy of anything needed byte-exact** (IDs, hashes, secrets, exact numbers).
+* inkling is a **lossy, recency-graded gist tier**: recent turns stay text, older bulk history becomes images. Safe to navigate by gist; **unsafe as the sole copy of anything needed byte-exact** (IDs, hashes, secrets, exact numbers).
 * the one **open item** before this is production-ready is a **verbatim-risk guard** in the gate — never image blocks carrying unique IDs / hashes / exact values. Not yet built.
 
-**Corrected one-liner:** the encoder limit kills *verbatim*; it does **not** kill the product. On dense traffic pxpipe is a real ~68% gist compressor with one fixable silent-confabulation gap — measured live, apples-to-apples, on Opus 4.8. Everything below this line is the original (superseded) "dead" writeup, preserved.
+**Corrected one-liner:** the encoder limit kills *verbatim*; it does **not** kill the product. On dense traffic inkling is a real ~68% gist compressor with one fixable silent-confabulation gap — measured live, apples-to-apples, on Opus 4.8. Everything below this line is the original (superseded) "dead" writeup, preserved.
 
 ---
 
 ## Original TL;DR (superseded 2026-05-29 — see verdict above)
 
-pxpipe rewrites Claude Code tool-result text into compact PNGs before they reach
+inkling rewrites Claude Code tool-result text into compact PNGs before they reach
 the model, betting that vision tokens for a dense image are cheaper than the same
 content delivered as transcript text. **The tokens are cheaper. The model cannot
 read the content back.** That is the whole story.
@@ -574,7 +574,7 @@ round numbers (two-proportion test across the model bump: z≈0.76, **p≈0.45**
 its failure mode is **silent confabulation** — which is worse than an error,
 because the caller can't tell.
 
-pxpipe is theater. The image *is* sent and the model *acknowledges seeing it*,
+inkling is theater. The image *is* sent and the model *acknowledges seeing it*,
 but it cannot extract either verbatim strings or specific facts from it. The token
 "savings" come from Opus quietly throwing the content away.
 
@@ -608,7 +608,7 @@ is decorative and the savings are fake.
   - **verbatim** — a random 12-char hex needle (`VARIABLE x IS ASSIGNED THE VALUE
     <hex>`), asked back exactly. This is the OCR-hard case.
   - **semantic** — a specific fact stated in the rendered tool-reference doc (e.g.
-    "what is the default timeout for `net.fetch`?"). This is pxpipe's *actual*
+    "what is the default timeout for `net.fetch`?"). This is inkling's *actual*
     sales pitch: "comprehension over bulky docs."
 
 **Controlled:** identical needle/haystack across ON and OFF; image is 1568×1276
@@ -656,7 +656,7 @@ image at all. Verbatim stayed at a hard zero across both versions.
 
 Before writing the tombstone we isolated **encoder incapability** from a
 **rendering/density** problem by feeding Opus custom images directly (same vision
-path, bypassing pxpipe's specific renderer; `eval/needle-haystack/crux.py`).
+path, bypassing inkling's specific renderer; `eval/needle-haystack/crux.py`).
 
 | tier | rendering | result |
 |---|---|---|
@@ -665,12 +665,12 @@ path, bypassing pxpipe's specific renderer; `eval/needle-haystack/crux.py`).
 
 **The encoder is not fundamentally hex-blind.** When glyphs are large and isolated
 it nails them. So the 0/15 was never an encoder wall — it is a
-**density / resolution-per-character** problem. pxpipe's ~8pt wall-to-wall
+**density / resolution-per-character** problem. inkling's ~8pt wall-to-wall
 filler was simply below the glyph-resolution floor.
 
 ### Phase 4 — Density sweep: where does it break, and is the readable zone economical?
 
-We swept font size **down** from "clean" at fixed pxpipe dimensions
+We swept font size **down** from "clean" at fixed inkling dimensions
 (`eval/needle-haystack/sweep.py`, ~2,668 image tokens throughout):
 
 | font | retrieval | chars/image | failure mode |
@@ -756,7 +756,7 @@ outstanding for semantic."
 ## What this proves / doesn't prove
 
 **Proven:**
-- pxpipe **as built** does not work. Verbatim retrieval is zero across two model
+- inkling **as built** does not work. Verbatim retrieval is zero across two model
   versions; prose-density compression loses money in the readable zone.
 - The failure is architectural (encoder is a summarizer, not an OCR; image cost is a
   fixed token canvas), not a tuning parameter. Font size, resolution, and "try
@@ -819,7 +819,7 @@ Preserved under `eval/needle-haystack/` (copied from the volatile `/tmp/needle_e
 | `crux.py` | direct-to-Opus billboard/clean encoder test (Phase 3) |
 | `sweep.py` | fixed-dimension font-size density sweep (Phase 4) |
 
-Run: start the pxpipe proxy (`127.0.0.1:47821`), then
+Run: start the inkling proxy (`127.0.0.1:47821`), then
 `cd eval/needle-haystack && ./run3.sh`. Requires a `claude` CLI on a MAX plan
 (no API key needed) and PIL + a monospace TTF for the Python tiers.
 
@@ -830,7 +830,7 @@ rows. The `4-8` raw rows are in `results2.tsv` and Appendix B.
 ## Appendix B — Raw `opus-4-8` data (Phase 2)
 
 **verbatim / ON:** 15/15 returned **empty** — not garbled, not a near-miss. The
-encoder never resolved character-level glyphs at pxpipe's density; it saw "a
+encoder never resolved character-level glyphs at inkling's density; it saw "a
 block of code-like texture" and gave up.
 
 **semantic / ON — the confabulations** (expected → got; the dangerous part is these

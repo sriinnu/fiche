@@ -156,7 +156,7 @@ describe('per-model pricing is applied correctly (Fable vs Opus vs GPT)', () => 
   });
 
   it('cached-read discount is model-GATED: gpt-5.x and claude → 0.1×, other GPT must NOT get it', () => {
-    // pxpipe images gpt-5.x and (via the Codex->Anthropic bridge) claude-*.
+    // inkling images gpt-5.x and (via the Codex->Anthropic bridge) claude-*.
     // Both bill cache reads at 0.1x. Pricing an unrelated GPT row at the
     // aggressive 0.1x would overstate its cache savings, so the fallback stays
     // 0.5x. The gate keeps families from bleeding each other's rates.

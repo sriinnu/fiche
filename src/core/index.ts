@@ -1,12 +1,12 @@
 export {
   getAllowedModelBases,
   getConfiguredModelBases,
-  isPxpipeSupportedGptModel,
-  isPxpipeSupportedModel,
+  isInklingSupportedGptModel,
+  isInklingSupportedModel,
   setAllowedModelBases,
   shouldTransformAnthropicMessages,
-  type PxpipeApplicabilityInput,
-  type PxpipeApplicabilityReason,
+  type InklingApplicabilityInput,
+  type InklingApplicabilityReason,
 } from './applicability.js';
 export {
   buildCountTokensBodies,
@@ -18,17 +18,17 @@ export {
 export {
   transformAnthropicMessages,
   renderTextToImages,
-  type PxpipeOptions,
-  type PxpipeReason,
-  type PxpipeTransformInput,
-  type PxpipeTransformResult,
+  type InklingOptions,
+  type InklingReason,
+  type InklingTransformInput,
+  type InklingTransformResult,
   type RenderTextToImagesOptions,
   type RenderedTextImage,
   type RenderTextToImagesResult,
 } from './library.js';
 export {
   transformRequest,
-  type TransformInfo as PxpipeTransformInfo,
+  type TransformInfo as InklingTransformInfo,
   type TransformOptions,
   type KeepSharpBlock,
   type RecoverableBlock,

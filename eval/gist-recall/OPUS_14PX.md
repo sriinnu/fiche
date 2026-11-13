@@ -6,7 +6,7 @@ Date: 2026-07-23. Model under test: `claude-opus-4-8`.
 
 The gist-recall corpus was originally rendered at `claude-fable-5`'s production
 density (`5x8`, ~180 cols). Measuring Opus against a fable-shaped render is the
-wrong comparison — pxpipe ships Opus at native 14px (`9x16`, 782px pages,
+wrong comparison — inkling ships Opus at native 14px (`9x16`, 782px pages,
 `jetbrains-mono-14`), so the corpus was **re-rendered at Opus's real production
 profile** and the image arm re-run. Each model is now scored at its own shipped
 density, matching how fable's matrix cells are scored at fable's `5x8`.
@@ -20,7 +20,7 @@ density, matching how fable's matrix cells are scored at fable's `5x8`.
   pageWidthPx}`; `run*.py` **preflight-aborts before any API call** if the
   corpus manifest model ≠ the model under test (guards silent profile/model
   mismatch).
-- Model reached via **the gateway upstream, pxpipe-bypassed** — so pxpipe's own
+- Model reached via **the gateway upstream, inkling-bypassed** — so inkling's own
   text→image rendering does not contaminate the arms; the model still gets the
   images. Concurrency 3, `CCI_READY_TIMEOUT=120`, `CCI_TIMEOUT=210`.
 - Raw results: `work/results.opus-14px.jsonl`, `work2/…`, `work3/…`.

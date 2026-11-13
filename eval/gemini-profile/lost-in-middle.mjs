@@ -1,5 +1,5 @@
 // 300k Effective Context Window Benchmark — Reasoning & Causal State Tracking in the Middle
-// Evaluates Raw Text vs pxpipe Visual Context across relative context depths (10%, 30%, 50%, 70%, 90%).
+// Evaluates Raw Text vs inkling Visual Context across relative context depths (10%, 30%, 50%, 70%, 90%).
 
 import { writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -227,13 +227,13 @@ async function runEval() {
         }
       }
 
-      // 2. pxpipe Visual Context Arm
+      // 2. inkling Visual Context Arm
       let pxAns = null;
       let pxScore = null;
       let pxMs = 0;
       let pxUsage = null;
-      if (RUN_ARM === 'all' || RUN_ARM === 'pxpipe' || RUN_ARM === 'visual') {
-        console.log(`  -> Running pxpipe Visual Context Arm...`);
+      if (RUN_ARM === 'all' || RUN_ARM === 'inkling' || RUN_ARM === 'visual') {
+        console.log(`  -> Running inkling Visual Context Arm...`);
         try {
           const bodyBytes = new TextEncoder().encode(JSON.stringify(scenario.request));
           const transformed = await transformGoogleGenerateContent(bodyBytes, MODEL, {
@@ -253,21 +253,21 @@ async function runEval() {
           pxUsage = pxRes.usage;
           pxScore = score(pxAns, scenario);
         } catch (err) {
-          console.error(`     pxpipe error: ${err.message}`);
+          console.error(`     inkling error: ${err.message}`);
           pxScore = { error: err.message };
         }
       }
 
       const rawStatus = rawScore ? (rawScore.reasoningSuccess ? '✓' : '✗') : 'skipped';
       const pxStatus = pxScore ? (pxScore.reasoningSuccess ? '✓' : '✗') : 'skipped';
-      console.log(`  [Depth ${depthPct}%] Raw Reasoning: ${rawStatus} (${rawMs}ms) | pxpipe Reasoning: ${pxStatus} (${pxMs}ms)`);
+      console.log(`  [Depth ${depthPct}%] Raw Reasoning: ${rawStatus} (${rawMs}ms) | inkling Reasoning: ${pxStatus} (${pxMs}ms)`);
 
       results.push({
         depth,
         repeat: r,
         targetCluster: scenario.targetCluster,
         raw: { score: rawScore, ms: rawMs, usage: rawUsage, text: rawAns },
-        pxpipe: { score: pxScore, ms: pxMs, usage: pxUsage, text: pxAns },
+        inkling: { score: pxScore, ms: pxMs, usage: pxUsage, text: pxAns },
       });
     }
   }
@@ -284,14 +284,14 @@ async function runEval() {
   for (const d of DEPTHS) {
     const dRows = results.filter((r) => r.depth === d);
     const rawActive = dRows.filter((r) => r.raw.score !== null);
-    const pxActive = dRows.filter((r) => r.pxpipe.score !== null);
+    const pxActive = dRows.filter((r) => r.inkling.score !== null);
     summary.byDepth[d] = {
       raw_reasoning_acc: rawActive.length > 0 ? (rawActive.filter((r) => r.raw.score?.reasoningSuccess).length / rawActive.length) : null,
-      pxpipe_reasoning_acc: pxActive.length > 0 ? (pxActive.filter((r) => r.pxpipe.score?.reasoningSuccess).length / pxActive.length) : null,
+      inkling_reasoning_acc: pxActive.length > 0 ? (pxActive.filter((r) => r.inkling.score?.reasoningSuccess).length / pxActive.length) : null,
       raw_multihop_acc: rawActive.length > 0 ? (rawActive.filter((r) => r.raw.score?.fullMultiHopSuccess).length / rawActive.length) : null,
-      pxpipe_multihop_acc: pxActive.length > 0 ? (pxActive.filter((r) => r.pxpipe.score?.fullMultiHopSuccess).length / pxActive.length) : null,
+      inkling_multihop_acc: pxActive.length > 0 ? (pxActive.filter((r) => r.inkling.score?.fullMultiHopSuccess).length / pxActive.length) : null,
       raw_avg_ms: rawActive.length > 0 ? Math.round(rawActive.reduce((a, b) => a + (b.raw.ms || 0), 0) / rawActive.length) : 0,
-      pxpipe_avg_ms: pxActive.length > 0 ? Math.round(pxActive.reduce((a, b) => a + (b.pxpipe.ms || 0), 0) / pxActive.length) : 0,
+      inkling_avg_ms: pxActive.length > 0 ? Math.round(pxActive.reduce((a, b) => a + (b.inkling.ms || 0), 0) / pxActive.length) : 0,
     };
   }
 

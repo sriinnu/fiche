@@ -31,34 +31,29 @@ export function supportsExplicitPromptCacheBreakpoint(route: PromptCacheRoute = 
   return true;
 }
 
-/** Drop injected or hinted breakpoint objects. Does not touch other cache fields
- *  such as OpenAI's prompt_cache_key. Bodies that do not contain the key are
- *  returned unchanged so a Codex passthrough stays byte-identical. */
+// The only breakpoint this proxy injects is `{ mode: 'explicit' }` on a
+// content part (openai.ts). Match that object as a key/value pair: after a
+// comma, or right after `{`. Inside a JSON string the quotes are escaped, so
+// `,"` and `{"` cannot match there.
+const AFTER_COMMA = /,\s*"prompt_cache_breakpoint"\s*:\s*\{\s*"mode"\s*:\s*"explicit"\s*\}/g;
+const AFTER_BRACE = /(?<=\{)\s*"prompt_cache_breakpoint"\s*:\s*\{\s*"mode"\s*:\s*"explicit"\s*\}\s*,?/g;
+
+/** Drop breakpoint objects of the injected shape, editing the text in place.
+ *  Nothing else is reserialized, so large integers, number spellings and
+ *  key order survive, and a tool schema with a property of the same name is
+ *  left alone. Bodies without the key are returned unchanged, so a Codex
+ *  passthrough stays byte-identical. */
 export function scrubPromptCacheBreakpoint(body: Uint8Array): Uint8Array {
-  let parsed: unknown;
+  const text = new TextDecoder().decode(body);
+  if (!text.includes('"prompt_cache_breakpoint"')) return body;
+  const next = text.replace(AFTER_COMMA, '').replace(AFTER_BRACE, '');
+  if (next === text) return body;
   try {
-    parsed = JSON.parse(new TextDecoder().decode(body));
+    JSON.parse(next);
   } catch {
     return body;
   }
-  let removed = false;
-  const scrubbed = stripKey(parsed, () => { removed = true; });
-  if (!removed) return body;
-  return new TextEncoder().encode(JSON.stringify(scrubbed));
-}
-
-function stripKey(value: unknown, onRemove: () => void): unknown {
-  if (Array.isArray(value)) return value.map((item) => stripKey(item, onRemove));
-  if (!value || typeof value !== 'object') return value;
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (key === 'prompt_cache_breakpoint') {
-      onRemove();
-      continue;
-    }
-    out[key] = stripKey(child, onRemove);
-  }
-  return out;
+  return new TextEncoder().encode(next);
 }
 
 export function bodyHasPromptCacheBreakpoint(body: Uint8Array | string): boolean {

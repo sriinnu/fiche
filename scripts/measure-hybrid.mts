@@ -10,7 +10,7 @@ function events(n: number) {
       user: 'octocat',
       status: 'ok',
       path: 'src/core/hybrid.ts',
-      service: 'pxpipe-fork',
+      service: 'inkling',
       ms: 5000 + i,
       note: 'static slab cache hit on the system prompt',
     })),

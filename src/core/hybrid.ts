@@ -1,12 +1,12 @@
 /**
- * Hybrid pipeline: lossless PAKT on structured leaves, then pxpipe images
+ * Hybrid pipeline: lossless PAKT on structured leaves, then inkling images
  * only for readers that can actually read the pages.
  */
 import { countTokens } from '@sriinnu/pakt';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint, type PromptCacheRoute } from './codex-cache.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { transformGoogleGenerateContent } from './google.js';
-import { PAKT_LEGEND, packStructured, type PackResult } from './pakt-stage.js';
+import { PAKT_LEGEND, jsonLosslessUnderParse, packStructured, type PackResult } from './pakt-stage.js';
 import { readerTier, type ReaderTier } from './reader-tier.js';
 import { transformRequest, type TransformInfo, type TransformOptions } from './transform.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -51,7 +51,7 @@ export interface HybridTransformOptions extends TransformOptions {
   /** L4. Proxy and MCP default this off. */
   lossy?: boolean;
   semanticBudget?: number;
-  /** Per-call override. Does not read or write PXPIPE_FORCE_IMAGES. */
+  /** Per-call override. Does not read or write INKLING_FORCE_IMAGES. */
   forceImages?: boolean;
 }
 
@@ -78,59 +78,134 @@ interface WalkStats {
   originalTokens: number;
   packedTokens: number;
   vias: PackResult['via'][];
+  /** Set once a packed leaf carries the legend. */
+  legendPlaced: boolean;
 }
 
-function rewriteNode(value: unknown, stats: WalkStats, model: string | undefined, toolName: string | undefined, lossy: boolean, semanticBudget: number | undefined): unknown {
-  if (typeof value === 'string') {
-    const packed = packStructured(value, { model, toolName, lossy, semanticBudget });
-    if (!packed) return value;
-    stats.blocks += 1;
-    stats.savedTokens += packed.savedTokens;
-    stats.originalTokens += packed.originalTokens;
-    stats.packedTokens += packed.packedTokens;
-    stats.vias.push(packed.via);
-    return packed.text;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => rewriteNode(item, stats, model, toolName, lossy, semanticBudget));
-  }
-  if (!value || typeof value !== 'object') return value;
-  const record = value as Record<string, unknown>;
-  const nextTool = record.type === 'tool_result'
-    ? (typeof record.name === 'string' ? record.name : 'tool_result')
-    : toolName;
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(record)) {
-    out[key] = rewriteNode(child, stats, model, nextTool, lossy, semanticBudget);
-  }
+interface WalkContext {
+  stats: WalkStats;
+  model: string | undefined;
+  lossy: boolean;
+  semanticBudget: number | undefined;
+  legendTokens: number;
+}
+
+const LEGEND_PREFIX = `${PAKT_LEGEND}\n\n`;
+/** A packed leaf after the first must still save at least this much. */
+const MIN_LEAF_SAVING = 16;
+const TOOL_NAME = 'tool_result';
+
+/**
+ * Pack one tool-result string, or return it unchanged.
+ *
+ * The decision depends only on this leaf and the leaves before it, never on
+ * anything later in the request. Conversations only append, so a leaf packed
+ * (or left alone) on turn N gets the same answer on turn N+1 and the cached
+ * prefix stays byte-stable. The legend rides in front of the first packed leaf
+ * instead of the system prompt, for the same reason, and that first leaf has
+ * to pay for it on its own.
+ */
+function packLeaf(text: string, ctx: WalkContext): string {
+  const packed = packStructured(text, {
+    model: ctx.model,
+    toolName: TOOL_NAME,
+    lossy: ctx.lossy,
+    semanticBudget: ctx.semanticBudget,
+  });
+  if (!packed) return text;
+  const stats = ctx.stats;
+  const cost = stats.legendPlaced ? 0 : ctx.legendTokens;
+  if (packed.savedTokens - cost < MIN_LEAF_SAVING) return text;
+  const out = stats.legendPlaced ? packed.text : `${LEGEND_PREFIX}${packed.text}`;
+  stats.legendPlaced = true;
+  stats.blocks += 1;
+  stats.savedTokens += packed.savedTokens - cost;
+  stats.originalTokens += packed.originalTokens;
+  stats.packedTokens += packed.packedTokens + cost;
+  stats.vias.push(packed.via);
   return out;
 }
 
-function insertLegend(root: Record<string, unknown>): void {
-  // Append. Claude Code classifies subscription traffic by the first system
-  // block; a legend in front of that identity is an opaque 429 (#149). A
-  // `role: "system"` message is also illegal on the Anthropic Messages API,
-  // so when there is no system/instructions field the legend is skipped.
-  const marker = 'Pipe-Aligned Kompact Text';
-  if (typeof root.instructions === 'string') {
-    if (!root.instructions.includes(marker)) root.instructions = `${root.instructions}\n\n${PAKT_LEGEND}`;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** Tool-result content that is a string or an array of text parts. */
+function packContent(content: unknown, ctx: WalkContext, textTypes: readonly string[]): unknown {
+  if (typeof content === 'string') return packLeaf(content, ctx);
+  if (!Array.isArray(content)) return content;
+  return content.map((part) => {
+    if (!isRecord(part) || typeof part.text !== 'string') return part;
+    if (typeof part.type === 'string' && !textTypes.includes(part.type)) return part;
+    const text = packLeaf(part.text, ctx);
+    return text === part.text ? part : { ...part, text };
+  });
+}
+
+/** Every string value inside a Gemini functionResponse.response object. */
+function packResponseValues(value: unknown, ctx: WalkContext): unknown {
+  if (typeof value === 'string') return packLeaf(value, ctx);
+  if (Array.isArray(value)) return value.map((item) => packResponseValues(item, ctx));
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) out[key] = packResponseValues(child, ctx);
+  return out;
+}
+
+/**
+ * Rewrite only tool-result text. Everything else (tool-call arguments,
+ * `tool_use.input`, thinking blocks and their signatures, tool definitions,
+ * metadata, system prompts, user and assistant text) is never touched.
+ */
+function rewriteToolResults(root: Record<string, unknown>, wire: Exclude<HybridWire, 'auto'>, ctx: WalkContext): void {
+  if (wire === 'anthropic' && Array.isArray(root.messages)) {
+    root.messages = root.messages.map((message) => {
+      if (!isRecord(message) || !Array.isArray(message.content)) return message;
+      return {
+        ...message,
+        content: message.content.map((block) => {
+          if (!isRecord(block) || block.type !== 'tool_result') return block;
+          return { ...block, content: packContent(block.content, ctx, ['text']) };
+        }),
+      };
+    });
     return;
   }
-  if (typeof root.system === 'string') {
-    if (!root.system.includes(marker)) root.system = `${root.system}\n\n${PAKT_LEGEND}`;
+  if (wire === 'responses' && Array.isArray(root.input)) {
+    root.input = root.input.map((item) => {
+      if (!isRecord(item)) return item;
+      if (item.type !== 'function_call_output' && item.type !== 'custom_tool_call_output') return item;
+      return { ...item, output: packContent(item.output, ctx, ['input_text', 'output_text', 'text']) };
+    });
     return;
   }
-  if (Array.isArray(root.system)) {
-    const already = root.system.some((block) => JSON.stringify(block).includes(marker));
-    if (!already) root.system.push({ type: 'text', text: PAKT_LEGEND });
+  if (wire === 'chat' && Array.isArray(root.messages)) {
+    root.messages = root.messages.map((message) => {
+      if (!isRecord(message) || message.role !== 'tool') return message;
+      return { ...message, content: packContent(message.content, ctx, ['text']) };
+    });
+    return;
+  }
+  if (wire === 'google' && Array.isArray(root.contents)) {
+    root.contents = root.contents.map((content) => {
+      if (!isRecord(content) || !Array.isArray(content.parts)) return content;
+      return {
+        ...content,
+        parts: content.parts.map((part) => {
+          if (!isRecord(part) || !isRecord(part.functionResponse)) return part;
+          const fr = part.functionResponse;
+          return { ...part, functionResponse: { ...fr, response: packResponseValues(fr.response, ctx) } };
+        }),
+      };
+    });
   }
 }
 
-/** Rewrite structured strings inside a JSON request. Non-JSON bodies pass through. */
+/** Rewrite tool-result strings inside a JSON request. Non-JSON bodies pass through. */
 export function prepassRequest(
   body: Uint8Array,
   model?: string,
-  options: { lossy?: boolean; semanticBudget?: number; forceImages?: boolean } = {},
+  options: { lossy?: boolean; semanticBudget?: number; forceImages?: boolean; wire?: HybridWire } = {},
 ): HybridPrepass {
   const tier = readerTier(model, options.forceImages);
   const base: HybridPrepass = {
@@ -143,45 +218,60 @@ export function prepassRequest(
     packedTokens: 0,
     vias: [],
   };
+  const text = dec.decode(body);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(dec.decode(body));
+    parsed = JSON.parse(text);
   } catch {
     return base;
   }
-  if (!parsed || typeof parsed !== 'object') return base;
-  const stats: WalkStats = { blocks: 0, savedTokens: 0, originalTokens: 0, packedTokens: 0, vias: [] };
-  const rewritten = rewriteNode(parsed, stats, model, undefined, options.lossy === true, options.semanticBudget) as Record<string, unknown>;
-  if (stats.blocks === 0 || stats.savedTokens <= 0) return base;
-  insertLegend(rewritten);
-  const next = enc.encode(JSON.stringify(rewritten));
-  const after = countBillable(next, 0, model);
-  const before = countBillable(body, 0, model);
-  // Whole-request guard: a legend must not make the request larger than it started.
-  if (after >= before) return base;
+  if (!isRecord(parsed)) return base;
+  // Re-serializing goes through JSON.parse, so a body that parse cannot keep
+  // exactly (big integers, duplicate keys) is forwarded untouched.
+  if (!jsonLosslessUnderParse(text.trim())) return base;
+  const wire = detectWireParsed(parsed, options.wire);
+  const stats: WalkStats = {
+    blocks: 0, savedTokens: 0, originalTokens: 0, packedTokens: 0, vias: [], legendPlaced: false,
+  };
+  const ctx: WalkContext = {
+    stats,
+    model,
+    lossy: options.lossy === true,
+    semanticBudget: options.semanticBudget,
+    legendTokens: countTokens(LEGEND_PREFIX, tokenModel(model)),
+  };
+  rewriteToolResults(parsed, wire, ctx);
+  if (stats.blocks === 0) return base;
   return {
-    body: next,
+    body: enc.encode(JSON.stringify(parsed)),
     changed: true,
     tier,
     blocks: stats.blocks,
-    savedTokens: before - after,
-    originalTokens: before,
-    packedTokens: after,
+    savedTokens: stats.savedTokens,
+    originalTokens: stats.originalTokens,
+    packedTokens: stats.packedTokens,
     vias: stats.vias,
   };
+}
+
+function detectWireParsed(parsed: Record<string, unknown>, hinted: HybridWire | undefined): Exclude<HybridWire, 'auto'> {
+  if (hinted && hinted !== 'auto') return hinted;
+  if (typeof parsed.instructions === 'string' || Array.isArray(parsed.input)) return 'responses';
+  if (parsed.systemInstruction || parsed.contents) return 'google';
+  if (Array.isArray(parsed.messages)) {
+    if (parsed.system !== undefined) return 'anthropic';
+    const blob = JSON.stringify(parsed.messages);
+    if (blob.includes('"tool_result"') || blob.includes('"tool_use"')) return 'anthropic';
+    return 'chat';
+  }
+  return 'anthropic';
 }
 
 function detectWire(body: Uint8Array, hinted: HybridWire | undefined): Exclude<HybridWire, 'auto'> {
   if (hinted && hinted !== 'auto') return hinted;
   try {
-    const parsed = JSON.parse(dec.decode(body)) as Record<string, unknown>;
-    if (typeof parsed.instructions === 'string' || Array.isArray(parsed.input)) return 'responses';
-    if (parsed.systemInstruction || parsed.contents) return 'google';
-    if (Array.isArray(parsed.messages)) {
-      const blob = JSON.stringify(parsed.messages);
-      if (blob.includes('"tool_result"') || blob.includes('"tool_use"') || parsed.system) return 'anthropic';
-      return 'chat';
-    }
+    const parsed = JSON.parse(dec.decode(body)) as unknown;
+    if (isRecord(parsed)) return detectWireParsed(parsed, undefined);
   } catch {
     // fall through
   }
@@ -215,6 +305,7 @@ export async function hybridTransform(
     lossy: options.lossy,
     semanticBudget: options.semanticBudget,
     forceImages: options.forceImages,
+    wire: options.wire,
   });
   const allow = allowBreakpoints(options);
   const wire = detectWire(pre.body, options.wire);

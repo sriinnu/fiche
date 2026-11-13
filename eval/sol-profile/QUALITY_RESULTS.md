@@ -3,7 +3,7 @@
 # GPT-5.6 Sol quality results
 
 Model: `gpt-5.6-sol` through the Codex Responses provider. Image calls bypassed
-pxpipe.
+inkling.
 
 ## Production 5×8 profile
 
@@ -22,7 +22,7 @@ Matched arithmetic usage was 5,300 text input tokens and 7,000 production-image
 input tokens, **+32.1%**. The README rounds this to **+32%**. Short prompts are
 not a compression win, even when the model reads them.
 
-The 2026-07-15 run used the direct Responses upstream, not pxpipe. Two text-arm
+The 2026-07-15 run used the direct Responses upstream, not inkling. Two text-arm
 calls initially received HTTP 503 overload responses and were retried individually;
 the final receipt contains 100 completed calls for every arm and no errors.
 

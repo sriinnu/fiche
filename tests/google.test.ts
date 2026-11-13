@@ -686,7 +686,7 @@ describe('transformGoogleGenerateContent', () => {
     const serialized = JSON.stringify(out.contents);
 
     // Both the parent user question and the mid-work interjection must survive as native text outside the PNGs
-    expect(serialized).toContain('CURRENT USER REQUEST (live; kept as text by pxpipe');
+    expect(serialized).toContain('CURRENT USER REQUEST (live; kept as text by inkling');
     expect(serialized).toContain(
       'Can you help me organize the architecture of forge into a diagram?',
     );

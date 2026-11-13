@@ -28,7 +28,7 @@ node --test eval/model-quality/profile.test.mjs
 Change only `QUALITY_MODEL` to evaluate another model. Claude, Gemini, Grok,
 Qwen, GLM, Kimi, and other Responses models use their existing transport clients;
 rendering and scoring are shared. Direct endpoints must be configured for the
-selected client; the pxpipe port is rejected. Kimi requires an explicit direct
+selected client; the inkling port is rejected. Kimi requires an explicit direct
 `KIMI_QUALITY_BASE_URL`. No model's paid suite is triggered by testing another.
 
 The Sol/Grok/Gemini/Qwen/GLM `novel-arithmetic.mjs`, `gist-recall.mjs`, and

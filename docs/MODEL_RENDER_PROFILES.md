@@ -1,7 +1,7 @@
 # Model render profiles
 
 The endpoint is a wire protocol, not a rendering profile. Claude, GPT, and Grok
-can all arrive on `/v1/responses`; pxpipe resolves geometry and vision billing
+can all arrive on `/v1/responses`; inkling resolves geometry and vision billing
 from the model id.
 
 A gateway may prefix that wire path with one routing segment and may qualify the
@@ -39,23 +39,23 @@ profitability gate skip transforms whose amortized create cost it predicts will
 lose.
 
 Sol and Grok remain opt-in because their broader image-reading results do not
-match Claude. Enable them explicitly with `PXPIPE_MODELS`, for example:
+match Claude. Enable them explicitly with `INKLING_MODELS`, for example:
 
 ```bash
-PXPIPE_MODELS=claude-fable-5,gpt-5.6-sol
+INKLING_MODELS=claude-fable-5,gpt-5.6-sol
 ```
 `gpt-5.6-terra`, `gpt-6.1-terra`, and other non-Sol siblings do not inherit the Sol profile or allowlist.
 
 Evidence: [GPT-6.1 Sol 14px results](../eval/model-quality/results/gpt-6.1-sol/QUALITY_RESULTS.md) ([5×8 control](../eval/model-quality/results/gpt-6.1-sol-5x8/QUALITY_RESULTS.md)), [Sol pilot results](../eval/sol-profile/RESULTS.md), [Grok 4.7 14px results](../eval/model-quality/results/grok-4.7/QUALITY_RESULTS.md) ([5×8 control](../eval/model-quality/results/grok-4.7-5x8/QUALITY_RESULTS.md)), [Grok 4.5/4.6 results](../eval/grok-density/QUALITY_RESULTS.md).
 ## Overrides
 
-`PXPIPE_GPT_PROFILES` is a JSON map from model-id prefix to a partial profile.
+`INKLING_GPT_PROFILES` is a JSON map from model-id prefix to a partial profile.
 The longest prefix wins. Supported render fields are `font`, `cellWBonus`,
 `cellHBonus`, `aa`, `grid`, `gridCols`, `colorCycle`, `markerScale`, and
 `markerRed`; geometry fields are `stripCols` and `maxHeightPx`.
 
 ```bash
-PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
+INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
 ```
 
 The profitability gate uses the same resolved profile as the renderer, so a
@@ -69,7 +69,7 @@ geometry. Both are undefined in every shipped profile, so leaving them out
 changes nothing.
 
 ```bash
-PXPIPE_GPT_PROFILES='{"claude-opus-5":{"historyStripCols":172,"historyStyle":{"font":"jetbrains-mono-14"}}}'
+INKLING_GPT_PROFILES='{"claude-opus-5":{"historyStripCols":172,"historyStyle":{"font":"jetbrains-mono-14"}}}'
 ```
 
 They exist because reading accuracy and rendering cost are not the same axis.
@@ -95,7 +95,7 @@ legibility it was meant to buy.
 
 ## Unmeasured families
 
-An id that names a family pxpipe HAS measured, but does not match any of that
+An id that names a family inkling HAS measured, but does not match any of that
 family's profiles — an unmeasured Gemini or Grok sibling — is refused by
 `isMisresolvedModelId`, and the request passes through as text. Such an id would
 otherwise fall through to `DEFAULT_GPT_PROFILE` and be gated with OpenAI's tile
@@ -105,7 +105,7 @@ An id that names no known family at all (anything reached through a gateway's
 OpenAI-compatible route — Kimi K3 on Cloudflare is the example this repo has
 run) is NOT refused. It resolves to
 `DEFAULT_GPT_PROFILE` and is gated with OpenAI's tile math as an approximation.
-`PXPIPE_MODELS` is the only gate: listing such a model is the operator asserting
+`INKLING_MODELS` is the only gate: listing such a model is the operator asserting
 it is worth imaging. Two consequences worth stating plainly:
 
 - The savings figure is an approximation, not a measurement. If tile math
@@ -119,8 +119,8 @@ To replace the approximation with real numbers, declare the geometry and vision
 cost yourself:
 
 ```bash
-PXPIPE_MODELS=claude-fable-5,kimi-k3
-PXPIPE_GPT_PROFILES='{"kimi-k3":{"vision":{"regime":"mpix","tokensPerMegapixel":1000},"stripCols":152,"maxHeightPx":1932}}'
+INKLING_MODELS=claude-fable-5,kimi-k3
+INKLING_GPT_PROFILES='{"kimi-k3":{"vision":{"regime":"mpix","tokensPerMegapixel":1000},"stripCols":152,"maxHeightPx":1932}}'
 ```
 
 The `tokensPerMegapixel` above is a **placeholder, not a measurement** — read
