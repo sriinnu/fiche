@@ -1,5 +1,7 @@
 # Inkling review v2
 
+The body below is the review of `151227d`, before the fixes. The [remediation](#remediation) section is what changed after it, with before and after numbers.
+
 Independent review of `pxpipe-fork` 0.17.0-fork.1 (`151227d` on `main`). The fork imports teamchong/pxpipe v0.16.0 (`9e0e0e99`) and adds `@sriinnu/pakt@0.10.0` plus an MCP server. `REVIEW.md` was treated as a list of claims to check, not as evidence. Line numbers are from this tree before the fixes that follow this review.
 
 No provider API was called. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `XAI_API_KEY`, and `GROK_API_KEY` were unset, and there is no `~/.pxpipe/config.json`. Every token figure below is an estimate. Text tokens are `@sriinnu/pakt` `countTokens`. That function uses `o200k_base` only when `getModelEncoding` recognizes the id (`gpt-4o` did). `claude-*`, `gemini-*`, `grok-*`, and `gpt-5.6-sol` returned no encoding and fell through to `cl100k_base`. Image tokens are `visionTokens()` on the rendered page sizes in `src/core/vision-cost.ts`. They are not Anthropic, OpenAI, Google, or xAI usage fields. `REVIEW.md`'s statement that these counts are o200k is not true for the model ids the fork actually routes.
@@ -368,3 +370,41 @@ The order is the order that makes every default client no worse than upstream, t
 4. Leave L4's string compare as a fail-closed guard. Do not weaken it to chase CSV savings. Leave L5's tokenizer as an estimate and label it, unless a real Anthropic or Gemini count is wired in behind an API key. L6's Worker model list should match Node once H3 lands.
 
 After that, Opus on code should match upstream's image savings, Opus and Fable on monotonic JSON should take PAKT only when it beats that image, Sonnet and Grok should stay at raw on code and beat raw on structured text, and a warm `cache_control` prefix should still hit.
+
+## Remediation
+
+Follow-up PRs, still estimates, still no provider API. `pnpm test` and `pnpm exec tsc --noEmit` passed on each code branch. Docker is not installed here; the runtime layout was installed outside the repo and `node dist/node.js --version` printed `0.17.0-fork.1`. The same file with no `node_modules` still throws `ERR_MODULE_NOT_FOUND`.
+
+| PR | What it changes |
+| --- | --- |
+| [#11](https://github.com/sriinnu/inkling/pull/11) | H1, H2, H3, M1, M2, M3. Cache-safe splice. Allowlisted models, including Opus 5.5, are image candidates. The sent body is the cheaper of raw, PAKT text, and images of the original. L4 must decompress. The extra Haiku regex is gone. |
+| [#12](https://github.com/sriinnu/inkling/pull/12) | C1. The runtime image installs production dependencies. The OCI source label points at this fork. `wrangler.toml` keeps its narrower model list and says so (L6, documented rather than widened). |
+| [#13](https://github.com/sriinnu/inkling/pull/13) | M4, M5, M6, L1, L2, and the version / `stats` nits. Stdio cap, notification-with-id, `::1`, in-place Codex scrub, `/backend-api/codex/` including `responses/compact`, plugin manifest, marketplace, Cursor link, Gemini and Grok CLI docs. `prepare` builds `dist/node.js`. |
+
+`npm install github:sriinnu/inkling#cursor/mcp-plugin-and-codex-scrub-c280` installed 99 packages, `prepare` produced `dist/node.js`, and `node dist/node.js --version` printed `0.17.0-fork.1`. `node bin/mcp.js --help` printed the stdio / HTTP usage. The unqualified `npx --yes --package github:sriinnu/inkling pxpipe-mcp` tracks the default branch, so it picks this up once #13 is on `main`.
+
+### Before / after
+
+Same estimators as the rest of this file. "Before" is `151227d`. "After" is #11.
+
+| Case | Before | After |
+| --- | ---: | ---: |
+| Fable, 360 monotonic rows. Raw 17705, images 3875 | Hybrid 564, one image of the packed text | 936 PAKT text, 0 pages. Still under the image, and the model is not asked to read PAKT off a page |
+| Fable, mixed prose + TypeScript. Raw 3657, images 959 | 959 | 959 |
+| Opus 5.5, ~200 TypeScript functions, identity block, `cache_control`. Raw 8315, images 2165 | 8315, images refused | 2165, imaged, same as the image candidate |
+| Sonnet 5.5, same TypeScript. Raw 8316, forced images 2166 | 8316 | 8316. Not allowlisted, so this matches upstream. Prefix bytes through `cache_control` stayed equal |
+| Grok 4.7, same TypeScript. Raw 8313, forced images 4193 | 8313 | 8313. Same reason as Sonnet |
+| Sol agent session. Raw 2123, images 2214 (+4.3%) | Hybrid imaged at 2214 even though Sol is not allowlisted | 2123. Sol is not an image candidate until `PXPIPE_MODELS` names it |
+| Pretty JSON with `cache_control` on the identity block and a monotonic tool result | Prefix bytes changed (`{\n  "model"` became `{"model"`) and the legend was inserted into `system` | Bytes through the end of that `cache_control` object are identical. The legend is inside the tool result, after the boundary |
+
+Naming Sonnet or Grok in `PXPIPE_MODELS` makes images a candidate and the gate's choice is kept when it compresses. That is the upstream opt-in. The default stays text, which is also upstream.
+
+### Still open
+
+- L4. YAML and CSV still have to match `decompress` text. That fails closed. A CSV sample of 1437 characters did not pack. Not loosened.
+- L5. `countTokens` is still cl100k for Claude, Gemini, Grok, and Sol. The profile gate, including an operator `charsPerToken`, is what decides that images beat raw. Overriding that with the cl100k estimate rejected images the gate had accepted (a Sol chat fixture was 3095 versus 3062) and broke the upstream tests that set `charsPerToken: 1`. When Sol is allowlisted, a short session can still image at 2214 against a raw 2123, because that is the gate's decision. PAKT is allowed to beat that image; cl100k is not allowed to overturn the gate.
+- L6. The Worker model list is still `claude-fable-5,gemini-3.6-flash`. The comment in `wrangler.toml` says it is narrower than Node. Widening it is an operator change, not something this pass guessed.
+- The context engine is still built per tool string and then often discarded. The request path no longer needs it; `prepassRequest` calls `packStructured` without a tool name.
+- No live provider usage. Nothing here is an Anthropic, OpenAI, Google, or xAI bill.
+- The Docker image was not built with Docker. The runtime layout was. `docker` is not installed in this environment.
+- Sonnet, Haiku, and Grok on code are a tie with upstream, not a win. Imaging them by default would beat the token estimate and walk into the dense-hex failures upstream already measured. They stay out of the default allowlist.
