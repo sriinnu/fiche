@@ -8,6 +8,8 @@ RUN corepack enable
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# The prepare lifecycle script runs on install. It no-ops until src/ is copied.
+COPY scripts/prepare.mjs ./scripts/prepare.mjs
 RUN pnpm install --frozen-lockfile
 
 COPY bin ./bin
@@ -39,6 +41,8 @@ WORKDIR /app
 # so the image has to install production dependencies or the process exits
 # with ERR_MODULE_NOT_FOUND before it listens.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+# prepare runs on install and exits 0 here because src/ is not in this stage.
+COPY scripts/prepare.mjs ./scripts/prepare.mjs
 RUN pnpm install --frozen-lockfile --prod
 
 COPY --from=build --chown=node:node /app/dist/node.js ./dist/node.js

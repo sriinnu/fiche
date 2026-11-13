@@ -1,0 +1,16 @@
+{
+  "name": "inkling",
+  "description": "Inkling MCP tools and the notes for the local token-saving proxy.",
+  "owner": {
+    "name": "Srinivas Pendela",
+    "url": "https://github.com/sriinnu"
+  },
+  "plugins": [
+    {
+      "name": "inkling",
+      "source": "./",
+      "description": "Stdio MCP server for compress_text, inspect_savings, transform_request, health, and stats. Calling a tool does not shrink the turn that called it.",
+      "category": "development"
+    }
+  ]
+}
