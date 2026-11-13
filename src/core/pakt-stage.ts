@@ -225,7 +225,14 @@ export function packStructured(text: string, options: PackOptions = {}): PackRes
       });
       if (result.cacheBreakpoint) return null;
       if (result.compressedTokens >= result.originalTokens) return null;
-      return fromPacked(text, result.compressed, format, options.model, 'compress', result.reversible);
+      try {
+        if (format === 'markdown') decompressMixed(result.compressed);
+        else decompress(result.compressed, format);
+      } catch {
+        return null;
+      }
+      const reversible = roundTrips(text, result.compressed, format);
+      return fromPacked(text, result.compressed, format, options.model, 'compress', reversible);
     } catch {
       return null;
     }

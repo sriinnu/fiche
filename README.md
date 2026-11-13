@@ -90,17 +90,17 @@ More clients (Claude Desktop, Pi, Grok Bot, Ribhu, OpenCode) are covered in [MCP
 
 ## What is better than upstream, on one fixture
 
-Not a universal 90%. This is one repetitive agent log (360 monotonic JSON rows plus a short system prompt), counted with `gpt-4o` / o200k after base64 is removed and vision tokens are added back. Reproduce with `pnpm exec tsx scripts/measure-hybrid.mts`.
+Not a universal 90%. This is one repetitive agent log (360 monotonic JSON rows plus a short system prompt). Text tokens are `@sriinnu/pakt` `countTokens` (cl100k unless the id is a registered o200k model) after base64 is removed; image tokens come from the pixel profiles. They are not provider usage. Reproduce with `pnpm exec tsx scripts/measure-hybrid.mts`.
 
 | path | pages | billable tokens | vs 17,705 raw |
 | --- | ---: | ---: | ---: |
 | Raw JSON | 0 | 17,705 | — |
 | Upstream-style images only (Fable 5) | 4 | 3,875 | 78.1% fewer |
-| Hybrid, Fable 5 (PAKT, then one image) | 1 | 564 | 96.8% fewer |
+| Hybrid, Fable 5 (PAKT text; cheaper than the image) | 0 | 936 | 94.7% fewer |
 | Hybrid, Claude Sonnet 5.5 (PAKT text, no images) | 0 | 939 | 94.7% fewer |
 | Hybrid, Grok 4.7 (PAKT text, no images) | 0 | 936 | 94.7% fewer |
 
-On this fixture the hybrid is also cheaper than imaging alone (564 vs 3,875 billable tokens, one page instead of four) and the weak-reader path round-trips through `decompress`. Prose with no repetition is left alone. A deeply nested config can expand; the negative-savings guard keeps the original. Cyclic counters that fail the round-trip guard are kept as JSON. No live Grok or Claude 5.5 API call was made here. Upstream's published read-accuracy numbers still apply when `PXPIPE_FORCE_IMAGES=1` turns images back on: Grok's forced-image profile is the upstream JetBrains Mono 14px / 84-column page, and Claude 5.5's is the upstream Spleen 5×8 page with +2px rows. Those pages are still weak on dense hex. PAKT text is the default because of that, not because a new font was measured.
+On this fixture PAKT text is cheaper than imaging (936 vs 3,875) and the packed tool result round-trips through `decompress`. The request is not turned into an image of the packed notation. Prose with no repetition is left alone. A deeply nested config can expand; the negative-savings guard keeps the original. Cyclic counters that fail the round-trip guard are kept as JSON. No live API call was made here. Sonnet and Grok are not in the default allowlist, so code stays text, matching upstream. Naming them in `PXPIPE_MODELS` makes images a candidate and the cheaper of the three is sent. Claude 5.5 and Grok pages are still weak on dense hex; that is why they are not in the default list.
 
 ## Run the proxy
 
@@ -114,7 +114,8 @@ pnpm exec tsx src/node.ts
 Proxy listens on `127.0.0.1:47821`. After `pnpm build`, `node dist/node.js` is the same server. The `pxpipe` bin still works; `pxpipe-fork` is the fork name.
 
 ```bash
-# Claude Code, images for Fable, PAKT text for Opus 5.5
+# Claude Code. Allowlisted models (Fable, Opus 5.5, Gemini) get whichever
+# of raw, cache-safe PAKT, and images is cheaper on that request.
 ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
 
 # ChatGPT Codex. Do not point this at api.openai.com.
@@ -123,7 +124,8 @@ PORT=47821 OPENAI_UPSTREAM=https://chatgpt.com \
   PXPIPE_MODELS=gpt-5.6-sol \
   pnpm exec tsx src/node.ts
 
-# Grok stays PAKT text. Name it to opt in; images stay off.
+# Naming Grok makes images a candidate. The request still sends the cheapest
+# of raw, PAKT text, and images.
 PXPIPE_MODELS=claude-fable-5,gemini,grok-4.7 pnpm exec tsx src/node.ts
 # Warp the xAI host yourself:
 # pxpipe-fork warp --route 'api.x.ai/v1/*=http://127.0.0.1:47821' -- <grok-cli>
@@ -143,7 +145,7 @@ requires_openai_auth = true
 supports_websockets = false
 ```
 
-`PXPIPE_FORCE_IMAGES=1` lifts the PAKT-text veto for a model that is already in scope. Opus 5.5 is in the default scope, so the flag images it. Sonnet 5.5, Haiku 5.5, and Grok also need to be named in `PXPIPE_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
+Allowlisted models are priced three ways and the cheapest is sent: the original bytes, cache-safe PAKT text, or images of the original. Opus 5.5 is in the default scope, so images are a candidate without `PXPIPE_FORCE_IMAGES`. Sonnet 5.5, Haiku 5.5, and Grok are not, until `PXPIPE_MODELS` names them. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com. PAKT edits are spliced in after the last `cache_control` block, so that prefix stays byte-identical.
 
 ## MCP for every agent
 

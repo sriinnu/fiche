@@ -26,27 +26,34 @@ describe('review fixes', () => {
     else process.env.PXPIPE_FORCE_IMAGES = prev;
   });
 
-  it('appends the PAKT legend after the Claude Code identity, never in front of it', () => {
-    const body = enc.encode(JSON.stringify({
-      model: 'claude-opus-5-5',
-      system: [
-        { type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY },
-        { type: 'text', text: 'Follow the repository conventions.' },
-      ],
-      messages: [{
-        role: 'user',
-        content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: repetitiveJson() }],
-      }],
-    }));
+  it('keeps the Claude Code identity and the cache_control prefix byte-identical', () => {
+    const pretty = `{
+  "model": "claude-opus-5-5",
+  "system": [
+    { "type": "text", "text": ${JSON.stringify(CLAUDE_CODE_OAUTH_IDENTITY)}, "cache_control": { "type": "ephemeral" } },
+    { "type": "text", "text": "Follow the repository conventions." }
+  ],
+  "messages": [{
+    "role": "user",
+    "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": ${JSON.stringify(repetitiveJson())} }]
+  }]
+}`;
+    const body = enc.encode(pretty);
     const pre = prepassRequest(body, 'claude-opus-5-5');
     expect(pre.changed).toBe(true);
-    const out = JSON.parse(new TextDecoder().decode(pre.body)) as {
+    const outText = new TextDecoder().decode(pre.body);
+    const boundary = pretty.indexOf('"cache_control"');
+    const end = pretty.indexOf('}', pretty.indexOf('}', boundary) + 1);
+    expect(outText.slice(0, end + 1)).toBe(pretty.slice(0, end + 1));
+    const out = JSON.parse(outText) as {
       system: Array<{ text: string }>;
-      messages: Array<{ role?: string }>;
+      messages: Array<{ role?: string; content?: Array<{ content?: string }> }>;
     };
     expect(out.system[0]!.text).toBe(CLAUDE_CODE_OAUTH_IDENTITY);
-    expect(out.system.at(-1)!.text).toContain('Pipe-Aligned Kompact Text');
+    expect(out.system.some((block) => block.text.includes('Pipe-Aligned Kompact Text'))).toBe(false);
     expect(out.messages.some((message) => message.role === 'system')).toBe(false);
+    expect(out.messages[0]!.content?.[0]?.content).toContain('Pipe-Aligned Kompact Text');
+    expect(out.messages[0]!.content?.[0]?.content).toContain('@from json');
   });
 
   it('does not reserialize a Codex body that has no breakpoint', () => {
@@ -76,12 +83,12 @@ describe('review fixes', () => {
     delete process.env.PXPIPE_FORCE_IMAGES;
     expect(shouldImageModel('claude-fable-5', true)).toBe(true);
     expect(shouldImageModel('claude-opus-5', true)).toBe(true);
-    expect(shouldImageModel('claude-opus-5-5', true)).toBe(false);
+    expect(shouldImageModel('claude-opus-5-5', true)).toBe(true);
     expect(shouldImageModel('claude-opus-5-5', true, true)).toBe(true);
     expect(shouldImageModel('grok-4.7', false)).toBe(false);
     expect(shouldImageModel('grok-4.7', false, true)).toBe(false);
-    expect(shouldImageModel('grok-4.7', true)).toBe(false);
-    expect(shouldImageModel('grok-4.7', true, true)).toBe(true);
+    expect(shouldImageModel('grok-4.7', true)).toBe(true);
+    expect(shouldImageModel('claude-haiku-4-5', true)).toBe(true);
     expect(shouldImageModel('gpt-5.6-sol', false)).toBe(false);
     expect(shouldImageModel('gpt-5.6-sol', true)).toBe(true);
   });
