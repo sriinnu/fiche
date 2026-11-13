@@ -30,11 +30,11 @@ function modelIds(model: string | null | undefined): string[] {
   return slash >= 0 ? [raw, raw.slice(slash + 1)] : [raw];
 }
 
-/** Claude 5.5 and Grok stay on PAKT text even when a chip or PXPIPE_MODELS
- *  lists them. Other opt-in readers (Opus 5, Sol) still image once named. */
+/** Labels only. The cost check decides whether an allowlisted model is
+ *  actually sent images. Claude 5.5 and Grok are not strong page readers;
+ *  Haiku 4.x is not in this list (the 5.5 pattern already covers Haiku 5.5). */
 const PAKT_ONLY = [
   /claude-(?:opus|sonnet|haiku)-5-5(?:-|$)/,
-  /claude-haiku(?:-|$)/,
   /(?:^|\/)grok(?:-|$)/,
 ];
 
@@ -53,11 +53,12 @@ export function readerTier(model: string | null | undefined, forceImages?: boole
 }
 
 /**
- * Imaging requires the model allowlist (`PXPIPE_MODELS` / default scope) AND
- * a reader that is not PAKT-only. `PXPIPE_FORCE_IMAGES` lifts the PAKT-only
- * veto. It does not add a model to the allowlist: Grok, Sonnet 5.5, and Haiku
- * stay text until they are also named in `PXPIPE_MODELS`.
+ * An allowlisted model is an image candidate. The caller prices that candidate
+ * against raw text and cache-safe PAKT and sends the cheapest. `forceImages`
+ * does not add a model that failed the allowlist: Grok and Sonnet stay out
+ * until `PXPIPE_MODELS` names them.
  */
-export function shouldImageModel(model: string | null | undefined, allowed: boolean, forceImages?: boolean): boolean {
-  return allowed && !prefersPaktText(model, forceImages);
+export function shouldImageModel(model: string | null | undefined, allowed: boolean, _forceImages?: boolean): boolean {
+  void model;
+  return allowed;
 }

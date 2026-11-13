@@ -325,11 +325,11 @@ Environment:
                           families through one gateway base URL
   PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
   PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
-  PXPIPE_MODELS           comma-separated model bases allowed to image
+  PXPIPE_MODELS           comma-separated model bases that may be imaged
                           (default claude-fable-5,claude-opus-5-5,gemini).
-                          This fork still routes Claude 5.5 and Grok to lossless
-                          PAKT text unless PXPIPE_FORCE_IMAGES=1.
-  PXPIPE_FORCE_IMAGES     1 images weak readers too (Claude 5.5, Grok). Does not
+                          Each request sends the cheaper of raw text, cache-safe
+                          PAKT, and images. Models not in the list stay text.
+  PXPIPE_FORCE_IMAGES     Does not add a model to PXPIPE_MODELS and does not
                           re-enable prompt_cache_breakpoint on ChatGPT Codex.
   PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
                           supports {"models": [...]} or {"models": "off"}

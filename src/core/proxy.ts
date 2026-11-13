@@ -1807,45 +1807,66 @@ let responseContentType: string | undefined;
           pathname: url.pathname,
           upstream: openAIUpstream,
         });
-        // PAKT runs for every JSON body. Weak readers (Claude 5.5, Grok, …)
-        // stop here; strong readers continue into the image transform.
-        const pre = await prepareHybridBody(bridgeBody, routeModel);
-        // Allowlisted models image, except Claude 5.5 and Grok, which stay on
-        // PAKT text until PXPIPE_FORCE_IMAGES. That flag does not itself add a
-        // model to the allowlist. Opus 5 still images once named.
-        const imageThisRequest = shouldImageModel(routeModel, modelOk);
-        const effectiveOpts = imageThisRequest
-          ? { ...transformOpts, explicitPromptCacheBreakpoints: allowBreakpoints }
-          : { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
+        // Cache-safe PAKT on the original bytes. Images, when the model is
+        // allowlisted, are rendered from those same original bytes. The cheaper
+        // of raw, PAKT text, and images is what we forward.
+        const hybridMod = await loadHybrid();
+        const pre = hybridMod
+          ? hybridMod.prepassRequest(bridgeBody, routeModel)
+          : {
+              body: bridgeBody,
+              changed: false,
+              tier: 'image' as const,
+              blocks: 0,
+              savedTokens: 0,
+              originalTokens: 0,
+              packedTokens: 0,
+              vias: [] as Array<'none' | 'compress' | 'context-engine' | 'mixed'>,
+            };
+        const imageThisRequest = shouldImageModel(routeModel, modelOk) && transformOpts?.compress !== false;
+        const effectiveOpts = {
+          ...transformOpts,
+          explicitPromptCacheBreakpoints: allowBreakpoints,
+          compress: imageThisRequest,
+        };
         // Local render+encode cost only. The Google branch below issues upstream
         // count_tokens probes, so the timer closes here rather than after them —
         // otherwise network latency would be charged to our own CPU.
         const tTransform = Date.now();
-        let r = isGoogle
-          ? await transformGoogleGenerateContent(pre.body, model!, effectiveOpts)
+        const renderBody = imageThisRequest ? bridgeBody : (pre.changed ? pre.body : bridgeBody);
+        let rendered = isGoogle
+          ? await transformGoogleGenerateContent(renderBody, model!, effectiveOpts)
           : isMessages
             ? bridgedGptMessages
-              ? await transformOpenAIResponses(pre.body, effectiveOpts)
+              ? await transformOpenAIResponses(renderBody, effectiveOpts)
               : bridgedChatMessages
-                ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
-                : await transformRequest(pre.body, { ...effectiveOpts, model: effectiveModel ?? undefined })
+                ? await transformOpenAIChatCompletions(renderBody, effectiveOpts)
+                : await transformRequest(renderBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
             : isOpenAIChat
-              ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
-              : await transformOpenAIResponses(pre.body, effectiveOpts);
+              ? await transformOpenAIChatCompletions(renderBody, effectiveOpts)
+              : await transformOpenAIResponses(renderBody, effectiveOpts);
+        if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
+          rendered = { ...rendered, body: scrubPromptCacheBreakpoint(rendered.body) };
+        }
+        const picked = hybridMod
+          ? hybridMod.pickCheapest(
+              bridgeBody,
+              pre,
+              imageThisRequest ? rendered : undefined,
+              routeModel,
+            )
+          : { body: rendered.body, info: rendered.info, choice: 'image' as const };
+        let chosenBody = picked.body;
+        if (!imageThisRequest) {
+          // compress:false still normalizes Gemini thought signatures.
+          chosenBody = rendered.body;
+        } else if (isGoogle && picked.choice !== 'image') {
+          const stamped = await transformGoogleGenerateContent(picked.body, model!, { ...effectiveOpts, compress: false });
+          chosenBody = stamped.body;
+        }
+        let r = { body: chosenBody, info: picked.info };
         if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
           r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
-        }
-        if (pre.blocks > 0) {
-          r.info.hybrid = {
-            readerTier: pre.tier,
-            paktBlocks: pre.blocks,
-            paktSavedTokens: pre.savedTokens,
-            imaged: imageThisRequest && (r.info.imageCount ?? 0) > 0,
-          };
-          if (!imageThisRequest) {
-            r.info.compressed = true;
-            r.info.reason = 'pakt_text';
-          }
         }
         transformMs = Date.now() - tTransform;
         if (isGoogle && r.info.compressed) {
@@ -1865,17 +1886,19 @@ let responseContentType: string | undefined;
           ]);
           if (baseline !== null && transformed !== null) {
             if (transformed >= baseline) {
-              // Drop the images. Keep a PAKT rewrite that already paid for
-              // itself; reverting all the way to bodyIn would throw that away.
+              // The probed body was not cheaper. An image miss can still keep
+              // a PAKT rewrite. A PAKT body that itself lost the probe cannot.
+              const probedWasPakt = r.info.reason === 'pakt_text';
+              const keepPakt = !probedWasPakt && pre.changed;
               r = {
-                body: pre.changed ? pre.body : bodyIn,
+                body: keepPakt ? pre.body : bodyIn,
                 info: revertedGoogleInfo(
                   r.info,
                   `not_profitable (${transformed} >= ${baseline} tokens)`,
                   'ok',
                 ),
               };
-              if (pre.changed) {
+              if (keepPakt) {
                 r.info.compressed = true;
                 r.info.reason = 'pakt_text';
                 r.info.hybrid = {

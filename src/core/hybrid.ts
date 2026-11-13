@@ -3,6 +3,8 @@
  * only for readers that can actually read the pages.
  */
 import { countTokens } from '@sriinnu/pakt';
+import { isPxpipeSupportedModel } from './applicability.js';
+import { scanJsonStrings, spliceJsonStrings } from './cache-splice.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint, type PromptCacheRoute } from './codex-cache.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { transformGoogleGenerateContent } from './google.js';
@@ -51,8 +53,11 @@ export interface HybridTransformOptions extends TransformOptions {
   /** L4. Proxy and MCP default this off. */
   lossy?: boolean;
   semanticBudget?: number;
-  /** Per-call override. Does not read or write PXPIPE_FORCE_IMAGES. */
+  /** Per-call override. Does not read or write PXPIPE_FORCE_IMAGES.
+   *  True considers images even when the model is not allowlisted. */
   forceImages?: boolean;
+  /** When set, overrides the allowlist. The proxy passes its model gate here. */
+  allowImages?: boolean;
 }
 
 const enc = new TextEncoder();
@@ -80,53 +85,12 @@ interface WalkStats {
   vias: PackResult['via'][];
 }
 
-function rewriteNode(value: unknown, stats: WalkStats, model: string | undefined, toolName: string | undefined, lossy: boolean, semanticBudget: number | undefined): unknown {
-  if (typeof value === 'string') {
-    const packed = packStructured(value, { model, toolName, lossy, semanticBudget });
-    if (!packed) return value;
-    stats.blocks += 1;
-    stats.savedTokens += packed.savedTokens;
-    stats.originalTokens += packed.originalTokens;
-    stats.packedTokens += packed.packedTokens;
-    stats.vias.push(packed.via);
-    return packed.text;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => rewriteNode(item, stats, model, toolName, lossy, semanticBudget));
-  }
-  if (!value || typeof value !== 'object') return value;
-  const record = value as Record<string, unknown>;
-  const nextTool = record.type === 'tool_result'
-    ? (typeof record.name === 'string' ? record.name : 'tool_result')
-    : toolName;
-  const out: Record<string, unknown> = {};
-  for (const [key, child] of Object.entries(record)) {
-    out[key] = rewriteNode(child, stats, model, nextTool, lossy, semanticBudget);
-  }
-  return out;
-}
-
-function insertLegend(root: Record<string, unknown>): void {
-  // Append. Claude Code classifies subscription traffic by the first system
-  // block; a legend in front of that identity is an opaque 429 (#149). A
-  // `role: "system"` message is also illegal on the Anthropic Messages API,
-  // so when there is no system/instructions field the legend is skipped.
-  const marker = 'Pipe-Aligned Kompact Text';
-  if (typeof root.instructions === 'string') {
-    if (!root.instructions.includes(marker)) root.instructions = `${root.instructions}\n\n${PAKT_LEGEND}`;
-    return;
-  }
-  if (typeof root.system === 'string') {
-    if (!root.system.includes(marker)) root.system = `${root.system}\n\n${PAKT_LEGEND}`;
-    return;
-  }
-  if (Array.isArray(root.system)) {
-    const already = root.system.some((block) => JSON.stringify(block).includes(marker));
-    if (!already) root.system.push({ type: 'text', text: PAKT_LEGEND });
-  }
-}
-
-/** Rewrite structured strings inside a JSON request. Non-JSON bodies pass through. */
+/**
+ * Pack structured string values without touching the cached prefix.
+ * The legend rides inside the first packed string, after the cache boundary,
+ * so `system` and `instructions` stay byte-identical. Claude Code classifies
+ * the subscription on the first system block; a legend in front of it is a 429.
+ */
 export function prepassRequest(
   body: Uint8Array,
   model?: string,
@@ -143,21 +107,51 @@ export function prepassRequest(
     packedTokens: 0,
     vias: [],
   };
+  const text = dec.decode(body);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(dec.decode(body));
+    parsed = JSON.parse(text);
   } catch {
     return base;
   }
   if (!parsed || typeof parsed !== 'object') return base;
+  const scan = scanJsonStrings(text);
+  if (!scan) return base;
   const stats: WalkStats = { blocks: 0, savedTokens: 0, originalTokens: 0, packedTokens: 0, vias: [] };
-  const rewritten = rewriteNode(parsed, stats, model, undefined, options.lossy === true, options.semanticBudget) as Record<string, unknown>;
-  if (stats.blocks === 0 || stats.savedTokens <= 0) return base;
-  insertLegend(rewritten);
-  const next = enc.encode(JSON.stringify(rewritten));
+  const replacements: Array<{ start: number; end: number; next: string }> = [];
+  let legendUsed = false;
+  for (const span of scan.strings) {
+    if (span.start < scan.boundary) continue;
+    const packed = packStructured(span.decoded, {
+      model,
+      lossy: options.lossy === true,
+      semanticBudget: options.semanticBudget,
+    });
+    if (!packed) continue;
+    let payload = packed.text;
+    if (!legendUsed && !payload.includes('Pipe-Aligned Kompact Text')) {
+      payload = `${PAKT_LEGEND}\n\n${payload}`;
+      legendUsed = true;
+    }
+    replacements.push({ start: span.start, end: span.end, next: JSON.stringify(payload) });
+    stats.blocks += 1;
+    stats.savedTokens += packed.savedTokens;
+    stats.originalTokens += packed.originalTokens;
+    stats.packedTokens += packed.packedTokens;
+    stats.vias.push(packed.via);
+  }
+  if (stats.blocks === 0) return base;
+  const spliced = spliceJsonStrings(text, replacements);
+  if (scan.boundary > 0 && spliced.slice(0, scan.boundary) !== text.slice(0, scan.boundary)) return base;
+  try {
+    JSON.parse(spliced);
+  } catch {
+    return base;
+  }
+  const next = enc.encode(spliced);
   const after = countBillable(next, 0, model);
   const before = countBillable(body, 0, model);
-  // Whole-request guard: a legend must not make the request larger than it started.
+  // The legend sits in the tail. It must not make the request larger than it started.
   if (after >= before) return base;
   return {
     body: next,
@@ -202,9 +196,98 @@ function allowBreakpoints(options: HybridTransformOptions): boolean {
   return true;
 }
 
+function blankInfo(reason: string, compressed: boolean): TransformInfo {
+  return {
+    compressed,
+    reason,
+    origChars: 0,
+    compressedChars: 0,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+  };
+}
+
+/** Allowlisted models, or an explicit per-call force. `compress: false` wins. */
+export function imageCandidateEnabled(model: string | undefined, options: HybridTransformOptions = {}): boolean {
+  if (options.compress === false) return false;
+  if (options.forceImages === true) return true;
+  if (options.allowImages === false) return false;
+  if (options.allowImages === true) return true;
+  return isPxpipeSupportedModel(model);
+}
+
+export interface PricedBody {
+  body: Uint8Array;
+  info: TransformInfo;
+  choice: 'raw' | 'pakt' | 'image';
+}
+
 /**
- * PAKT first. Images only when the reader tier is `image` and compression
- * is not explicitly off. Codex routes leave without prompt_cache_breakpoint.
+ * Strict minimum of raw, cache-safe PAKT, and (when compressed) images of the
+ * original. A tie keeps the earlier candidate: raw, then PAKT text, then images.
+ */
+export function pickCheapest(
+  raw: Uint8Array,
+  pakt: HybridPrepass,
+  image: { body: Uint8Array; info: TransformInfo } | undefined,
+  model?: string,
+): PricedBody {
+  const rawCost = countBillable(raw, 0, model);
+  const paktCost = pakt.changed ? countBillable(pakt.body, 0, model) : Number.POSITIVE_INFINITY;
+  // `compressed` is the profile gate (including charsPerToken). countBillable
+  // is cl100k plus pixel math and can disagree by a few tokens; it is not
+  // allowed to overturn a gate that already chose images. It does decide
+  // whether PAKT text beats that image.
+  const imageAccepted = image?.info.compressed === true;
+  const imageCost = imageAccepted
+    ? countBillable(image!.body, chargedImageTokens(image!.info, model), model)
+    : Number.POSITIVE_INFINITY;
+  const paktBeatsRaw = paktCost < rawCost;
+  const paktBeatsImage = !imageAccepted || paktCost < imageCost;
+  let best: PricedBody;
+  if (paktBeatsRaw && paktBeatsImage) {
+    best = {
+      body: pakt.body,
+      choice: 'pakt',
+      info: {
+        ...blankInfo('pakt_text', true),
+        hybrid: {
+          readerTier: pakt.tier,
+          paktBlocks: pakt.blocks,
+          paktSavedTokens: pakt.savedTokens,
+          imaged: false,
+        },
+      },
+    };
+  } else if (imageAccepted && image) {
+    best = { body: image.body, choice: 'image', info: image.info };
+  } else {
+    const reason = image?.info.reason ?? 'pakt_noop';
+    best = {
+      body: raw,
+      choice: 'raw',
+      info: image
+        ? { ...image.info, compressed: false, reason }
+        : blankInfo(reason, false),
+    };
+  }
+  best.info.hybrid = {
+    readerTier: pakt.tier,
+    paktBlocks: best.choice === 'pakt' ? pakt.blocks : 0,
+    paktSavedTokens: best.choice === 'pakt' ? pakt.savedTokens : 0,
+    imaged: best.choice === 'image' && (best.info.imageCount ?? 0) > 0,
+  };
+  return best;
+}
+
+/**
+ * Cache-safe PAKT and, when the model is allowlisted or forceImages is set,
+ * images of the original body. Sends whichever estimate is strictly cheapest.
+ * Codex routes leave without prompt_cache_breakpoint.
  */
 export async function hybridTransform(
   body: Uint8Array,
@@ -217,67 +300,33 @@ export async function hybridTransform(
     forceImages: options.forceImages,
   });
   const allow = allowBreakpoints(options);
-  const wire = detectWire(pre.body, options.wire);
-  const imageTier = pre.tier === 'image' && options.compress !== false;
-  let outBody = pre.body;
-  let info: TransformInfo = {
-    compressed: pre.changed,
-    reason: pre.changed ? 'pakt_text' : 'pakt_noop',
-    origChars: 0,
-    compressedChars: 0,
-    imageCount: 0,
-    imageBytes: 0,
-    staticChars: 0,
-    dynamicChars: 0,
-    dynamicBlockCount: 0,
-    droppedChars: 0,
-  };
-  if (imageTier) {
+  const wire = detectWire(body, options.wire);
+  let image: { body: Uint8Array; info: TransformInfo } | undefined;
+  if (imageCandidateEnabled(model, options)) {
     const imageOptions: TransformOptions = {
       ...options,
       model,
       explicitPromptCacheBreakpoints: allow,
     };
-    if (wire === 'responses') {
-      const result = await transformOpenAIResponses(pre.body, imageOptions);
-      outBody = result.body;
-      info = result.info;
-    } else if (wire === 'chat') {
-      const result = await transformOpenAIChatCompletions(pre.body, imageOptions);
-      outBody = result.body;
-      info = result.info;
-    } else if (wire === 'google') {
-      const result = await transformGoogleGenerateContent(pre.body, model ?? 'gemini', imageOptions);
-      outBody = result.body;
-      info = result.info;
-    } else {
-      const result = await transformRequest(pre.body, imageOptions);
-      outBody = result.body;
-      info = result.info;
-    }
+    if (wire === 'responses') image = await transformOpenAIResponses(body, imageOptions);
+    else if (wire === 'chat') image = await transformOpenAIChatCompletions(body, imageOptions);
+    else if (wire === 'google') image = await transformGoogleGenerateContent(body, model ?? 'gemini', imageOptions);
+    else image = await transformRequest(body, imageOptions);
   }
+  const picked = pickCheapest(body, pre, image, model);
+  let outBody = picked.body;
   if (!allow) outBody = scrubPromptCacheBreakpoint(outBody);
-  const imageTokens = chargedImageTokens(info, model);
+  const imageTokens = picked.choice === 'image' ? chargedImageTokens(picked.info, model) : 0;
   const originalTokens = countBillable(body, 0, model);
   const afterPaktTokens = countBillable(pre.body, 0, model);
   const billableTokens = countBillable(outBody, imageTokens, model);
   const savedVsOriginal = originalTokens - billableTokens;
   const breakpoint = dec.decode(outBody).includes('"prompt_cache_breakpoint"');
-  info.hybrid = {
-    readerTier: pre.tier,
-    paktBlocks: pre.blocks,
-    paktSavedTokens: pre.savedTokens,
-    imaged: imageTier && info.imageCount > 0,
-  };
-  if (!imageTier && pre.changed) {
-    info.compressed = true;
-    info.reason = 'pakt_text';
-  }
   const report: HybridReport = {
     readerTier: pre.tier,
-    imaged: info.hybrid.imaged,
-    paktBlocks: pre.blocks,
-    paktSavedTokens: pre.savedTokens,
+    imaged: picked.info.hybrid?.imaged === true,
+    paktBlocks: picked.choice === 'pakt' ? pre.blocks : 0,
+    paktSavedTokens: picked.choice === 'pakt' ? pre.savedTokens : 0,
     originalTokens,
     afterPaktTokens,
     imageTokens,
@@ -285,7 +334,7 @@ export async function hybridTransform(
     savedVsOriginal,
     savedPercent: originalTokens > 0 ? Math.round((savedVsOriginal / originalTokens) * 1000) / 10 : 0,
     promptCacheBreakpoint: breakpoint,
-    reason: info.reason,
+    reason: picked.info.reason,
   };
-  return { body: outBody, info, report };
+  return { body: outBody, info: picked.info, report };
 }
