@@ -59,6 +59,10 @@ describe('review fixes', () => {
   it('does not reserialize a Codex body that has no breakpoint', () => {
     const raw = enc.encode('{\n  "model": "gpt-5.6-sol",\n  "input": "hi"\n}\n');
     expect(scrubPromptCacheBreakpoint(raw)).toBe(raw);
+    const plantedPretty = '{\n  "model": "gpt-5.6-sol",\n  "input": "hi",\n  "prompt_cache_breakpoint": { "mode": "explicit" }\n}\n';
+    const scrubbedPretty = new TextDecoder().decode(scrubPromptCacheBreakpoint(enc.encode(plantedPretty)));
+    expect(scrubbedPretty).toBe('{\n  "model": "gpt-5.6-sol",\n  "input": "hi"\n}\n');
+    expect(scrubbedPretty.startsWith('{\n  "model"')).toBe(true);
     const planted = enc.encode(JSON.stringify({
       input: [{ content: [{ type: 'input_text', text: 'hi', prompt_cache_breakpoint: { mode: 'explicit' } }] }],
     }));

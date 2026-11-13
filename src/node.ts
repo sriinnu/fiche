@@ -275,7 +275,7 @@ function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefin
 }
 
 function printHelp(): void {
-  console.log(`pxpipe — token-saving proxy for Claude Code
+  console.log(`inkling — token-saving proxy (pxpipe fork) for coding agents
 
 Usage:
   pxpipe                run the proxy (no flags)

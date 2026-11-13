@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  MCP_MAX_BYTES,
   MCP_TOOLS,
   encodeMcpMessage,
   handleMcpMessage,
@@ -35,6 +36,8 @@ describe('MCP server', () => {
     expect(initBody.result.protocolVersion).toBe('2025-03-26');
     expect(initBody.result.serverInfo.name).toBe('pxpipe-fork');
     expect(await handleMcpMessage({ jsonrpc: '2.0', method: 'notifications/initialized' })).toBeNull();
+    const withId = await handleMcpMessage({ jsonrpc: '2.0', id: 9, method: 'notifications/initialized' });
+    expect(withId).toEqual({ jsonrpc: '2.0', id: 9, result: {} });
 
     const listed = await handleMcpMessage(rpc('tools/list'));
     const tools = (listed as { result: { tools: typeof MCP_TOOLS } }).result.tools;
@@ -46,13 +49,16 @@ describe('MCP server', () => {
       'stats',
     ]);
     for (const tool of tools) {
-      expect(tool.annotations).toEqual({
+      expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: true,
         openWorldHint: false,
       });
+      expect(tool.annotations.idempotentHint).toBe(tool.name !== 'stats');
       expect(tool.inputSchema.type).toBe('object');
+      if (tool.name !== 'health' && tool.name !== 'stats') {
+        expect(tool.description).toContain('does not remove text already in the conversation');
+      }
     }
   });
 
@@ -99,6 +105,9 @@ describe('MCP server', () => {
     buffer = pushMcpChunk(buffer, raw, (message) => frames.push(message));
     expect(buffer).toBe('');
     expect(frames).toHaveLength(2);
+    const tooBig: unknown[] = [];
+    pushMcpChunk('', 'x'.repeat(MCP_MAX_BYTES + 1), (message) => tooBig.push(message));
+    expect(JSON.stringify(tooBig[0])).toContain('message exceeds');
 
     const http = await startHttpServer(0);
     try {

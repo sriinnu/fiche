@@ -157,9 +157,15 @@ node dist/node.js mcp                 # stdio
 node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
 ```
 
-`npx -y pxpipe-fork mcp` is the same binary after this package is installed. It is not the upstream `pxpipe-proxy` package. Until you publish or `npm install` this checkout, point clients at `node` and the `dist/node.js` path below.
+The package name on npm is `pxpipe-fork`, and it is not published. `npx -y inkling` is a different package. This checkout installs from git with:
 
-Tools (all `readOnlyHint`, not destructive, idempotent, `openWorldHint: false`):
+```bash
+npx --yes --package github:sriinnu/inkling pxpipe-mcp
+```
+
+`prepare` builds `dist/node.js` on that install. A local checkout can still use `node dist/node.js mcp` after `pnpm build`. Claude Code can also load this repo as a plugin: `.claude-plugin/plugin.json` plus `.mcp.json`, and `.claude-plugin/marketplace.json` is the marketplace manifest (`claude plugin marketplace add sriinnu/inkling`). The HTTP proxy, not these tools, is what reduces the provider bill. A tool call sends the text in as an argument and gets a result back, so the turn that calls it is larger, and the tool list itself is extra cached prefix.
+
+Tools (`readOnlyHint`, not destructive, `openWorldHint: false`; `stats` is not idempotent):
 
 | tool | what it does |
 | --- | --- |
@@ -230,27 +236,42 @@ Or paste the Claude JSON entry into `~/.pi/agent/mcp.json`.
 
 ### Cursor
 
-`.cursor/mcp.json`:
+`.cursor/mcp.json` is the same `mcpServers` object as Claude Code. One-click install, which prompts before it writes `~/.cursor/mcp.json`:
+
+```text
+cursor://anysphere.cursor-deeplink/mcp/install?name=inkling&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyItLXllcyIsIi0tcGFja2FnZSIsImdpdGh1Yjpzcmlpbm51L2lua2xpbmciLCJweHBpcGUtbWNwIl19
+```
+
+Paste that link into a browser. Cursor prompts before it writes `~/.cursor/mcp.json`. The config is the git `npx` command above, not a local path.
+
+### Gemini CLI
+
+`~/.gemini/settings.json` or `.gemini/settings.json`:
 
 ```json
 {
   "mcpServers": {
-    "pxpipe-fork": {
-      "command": "node",
-      "args": ["<checkout>/dist/node.js", "mcp"]
+    "inkling": {
+      "command": "npx",
+      "args": ["--yes", "--package", "github:sriinnu/inkling", "pxpipe-mcp"]
     }
   }
 }
 ```
 
-### Grok Bot
+Gemini's HTTP field is `httpUrl`, not `url`: `"httpUrl": "http://127.0.0.1:47823/mcp"`.
 
-Add a custom MCP server (Cursor's Add MCP Server uses the same command and args):
+### Grok CLI
 
-- command: `node`
-- args: `<checkout>/dist/node.js` `mcp`
+`~/.grok/config.toml`, or `grok mcp add inkling -- npx --yes --package github:sriinnu/inkling pxpipe-mcp`:
 
-HTTP URL, if the client asks for one: `http://127.0.0.1:47823/mcp`
+```toml
+[mcp_servers.inkling]
+command = "npx"
+args = ["--yes", "--package", "github:sriinnu/inkling", "pxpipe-mcp"]
+```
+
+This is the grok CLI. It is not Cursor's Add MCP dialog.
 
 ### Ribhu
 
@@ -260,7 +281,7 @@ Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subpr
 {
   "slash": "/pxpipe",
   "description": "Lossless PAKT plus pxpipe hybrid context tools",
-  "prompt": "Use the pxpipe-fork MCP tools to compress structured context before answering. {args}",
+  "prompt": "Use inkling's inspect_savings when you need an estimate. Do not call compress_text on text already in the conversation; that adds tokens. The proxy is what saves them. {args}",
   "mcp": {
     "command": "node",
     "args": ["<checkout>/dist/node.js", "mcp"]

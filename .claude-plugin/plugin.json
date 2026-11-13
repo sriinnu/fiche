@@ -1,0 +1,14 @@
+{
+  "name": "inkling",
+  "displayName": "Inkling",
+  "version": "0.17.0-fork.1",
+  "description": "Lossless PAKT and pxpipe routing for coding agents. The HTTP proxy is what reduces provider tokens. The MCP tools inspect and pack a string you pass in; they do not remove text already in the conversation.",
+  "author": {
+    "name": "Srinivas Pendela",
+    "url": "https://github.com/sriinnu"
+  },
+  "homepage": "https://github.com/sriinnu/inkling",
+  "repository": "https://github.com/sriinnu/inkling",
+  "license": "MIT",
+  "keywords": ["pakt", "pxpipe", "tokens", "mcp"]
+}
