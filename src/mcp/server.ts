@@ -1,5 +1,5 @@
 /**
- * MCP server for the pxpipe-fork hybrid (stdio and stateless Streamable HTTP).
+ * inkling-mcp (stdio and stateless Streamable HTTP).
  * One tool surface for every client. Tools are local, deterministic, and do
  * not send the payload anywhere.
  */
@@ -12,7 +12,7 @@ import { supportsExplicitPromptCacheBreakpoint } from '../core/codex-cache.js';
 import pkg from '../../package.json' with { type: 'json' };
 
 export const MCP_PROTOCOL = '2025-03-26';
-export const SERVER_NAME = 'pxpipe-fork';
+export const SERVER_NAME = 'inkling-mcp';
 export const SERVER_VERSION = pkg.version;
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
@@ -266,7 +266,7 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: 'pxpipe-fork hybrid: lossless PAKT for structured text, pxpipe images only for Gemini, Fable 5, and Sol. Claude 5.5 and Grok get PAKT text. L4 is opt-in. This server does not store prompts.',
+        instructions: 'inkling-mcp: lossless PAKT for structured text. Images of the original text only for Gemini, Fable 5, and Sol. Claude 5.5 and Grok get PAKT text. L4 is opt-in. This server does not store prompts.',
       },
     };
   }

@@ -14,7 +14,7 @@ Srinivas Pendela. Not an official teamchong release. Package name is
 - ChatGPT Codex (`chatgpt.com`, `/backend-api/codex/responses`) no longer
   receives `prompt_cache_breakpoint`. api.openai.com still does when the
   profile asks. `PXPIPE_GPT_PROFILES` `cacheBreakpoints: false` is honored.
-- MCP server (`pxpipe-fork mcp`, also `pxpipe-mcp`) over stdio and stateless
+- MCP server `inkling-mcp` over stdio and stateless
   Streamable HTTP. Tools: `compress_text`, `inspect_savings`,
   `transform_request`, `health`, `stats`.
 

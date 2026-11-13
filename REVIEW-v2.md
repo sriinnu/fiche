@@ -383,6 +383,8 @@ Follow-up PRs, still estimates, still no provider API. `pnpm test` and `pnpm exe
 
 `npm install github:sriinnu/inkling#cursor/mcp-plugin-and-codex-scrub-c280` installed 99 packages, `prepare` produced `dist/node.js`, and `node dist/node.js --version` printed `0.17.0-fork.1`. `node bin/mcp.js --help` printed the stdio / HTTP usage. The unqualified `npx --yes --package github:sriinnu/inkling pxpipe-mcp` tracks the default branch, so it picks this up once #13 is on `main`.
 
+The server's own name is now `inkling-mcp`: `serverInfo.name` and the bin. `pxpipe-mcp` in the findings above is the name this review saw. The npm package stays `pxpipe-fork`. `inkling` on npm is a different package.
+
 ### Before / after
 
 Same estimators as the rest of this file. "Before" is `151227d`. "After" is #11.

@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "inkling": {
+    "inkling-mcp": {
       "command": "npx",
-      "args": ["--yes", "--package", "github:sriinnu/inkling", "pxpipe-mcp"]
+      "args": ["--yes", "--package", "github:sriinnu/inkling", "inkling-mcp"]
     }
   }
 }

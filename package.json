@@ -6,7 +6,7 @@
   "bin": {
     "pxpipe": "bin/cli.js",
     "pxpipe-fork": "bin/cli.js",
-    "pxpipe-mcp": "bin/mcp.js"
+    "inkling-mcp": "bin/mcp.js"
   },
   "exports": {
     ".": {
