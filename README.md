@@ -1,12 +1,92 @@
-# pxpipe-fork
+<p align="center">
+  <img src="assets/inkling-logo.svg" alt="Inkling" width="420">
+</p>
 
-Fork of [pxpipe](https://github.com/teamchong/pxpipe) (Steven / [teamchong](https://github.com/teamchong), MIT, imported at **v0.16.0** `9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`) plus [PAKT](https://github.com/sriinnu/clipforge-PAKT) (Srinivas Pendela / [sriinnu](https://github.com/sriinnu), `@sriinnu/pakt@0.10.0`, MIT). This is not an official teamchong release and not a separate company. The npm name is `pxpipe-fork` so it cannot be installed over upstream `pxpipe-proxy` 0.16.0. A public product name comes later.
+<h1 align="center">Inkling</h1>
 
-**PAKT for structured text. Images only when the model can read them.**
+<p align="center"><strong>PAKT for structured text. Images only when the model can read them.</strong></p>
 
-Lossless PAKT (L1–L3) rewrites JSON, YAML, CSV, and markdown data blocks before anything is rasterized. Gemini, Fable 5 (including 5.1/5.2), and Sol 5.6/6.1 then take the usual pxpipe images. Claude 5.5 (Opus, Sonnet, Haiku) and Grok stay on the PAKT text, which those models can read, instead of dense glyphs they cannot. L4 stays off unless a caller passes `lossy: true` and a positive `semanticBudget`. A packed string is kept only when `decompress` restores the original values: PAKT 0.10.0's delta encoding can corrupt cyclic integers, and this fork drops those results.
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-6D5BFF.svg"></a>
+  <img alt="Node >= 20.19" src="https://img.shields.io/badge/node-%3E%3D20.19-339933.svg?logo=node.js&logoColor=white">
+  <img alt="pnpm 10" src="https://img.shields.io/badge/pnpm-10.21.0-F69220.svg?logo=pnpm&logoColor=white">
+  <img alt="MCP server" src="https://img.shields.io/badge/MCP-server-1E1B4B.svg">
+  <a href="https://github.com/sriinnu/inkling/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sriinnu/inkling/actions/workflows/ci.yml/badge.svg"></a>
+</p>
 
-`pxpipe` still starts the proxy. `pxpipe-fork` is the same command. `pxpipe-mcp` is the MCP server.
+## What it is
+
+Inkling is a context-compression proxy and MCP server for coding agents. It is a fork of [pxpipe](https://github.com/teamchong/pxpipe) by Steven ([teamchong](https://github.com/teamchong)), imported at **v0.16.0** (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`), combined with [PAKT](https://github.com/sriinnu/clipforge-PAKT) (`@sriinnu/pakt@0.10.0`) by Srinivas Pendela ([sriinnu](https://github.com/sriinnu)).
+
+- **Lossless PAKT first.** JSON, YAML, CSV, and markdown data blocks are rewritten with PAKT L1–L3 before anything is rasterized. A packed string is kept only when `decompress` restores the original values.
+- **Images only for strong vision readers.** Gemini, Fable 5 (including 5.1/5.2), and Sol 5.6/6.1 get the usual pxpipe image pages. Claude 5.5 (Opus, Sonnet, Haiku) and Grok stay on PAKT text, which they read reliably, instead of dense glyphs they do not.
+- **ChatGPT Codex fix.** `prompt_cache_breakpoint` is not sent to `chatgpt.com` / `/backend-api/codex/responses`, which reject it with HTTP 400.
+- **One MCP server for every agent.** `compress_text`, `inspect_savings`, `transform_request`, `health`, and `stats` over stdio or Streamable HTTP.
+
+L4 (lossy) stays off unless a caller passes `lossy: true` and a positive `semanticBudget`. PAKT 0.10.0's delta encoding can corrupt cyclic integers; Inkling drops those results and keeps the original JSON.
+
+Inkling is not an official teamchong release. The npm package name is still `pxpipe-fork` (so it cannot be installed over upstream `pxpipe-proxy`), and the bins are `pxpipe`, `pxpipe-fork`, and `pxpipe-mcp`.
+
+## Status
+
+**Experimental.** See [REVIEW.md](REVIEW.md) for the full deep review. In short: fine to try with ChatGPT Codex, and Grok will not be billed for images by accident, but it is **not yet ready as a daily Claude Code proxy on Opus 5.5**. Two high-severity issues are still open (Opus 5.5 sits in the default image list but is then refused images and sent raw text; a PAKT hit re-serializes the whole request and can break the cached prefix). On mixed prose and code, plain imaging can beat the hybrid for some models; the big wins are on repetitive structured logs.
+
+## Quick start
+
+Requires Node.js >= 20.19 and pnpm.
+
+```bash
+git clone https://github.com/sriinnu/inkling.git
+cd inkling
+pnpm install
+pnpm build
+
+# Proxy on 127.0.0.1:47821
+node dist/node.js
+
+# Point Claude Code at it
+ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
+```
+
+### MCP server
+
+```bash
+node dist/node.js mcp                 # stdio
+node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
+```
+
+`bin/mcp.js` (the `pxpipe-mcp` bin) starts the same stdio server. Replace `<checkout>` with the absolute path of your clone.
+
+Claude Code (`.mcp.json`) and Cursor (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "inkling": {
+      "command": "node",
+      "args": ["<checkout>/dist/node.js", "mcp"]
+    }
+  }
+}
+```
+
+Codex CLI (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.inkling]
+command = "node"
+args = ["<checkout>/dist/node.js", "mcp"]
+```
+
+More clients (Claude Desktop, Pi, Grok Bot, Ribhu, OpenCode) are covered in [MCP for every agent](#mcp-for-every-agent) below.
+
+## Credits
+
+- **[pxpipe](https://github.com/teamchong/pxpipe)** by Steven ([teamchong](https://github.com/teamchong)), MIT. The image pipeline, proxy, fonts, profiles, and the benchmarks in the inherited guide below are upstream work.
+- **[PAKT](https://github.com/sriinnu/clipforge-PAKT)** (`@sriinnu/pakt`) by Srinivas Pendela, MIT. PAKT's L1 syntax is inspired by [TOON Format](https://github.com/toon-format/spec).
+- Fork changes (hybrid PAKT pipeline, Codex breakpoint fix, MCP server) by Srinivas Pendela.
+
+---
 
 ## What is better than upstream, on one fixture
 
@@ -674,4 +754,4 @@ Third-party projects listed here are not maintained or supported by pxpipe.
 
 ## License
 
-MIT.
+[MIT](LICENSE). The upstream pxpipe copyright notice is kept intact in [LICENSE](LICENSE); fork changes are Copyright (c) 2026 Srinivas Pendela under the same license. See [NOTICE](NOTICE) for full attribution to pxpipe and PAKT.
