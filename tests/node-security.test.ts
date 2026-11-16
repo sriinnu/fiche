@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -155,6 +155,30 @@ describe('Node dashboard security', () => {
       body: 'list=off',
     });
     expect(response.status).toBe(403);
+  });
+
+  it('guards the proxy API against cross-site pages and rebound Hosts', async () => {
+    const { base } = await startNode();
+    const body = JSON.stringify({ model: 'claude-fable-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] });
+    const post = (headers: Record<string, string>) => fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body,
+    });
+    // fetch() drops a caller-set Host header, so Host cases go through node:http.
+    const withHost = (host: string) => new Promise<number>((resolve, reject) => {
+      const u = new URL(`${base}/v1/messages`);
+      const req = httpRequest({
+        hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST',
+        headers: { host, 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+      }, (res) => { res.resume(); resolve(res.statusCode ?? 0); });
+      req.on('error', reject);
+      req.end(body);
+    });
+    expect((await post({ origin: 'https://evil.example' })).status).toBe(403);
+    expect(await withHost('evil.example:47821')).toBe(421);
+    expect((await post({})).status).toBe(200);
+    expect(await withHost('api.anthropic.com')).toBe(200);
   });
 
   it('creates the event log and containing directory with private permissions', async () => {

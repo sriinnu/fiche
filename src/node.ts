@@ -16,6 +16,7 @@ import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { guardProxyRequest, parseAllowedHosts } from './core/request-guard.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -310,6 +311,10 @@ Environment:
   HOST                    interface to bind (default 127.0.0.1, loopback only).
                           Non-loopback bindings expose only the proxy API;
                           dashboard routes remain loopback-only.
+  INKLING_ALLOWED_HOSTS    extra Host/Origin names the proxy API accepts
+                          (comma list; '*' turns the check off). Browser
+                          requests from non-loopback pages, and Hosts that are
+                          public DNS names (DNS rebinding), are refused.
   INKLING_UPSTREAM         upstream API base for every API family
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides INKLING_UPSTREAM
                            (default https://api.anthropic.com)
@@ -1413,6 +1418,7 @@ async function main(): Promise<void> {
     },
   };
   const handle = createProxy(config);
+  const allowedHosts = parseAllowedHosts(process.env.INKLING_ALLOWED_HOSTS);
 
   const server = createServer((req, res) => {
     req.socket?.setNoDelay?.(true);
@@ -1437,6 +1443,19 @@ async function main(): Promise<void> {
             await writeWebResponse(webRes, res);
             return;
           }
+        }
+        // Proxy API: refuse browser cross-site requests and rebound Hosts, which
+        // would otherwise spend the configured keys (see core/request-guard.ts).
+        const denial = guardProxyRequest(
+          { host: req.headers.host, origin: req.headers.origin },
+          { allowedHosts },
+        );
+        if (denial) {
+          await writeWebResponse(new Response(JSON.stringify({ error: denial.reason, message: denial.message }), {
+            status: denial.status,
+            headers: { 'content-type': 'application/json' },
+          }), res);
+          return;
         }
         const webReq = toWebRequest(req);
         const webRes = await handle(webReq);

@@ -735,6 +735,22 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** Event info for a request forwarded untouched because the transform threw. */
+function failOpenInfo(body: Uint8Array, message: string): TransformInfo {
+  return {
+    compressed: false,
+    reason: `transform_error_fail_open: ${message.slice(0, 200)}`,
+    origChars: body.byteLength,
+    compressedChars: body.byteLength,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+  };
+}
+
 function revertedGoogleInfo(
   info: TransformInfo,
   reason: string,
@@ -1151,13 +1167,27 @@ function isOpenAIResponsesPath(pathname: string): boolean {
 }
 
 /** ChatGPT endpoints used by Codex when `requires_openai_auth = true` is set
- * on a custom provider. They must go to OPENAI_UPSTREAM, never the Anthropic
- * default. Only `responses` is transformed; the models catalogue is forwarded
- * byte-for-byte so Codex can refresh its model list without noisy 404s. */
-function isChatGPTCodexPath(pathname: string): boolean {
-  return pathname === '/backend-api/codex/responses'
-    || pathname === '/backend-api/codex/models'
-    || pathname.startsWith('/backend-api/codex/models/');
+ * on a custom provider. Every `/backend-api/` path is ChatGPT's (responses,
+ * responses/compact, models, usage), so all of them go to OPENAI_UPSTREAM and
+ * never to the Anthropic default, which would swap the ChatGPT bearer for an
+ * Anthropic one and hand the conversation to the wrong provider. Only
+ * `codex/responses` is transformed; the rest are forwarded byte-for-byte. */
+function isChatGPTBackendPath(pathname: string): boolean {
+  return pathname.startsWith('/backend-api/');
+}
+
+/** Google API shapes that are not inference (countTokens, model listing,
+ *  Code Assist control calls). They go to the Google upstream untransformed. */
+function isGoogleFamilyPath(pathname: string): boolean {
+  return /^\/(?:upload\/)?v1(?:beta|alpha)\//.test(pathname)
+    || pathname.startsWith('/v1internal:')
+    || /^\/v1\/models\/[^/]+:[A-Za-z]+$/.test(pathname);
+}
+
+/** Paths the Anthropic default upstream serves. Anything outside every known
+ *  family is refused rather than sent to Anthropic with injected keys. */
+function isAnthropicFamilyPath(pathname: string): boolean {
+  return pathname.startsWith('/v1/') || pathname.startsWith('/api/');
 }
 
 function resolveAuthToken(config: ProxyConfig): string | undefined {
@@ -1260,7 +1290,7 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
-    || isChatGPTCodexPath(pathname)
+    || isChatGPTBackendPath(pathname)
     || (isModelsPath && looksOpenAIAuth);
 }
 
@@ -1641,13 +1671,14 @@ let responseContentType: string | undefined;
     const isGoogleInference = req.method === 'POST' && isGoogleInferencePath(url.pathname);
     const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
     const isGoogle = isGoogleRoute && !bypass;
+    const isGoogleFamily = isGoogleRoute || isGoogleFamilyPath(url.pathname);
     const isOpenAIPath = isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
     const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
-    const upstreamBase = isGoogleRoute
+    const upstreamBase = isGoogleFamily
       ? googleUpstream
       : providerPrefixed
         ? passthroughUpstream
@@ -1668,6 +1699,21 @@ let responseContentType: string | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
     let responsesStreaming = false;
+
+    // Default-deny on the stock Anthropic upstream: a path outside every known
+    // family (an agent we do not recognise, a stray browser fetch) would
+    // otherwise reach api.anthropic.com with the host's keys injected. A
+    // custom gateway upstream keeps forwarding unknown paths, since the
+    // operator chose where they go.
+    if (upstreamBase === DEFAULT_UPSTREAM
+      && !isAnthropicFamilyPath(url.pathname)
+      && !isMessagesWire && !isOpenAIChatWire && !isOpenAIResponsesWire) {
+      fire(404, undefined, `unknown_route: ${url.pathname.slice(0, 200)}`);
+      return new Response(JSON.stringify({
+        error: 'unknown_route',
+        message: `inkling does not forward ${url.pathname}; see docs/SECURITY_MODEL.md`,
+      }), { status: 404, headers: { 'content-type': 'application/json' } });
+    }
 
     if (bypass && isOpenAIResponsesWire
       && (req.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
@@ -1789,17 +1835,25 @@ let responseContentType: string | undefined;
         // count_tokens probes, so the timer closes here rather than after them —
         // otherwise network latency would be charged to our own CPU.
         const tTransform = Date.now();
-        let r = isGoogle
-          ? await transformGoogleGenerateContent(bridgeBody, model!, effectiveOpts)
-          : isMessages
-            ? bridgedGptMessages
-              ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
-              : bridgedChatMessages
+        // Fail open: a renderer or transform bug must never cost the user a
+        // turn. The request goes out as it arrived (after any wire bridge, which
+        // the upstream needs), and the event row records why.
+        let r: { body: Uint8Array; info: TransformInfo };
+        try {
+          r = isGoogle
+            ? await transformGoogleGenerateContent(bridgeBody, model!, effectiveOpts)
+            : isMessages
+              ? bridgedGptMessages
+                ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
+                : bridgedChatMessages
+                  ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+                  : await transformRequest(bridgeBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
+              : isOpenAIChat
                 ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformRequest(bridgeBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
-            : isOpenAIChat
-              ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-              : await transformOpenAIResponses(bridgeBody, effectiveOpts);
+                : await transformOpenAIResponses(bridgeBody, effectiveOpts);
+        } catch (e) {
+          r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
+        }
         if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
           r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
         }
@@ -1980,7 +2034,7 @@ let responseContentType: string | undefined;
         else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
         // 'keep-inbound' leaves the header filterHeaders already copied.
       }
-    } else if (isGoogleRoute) {
+    } else if (isGoogleFamily) {
       // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
