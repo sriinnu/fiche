@@ -599,13 +599,6 @@ export interface EnvFields {
 export interface TransformInfo {
   compressed: boolean;
   reason?: string;
-  /** Fork hybrid (PAKT text and/or images). Absent when the pre-pass did not run. */
-  hybrid?: {
-    readerTier: 'image' | 'pakt-text';
-    paktBlocks: number;
-    paktSavedTokens: number;
-    imaged: boolean;
-  };
   /** Exact UTF-8 byte length of the final serialized provider request. */
   serializedRequestBytes?: number;
   /** Result of the profile-level serialized request guard. */

@@ -6,7 +6,7 @@ import {
   scrubPromptCacheBreakpoint,
   supportsExplicitPromptCacheBreakpoint,
 } from '../src/core/codex-cache.js';
-import { hybridTransform } from '../src/core/hybrid.js';
+import { transformAnyRequest } from '../src/core/request-transform.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -76,13 +76,13 @@ describe('ChatGPT Codex prompt_cache_breakpoint', () => {
     expect(bodyHasPromptCacheBreakpoint(result.body)).toBe(false);
   });
 
-  it('strips a planted breakpoint and does not let the hybrid reintroduce one on Codex', async () => {
+  it('strips a planted breakpoint and does not let the transform reintroduce one on Codex', async () => {
     const planted = enc.encode(JSON.stringify({
       model: 'gpt-5.6-sol',
       input: [{ role: 'user', content: [{ type: 'input_text', text: 'hi', prompt_cache_breakpoint: { mode: 'explicit' } }] }],
     }));
     expect(bodyHasPromptCacheBreakpoint(scrubPromptCacheBreakpoint(planted))).toBe(false);
-    const result = await hybridTransform(solBody(), {
+    const result = await transformAnyRequest(solBody(), {
       model: 'gpt-5.6-sol',
       wire: 'responses',
       route: { pathname: '/backend-api/codex/responses', upstream: 'https://chatgpt.com' },

@@ -1,8 +1,7 @@
 # Security Policy
 
 The MCP server and the proxy do not store request bodies. `health` and
-`stats` return counters and version strings only. L4 (lossy) PAKT is off
-unless a tool call sets `lossy: true` and a positive `semanticBudget`.
+`stats` return counters and version strings only.
 
 ## Supported versions
 

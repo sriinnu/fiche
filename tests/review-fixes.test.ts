@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CLAUDE_CODE_OAUTH_IDENTITY } from '../src/core/transform.js';
-import { prepassRequest, hybridTransform } from '../src/core/hybrid.js';
+import { transformAnyRequest } from '../src/core/request-transform.js';
 import { scrubPromptCacheBreakpoint } from '../src/core/codex-cache.js';
 import { shouldImageModel } from '../src/core/reader-tier.js';
 import { MCP_MAX_BYTES, hostHeaderAllowed, pushMcpChunk, startHttpServer } from '../src/mcp/server.js';
@@ -13,7 +13,7 @@ function repetitiveJson(): string {
     events: Array.from({ length: 40 }, (_, i) => ({
       id: i + 1,
       status: 'ok',
-      path: 'src/core/hybrid.ts',
+      path: 'src/core/request-transform.ts',
       note: 'review fixture row',
     })),
   });
@@ -26,7 +26,7 @@ describe('review fixes', () => {
     else process.env.INKLING_FORCE_IMAGES = prev;
   });
 
-  it('leaves the system prompt and Claude Code identity untouched and puts the legend in the tool result', () => {
+  it('returns a weak-reader request byte-identical, Claude Code identity included', async () => {
     const body = enc.encode(JSON.stringify({
       model: 'claude-opus-5-5',
       system: [
@@ -38,18 +38,10 @@ describe('review fixes', () => {
         content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: repetitiveJson() }],
       }],
     }));
-    const pre = prepassRequest(body, 'claude-opus-5-5');
-    expect(pre.changed).toBe(true);
-    const out = JSON.parse(new TextDecoder().decode(pre.body)) as {
-      system: Array<{ text: string }>;
-      messages: Array<{ role?: string }>;
-    };
-    expect(out.system).toEqual([
-      { type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY },
-      { type: 'text', text: 'Follow the repository conventions.' },
-    ]);
-    expect(out.messages.some((message) => message.role === 'system')).toBe(false);
-    expect(JSON.stringify(out.messages)).toContain('Pipe-Aligned Kompact Text');
+    const result = await transformAnyRequest(body, { model: 'claude-opus-5-5', wire: 'anthropic', charsPerToken: 1, minCompressChars: 1 });
+    expect(result.report.readerTier).toBe('text');
+    expect(result.report.imaged).toBe(false);
+    expect(result.body).toBe(body);
   });
 
   it('does not reserialize a Codex body that has no breakpoint', () => {
@@ -91,7 +83,7 @@ describe('review fixes', () => {
 
   it('does not write INKLING_FORCE_IMAGES while transforming one MCP-style call', async () => {
     delete process.env.INKLING_FORCE_IMAGES;
-    await hybridTransform(enc.encode(JSON.stringify({
+    await transformAnyRequest(enc.encode(JSON.stringify({
       model: 'claude-sonnet-5-5',
       messages: [{ role: 'user', content: 'hi' }],
     })), {

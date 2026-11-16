@@ -39,8 +39,7 @@ describe('MCP server', () => {
     const listed = await handleMcpMessage(rpc('tools/list'));
     const tools = (listed as { result: { tools: typeof MCP_TOOLS } }).result.tools;
     expect(tools.map((tool) => tool.name)).toEqual([
-      'compress_text',
-      'inspect_savings',
+      'check_model',
       'transform_request',
       'health',
       'stats',
@@ -56,18 +55,21 @@ describe('MCP server', () => {
     }
   });
 
-  it('compresses structured text and routes a weak model to PAKT text', async () => {
-    const compressed = await handleMcpMessage(rpc('tools/call', {
-      name: 'compress_text',
-      arguments: { text: events, model: 'claude-sonnet-5-5' },
+  it('reports the tier for a model and returns a weak-reader request unchanged', async () => {
+    const checked = await handleMcpMessage(rpc('tools/call', {
+      name: 'check_model',
+      arguments: { model: 'claude-opus-5-5' },
     }));
-    const packed = (compressed as { result: { structuredContent: { applied: boolean; savedPercent: number; reversible: boolean; promptCacheBreakpoint: boolean; compressed: string } } }).result.structuredContent;
-    expect(packed.applied).toBe(true);
-    expect(packed.reversible).toBe(true);
-    expect(packed.savedPercent).toBeGreaterThan(20);
-    expect(packed.promptCacheBreakpoint).toBe(false);
-    expect(packed.compressed).not.toContain('prompt_cache_breakpoint');
+    const tier = (checked as { result: { structuredContent: { readerTier: string; action: string } } }).result.structuredContent;
+    expect(tier.readerTier).toBe('text');
+    expect(tier.action).toMatch(/passthrough/);
 
+    const request = {
+      model: 'grok-4.7',
+      max_tokens: 64,
+      system: 'You are a coding agent.',
+      messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: events }] }],
+    };
     const transformed = await handleMcpMessage(rpc('tools/call', {
       name: 'transform_request',
       arguments: {
@@ -75,21 +77,15 @@ describe('MCP server', () => {
         wire: 'anthropic',
         upstream: 'https://chatgpt.com',
         pathname: '/backend-api/codex/responses',
-        request: {
-          model: 'grok-4.7',
-          max_tokens: 64,
-          system: 'You are a coding agent.',
-          messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: events }] }],
-        },
+        request,
       },
     }));
-    const body = (transformed as { result: { structuredContent: { report: { readerTier: string; imaged: boolean; promptCacheBreakpoint: boolean; savedPercent: number }; request: { messages: Array<{ content: unknown }> } } } }).result.structuredContent;
-    expect(body.report.readerTier).toBe('pakt-text');
+    const body = (transformed as { result: { structuredContent: { report: { readerTier: string; imaged: boolean; promptCacheBreakpoint: boolean; savedVsOriginal: number }; request: unknown } } }).result.structuredContent;
+    expect(body.report.readerTier).toBe('text');
     expect(body.report.imaged).toBe(false);
     expect(body.report.promptCacheBreakpoint).toBe(false);
-    expect(body.report.savedPercent).toBeGreaterThan(10);
-    expect(JSON.stringify(body.request)).toContain('@from json');
-    expect(JSON.stringify(body.request)).not.toContain('prompt_cache_breakpoint');
+    expect(body.report.savedVsOriginal).toBe(0);
+    expect(body.request).toEqual(request);
   });
 
   it('speaks newline frames and streamable HTTP', async () => {
@@ -108,9 +104,9 @@ describe('MCP server', () => {
         body: JSON.stringify(rpc('tools/call', { name: 'health', arguments: {} }, 7)),
       });
       expect(res.status).toBe(200);
-      const json = await res.json() as { result: { structuredContent: { name: string; pakt: string } } };
+      const json = await res.json() as { result: { structuredContent: { name: string; codex: string } } };
       expect(json.result.structuredContent.name).toBe('inkling');
-      expect(json.result.structuredContent.pakt).toContain('@sriinnu/pakt');
+      expect(json.result.structuredContent.codex).toContain('chatgpt.com');
       const denied = await fetch(`http://127.0.0.1:${http.port}/mcp`, {
         method: 'POST',
         headers: { origin: 'https://evil.example', 'content-type': 'application/json' },

@@ -1,7 +1,7 @@
 {
   "name": "@sriinnu/inkling",
   "version": "0.17.0",
-  "description": "LLM context proxy. Lossless PAKT for structured tool results, images only for models that can read them.",
+  "description": "Local context proxy for coding agents. Renders stale context as images for models that can read them; everything else passes through untouched.",
   "type": "module",
   "bin": {
     "inkling": "bin/cli.js",
@@ -72,7 +72,6 @@
     "prompt-cache",
     "vision-tokens",
     "cloudflare-workers",
-    "pakt",
     "mcp"
   ],
   "engines": {
@@ -98,19 +97,11 @@
     "wrangler": "^4.93.0"
   },
   "dependencies": {
-    "@sriinnu/pakt": "0.10.0",
     "gpt-tokenizer": "^4.0.0"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sriinnu/inkling.git"
   },
-  "homepage": "https://github.com/sriinnu/inkling#readme",
-  "pakt": {
-    "package": "@sriinnu/pakt",
-    "version": "0.10.0",
-    "repo": "https://github.com/sriinnu/clipforge-PAKT",
-    "author": "Srinivas Pendela (https://github.com/sriinnu)",
-    "license": "MIT"
-  }
+  "homepage": "https://github.com/sriinnu/inkling#readme"
 }

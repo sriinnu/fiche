@@ -26,10 +26,10 @@ function baseModelId(model: string): string {
 /** Dashboard runtime override; null = fall back to INKLING_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when INKLING_MODELS is unset: Fable 5, Opus 5.5, and every Gemini model.
- *  Opus 5.5 is listed so the chip stays visible, but the proxy
- *  routes Claude 5.5 and Grok to lossless PAKT text instead of images
- *  unless INKLING_FORCE_IMAGES=1. Fable and Gemini still image.
+/** Built-in default scope when INKLING_MODELS is unset: Fable 5 and Gemini.
+ *  Opus 5.5 is not listed: it misreads dense glyphs (3/15 hex), so imaging it
+ *  is not a saving. Gemini 4 hydrogen/carbon are in scope but stay text until
+ *  measured (reader-tier.ts).
  *  Everything else is opt-in via dashboard chips or INKLING_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
@@ -52,7 +52,7 @@ let runtimeModelBases: readonly string[] | null = null;
  *  is the ordinary path — drop `gemini` from INKLING_MODELS or click the chip off —
  *  which only works because the Google gate in proxy.ts/dashboard.ts consults
  *  this list and nothing else. */
-export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'claude-opus-5-5', 'gemini'];
+export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());

@@ -1,31 +1,17 @@
 # inkling
 
-**PAKT for structured tool results. Images only when the model can read them.**
+**Images for the context a model can read. Everything else untouched.**
 
-inkling is a local proxy for coding agents (Claude Code, Codex, Gemini, Grok and anything that speaks the Anthropic, OpenAI or Gemini wire formats). It shrinks what each request bills in two ways:
+inkling is a local proxy for coding agents (Claude Code, Codex, OpenCode, pi, and anything that speaks the Anthropic, OpenAI or Gemini wire formats). Providers bill an image by its pixel area, not by the characters drawn on it, so inkling renders the stale, bulky parts of a request (the system and tool slab, old closed tool-call history, large tool results) as dense PNG pages. A 1568×728 page bills about 1,456 tokens on Anthropic and holds about 28k characters.
 
-- **PAKT**: lossless PAKT (L1–L3, [`@sriinnu/pakt`](https://github.com/sriinnu/clipforge-PAKT)) rewrites JSON, YAML and fenced markdown data blocks inside **tool results**. Nothing else in the request is touched: tool-call arguments, `tool_use.input`, thinking blocks, tool definitions, metadata, system prompts and what you or the model wrote all go through byte-for-byte. A packed string is kept only when `decompress` restores exactly the same values. Documents that `JSON.parse` itself cannot keep exactly (integers past 2^53, `1.0`, duplicate keys) are never packed. CSV is not packed: PAKT 0.10.0's CSV decompress does not round-trip.
-- **Images**: Gemini, Fable 5 (including 5.1/5.2) and Sol 5.6/6.1 then get dense rendered pages. Claude 5.5 (Opus, Sonnet, Haiku) and Grok stay on the PAKT text, which those models can read, instead of glyphs they cannot.
+- **Strong readers get images:** Gemini, Fable 5 (including 5.1/5.2 at the spaced profile) and opt-in Sol 5.6/6.1. The live tail, any open tool sequence and your current message stay text, and a short verbatim factsheet of paths, hashes and numbers rides next to each image.
+- **Everyone else passes through byte-for-byte:** Claude 5.5 (Opus, Sonnet, Haiku), Grok, and unmeasured models such as Gemini 4 hydrogen and carbon. They understand rendered pages but misread single characters, so imaging them is not a saving.
 
-Only in-scope models are touched (`INKLING_MODELS`, default `claude-fable-5,claude-opus-5-5,gemini`). Everything else passes through untouched. `INKLING_PAKT=off` turns the PAKT stage off on its own. `compress: false` and `INKLING_MODELS=off` turn both stages off. Each tool result is packed or left alone on its own merits, and the PAKT legend travels with the first packed tool result, so the system prompt never changes and an earlier turn is never rewritten later. L4 stays off unless a caller passes `lossy: true` and a positive `semanticBudget`.
+Only in-scope models are touched (`INKLING_MODELS`, default `claude-fable-5,gemini`). Everything else passes through untouched. `compress: false` and `INKLING_MODELS=off` turn compression off. Old pages stay byte-identical from turn to turn, so they are read from the prompt cache instead of being re-billed.
 
-`inkling` starts the proxy. `inkling-mcp` (or `inkling mcp`) is the MCP server.
+`inkling` starts the proxy. `inkling-mcp` (or `inkling mcp`) is the MCP server. How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 inkling is built on [pxpipe](https://github.com/teamchong/pxpipe); see [Credits](#credits).
-
-## Savings on one fixture
-
-Not a universal 90%. This is one repetitive agent log (360 monotonic JSON rows plus a short system prompt), counted with `gpt-4o` / o200k after base64 is removed and vision tokens are added back. Reproduce with `pnpm exec tsx scripts/measure-hybrid.mts`.
-
-| path | pages | billable tokens | vs 17,705 raw |
-| --- | ---: | ---: | ---: |
-| Raw JSON | 0 | 17,705 | — |
-| Images only, no PAKT (Fable 5) | 4 | 3,875 | 78.1% fewer |
-| Hybrid, Fable 5 (PAKT, then one image) | 1 | 575 | 96.8% fewer |
-| Hybrid, Claude Sonnet 5.5 (PAKT text, no images) | 0 | 939 | 94.7% fewer |
-| Hybrid, Grok 4.7 (PAKT text, no images) | 0 | 936 | 94.7% fewer |
-
-On this fixture the hybrid is also cheaper than imaging alone (575 vs 3,875 billable tokens, one page instead of four) and the weak-reader path round-trips through `decompress`. Prose with no repetition is left alone. A deeply nested config can expand; the negative-savings guard keeps the original. Cyclic counters that fail the round-trip guard are kept as JSON. No live Grok or Claude 5.5 API call was made here. The read-accuracy numbers below still apply when `INKLING_FORCE_IMAGES=1` turns images back on: Grok's forced-image profile is the JetBrains Mono 14px / 84-column page, and Claude 5.5's is the Spleen 5×8 page with +2px rows. Those pages are still weak on dense hex. PAKT text is the default because of that, not because a new font was measured.
 
 ## Run the proxy
 
@@ -39,7 +25,7 @@ pnpm exec tsx src/node.ts
 Proxy listens on `127.0.0.1:47821`. After `pnpm build`, `node dist/node.js` is the same server. The `inkling` bin is the same server.
 
 ```bash
-# Claude Code, images for Fable, PAKT text for Opus 5.5
+# Claude Code: images for Fable, Opus 5.5 passes through
 ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
 
 # ChatGPT Codex. Do not point this at api.openai.com.
@@ -48,7 +34,7 @@ PORT=47821 OPENAI_UPSTREAM=https://chatgpt.com \
   INKLING_MODELS=gpt-5.6-sol \
   pnpm exec tsx src/node.ts
 
-# Grok stays PAKT text. Name it to opt in; images stay off.
+# Grok passes through as text even when named in scope.
 INKLING_MODELS=claude-fable-5,gemini,grok-4.7 pnpm exec tsx src/node.ts
 # Warp the xAI host yourself:
 # inkling warp --route 'api.x.ai/v1/*=http://127.0.0.1:47821' -- <grok-cli>
@@ -68,7 +54,7 @@ requires_openai_auth = true
 supports_websockets = false
 ```
 
-`INKLING_FORCE_IMAGES=1` lifts the PAKT-text veto for a model that is already in scope. Opus 5.5 is in the default scope, so the flag images it. Sonnet 5.5, Haiku 5.5, and Grok also need to be named in `INKLING_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
+`INKLING_FORCE_IMAGES=1` lifts the text-only veto for a model that is already in scope. Opus 5.5, Sonnet 5.5, Haiku 5.5, Grok and Gemini 4 hydrogen/carbon also need to be named in `INKLING_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
 
 ## MCP for every agent
 
@@ -86,10 +72,9 @@ Tools (all `readOnlyHint`, not destructive, idempotent, `openWorldHint: false`):
 
 | tool | what it does |
 | --- | --- |
-| `compress_text` | Lossless PAKT on one string. L4 only if `lossy` and `semanticBudget` > 0. |
-| `inspect_savings` | Token counts and which route a model would take. |
-| `transform_request` | Full hybrid on a request object. Pass `upstream: "https://chatgpt.com"` or `pathname: "/backend-api/codex/responses"` to strip `prompt_cache_breakpoint`. |
-| `health` | Version, PAKT version, legend. No payloads. |
+| `check_model` | Whether a model is in scope and gets images or passes through as text. |
+| `transform_request` | Run inkling on a request object and report estimated tokens before and after. Pass `upstream: "https://chatgpt.com"` or `pathname: "/backend-api/codex/responses"` to strip `prompt_cache_breakpoint`. |
+| `health` | Version and the Codex breakpoint policy. No payloads. |
 | `stats` | Process counters only. |
 
 Example stdio exchange after `initialize`:
@@ -182,8 +167,8 @@ Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subpr
 ```json
 {
   "slash": "/inkling",
-  "description": "Lossless PAKT plus inkling hybrid context tools",
-  "prompt": "Use the inkling MCP tools to compress structured context before answering. {args}",
+  "description": "inkling context tools",
+  "prompt": "Use the inkling MCP tools to check which models inkling images and to inspect a request. {args}",
   "mcp": {
     "command": "node",
     "args": ["<checkout>/dist/node.js", "mcp"]
@@ -211,7 +196,7 @@ OpenCode's remote form is `"type": "remote"` and a `url` of `http://127.0.0.1:47
 
 ## Codex breakpoint
 
-The Sol and GPT-6 profiles inject `prompt_cache_breakpoint: { mode: "explicit" }`. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. inkling does not inject that field when the path is `/backend-api/codex/responses` or the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` turns it off. PAKT is not asked for a cache-breakpoint hint, and an injected `prompt_cache_breakpoint` on a Codex request is removed as a text edit before the bytes leave the proxy, so nothing else in the body is reserialized.
+The Sol and GPT-6 profiles inject `prompt_cache_breakpoint: { mode: "explicit" }`. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. inkling does not inject that field when the path is `/backend-api/codex/responses` or the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` turns it off. An injected `prompt_cache_breakpoint` on a Codex request is removed as a text edit before the bytes leave the proxy, so nothing else in the body is reserialized.
 
 ---
 
@@ -342,8 +327,8 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
 | **Tier 1 — Full-fidelity readers** | `gemini-4-argon` (`gemini-4*`) | **15/15** | **98/98** | **100/100** | **On by default.** First model to hit 15/15 hex and 100/100 arithmetic on pure images; 96-page history cap + compact factsheet. |
 | **Tier 1 — Full-fidelity readers** | `google/gemini-3.6-flash`, `3.7-flash`, `3.8-flash` | **14/15** | **98/98** | **100/100** | **On by default** (compact factsheet). ~5.0–5.3× text capacity. |
 | **Tier 1 — Full-fidelity readers** | `claude-fable-5` (original June 2026) | **13/15** | **98/98** | **100/100** | **On by default.** SWE-bench Lite 10/10, SWE-bench Pro 14/19. |
-| **Tier 2 — Gist & agentic history only** (not byte-exact on dense logs/JSON) | `claude-opus-5-5` (default), `claude-fable-5-1` / `claude-fable-5-2` (default, spaced profile), `claude-opus-5` (opt-in), `grok-4.5` / `grok-4.6` (opt-in), `gpt-5.6-sol` (opt-in) | 0/15–14/15 | 83/98–**98/98** | 98/100–**100/100** | **Do not use for tool-less document/log extraction.** Safe only in live agent sessions where recent turns stay text and the agent has tools (`Read`/`Grep`) to re-fetch exact IDs/numbers. |
-| **Unsupported — Do not image** | `claude-haiku-5-5` (`claude-haiku-*`), `claude-sonnet-5-5`, `claude-opus-4-8`, `gpt-6.1-sol`, `grok-4.7`, `gpt-6-astra`, `kimi-k3`, `glm-5.3-flash`, `deepseek-v4.1-flash-1017` | 0/15–2/15 | 14/98–98/98 | 36/100–100/100 | **Not in default scope** (or loses money after cache discount). Weak readers guess plausible wrong numbers/IDs or misbind factsheet tokens when tools are disabled. |
+| **Tier 2 — Gist & agentic history only** (not byte-exact on dense logs/JSON) | `claude-opus-5-5` (opt-in, text by default), `claude-fable-5-1` / `claude-fable-5-2` (default, spaced profile), `claude-opus-5` (opt-in), `grok-4.5` / `grok-4.6` (opt-in), `gpt-5.6-sol` (opt-in) | 0/15–14/15 | 83/98–**98/98** | 98/100–**100/100** | **Do not use for tool-less document/log extraction.** Safe only in live agent sessions where recent turns stay text and the agent has tools (`Read`/`Grep`) to re-fetch exact IDs/numbers. |
+| **Unsupported — Do not image** | `claude-haiku-5-5` (`claude-haiku-*`), `claude-sonnet-5-5`, `claude-opus-4-8`, `gpt-6.1-sol` at 5×8 (its shipped 14px profile is a strong reader), `grok-4.7`, `gpt-6-astra`, `kimi-k3`, `glm-5.3-flash`, `deepseek-v4.1-flash-1017` | 0/15–2/15 | 14/98–98/98 | 36/100–100/100 | **Not in default scope** (or loses money after cache discount). Weak readers guess plausible wrong numbers/IDs or misbind factsheet tokens when tools are disabled. |
 
 - **Independent 6-document benchmark (`TokenSave` / `johnisking` corpus — English/Korean/Japanese prose, JS code, 60-record JSON, 230-line log):** That benchmark tested only `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, and `claude-fable-5-1` with `--tools ""`, where `images only` scored **3/60 to 14/60** on planted hex IDs, **6/60 to 29/60** on planted numbers, **0/80** on unplanted log/JSON IDs, and **3/10** on Korean prose numbers (`94392` misread as `9392`). Running the exact same 6-document, 80-item benchmark on **`gemini-4-argon` pure images (no factsheet)** scores **28/30 (93.3%)** on planted hex IDs (**10/10** on English + Code, **10/10** on Korean `prose_ko` including `94392` exact, **5/5** on Japanese hex), **27/30 (90.0%)** on planted numbers, and **13/20** on unplanted JSON/log items (including **4/5** on unplanted 230-line log `req=` IDs where all four Claude models scored 0/20).
 - **We tested removing the factsheet on Gemini 4 (`68/80` pure-image) — and put it back:** Because `gemini-4-argon` scored **15/15** on our 12-char `verbatim-hex` benchmark and **100/100** on pure-image arithmetic, we tested removing the text factsheet completely (`factSheetFormat: 'none'`) on the 6-document TokenSave corpus. Even at 85% overall (`28/30` planted hex, `27/30` planted numbers), 5 of the 12 pure-image misses were single-pixel `0`↔`8` / `6`↔`8` substitutions inside 22-char `req_<18-hex>` strings (`req_709b2b8ff97e92994a` → `req_709b2b0ff97e92994a`) or `30141` → `38141`. In Spleen 5×8, `0` and `8` differ by one interior pixel. When a strong reader (`gemini-4-argon` or `claude-fable-5`) reads the image, it already sees which ticket/row goes with which value and uses the bounded 96-token factsheet to disambiguate `0` vs `8` (recovering the planted misses to **30/30** hex and **29/30** numbers), so we kept the factsheet in production. On weak readers (`opus-5-5`, `sonnet-5-5`, `fable-5-1`), the model cannot read the image rows at all, so it guesses pairings from the factsheet and fails 0/80 on any ID past the 96-token cap ([FINDINGS.md](FINDINGS.md), 2026-10-25 entry).
@@ -355,10 +340,10 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
 <details>
 <summary><strong>Configuration, `INKLING_MODELS`, and per-model rendering details</strong></summary>
 
-- **Model scope:** default `INKLING_MODELS=claude-fable-5,claude-opus-5-5,gemini`. The `gemini`
+- **Model scope:** default `INKLING_MODELS=claude-fable-5,gemini`. The `gemini`
   base covers every Gemini id (3.6/3.7/3.8 Flash, Pro, 4, 5, and future
   versions); to opt Gemini out, drop `gemini` from `INKLING_MODELS` or click the
-  chip off. Opus 5, Sonnet 5.5, Sol, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
+  chip off. Gemini 4 hydrogen and carbon are in that scope but pass through as text until they are measured. Opus 5, Opus 5.5, Sonnet 5.5, Sol, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
   `INKLING_MODELS`). Haiku is never enabled. The exact Sol id still matters: sibling variants such as
   `gpt-5.6-terra` do not inherit Sol's allowlist or render profile. `INKLING_MODELS=off` disables
   imaging. Everything else passes through byte-identical. On the GPT path,
@@ -371,7 +356,7 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
   `INKLING_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **`claude-opus-5-5` & `claude-opus-5`:** `claude-opus-5-5` is on by default at spaced 5×8 (+2px row height, ~25% more image tokens than Fable's layout, still ~50%+ live savings). Good for gist/reasoning (94/98 gist, 100/100 arithmetic, 0/16 never-stated), weak on dense verbatim hex (3/15 on Opus 5.5, 2/15 on Opus 5); agents must re-fetch exact IDs via tools. Details: [FINDINGS.md](FINDINGS.md).
+- **`claude-opus-5-5` & `claude-opus-5`:** `claude-opus-5-5` passes through as text by default; `INKLING_FORCE_IMAGES=1` with the model named in scope images it at spaced 5×8 (+2px row height, ~25% more image tokens than Fable's layout). Good for gist/reasoning (94/98 gist, 100/100 arithmetic, 0/16 never-stated), weak on dense verbatim hex (3/15 on Opus 5.5, 2/15 on Opus 5); agents must re-fetch exact IDs via tools. Details: [FINDINGS.md](FINDINGS.md).
 - **Per-model rendering:** Gemini 4 (`GEMINI_PROFILE`) uses 312-column, 1568×728 5×8 Spleen with 96 max history pages, `mixed` history grouping, and a compact factsheet; Gemini 3.x uses the same 5×8 canvas with a 32-page cap. Claude uses 312-column 5×8 Spleen (dense for Fable, +2px row spacing for Opus/Sonnet). Opt-in `gpt-5.6-sol` and Grok use native 14px JetBrains Mono glyphs in a 9×16 cell, 84 columns, and a 764px full-width strip.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
@@ -402,7 +387,7 @@ numbers predate it).
 | `claude-fable-5` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `claude-fable-5-1` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | spaced profile; was 6/15 hex and 95/98 gist on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
 | `claude-fable-5-2` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | spaced profile; 13/15 and 11/15 over two hex runs, was 7/15 and 5/15 on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](eval/model-quality/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
-| `claude-opus-5-5` (default, gist-only) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `claude-opus-5-5` (opt-in, text by default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-opus-5` (opt-in) | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `INKLING_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `grok-4.5` (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
@@ -666,8 +651,6 @@ accuracy claim.
 ## Credits
 
 inkling's image pipeline, renderer, evals and most of the research in [FINDINGS.md](FINDINGS.md) come from **[pxpipe](https://github.com/teamchong/pxpipe)** by Steven ([teamchong](https://github.com/teamchong)), MIT. inkling started from pxpipe v0.16.0 (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`). The "context as images" idea, the fonts and atlases, the count_tokens counterfactual and the model-tier measurements are his work. Thank you, Steven.
-
-PAKT is [clipforge-PAKT](https://github.com/sriinnu/clipforge-PAKT) by Srinivas Pendela ([sriinnu](https://github.com/sriinnu)), MIT.
 
 Other projects built on pxpipe, not maintained by inkling:
 

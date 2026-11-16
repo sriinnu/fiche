@@ -48,9 +48,6 @@ await build({
   // identifier with the string literal at every reference.
   define: { __INKLING_VERSION__: JSON.stringify(pkg.version) },
   // Atlas is inlined as a base64 string in src/core/atlas.ts, so no external assets.
-  // PAKT stays a runtime dependency so the bundle does not swallow its
-  // tokenizer and MCP SDK copies.
-  external: ['@sriinnu/pakt'],
   banner: { js: '#!/usr/bin/env node' },
 });
 

@@ -17,9 +17,9 @@ Small PRs with receipts merge fast.
   include: model id, date, client version, render geometry, sample size, and
   failure categories. The README is held to the same standard.
 - Provider pricing carries a source URL and a date.
-- Changes to the PAKT stage include a test through `createProxy`, not only
-  `hybridTransform`. The proxy has its own wiring, and a unit test alone has
-  passed against a broken proxy before.
+- Changes to what the proxy rewrites include a test through `createProxy`,
+  not only `transformAnyRequest`. The proxy has its own wiring, and a unit
+  test alone has passed against a broken proxy before.
 - Security reports go through [SECURITY.md](SECURITY.md), not the public
   issue tracker.
 

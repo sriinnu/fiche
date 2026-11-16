@@ -1447,45 +1447,6 @@ function resolveGoogleUpstream(
 }
 
 /** Build the proxy fetch handler. */
-let hybridLoader: Promise<typeof import('./hybrid.js') | null> | undefined;
-
-function loadHybrid(): Promise<typeof import('./hybrid.js') | null> {
-  hybridLoader ??= import('./hybrid.js').catch((err: unknown) => {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[inkling] hybrid prepass unavailable: ${message}`);
-    return null;
-  });
-  return hybridLoader;
-}
-
-/** `INKLING_PAKT=off` (or 0/false/no) turns the PAKT stage off on its own,
- *  leaving image compression as it was. */
-export function paktEnabled(): boolean {
-  const v = (typeof process !== 'undefined' ? process.env?.INKLING_PAKT : '') ?? '';
-  return !/^(0|false|no|off)$/i.test(v.trim());
-}
-
-async function prepareHybridBody(
-  body: Uint8Array,
-  model: string | undefined,
-  wire: 'anthropic' | 'responses' | 'chat' | 'google',
-): Promise<{
-  body: Uint8Array;
-  blocks: number;
-  savedTokens: number;
-  changed: boolean;
-}> {
-  const hybrid = await loadHybrid();
-  if (!hybrid) return { body, blocks: 0, savedTokens: 0, changed: false };
-  const pre = hybrid.prepassRequest(body, model, { wire });
-  return {
-    body: pre.body,
-    blocks: pre.blocks,
-    savedTokens: pre.savedTokens,
-    changed: pre.changed,
-  };
-}
-
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
   const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
@@ -1816,22 +1777,10 @@ let responseContentType: string | undefined;
           pathname: url.pathname,
           upstream: openAIUpstream,
         });
-        // PAKT runs only where compression runs at all: an in-scope model and
-        // compress not switched off. Out-of-scope models pass through untouched.
-        // Weak readers (Claude 5.5, Grok, …) stop at PAKT text; strong readers
-        // continue into the image transform.
-        const hybridWire = isGoogle
-          ? 'google'
-          : isMessages
-            ? bridgedGptMessages ? 'responses' : bridgedChatMessages ? 'chat' : 'anthropic'
-            : isOpenAIChat ? 'chat' : 'responses';
-        const runPakt = modelOk && transformOpts?.compress !== false && paktEnabled();
-        const pre = runPakt
-          ? await prepareHybridBody(bridgeBody, routeModel, hybridWire)
-          : { body: bridgeBody, blocks: 0, savedTokens: 0, changed: false };
-        // Allowlisted models image, except Claude 5.5 and Grok, which stay on
-        // PAKT text until INKLING_FORCE_IMAGES. That flag does not itself add a
-        // model to the allowlist. Opus 5 still images once named.
+        // Allowlisted models image, except weak or unmeasured readers (Claude
+        // 5.5, Grok, Gemini 4 hydrogen/carbon), which pass through as text until
+        // INKLING_FORCE_IMAGES. That flag does not itself add a model to the
+        // allowlist. Opus 5 still images once named.
         const imageThisRequest = shouldImageModel(routeModel, modelOk);
         const effectiveOpts = imageThisRequest
           ? { ...transformOpts, explicitPromptCacheBreakpoints: allowBreakpoints }
@@ -1841,30 +1790,18 @@ let responseContentType: string | undefined;
         // otherwise network latency would be charged to our own CPU.
         const tTransform = Date.now();
         let r = isGoogle
-          ? await transformGoogleGenerateContent(pre.body, model!, effectiveOpts)
+          ? await transformGoogleGenerateContent(bridgeBody, model!, effectiveOpts)
           : isMessages
             ? bridgedGptMessages
-              ? await transformOpenAIResponses(pre.body, effectiveOpts)
+              ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
               : bridgedChatMessages
-                ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
-                : await transformRequest(pre.body, { ...effectiveOpts, model: effectiveModel ?? undefined })
+                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+                : await transformRequest(bridgeBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
             : isOpenAIChat
-              ? await transformOpenAIChatCompletions(pre.body, effectiveOpts)
-              : await transformOpenAIResponses(pre.body, effectiveOpts);
+              ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+              : await transformOpenAIResponses(bridgeBody, effectiveOpts);
         if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
           r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
-        }
-        if (pre.blocks > 0) {
-          r.info.hybrid = {
-            readerTier: imageThisRequest ? 'image' : 'pakt-text',
-            paktBlocks: pre.blocks,
-            paktSavedTokens: pre.savedTokens,
-            imaged: imageThisRequest && (r.info.imageCount ?? 0) > 0,
-          };
-          if (!imageThisRequest) {
-            r.info.compressed = true;
-            r.info.reason = 'pakt_text';
-          }
         }
         transformMs = Date.now() - tTransform;
         if (isGoogle && r.info.compressed) {
@@ -1884,26 +1821,14 @@ let responseContentType: string | undefined;
           ]);
           if (baseline !== null && transformed !== null) {
             if (transformed >= baseline) {
-              // Drop the images. Keep a PAKT rewrite that already paid for
-              // itself; reverting all the way to bodyIn would throw that away.
               r = {
-                body: pre.changed ? pre.body : bodyIn,
+                body: bodyIn,
                 info: revertedGoogleInfo(
                   r.info,
                   `not_profitable (${transformed} >= ${baseline} tokens)`,
                   'ok',
                 ),
               };
-              if (pre.changed) {
-                r.info.compressed = true;
-                r.info.reason = 'pakt_text';
-                r.info.hybrid = {
-                  readerTier: imageThisRequest ? 'image' : 'pakt-text',
-                  paktBlocks: pre.blocks,
-                  paktSavedTokens: pre.savedTokens,
-                  imaged: false,
-                };
-              }
             } else {
               r.info.baselineTokens = baseline;
               r.info.baselineProbeStatus = 'ok';
@@ -1914,7 +1839,7 @@ let responseContentType: string | undefined;
             r.info.baselineProbeStatus = 'failed';
           }
         }
-        if (!modelOk && r.info.reason !== 'pakt_text') r.info.reason = 'unsupported_model';
+        if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;

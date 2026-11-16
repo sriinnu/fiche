@@ -326,11 +326,11 @@ Environment:
   INKLING_GATEWAY_BASE_URL gateway base URL (required with INKLING_PROVIDER)
   INKLING_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
   INKLING_MODELS           comma-separated model bases allowed to compress
-                          (default claude-fable-5,claude-opus-5-5,gemini).
-                          Out-of-scope models pass through untouched. Claude
-                          5.5 and Grok get lossless PAKT text, not images,
+                          (default claude-fable-5,gemini).
+                          Out-of-scope models pass through untouched. Weak or
+                          unmeasured readers (Claude 5.5, Grok, Gemini 4
+                          hydrogen/carbon) pass through as text, not images,
                           unless INKLING_FORCE_IMAGES=1.
-  INKLING_PAKT             off disables the PAKT stage alone (images unaffected).
   INKLING_FORCE_IMAGES     1 images weak readers too (Claude 5.5, Grok). Does not
                           re-enable prompt_cache_breakpoint on ChatGPT Codex.
   INKLING_CONFIG           JSON config path (default ~/.config/inkling/config.json)
