@@ -136,3 +136,19 @@ export function gateRatesFor(model: string | undefined): Readonly<PriceRates> | 
   if (priceMode() === 'legacy') return ANTHROPIC_GATE_RATES;
   return koshaRates(model)?.rates ?? null;
 }
+
+/** Cache-read ratio for the Anthropic savings math (baseline.ts). Legacy and
+ *  unpriced models keep the historical 0.1x. Writes stay at Anthropic's
+ *  published 1.25x (5m) / 2x (1h), which hold for every Claude model. */
+export function anthropicReadRate(model: string | undefined): number {
+  if (priceMode() === 'legacy') return CACHE_READ_RATE;
+  return gateRatesFor(model)?.read ?? CACHE_READ_RATE;
+}
+
+/** USD per 1M uncached input tokens for converting saved token-equivalents to
+ *  dollars, or undefined when legacy mode or the model is unpriced. */
+export function inputUsdPerMtok(model: string | undefined): number | undefined {
+  if (priceMode() === 'legacy' || !koshaRates(model)) return undefined;
+  const row = priceRowFor(model);
+  return row && row.in > 0 ? row.in : undefined;
+}

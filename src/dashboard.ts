@@ -33,6 +33,7 @@ import * as os from 'node:os';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
+import { anthropicReadRate, inputUsdPerMtok, priceMode, PRICE_SNAPSHOT } from './core/pricing.js';
 import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
@@ -250,6 +251,11 @@ interface Totals {
   pricedActualInputWeighted: number;
   pricedBaselineInputWeighted: number;
   pricedOutputWeighted: number;
+  /** Kosha mode: saved dollars at each row's own input price. */
+  pricedSavedUsd: number;
+  /** Rows converted to dollars at their own price / rows with no price. */
+  usdPricedRequests: number;
+  usdUnpricedRequests: number;
   /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
    *  with a usage block. For measured rows: cache-aware baseline (what the
    *  unproxied path would have billed). For unmeasured/probe-failed rows:
@@ -320,6 +326,9 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     pricedActualInputWeighted: 0,
     pricedBaselineInputWeighted: 0,
     pricedOutputWeighted: 0,
+    pricedSavedUsd: 0,
+    usdPricedRequests: 0,
+    usdUnpricedRequests: 0,
     allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
@@ -747,7 +756,7 @@ export class DashboardState {
 
       // Weighted INPUT cost we actually paid this turn.
       actualInputEff = haveUsage
-        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(ev.model))
         : 0;
 
       // inkling only reduces input by imaging the static slab. An UNCOMPRESSED
@@ -797,6 +806,7 @@ export class DashboardState {
             prevCacheable,
             cc1h,
             cc5m,
+            anthropicReadRate(ev.model),
           )
         : actualInputEff;
       // Record this completed turn's prefix for later warmth/split decisions.
@@ -889,6 +899,15 @@ export class DashboardState {
         totals.pricedBaselineInputWeighted += baselineInputEff;
         totals.pricedActualInputWeighted += actualInputEff;
         totals.pricedOutputWeighted += outputEquiv;
+        // Kosha mode: dollars at this model's own input price. Unpriced rows
+        // are counted, never converted at a guessed rate.
+        const usdPerMtok = inputUsdPerMtok(ev.model);
+        if (usdPerMtok !== undefined) {
+          totals.pricedSavedUsd += ((baselineInputEff - actualInputEff) * usdPerMtok) / 1e6;
+          totals.usdPricedRequests += 1;
+        } else {
+          totals.usdUnpricedRequests += 1;
+        }
       }
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
@@ -1126,7 +1145,7 @@ export class DashboardState {
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
         actualInputEff = haveUsage
-          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(t.model))
           : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
@@ -1162,6 +1181,7 @@ export class DashboardState {
               prevCacheableR,
               cc1h,
               cc5m,
+              anthropicReadRate(t.model),
             )
           : actualInputEff;
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
@@ -1418,7 +1438,11 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      // Legacy: every saved token at the assumed $10/MTok. Kosha: each row at
+      // its own model's input price; unpriced rows are left out and counted.
+      saved_usd: round4(priceMode() === 'kosha'
+        ? totals.pricedSavedUsd
+        : (pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
@@ -1429,6 +1453,10 @@ export class DashboardState {
         cache_write_1h_multiplier: 2.0,
         cache_read_multiplier: 0.1,
         source: 'docs.anthropic.com/en/docs/about-claude/pricing (verified 2026-05-19)',
+        price_mode: priceMode(),
+        price_snapshot: PRICE_SNAPSHOT,
+        usd_priced_requests: totals.usdPricedRequests,
+        usd_unpriced_requests: totals.usdUnpricedRequests,
       },
       // Honest output measurement — char counts from the SSE/JSON scanner,
       // independent of Anthropic's `usage.output_tokens`. Surfaces the gap

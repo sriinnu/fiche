@@ -38,6 +38,7 @@ import {
   type BaselineWarmthPrev,
 } from './core/baseline.js';
 import { sessionAnchorText } from './core/session-state.js';
+import { anthropicReadRate } from './core/pricing.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -220,8 +221,9 @@ export async function aggregateSessions(
         prevCacheable,
         cc1h,
         cc5m,
+        anthropicReadRate(ev.model),
       );
-      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m);
+      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(ev.model));
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);

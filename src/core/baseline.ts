@@ -201,12 +201,13 @@ export function computeBaselineInputEffWithCacheTier(
   prevCacheable: number,
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
+  readRate: number = CACHE_READ_RATE,
 ): number {
   if (baseline <= 0) return 0;
   // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
   if (baselineCacheable <= 0) {
     return computeActualInputEffWithCacheTier(
-      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens,
+      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens, readRate,
     );
   }
   const cacheable = Math.min(baselineCacheable, baseline);
@@ -218,7 +219,7 @@ export function computeBaselineInputEffWithCacheTier(
     // the image path's cache.
     const reused = Math.min(Math.max(prevCacheable, 0), cacheable);
     const grown = cacheable - reused;
-    return reused * CACHE_READ_RATE + grown * createRate + coldTail * 1.0;
+    return reused * readRate + grown * createRate + coldTail * 1.0;
   }
   // Cold (first turn / TTL expiry): no warm cache for text either, so it
   // re-creates the whole cacheable prefix at the create rate — same event the
@@ -242,8 +243,9 @@ export function computeActualInputEffWithCacheTier(
   cr: number,
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
+  readRate: number = CACHE_READ_RATE,
 ): number {
   return inputTokens
     + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
-    + cr * CACHE_READ_RATE;
+    + cr * readRate;
 }

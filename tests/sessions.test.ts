@@ -436,6 +436,24 @@ describe('aggregateSessions', () => {
     expect(await run('b2222222', '5m', later)).toBeGreaterThan(await run('b2222222', '5m', soon));
   });
 
+  it('INKLING_PRICES=kosha prices the Claude read at the model rate', async () => {
+    const saved = process.env.INKLING_PRICES;
+    const one = (sid: string, model: string) => ev({
+      ts: '2026-05-18T00:00:00.000Z', compressed: true, first_user_sha8: sid, model,
+      system_sha8: 's', baseline_probe_status: 'ok', baseline_tokens: 30_000, baseline_cacheable_tokens: 20_000,
+      input_tokens: 100, output_tokens: 0, cache_create_tokens: 0, cache_read_tokens: 10_000,
+    });
+    try {
+      delete process.env.INKLING_PRICES;
+      writeEvents(tmp, [one('k1111111', 'claude-opus-5-5')]);
+      expect((await aggregateSessions(tmp)).sessions.get('k1111111')!.tokensSavedEst).toBe(10_900); // 0.1x
+      process.env.INKLING_PRICES = 'kosha';
+      expect((await aggregateSessions(tmp)).sessions.get('k1111111')!.tokensSavedEst).toBe(10_400); // 0.05x
+    } finally {
+      if (saved === undefined) delete process.env.INKLING_PRICES; else process.env.INKLING_PRICES = saved;
+    }
+  });
+
   it('keeps text cold on an image miss when the tools hash changed', async () => {
     writeEvents(tmp, [
       ev({

@@ -588,6 +588,44 @@ describe('GPT savings split', () => {
     expect(stats.saved_usd).toBe(0.14);
   });
 
+  it('INKLING_PRICES=kosha prices each Claude row at its own read rate and input price', async () => {
+    const savedMode = process.env.INKLING_PRICES;
+    const row = (model: string, sid: string) => ({
+      method: 'POST', path: '/v1/messages', model, status: 200, durationMs: 1,
+      usage: { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 10000 },
+      info: {
+        compressed: true, baselineTokens: 30000, baselineCacheableTokens: 20000,
+        baselineProbeStatus: 'ok', firstUserSha8: sid,
+      },
+    });
+    try {
+      setAllowedModelBases(['claude-opus-5-5', 'claude-mystery-9']);
+      // Legacy: 0.1x read, $10/MTok. actual 100 + 1000, text 2000 + 10000.
+      delete process.env.INKLING_PRICES;
+      dash.update(row('claude-opus-5-5', 'legacy1') as never);
+      let stats = (await dash.serveStats().json()) as StatsPayload;
+      expect(stats.actual_input_weighted).toBe(1100);
+      expect(stats.saved_usd).toBe(0.109);
+
+      // Kosha: Opus 5.5 reads at 0.05x and costs $4/MTok input.
+      process.env.INKLING_PRICES = 'kosha';
+      dash = new DashboardState(tmp);
+      dash.update(row('claude-opus-5-5', 'kosha1') as never);
+      dash.update(row('claude-mystery-9', 'kosha2') as never);
+      stats = (await dash.serveStats().json()) as StatsPayload;
+      // Opus row: actual 100 + 500, text 1000 + 10000, saved 10400 at $4.
+      // Mystery row: unpriced, keeps 0.1x (actual 1100) and stays out of dollars.
+      expect(stats.actual_input_weighted).toBe(600 + 1100);
+      expect(stats.saved_usd).toBe(0.0416);
+      const pa = stats.pricing_assumptions as unknown as Record<string, unknown>;
+      expect(pa.price_mode).toBe('kosha');
+      expect(pa.usd_priced_requests).toBe(1);
+      expect(pa.usd_unpriced_requests).toBe(1);
+    } finally {
+      if (savedMode === undefined) delete process.env.INKLING_PRICES; else process.env.INKLING_PRICES = savedMode;
+    }
+  });
+
   it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
     writeEvents(tmp, [
       ev({
