@@ -27,6 +27,7 @@ import {
   type ExportResult,
 } from './core/export.js';
 import { readExportTextFile } from './export-collect.js';
+import { decodeRequestBody } from './request-decoding.js';
 import {
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
@@ -1303,6 +1304,7 @@ async function main(): Promise<void> {
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
     maxRequestBytes: opts.maxRequestBytes,
+    decodeRequestBody,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards

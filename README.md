@@ -54,6 +54,8 @@ requires_openai_auth = true
 supports_websockets = false
 ```
 
+Codex 0.167+ rejects `[profiles.*]` in `config.toml`. For an opt-in profile, put `model_provider = "inkling"` and the provider table in `~/.codex/inkling.config.toml` and run `codex -p inkling`. Setting `openai_base_url = "http://127.0.0.1:47821/backend-api/codex"` on the built-in provider also works. That provider tries a WebSocket first; inkling answers 426, so Codex falls back to HTTP and sends a zstd body, which inkling decodes before compressing.
+
 `INKLING_FORCE_IMAGES=1` lifts the text-only veto for a model that is already in scope. Opus 5.5, Sonnet 5.5, Haiku 5.5, Grok and Gemini 4 hydrogen/carbon also need to be named in `INKLING_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
 
 ## MCP for every agent

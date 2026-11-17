@@ -89,6 +89,15 @@ export interface ProxyConfig {
    *  negative value is ignored in favour of that default: an unusable limit must
    *  not silently become no limit. */
   maxRequestBytes?: number;
+  /** Undo a request `Content-Encoding` on transformable routes so the body can
+   *  be read. Codex's built-in provider zstd-compresses its Responses POST; left
+   *  encoded, the transform silently skips it. Return `undefined` when the coding
+   *  is unknown, the bytes are corrupt, or the output would pass `maxBytes`: the
+   *  original bytes and header are then forwarded untouched. A decoded body is
+   *  forwarded as plain bytes without the header, since chatgpt.com has been seen
+   *  to refuse zstd on image-heavy bodies. Core stays runtime-neutral, so the Node
+   *  entry supplies this; without it, encoded bodies pass through as before. */
+  decodeRequestBody?: (bytes: Uint8Array, encoding: string, maxBytes: number) => Uint8Array<ArrayBuffer> | undefined;
 }
 
 export interface ProxyEvent {
@@ -1522,6 +1531,17 @@ export function createProxy(config: ProxyConfig = {}) {
     const url = new URL(req.url);
     const path = url.pathname + url.search;
 
+    // inkling speaks HTTP only. A WebSocket handshake forwarded as a plain GET
+    // comes back 405 from chatgpt.com, and Codex's built-in provider then
+    // retries the socket several times before falling back. 426 is the answer
+    // it takes as "use HTTP" on the first try (measured, codex-cli 0.167.1).
+    if ((req.headers.get('upgrade') ?? '').toLowerCase().includes('websocket')) {
+      return new Response(JSON.stringify({ error: { type: 'websocket_unsupported', message: 'inkling proxies HTTP only; retry over HTTP' } }), {
+        status: 426,
+        headers: { 'content-type': 'application/json', connection: 'close' },
+      });
+    }
+
     // Reversibly disguise the configured upstream id for Claude Code's model
     // picker, matching CLIProxyAPI. The id decodes back to the exact provider
     // model on /v1/messages, so discovery and routing cannot drift apart.
@@ -1685,6 +1705,8 @@ let responseContentType: string | undefined;
         : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
+    /** Set when `decodeRequestBody` undid the request Content-Encoding. */
+    let requestBodyDecoded = false;
     let info: TransformInfo | undefined;
     let requestModel: string | undefined = googleModelFromPath ?? undefined;
     let bridgedGptMessages = false;
@@ -1743,10 +1765,26 @@ let responseContentType: string | undefined;
           headers: { 'content-type': 'application/json' },
         });
       }
-      const bodyIn = bounded.bytes;
+      let bodyIn = bounded.bytes;
+      const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
+      if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
+        const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
+        if (decoded) {
+          bodyIn = decoded;
+          requestBodyDecoded = true;
+        }
+      }
+      const encodedUndecoded =
+        contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
       try {
-        const transformOpts =
+        const baseTransformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
+        // Bytes still under a coding we did not undo must not be rewritten: the
+        // header would go out unchanged and the upstream would try to decompress
+        // whatever the transform produced. Forward them as they came.
+        const transformOpts = encodedUndecoded
+          ? { ...baseTransformOpts, compress: false }
+          : baseTransformOpts;
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = googleModelFromPath ?? readModelField(bodyIn);
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
@@ -2004,6 +2042,9 @@ let responseContentType: string | undefined;
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
+    // The body now travels as plain bytes; a stale coding header would make
+    // the upstream try to decompress JSON.
+    if (requestBodyDecoded) outHeaders.delete('content-encoding');
     if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
       // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
       outHeaders.delete('x-api-key');
