@@ -54,7 +54,7 @@ import {
 } from './history.js';
 import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
-import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { ANTHROPIC_GATE_RATES, gateRatesFor, type PriceRates } from './pricing.js';
 import { visionTokens, type VisionPricing } from './vision-cost.js';
 import { CLAUDE_PROFILE } from './claude-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -430,6 +430,7 @@ export function evalCompressionProfitability(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   geometry?: GateGeometry,
+  rates: Readonly<PriceRates> = ANTHROPIC_GATE_RATES,
 ): {
   imageTokens: number;
   textTokens: number;
@@ -444,10 +445,10 @@ export function evalCompressionProfitability(
   const imageTokens = imageTokensCost(text, cols, imageCountCap, shrinkWidth, READABLE_CHARS_PER_IMAGE, geometry);
   const textTokens = text.length / cpt;
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
-    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    ? priorWarmTokens * (rates.write - rates.read)
     : 0;
   const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
-    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    ? priorWarmImageTokens * (rates.write - rates.read)
     : 0;
   return {
     imageTokens,
@@ -468,6 +469,7 @@ export function isCompressionProfitable(
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   geometry?: GateGeometry,
+  rates: Readonly<PriceRates> = ANTHROPIC_GATE_RATES,
 ): boolean {
   if (typeof text !== 'string' || text.length === 0) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
@@ -480,10 +482,10 @@ export function isCompressionProfitable(
   // side that would flip — pinning the session in its current mode until
   // per-turn savings exceed the burn cost.
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
-    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    ? priorWarmTokens * (rates.write - rates.read)
     : 0;
   const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
-    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    ? priorWarmImageTokens * (rates.write - rates.read)
     : 0;
   return imageTokensCost_ + burnImageSide < textTokensEquivalent + burnTextSide;
 }
@@ -508,9 +510,10 @@ export function isCompressionProfitableAmortized(
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   geometry?: GateGeometry,
+  rates: Readonly<PriceRates> = ANTHROPIC_GATE_RATES,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
-    return isCompressionProfitable(text, cols, imageCountCap, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, geometry);
+    return isCompressionProfitable(text, cols, imageCountCap, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, geometry, rates);
   }
   const N = Math.max(2, Math.floor(horizon));
   if (typeof text !== 'string' || text.length === 0) return false;
@@ -520,14 +523,14 @@ export function isCompressionProfitableAmortized(
   const imageTokens = imageTokensCost(text, cols, imageCountCap, shrinkWidth, maxCharsPerImage, geometry);
   const textTokens = text.length / cpt;
   // Worst-case-for-image vs best-case-for-text (conservative, on purpose).
-  const imageLifetime = imageTokens * (CACHE_CREATE_RATE + CACHE_READ_RATE * (N - 1));
-  const textLifetime = textTokens * CACHE_READ_RATE * N;
+  const imageLifetime = imageTokens * (rates.write + rates.read * (N - 1));
+  const textLifetime = textTokens * rates.read * N;
   // Symmetric burn — see isCompressionProfitable for anti-flapping rationale.
   const burnImageSide = Number.isFinite(priorWarmTokens) && priorWarmTokens > 0
-    ? priorWarmTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    ? priorWarmTokens * (rates.write - rates.read)
     : 0;
   const burnTextSide = Number.isFinite(priorWarmImageTokens) && priorWarmImageTokens > 0
-    ? priorWarmImageTokens * (CACHE_CREATE_RATE - CACHE_READ_RATE)
+    ? priorWarmImageTokens * (rates.write - rates.read)
     : 0;
   return imageLifetime + burnImageSide < textLifetime + burnTextSide;
 }
@@ -2011,7 +2014,7 @@ async function compressToolResultsInPlace(
             if (innerR.length < o.minToolResultChars) {
               bumpPassthrough(info, 'below_threshold');
               rewritten.push(blk);
-            } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
+            } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo, gateRatesFor(o.model))) {
               bumpPassthrough(info, 'not_profitable');
               rewritten.push(blk);
             } else {
@@ -2125,7 +2128,7 @@ async function compressToolResultsInPlace(
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
               }
-              if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo)) {
+              if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo, gateRatesFor(o.model))) {
                 bumpPassthrough(info, 'not_profitable');
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
@@ -2255,6 +2258,7 @@ async function runHistoryCollapseAndFinalize(
       return isCompressionProfitableAmortized(
         text, historyGeometry.cols, undefined, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
+        gateRatesFor(o.model),
       );
     };
     // The slab needs no shield here: this path runs only when the slab did NOT
@@ -2691,6 +2695,7 @@ export async function transformRequest(
     combinedWithHeader, slabCols, undefined, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
     denseGeo,
+    gateRatesFor(o.model),
   );
   if (slabGateEval) {
     info.gateEval = {
@@ -2712,6 +2717,7 @@ export async function transformRequest(
     false,
     READABLE_CHARS_PER_IMAGE,
     denseGeo,
+    gateRatesFor(o.model),
   )) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
@@ -2868,6 +2874,7 @@ export async function transformRequest(
       return isCompressionProfitableAmortized(
         text, historyGeometry.cols, undefined, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
+        gateRatesFor(o.model),
       );
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
