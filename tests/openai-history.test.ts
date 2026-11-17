@@ -539,7 +539,8 @@ describe('planResponsesPairCollapse — native state classification', () => {
       minCollapseTokens: 1, maxImages: 100,
     });
     const selected = new Set(plan.selectedIndices);
-    expect(selected.has(0)).toBe(true);
+    // User messages are native barriers (cross-turn cache stability).
+    expect(selected.has(0)).toBe(false);
     expect(selected.has(1)).toBe(true);
     expect(selected.has(2)).toBe(true);
     expect(selected.has(3)).toBe(true);
@@ -549,7 +550,6 @@ describe('planResponsesPairCollapse — native state classification', () => {
     expect(plan.segments).toHaveLength(2);
     expect(plan.pairState.collapsedPairs).toBe(1);
     const expectedBaseline =
-      o200k(String(items[0]!.content)) +
       o200k(String(items[1]!.content)) +
       o200k(JSON.stringify(items[2])) +
       o200k(String(items[3]!.output)) +
@@ -571,8 +571,9 @@ describe('planResponsesPairCollapse — native state classification', () => {
       minCollapseTokens: 1, maxImages: 100,
     });
     const selected = new Set(plan.selectedIndices);
-    // Only the latest user turn stays native; the old turns collapse.
-    expect(selected.has(0)).toBe(true);
+    // keepTail 0 still collapses the old assistant turn. User messages stay
+    // native barriers (cross-turn cache stability).
+    expect(selected.has(0)).toBe(false);
     expect(selected.has(1)).toBe(true);
     expect(selected.has(2)).toBe(false);
   });
@@ -590,7 +591,8 @@ describe('planResponsesPairCollapse — native state classification', () => {
       minCollapseTokens: 1, maxImages: 100,
     });
     const selected = new Set(plan.selectedIndices);
-    expect(selected.has(0)).toBe(true);
+    // User messages are native barriers (cross-turn cache stability).
+    expect(selected.has(0)).toBe(false);
     expect(selected.has(1)).toBe(true);
     expect(selected.has(2)).toBe(true);
     expect(selected.has(3)).toBe(true);

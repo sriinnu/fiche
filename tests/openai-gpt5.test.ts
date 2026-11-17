@@ -678,12 +678,16 @@ describe('transformOpenAIResponses — history collapse', () => {
       );
     });
     expect(historyItems.length).toBeGreaterThan(0);
-    expect(historyItems.length).toBeLessThan(result.info.responsesComposition!.collapsedFunctionPairs ?? Infinity);
+    // Every user message opens a section (cache stability across turns), and
+    // this fixture has one user message per round, so groups <= rounds.
+    expect(historyItems.length).toBeLessThanOrEqual(result.info.responsesComposition!.collapsedFunctionPairs ?? Infinity);
     const firstHistoryIdx = out.input.indexOf(historyItems[0]!);
     expect(firstHistoryIdx).toBeGreaterThan(0); // slab and opening user state stay first
     const serialized = JSON.stringify(out.input);
-    // Old conversation text is now covered by the image instead of remaining native.
-    expect(serialized).not.toContain(`${OPENING_PROMPT_MARKER} ${OPENING_PROMPT_MARKER}`);
+    // User messages stay native barriers (cross-turn cache stability), so the
+    // opening prompt is still text; the old rounds around it are imaged.
+    expect(serialized).toContain(`${OPENING_PROMPT_MARKER} ${OPENING_PROMPT_MARKER}`);
+    expect(serialized).not.toContain('Working on step 0. Working on step 0.');
     expect(serialized).toContain(LIVE_PROMPT_MARKER);
     // The recent tail is still raw text items (function_call / user), not collapsed.
     const lastUser = [...out.input].reverse().find(

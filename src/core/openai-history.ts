@@ -827,6 +827,10 @@ interface ResponsesMixedUnit {
   baselineTokens: number;
 }
 
+function isUserMessage(item: unknown): boolean {
+  return responseMessageText(item)?.role === 'user';
+}
+
 function freezeResponsesRuns<T extends { indices: number[] }>(
   runs: T[][],
   items: unknown[],
@@ -854,8 +858,10 @@ function freezeResponsesRuns<T extends { indices: number[] }>(
     let nextIndex = last.indices[last.indices.length - 1]! + 1;
     while (nextIndex < items.length && isContentlessMessage(items[nextIndex])) nextIndex++;
     const next = items[nextIndex] as Record<string, unknown> | undefined;
+    // A user message is a permanent barrier (see the mixed planner), so a run
+    // that ends at one can never grow and its tail is safe to seal now.
     if (next && !isResponsesToolCall(next) && !isResponsesToolOutput(next)
-      && responseMessageText(next) === null) seal();
+      && (responseMessageText(next) === null || isUserMessage(next))) seal();
   }
   return sections;
 }
@@ -922,6 +928,17 @@ async function planResponsesMixedCollapse(
         baselineTokens: round.callTokens + round.outputTokens,
       });
       i = round.endIndex;
+      continue;
+    }
+    // User messages stay native and split runs. The latest one is protected,
+    // and every user message is the latest for a while; one that sat inside a
+    // section kept the rounds after it native until the next turn unprotected
+    // it, and then a new segment landed mid-prefix and re-billed everything
+    // behind it uncached (replayed Codex traffic: ~295k tokens on one turn).
+    // As a barrier it never changes state, so earlier segments never move.
+    if (responseMessageText(items[i])?.role === 'user') {
+      noteBarrier(i);
+      flush();
       continue;
     }
     const item = items[i] as Record<string, unknown> | null;
