@@ -14,7 +14,7 @@ describe('warp route port selection', () => {
   it('honours the port when the pattern names one', () => {
     const routes = [parseRoute(`127.0.0.1:9090/v1/*=${front}`)];
     expect(matchRoute(routes, '127.0.0.1:9090', '/v1/responses')).not.toBeNull();
-    // Same host, different port: the pxpipe front door must not divert to itself.
+    // Same host, different port: the inkling front door must not divert to itself.
     expect(matchRoute(routes, '127.0.0.1:47821', '/v1/responses')).toBeNull();
     expect(hostCouldMatch(routes, '127.0.0.1:47821')).toBe(false);
   });

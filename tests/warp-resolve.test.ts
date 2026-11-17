@@ -14,7 +14,7 @@ describe('warp command resolution on win32', () => {
   let shims: string;
 
   beforeAll(() => {
-    root = mkdtempSync(join(tmpdir(), 'pxpipe-resolve-'));
+    root = mkdtempSync(join(tmpdir(), 'inkling-resolve-'));
     bin = join(root, 'bin');
     shims = join(root, 'shims');
     mkdirSync(bin);

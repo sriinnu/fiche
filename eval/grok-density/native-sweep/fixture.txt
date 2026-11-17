@@ -14,7 +14,7 @@ $ pnpm exec tsx eval/profile/run.mjs   # dry-run, no key
 $ node scripts/verify-stripe.mjs --strict
   ok: cursor atlas checksum matches the committed snapshot
 [commit] sweep: retune stripe cell density, keep native glyphs
-  installed pxpipe-proxy@4.25.63 from the private registry
+  installed inkling@4.25.63 from the private registry
   reviewer asked for a paired old-profile arm before shipping
 [note] confab guard: abstain beats a wrong verbatim read every time
 $ git log --oneline -12

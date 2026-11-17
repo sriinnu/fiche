@@ -80,7 +80,7 @@ export const COMPACT_HISTORY_TRANSCRIPT_OUTRO = '[End earlier conversation.]';
 // OLDEST turn, so it would otherwise be the first thing imaged and the model loses
 // it — "I wonder what the user actually asked" → off-task drift.
 const PINNED_REQUEST_HEADER =
-  '\n===== CURRENT USER REQUEST (live; kept as text by pxpipe, NOT inside any image) =====\n';
+  '\n===== CURRENT USER REQUEST (live; kept as text by inkling, NOT inside any image) =====\n';
 const PINNED_REQUEST_FOOTER =
   '\n===== END CURRENT USER REQUEST =====\n';
 
@@ -96,12 +96,12 @@ export function buildLiveRequestGuard(pinText?: string): string {
   if (pinText !== undefined) {
     const echo = pinText.length > 600 ? pinText.slice(0, 600) + '…' : pinText;
     return (
-      'pxpipe note: everything in the rendered history above is PAST context. Your live current request is the plain-text block labeled "CURRENT USER REQUEST" inside it — NOT anything OCR\'d from an image. It reads: «' +
+      'inkling note: everything in the rendered history above is PAST context. Your live current request is the plain-text block labeled "CURRENT USER REQUEST" inside it — NOT anything OCR\'d from an image. It reads: «' +
       echo +
       '» Answer THAT request.'
     );
   }
-  return 'pxpipe note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
+  return 'inkling note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
 }
 
 /** Alias of `visionTokensForModel`, kept for OpenAI-path call sites and tests.
@@ -203,7 +203,7 @@ function responsesCacheBreakpoint(
   profile: GptModelProfile,
   allowExplicit: boolean,
 ): Record<string, unknown> {
-  // ChatGPT Codex rejects this field on every model that 0.16.0 started
+  // ChatGPT Codex rejects this field on every model whose profile started
   // marking cacheBreakpoints. api.openai.com still receives it when the
   // profile asks and the caller did not already pick a non-implicit mode.
   if (!allowExplicit || profile.cacheBreakpoints !== true) return {};
@@ -341,7 +341,7 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
  *  history is expensive on its pixel bill + weak cache discount. */
 function configuredHistoryMaxImages(model: string): number {
   const fallback = resolveGptProfile(model).history.maxImages;
-  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_GPT_HISTORY_MAX_IMAGES : undefined;
+  const raw = typeof process !== 'undefined' ? process.env?.INKLING_GPT_HISTORY_MAX_IMAGES : undefined;
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   // Responses providers impose their own total image caps. Keep a defensive ceiling
@@ -847,7 +847,7 @@ function accumulateRenderedImages(
 }
 
 /** o200k_base token count — gpt-5 / gpt-4o / o-series share this encoding. The
- *  honest "as plain text" baseline for the content pxpipe imaged. Pure JS, no
+ *  honest "as plain text" baseline for the content inkling imaged. Pure JS, no
  *  native build, runs in both Node and Workers. */
 function gptTextTokens(text: string): number {
   if (!text) return 0;
@@ -859,14 +859,14 @@ function gptTextTokens(text: string): number {
 }
 
 /** Vision-token cost of the rendered images, summed over their real dims —
- *  what GPT actually bills as input for the slab pxpipe imaged. */
+ *  what GPT actually bills as input for the slab inkling imaged. */
 function gptImageTokens(model: string, images: RenderedImage[]): number {
   let n = 0;
   for (const img of images) n += visionTokensForModel(model, img.width, img.height);
   return n;
 }
 
-/** Text-token value of what pxpipe replaced with images this request: the
+/** Text-token value of what inkling replaced with images this request: the
  *  original system/developer text (now a pointer + image) plus the tool
  *  *description* tokens stripped from the native JSON (the verbose docs moved
  *  into the image). Tool *structure* stays in the JSON on both paths, so only
@@ -1093,19 +1093,19 @@ async function applyResponsesHistoryCollapse(
 
 export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
+  'These images were injected by inkling, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 export const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by pxpipe, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
+  'These images were injected by inkling, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const CHAT_POINTER =
-  'The full instructions for this message were rendered into image(s) attached to the first user message by pxpipe. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
+  'The full instructions for this message were rendered into image(s) attached to the first user message by inkling. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 
 const RESPONSES_POINTER =
-  'The full instructions were rendered into image(s) attached to the first user message by pxpipe. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
+  'The full instructions were rendered into image(s) attached to the first user message by inkling. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 
 export async function transformOpenAIChatCompletions(
   body: Uint8Array,
@@ -1151,7 +1151,8 @@ export async function transformOpenAIChatCompletions(
 
   const authorityDocs: string[] = [];
   const systemTexts: string[] = [];
-  for (const msg of req.messages) {
+  // Leading system/developer messages only; see the Responses path.
+  for (const msg of req.messages.slice(0, firstUserIdx)) {
     if (msg.role !== 'system' && msg.role !== 'developer') continue;
     const text = contentText(msg.content);
     if (!text) continue;
@@ -1302,7 +1303,7 @@ export async function transformOpenAIChatCompletions(
     ...req.messages.slice(firstUserIdx),
   ];
 
-  for (const msg of req.messages) {
+  for (const msg of req.messages.slice(0, firstUserIdx)) {
     if (msg.role !== 'system' && msg.role !== 'developer') continue;
     if (!contentText(msg.content)) continue;
     setTextContent(msg, CHAT_POINTER);
@@ -1387,7 +1388,12 @@ export async function transformOpenAIResponses(
     systemTexts.push(req.instructions);
     info.staticChars += req.instructions.length;
   }
-  for (const item of inputItems) {
+  // Only the LEADING system/developer items are static. Codex appends small
+  // developer notes mid-session (e.g. deferred tool namespaces added/removed);
+  // hoisting those into the slab re-rendered its last page and busted the whole
+  // cached prefix behind it. Later ones stay native, in place, as barriers.
+  const leadingAuthorityEnd = inputWasString ? 0 : firstUserIdx;
+  for (const item of inputItems.slice(0, leadingAuthorityEnd)) {
     const r = (item as ResponsesInputItem).role;
     if (r !== 'system' && r !== 'developer') continue;
     const content = (item as ResponsesInputItem).content;
@@ -1524,7 +1530,7 @@ export async function transformOpenAIResponses(
     ? [{ type: 'input_text', text: slabFactSheet }]
     : [];
   const authorityPointerCount = (typeof req.instructions === 'string' && req.instructions.length > 0 ? 1 : 0)
-    + inputItems.filter((item) => {
+    + inputItems.slice(0, leadingAuthorityEnd).filter((item) => {
       const it = item as ResponsesInputItem;
       return (it.role === 'system' || it.role === 'developer')
         && responsesContentText(it.content).length > 0;
@@ -1570,7 +1576,9 @@ export async function transformOpenAIResponses(
   // input_text part array keeps its array shape with a single pointer part, so a
   // request the caller sent as parts is not silently reshaped into a string.
   if (!inputWasString) {
-    for (const item of inputItems) {
+    // The slab now sits at leadingAuthorityEnd, so indices below it are exactly
+    // the items that were collected.
+    for (const item of inputItems.slice(0, leadingAuthorityEnd)) {
       const it = item as ResponsesInputItem;
       if (it.role !== 'system' && it.role !== 'developer') continue;
       const content = it.content;

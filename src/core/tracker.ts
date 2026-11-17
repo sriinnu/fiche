@@ -1,5 +1,5 @@
 /**
- * Runtime-agnostic event sink for pxpipe.
+ * Runtime-agnostic event sink for inkling.
  * Per-request JSONL record — same shape on Node (file) and Workers (console.log).
  * Never emits raw text; only sizes, counts, durations, env fields, and sha256 prefixes.
  */
@@ -48,7 +48,7 @@ export interface TrackEvent {
   image_tokens?: number;
   /** Provider-specific text-token estimate for imaged/stripped content. */
   baseline_imaged_tokens?: number;
-  /** Provider-specific estimate of pxpipe-added native text. */
+  /** Provider-specific estimate of inkling-added native text. */
   native_injected_tokens?: number;
   /** Chars re-emitted as the pin footer on the last user message.
    *  These are MOVED, not copied: the source lines are stripped from the
@@ -117,7 +117,7 @@ export interface TrackEvent {
    *  A drifting hash means the collapse boundary is unstable. Absent on no-collapse turns. */
   history_image_sha8?: string;
   /** sha8 of the exact cacheable prefix sent (tools+system+imaged prefix, live
-   *  tail excluded). Changes turn-over-turn within a session ⇒ pxpipe-side cache
+   *  tail excluded). Changes turn-over-turn within a session ⇒ inkling-side cache
    *  bust; stable while cache_create spikes ⇒ upstream eviction. See #11. */
   cache_prefix_sha8?: string;
   /** Approx chars in that pinned prefix (growth vs pure-invalidation split). */
@@ -130,7 +130,7 @@ export interface TrackEvent {
   cache_prefix_system_sha8?: string;
   cache_prefix_head_sha8?: string;
   /** The span Anthropic really caches (through the last cache_control marker),
-   *  its size, and the marker's position. Unstable marked digest ⇒ pxpipe-side
+   *  its size, and the marker's position. Unstable marked digest ⇒ inkling-side
    *  bust; stable digest with cache_read 0 ⇒ look upstream, not at the rewrite. */
   cache_prefix_marked_sha8?: string;
   cache_prefix_marked_bytes?: number;
@@ -414,5 +414,5 @@ export class JsonLogTracker implements Tracker {
   }
 }
 
-/** Tracker that drops everything. Used when PXPIPE_TRACK=0. */
+/** Tracker that drops everything. Used when INKLING_TRACK=0. */
 export const noopTracker: Tracker = { emit() {} };

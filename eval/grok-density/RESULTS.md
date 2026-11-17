@@ -55,4 +55,4 @@ GROK_DENSITY_LIVE=1 node eval/grok-density/run.mjs
 ```
 
 Endpoint: OpenAI-compatible Responses via `OPENAI_BASE_URL` + `OPENAI_API_KEY`.
-Harness bypasses pxpipe compression so scores measure raw image reading.
+Harness bypasses inkling compression so scores measure raw image reading.

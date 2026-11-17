@@ -1,6 +1,6 @@
 # Kimi K3 quality results
 
-Model: `moonshotai/kimi-k3` through pxpipe's Anthropic Messages to Cloudflare
+Model: `moonshotai/kimi-k3` through inkling's Anthropic Messages to Cloudflare
 Chat Completions bridge. The run used the generic GPT production profile:
 Spleen 5x8, 152 columns, max height 1932, and the adjacent text factsheet.
 

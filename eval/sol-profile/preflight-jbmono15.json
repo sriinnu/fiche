@@ -219,7 +219,7 @@
     "estimatedSavingsVsTextPct": 56.8
   },
   "tokenNotes": {
-    "image": "pxpipe production visionTokensForModel(gpt-5.6-sol, width, height) patch estimate",
+    "image": "inkling production visionTokensForModel(gpt-5.6-sol, width, height) patch estimate",
     "nonImage": "gpt-tokenizer(prompt) plus a small Responses-envelope allowance; provider usage may differ",
     "textBaseline": "source chars/4, used only for estimated image-vs-text savings"
   }

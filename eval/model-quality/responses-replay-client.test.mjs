@@ -32,7 +32,7 @@ test('retains incomplete-response usage without retrying', async () => {
   const r = await callResponsesRequest({ request, timeoutMs: 1000 });
   assert.equal(r.status, 'incomplete'); assert.equal(r.usage.output_tokens, 768); assert.equal(calls, 1);
 });
-test('refuses the pxpipe endpoint to avoid double transformation', async () => {
+test('refuses the inkling endpoint to avoid double transformation', async () => {
   setup(); process.env.OPENAI_BASE_URL = 'http://127.0.0.1:47821/v1';
   globalThis.fetch = () => { throw Error('must not fetch'); };
   await assert.rejects(callResponsesRequest({ request, timeoutMs: 1000 }));

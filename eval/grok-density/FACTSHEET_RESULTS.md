@@ -34,7 +34,7 @@ and history images (`src/core/openai.ts`).
 ## Verdict
 
 1. **Grok stays opt-in only** (not in `DEFAULT_MODEL_BASES`). Same bar as Opus:
-   not good enough as a silent pxpipe default.
+   not good enough as a silent inkling default.
 2. The factsheet rescues the four token shapes in this fixture, but n=1 cannot
    prove extractor coverage for real sessions.
 3. The built-in opt-in profile therefore uses the independently measured
@@ -43,7 +43,7 @@ and history images (`src/core/openai.ts`).
 4. Style knobs (grid, colorCycle) at 5×8 do not replace either larger cells or
    the factsheet for exact recall.
 
-Enable with `PXPIPE_MODELS=...,grok-4.5` or the dashboard Grok chip.
+Enable with `INKLING_MODELS=...,grok-4.5` or the dashboard Grok chip.
 
 ## How to re-run
 

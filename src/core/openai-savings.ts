@@ -1,16 +1,16 @@
-import { resolveGptProfile } from './gpt-model-profiles.js';
+import { resolvePriceRates } from './pricing.js';
 
 /** Cached-input ÷ uncached-input list-price ratio for the model serving this
  *  request. The ratio is a PROFILE field (`cacheReadRate`), so a new family is
- *  a profile entry or a PXPIPE_GPT_PROFILES override — not a regex added here,
+ *  a profile entry or a INKLING_GPT_PROFILES override — not a regex added here,
  *  which is how the gate and the savings math previously drifted apart. */
 export function openAICacheReadRate(model: string | undefined): number {
-  return resolveGptProfile(model).cacheReadRate;
+  return resolvePriceRates(model).read;
 }
 
 /** Output ÷ uncached-input list-price ratio, from the same profile. */
 export function openAIOutputRate(model: string | undefined): number {
-  return resolveGptProfile(model).outputRate;
+  return resolvePriceRates(model).output;
 }
 
 /** Weighted input tokens actually paid to OpenAI this turn. `cachedTokens` is a
@@ -26,7 +26,7 @@ export function computeOpenAIActualInputEff(
   const written = Math.max(0, Math.min(cacheWriteTokens || 0, inputTokens - cached));
   const uncached = inputTokens - cached - written;
   return uncached + cached * openAICacheReadRate(model)
-    + written * (resolveGptProfile(model).cacheWriteRate ?? 1);
+    + written * resolvePriceRates(model).write;
 }
 
 export function computeOpenAICollapsePaybackReads(
@@ -34,11 +34,11 @@ export function computeOpenAICollapsePaybackReads(
   collapsedTokens: number,
   model?: string,
 ): number {
-  const profile = resolveGptProfile(model);
-  const savedPerRead = (nativeTokens - collapsedTokens) * profile.cacheReadRate;
+  const rates = resolvePriceRates(model);
+  const savedPerRead = (nativeTokens - collapsedTokens) * rates.read;
   if (!(savedPerRead > 0)) return Infinity;
-  const transitionCost = collapsedTokens * (profile.cacheWriteRate ?? 1)
-    - nativeTokens * profile.cacheReadRate;
+  const transitionCost = collapsedTokens * rates.write
+    - nativeTokens * rates.read;
   return Math.ceil(Math.max(0, transitionCost) / savedPerRead);
 }
 
@@ -68,7 +68,7 @@ export function computeOpenAIBaselineInputEff(
   if (inputTokens <= 0 || imageTokens <= 0 || baselineImagedTokens <= 0) return actual;
   const delta = baselineImagedTokens - imageTokens;
   const deltaWeight = (cachedTokens || 0) > 0 ? openAICacheReadRate(model)
-    : cacheWriteTokens > 0 ? resolveGptProfile(model).cacheWriteRate ?? 1 : 1;
+    : cacheWriteTokens > 0 ? resolvePriceRates(model).write : 1;
   // Synthetic native text occupies the same stable prefix as the images, so
   // apply the same observed cache weight as the replacement delta.
   return actual + (delta - Math.max(0, nativeInjectedTokens || 0)) * deltaWeight;

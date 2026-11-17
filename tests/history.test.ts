@@ -857,7 +857,7 @@ describe('transformRequest history compression (always-on)', () => {
       const body = `turn ${i}: ` + bigPlain(3500);
       msgs.push(i % 2 === 0 ? usr(body) : asst(body));
     }
-    // Marked system array (as real Claude Code sends) gives pxpipe exactly one
+    // Marked system array (as real Claude Code sends) gives inkling exactly one
     // caller marker to relocate.
     const marked = new TextEncoder().encode(
       JSON.stringify({
@@ -889,7 +889,7 @@ describe('transformRequest history compression (always-on)', () => {
     expect(markedIdxs[0]).toBeLessThan(histImgs.length - 1);
 
     // Pure relocation: exactly one cache_control across the whole request — the
-    // caller sent one (on the system slab); pxpipe moved it, never added.
+    // caller sent one (on the system slab); inkling moved it, never added.
     const all = [
       ...(Array.isArray(reparsed.system) ? reparsed.system : []),
       ...reparsed.messages.flatMap((m: { content?: unknown }) =>

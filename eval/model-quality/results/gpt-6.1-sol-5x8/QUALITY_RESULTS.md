@@ -1,7 +1,7 @@
 # GPT 6.1 Sol — profile-aligned v2 (Spleen 5×8 control)
 
 2026-10-31. Model `gpt-6.1-sol`, Direct Responses transport, reasoning **low**.
-Runtime override (`PXPIPE_GPT_PROFILES`): Spleen **5×8**, **152 columns**, max height **1954px**, monochrome AA, reflow enabled, full native factsheet, normal image `detail` **high**.
+Runtime override (`INKLING_GPT_PROFILES`): Spleen **5×8**, **152 columns**, max height **1954px**, monochrome AA, reflow enabled, full native factsheet, normal image `detail` **high**.
 
 ## Results vs shipped 14px profile
 

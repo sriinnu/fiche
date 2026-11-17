@@ -4,7 +4,7 @@
 // Live (GROK_DENSITY_LIVE=1): also calls the model over OpenAI Responses and
 // scores the battery. Point OPENAI_BASE_URL + OPENAI_API_KEY at a direct
 // OpenAI-compatible Responses endpoint that serves the Grok model. Do not
-// route this harness through pxpipe — the goal is raw image-reading quality.
+// route this harness through inkling — the goal is raw image-reading quality.
 //
 // Run: pnpm run build && node eval/grok-density/run.mjs
 import { writeFileSync } from 'node:fs';

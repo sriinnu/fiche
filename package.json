@@ -1,11 +1,10 @@
 {
-  "name": "pxpipe-fork",
-  "version": "0.17.0-fork.1",
-  "description": "Fork of teamchong/pxpipe (Steven) plus @sriinnu/pakt. Lossless PAKT for structured text, pxpipe images only for readers that can see them. Not an official teamchong release.",
+  "name": "@sriinnu/inkling",
+  "version": "0.17.0",
+  "description": "Local context proxy for coding agents. Renders stale context as images for models that can read them; everything else passes through untouched.",
   "type": "module",
   "bin": {
-    "pxpipe": "bin/cli.js",
-    "pxpipe-fork": "bin/cli.js",
+    "inkling": "bin/cli.js",
     "inkling-mcp": "bin/mcp.js"
   },
   "exports": {
@@ -62,7 +61,9 @@
     "test:watch": "vitest",
     "prepare": "node scripts/prepare.mjs",
     "prepublishOnly": "pnpm run typecheck && pnpm test && pnpm run build",
-    "vendor:ui": "node scripts/vendor-ui.mjs"
+    "vendor:ui": "node scripts/vendor-ui.mjs",
+    "prices:gen": "tsx scripts/gen-prices.ts",
+    "prices:check": "tsx scripts/gen-prices.ts --check"
   },
   "keywords": [
     "claude",
@@ -74,7 +75,6 @@
     "prompt-cache",
     "vision-tokens",
     "cloudflare-workers",
-    "pakt",
     "mcp"
   ],
   "engines": {
@@ -100,7 +100,6 @@
     "wrangler": "^4.151.1"
   },
   "dependencies": {
-    "@sriinnu/pakt": "0.10.0",
     "gpt-tokenizer": "^4.1.1"
   },
   "author": "Srinivas Pendela (https://github.com/sriinnu)",
@@ -111,19 +110,5 @@
   "homepage": "https://github.com/sriinnu/inkling#readme",
   "bugs": {
     "url": "https://github.com/sriinnu/inkling/issues"
-  },
-  "pxpipeUpstream": {
-    "repo": "https://github.com/teamchong/pxpipe",
-    "author": "Steven (https://github.com/teamchong)",
-    "version": "0.16.0",
-    "commit": "9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3",
-    "license": "MIT"
-  },
-  "pakt": {
-    "package": "@sriinnu/pakt",
-    "version": "0.10.0",
-    "repo": "https://github.com/sriinnu/clipforge-PAKT",
-    "author": "Srinivas Pendela (https://github.com/sriinnu)",
-    "license": "MIT"
   }
 }

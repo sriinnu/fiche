@@ -12,7 +12,7 @@ export const CACHE_READ_RATE = 0.1;
 /** Effective cache-write rate for this request. Older usage payloads do not
  * expose the tier split; preserve the historical/conservative 5-minute rate
  * in that case. The text counterfactual uses the same observed tier mix as
- * the transformed request because pxpipe relocates, rather than invents, the
+ * the transformed request because inkling relocates, rather than invents, the
  * caller's cache-control markers. */
 function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
   if (!(cc > 0)) return CACHE_CREATE_RATE;
@@ -34,6 +34,23 @@ function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
  *  request reports cr === 0 (see deriveBaselineWarmth). */
 export const CACHE_TTL_SEC = 300;
 
+/** The 1-hour cache tier's TTL (seconds). Claude Code writes its main thread,
+ *  and with `subagentPromptCacheTtl: "1h"` its subagents too, at this tier. */
+export const CACHE_TTL_1H_SEC = 3600;
+
+/**
+ * TTL a session's cached prefix lives for, as last observed. Any 1-hour write
+ * proves the caller marks its prefix with `ttl: "1h"`, and that stays true for
+ * the session: later rows that only read, or only append 5-minute blocks after
+ * the 1h prefix, do not shorten the prefix's life. Sticky on purpose. Longer
+ * is the conservative side for savings, since it lets more self-busts count
+ * against inkling.
+ */
+export function observedCacheTtlSec(cc1h: number | undefined, prevTtlSec: number | undefined): number {
+  if ((cc1h ?? 0) > 0) return CACHE_TTL_1H_SEC;
+  return prevTtlSec ?? CACHE_TTL_SEC;
+}
+
 /** This session's previous usage-bearing turn, used only for warm split sizing. */
 export interface BaselineWarmthPrev {
   /** Completion time of that turn, in wall-clock seconds. */
@@ -46,10 +63,13 @@ export interface BaselineWarmthPrev {
   /** cache_prefix_tools_sha8 of that turn. A changed tool list busts the text
    *  prefix too; missing on either side is treated as unknown (don't care). */
   toolsSha?: string;
-  /** cache_prefix_sha8 pxpipe actually sent (post-transform). */
+  /** cache_prefix_sha8 inkling actually sent (post-transform). */
   pxPrefixSha?: string;
   /** Model of that turn; prompt cache does not cross models. */
   model?: string;
+  /** Cache TTL the session's prefix was observed at (see observedCacheTtlSec).
+   *  When set, it replaces the caller's default `ttlSec`. */
+  ttlSec?: number;
 }
 
 /**
@@ -59,8 +79,8 @@ export interface BaselineWarmthPrev {
  *  - this session has a prior row that completed less than `ttlSec` before
  *    this request started, with the same `system_sha8` (both known) and the
  *    same tools hash (or either unknown). The text request would have read
- *    that prefix from cache even if the image path missed — pxpipe busting its
- *    own cache is a real cost of pxpipe, not something text would have paid;
+ *    that prefix from cache even if the image path missed — inkling busting its
+ *    own cache is a real cost of inkling, not something text would have paid;
  *  - or the actual request reports `cr > 0`, which is server proof of a warm read.
  *
  * Otherwise the text baseline is priced cold. When warm, reused =
@@ -73,7 +93,8 @@ export interface BaselineWarmthPrev {
  * @param cacheable  this turn's cacheable-prefix tokens (the full-reuse credit
  *                   when warm only via cr, since cr proves a read but not the split).
  * @param cr         observed cache-read tokens this turn.
- * @param ttlSec     how recently a prior must have completed to count as fresh.
+ * @param ttlSec     how recently a prior must have completed to count as fresh,
+ *                   when the prior carries no observed tier (`prev.ttlSec`).
  * @param prefixSha  system_sha8 of this row. Must match the prior's for a
  *                   cr === 0 row to be warm.
  * @param toolsSha   cache_prefix_tools_sha8 of this row; a mismatch keeps the row cold.
@@ -94,32 +115,33 @@ export function deriveBaselineWarmth(
     || prefixSha === undefined
     || prev.prefixSha === prefixSha;
   // cr is the only warm/cold signal. A prior only refines the warm split.
-  const fresh = prev !== undefined && age >= 0 && age < ttlSec;
+  const window = prev?.ttlSec !== undefined && prev.ttlSec > 0 ? prev.ttlSec : ttlSec;
+  const fresh = prev !== undefined && age >= 0 && age < window;
   const sameTools = prev === undefined
     || prev.toolsSha === undefined
     || toolsSha === undefined
     || prev.toolsSha === toolsSha;
   // A same-prefix prior that completed inside the TTL means the TEXT request
   // would have found its own prefix cached, even when the image path missed
-  // (cr === 0 because pxpipe re-rendered and busted its own cache). Requires a
+  // (cr === 0 because inkling re-rendered and busted its own cache). Requires a
   // positive system match — an unknown system hash can't vouch for the prefix.
   const provenSystem = prev !== undefined
     && prev.prefixSha !== undefined
     && prefixSha !== undefined
     && prev.prefixSha === prefixSha;
   if (!(cr > 0)) {
-    // Self-bust exception: only when pxpipe PROVABLY changed what it sent.
+    // Self-bust exception: only when inkling PROVABLY changed what it sent.
     //  - prompt cache is per model: a model switch means text would miss too;
-    //  - the outgoing cache_prefix_sha8 must differ from the prior's. If pxpipe
+    //  - the outgoing cache_prefix_sha8 must differ from the prior's. If inkling
     //    sent the same prefix and still got cr === 0, the server evicted it and
-    //    text would have missed as well — not pxpipe's fault, not text's gain.
+    //    text would have missed as well — not inkling's fault, not text's gain.
     const sameModel = prev?.model !== undefined
       && opts?.model !== undefined
       && prev.model === opts.model;
-    const pxpipeBusted = prev?.pxPrefixSha !== undefined
+    const inklingBusted = prev?.pxPrefixSha !== undefined
       && opts?.pxPrefixSha !== undefined
       && prev.pxPrefixSha !== opts.pxPrefixSha;
-    if (fresh && provenSystem && sameTools && sameModel && pxpipeBusted) {
+    if (fresh && provenSystem && sameTools && sameModel && inklingBusted) {
       return { warm: true, prevCacheable: prev!.cacheable };
     }
     return { warm: false, prevCacheable: 0 };
@@ -145,7 +167,7 @@ export function deriveBaselineWarmth(
  *   warm turn (a prior turn cached the prefix within TTL):
  *     text append-caches ⇒ reused×CACHE_READ_RATE + grown×CACHE_CREATE_RATE + coldTail×1.0
  *     where reused = min(prevCacheable, cacheable), grown = cacheable − reused.
- *     This is what TEXT pays regardless of whether pxpipe's image busted its
+ *     This is what TEXT pays regardless of whether inkling's image busted its
  *     own cache on a growth turn — so the real growth loss is preserved.
  *
  * Saving = baseline_eff − actual_eff; can be negative (honestly reported, not floored).
@@ -179,12 +201,13 @@ export function computeBaselineInputEffWithCacheTier(
   prevCacheable: number,
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
+  readRate: number = CACHE_READ_RATE,
 ): number {
   if (baseline <= 0) return 0;
   // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
   if (baselineCacheable <= 0) {
     return computeActualInputEffWithCacheTier(
-      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens,
+      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens, readRate,
     );
   }
   const cacheable = Math.min(baselineCacheable, baseline);
@@ -196,7 +219,7 @@ export function computeBaselineInputEffWithCacheTier(
     // the image path's cache.
     const reused = Math.min(Math.max(prevCacheable, 0), cacheable);
     const grown = cacheable - reused;
-    return reused * CACHE_READ_RATE + grown * createRate + coldTail * 1.0;
+    return reused * readRate + grown * createRate + coldTail * 1.0;
   }
   // Cold (first turn / TTL expiry): no warm cache for text either, so it
   // re-creates the whole cacheable prefix at the create rate — same event the
@@ -204,7 +227,7 @@ export function computeBaselineInputEffWithCacheTier(
   return cacheable * createRate + coldTail * 1.0;
 }
 
-/** Weighted input cost pxpipe actually paid this turn. */
+/** Weighted input cost inkling actually paid this turn. */
 export function computeActualInputEff(
   inputTokens: number,
   cc: number,
@@ -220,8 +243,9 @@ export function computeActualInputEffWithCacheTier(
   cr: number,
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
+  readRate: number = CACHE_READ_RATE,
 ): number {
   return inputTokens
     + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
-    + cr * CACHE_READ_RATE;
+    + cr * readRate;
 }

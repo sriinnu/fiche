@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CLAUDE_CODE_OAUTH_IDENTITY } from '../src/core/transform.js';
-import { prepassRequest, hybridTransform } from '../src/core/hybrid.js';
+import { transformAnyRequest } from '../src/core/request-transform.js';
 import { scrubPromptCacheBreakpoint } from '../src/core/codex-cache.js';
 import { shouldImageModel } from '../src/core/reader-tier.js';
 import { MCP_MAX_BYTES, hostHeaderAllowed, pushMcpChunk, startHttpServer } from '../src/mcp/server.js';
@@ -13,56 +13,40 @@ function repetitiveJson(): string {
     events: Array.from({ length: 40 }, (_, i) => ({
       id: i + 1,
       status: 'ok',
-      path: 'src/core/hybrid.ts',
+      path: 'src/core/request-transform.ts',
       note: 'review fixture row',
     })),
   });
 }
 
 describe('review fixes', () => {
-  const prev = process.env.PXPIPE_FORCE_IMAGES;
+  const prev = process.env.INKLING_FORCE_IMAGES;
   afterEach(() => {
-    if (prev === undefined) delete process.env.PXPIPE_FORCE_IMAGES;
-    else process.env.PXPIPE_FORCE_IMAGES = prev;
+    if (prev === undefined) delete process.env.INKLING_FORCE_IMAGES;
+    else process.env.INKLING_FORCE_IMAGES = prev;
   });
 
-  it('keeps the Claude Code identity and the cache_control prefix byte-identical', () => {
-    const pretty = `{
-  "model": "claude-opus-5-5",
-  "system": [
-    { "type": "text", "text": ${JSON.stringify(CLAUDE_CODE_OAUTH_IDENTITY)}, "cache_control": { "type": "ephemeral" } },
-    { "type": "text", "text": "Follow the repository conventions." }
-  ],
-  "messages": [{
-    "role": "user",
-    "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": ${JSON.stringify(repetitiveJson())} }]
-  }]
-}`;
-    const body = enc.encode(pretty);
-    const pre = prepassRequest(body, 'claude-opus-5-5');
-    expect(pre.changed).toBe(true);
-    const outText = new TextDecoder().decode(pre.body);
-    const boundary = pretty.indexOf('"cache_control"');
-    const end = pretty.indexOf('}', pretty.indexOf('}', boundary) + 1);
-    expect(outText.slice(0, end + 1)).toBe(pretty.slice(0, end + 1));
-    const out = JSON.parse(outText) as {
-      system: Array<{ text: string }>;
-      messages: Array<{ role?: string; content?: Array<{ content?: string }> }>;
-    };
-    expect(out.system[0]!.text).toBe(CLAUDE_CODE_OAUTH_IDENTITY);
-    expect(out.system.some((block) => block.text.includes('Pipe-Aligned Kompact Text'))).toBe(false);
-    expect(out.messages.some((message) => message.role === 'system')).toBe(false);
-    expect(out.messages[0]!.content?.[0]?.content).toContain('Pipe-Aligned Kompact Text');
-    expect(out.messages[0]!.content?.[0]?.content).toContain('@from json');
+  it('returns a weak-reader request byte-identical, Claude Code identity included', async () => {
+    const body = enc.encode(JSON.stringify({
+      model: 'claude-opus-5-5',
+      system: [
+        { type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY },
+        { type: 'text', text: 'Follow the repository conventions.' },
+      ],
+      messages: [{
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: repetitiveJson() }],
+      }],
+    }));
+    const result = await transformAnyRequest(body, { model: 'claude-opus-5-5', wire: 'anthropic', charsPerToken: 1, minCompressChars: 1 });
+    expect(result.report.readerTier).toBe('text');
+    expect(result.report.imaged).toBe(false);
+    expect(result.body).toBe(body);
   });
 
   it('does not reserialize a Codex body that has no breakpoint', () => {
     const raw = enc.encode('{\n  "model": "gpt-5.6-sol",\n  "input": "hi"\n}\n');
     expect(scrubPromptCacheBreakpoint(raw)).toBe(raw);
-    const plantedPretty = '{\n  "model": "gpt-5.6-sol",\n  "input": "hi",\n  "prompt_cache_breakpoint": { "mode": "explicit" }\n}\n';
-    const scrubbedPretty = new TextDecoder().decode(scrubPromptCacheBreakpoint(enc.encode(plantedPretty)));
-    expect(scrubbedPretty).toBe('{\n  "model": "gpt-5.6-sol",\n  "input": "hi"\n}\n');
-    expect(scrubbedPretty.startsWith('{\n  "model"')).toBe(true);
     const planted = enc.encode(JSON.stringify({
       input: [{ content: [{ type: 'input_text', text: 'hi', prompt_cache_breakpoint: { mode: 'explicit' } }] }],
     }));
@@ -84,22 +68,22 @@ describe('review fixes', () => {
   });
 
   it('keeps FORCE_IMAGES from imaging a model that is not allowlisted', () => {
-    delete process.env.PXPIPE_FORCE_IMAGES;
+    delete process.env.INKLING_FORCE_IMAGES;
     expect(shouldImageModel('claude-fable-5', true)).toBe(true);
     expect(shouldImageModel('claude-opus-5', true)).toBe(true);
-    expect(shouldImageModel('claude-opus-5-5', true)).toBe(true);
+    expect(shouldImageModel('claude-opus-5-5', true)).toBe(false);
     expect(shouldImageModel('claude-opus-5-5', true, true)).toBe(true);
     expect(shouldImageModel('grok-4.7', false)).toBe(false);
     expect(shouldImageModel('grok-4.7', false, true)).toBe(false);
-    expect(shouldImageModel('grok-4.7', true)).toBe(true);
-    expect(shouldImageModel('claude-haiku-4-5', true)).toBe(true);
+    expect(shouldImageModel('grok-4.7', true)).toBe(false);
+    expect(shouldImageModel('grok-4.7', true, true)).toBe(true);
     expect(shouldImageModel('gpt-5.6-sol', false)).toBe(false);
     expect(shouldImageModel('gpt-5.6-sol', true)).toBe(true);
   });
 
-  it('does not write PXPIPE_FORCE_IMAGES while transforming one MCP-style call', async () => {
-    delete process.env.PXPIPE_FORCE_IMAGES;
-    await hybridTransform(enc.encode(JSON.stringify({
+  it('does not write INKLING_FORCE_IMAGES while transforming one MCP-style call', async () => {
+    delete process.env.INKLING_FORCE_IMAGES;
+    await transformAnyRequest(enc.encode(JSON.stringify({
       model: 'claude-sonnet-5-5',
       messages: [{ role: 'user', content: 'hi' }],
     })), {
@@ -108,7 +92,7 @@ describe('review fixes', () => {
       compress: false,
       forceImages: true,
     });
-    expect(process.env.PXPIPE_FORCE_IMAGES).toBeUndefined();
+    expect(process.env.INKLING_FORCE_IMAGES).toBeUndefined();
   });
 
   it('rejects a non-loopback Host and an oversized HTTP body', async () => {

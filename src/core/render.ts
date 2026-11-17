@@ -393,7 +393,7 @@ const NL_SENTINEL_CP = 0x21b5; // precomputed for hot-path comparisons
 /** Look-alike (U+23CE ⏎) for a ↵ that was ALREADY in the source content — distinct from
  *  the U+21B5 ↵ we insert for newlines. reflow() bails when its input already contains the
  *  sentinel; that's vanishingly rare for normal content but common when the content is about
- *  pxpipe itself (rendered dumps, OCR, this very transcript). {@link neutralizeSentinel}
+ *  inkling itself (rendered dumps, OCR, this very transcript). {@link neutralizeSentinel}
  *  swaps pre-existing sentinels for this glyph in RENDER-PREP only, so reflow can pack
  *  newlines instead of bailing to a raw, unpacked render. Originals are preserved verbatim
  *  elsewhere (recordRecoverable / cache-stable history), and reflow()'s own round-trip
@@ -1156,7 +1156,7 @@ function isWorkersRuntime(): boolean {
  *  after the module has already loaded. Node still resolves it once, below. */
 let renderCacheMaxBytesValue = (() => {
   // Edge-safe: `process` is undefined off-Node.
-  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_RENDER_CACHE_BYTES : undefined;
+  const raw = typeof process !== 'undefined' ? process.env?.INKLING_RENDER_CACHE_BYTES : undefined;
   const parsed = raw !== undefined && raw.trim() !== '' ? Number(raw) : NaN;
   // 0 disables the cache outright; negative/garbage falls back to the default.
   if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
@@ -1277,7 +1277,7 @@ function cloneForCaller(images: readonly RenderedImage[]): RenderedImage[] {
  *  codebase computes over the same bytes for another purpose (`sha8` over the slab,
  *  `sha256Text` in proxy.ts), and gives the encoding a version to bump if the input
  *  tuple ever grows a field. */
-const RENDER_CACHE_KEY_DOMAIN = 'pxpipe/render-cache/v1\n';
+const RENDER_CACHE_KEY_DOMAIN = 'inkling/render-cache/v1\n';
 
 const renderCacheKeyEncoder = new TextEncoder();
 
@@ -1424,7 +1424,7 @@ export interface RenderDensePagesOptions {
    *  `cols` width — the proxy's eval-backed full-canvas / slab behavior. */
   readonly shrink?: boolean;
   /** Reflow (minify + join hard newlines with ↵) before rendering. Default false. Callers
-   *  that pre-reflow (the proxy's maybeReflow / history lockstep) pass false; `pxpipe export`
+   *  that pre-reflow (the proxy's maybeReflow / history lockstep) pass false; `inkling export`
    *  passes true so short lines pack into full-width rows. */
   readonly reflow?: boolean;
   /** Max source chars per page. Default DENSE_CONTENT_CHARS_PER_IMAGE. */
@@ -1437,7 +1437,7 @@ export interface RenderDensePagesOptions {
 
 /**
  * The single dense-page rendering decision shared by the public SDK primitive
- * `renderTextToImages` (library.ts → `pxpipe export`) AND the proxy's `textToImageBlocks`
+ * `renderTextToImages` (library.ts → `inkling export`) AND the proxy's `textToImageBlocks`
  * (transform.ts): optionally reflow, measure the content width, then render. Both callers
  * route through HERE so
  * export PNGs and proxy image blocks are produced by the exact same code and cannot drift —

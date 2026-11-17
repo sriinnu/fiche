@@ -20,7 +20,7 @@
       "output_tokens": 1388
     }
   },
-  "_raw": "```json\n{\"hex12\":{\"answer\":\"8e074d9f2f4f\",\"conf\":\"high\"},\"camel\":{\"answer\":\"buildSessionSummary\",\"conf\":\"high\"},\"path\":{\"answer\":\"/Users/ops/repos/pxpipe/src/core/session.ts\",\"conf\":\"high\"},\"semver\":{\"answer\":\"2.5.63\",\"conf\":\"high\"},\"bytes\":{\"answer\":\"94208\",\"conf\":\"high\"},\"reqid\":{\"answer\":\"a89c48f7-8f7a\",\"conf\":\"high\"},\"envvar\":{\"answer\":\"TRACE_CAPTURE\",\"conf\":\"high\"},\"sha\":{\"answer\":\"c3f19a70e2b5d946\",\"conf\":\"high\"}}\n```",
+  "_raw": "```json\n{\"hex12\":{\"answer\":\"8e074d9f2f4f\",\"conf\":\"high\"},\"camel\":{\"answer\":\"buildSessionSummary\",\"conf\":\"high\"},\"path\":{\"answer\":\"/Users/ops/repos/inkling/src/core/session.ts\",\"conf\":\"high\"},\"semver\":{\"answer\":\"2.5.63\",\"conf\":\"high\"},\"bytes\":{\"answer\":\"94208\",\"conf\":\"high\"},\"reqid\":{\"answer\":\"a89c48f7-8f7a\",\"conf\":\"high\"},\"envvar\":{\"answer\":\"TRACE_CAPTURE\",\"conf\":\"high\"},\"sha\":{\"answer\":\"c3f19a70e2b5d946\",\"conf\":\"high\"}}\n```",
   "hex12": {
     "answer": "8e074d9f2f4f",
     "conf": "high"
@@ -30,7 +30,7 @@
     "conf": "high"
   },
   "path": {
-    "answer": "/Users/ops/repos/pxpipe/src/core/session.ts",
+    "answer": "/Users/ops/repos/inkling/src/core/session.ts",
     "conf": "high"
   },
   "semver": {

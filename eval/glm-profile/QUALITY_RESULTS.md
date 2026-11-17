@@ -4,7 +4,7 @@
 
 Model: `@cf/zai-org/glm-5.3-flash` through Cloudflare Workers AI (via a local
 OpenAI-compatible gateway). Evaluated on the default GPT fallback profile
-(Spleen 5×8, 152 cols, maxH 1932) — GLM has no measured pxpipe profile — plus a
+(Spleen 5×8, 152 cols, maxH 1932) — GLM has no measured inkling profile — plus a
 JetBrains Mono 14px pilot, because the 5×8 baseline turned out illegible to it.
 
 GLM is a reasoning model: completion tokens are spent on `reasoning_content`

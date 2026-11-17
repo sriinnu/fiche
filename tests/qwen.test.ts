@@ -35,14 +35,14 @@ function buildChatMessages(turns: number): Array<Record<string, unknown>> {
   return msgs;
 }
 
-let ambientPxpipeModels: string | undefined;
+let ambientInklingModels: string | undefined;
 beforeEach(() => {
-  ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  delete process.env.PXPIPE_MODELS;
+  ambientInklingModels = process.env.INKLING_MODELS;
+  delete process.env.INKLING_MODELS;
 });
 afterEach(() => {
-  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
-  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+  if (ambientInklingModels === undefined) delete process.env.INKLING_MODELS;
+  else process.env.INKLING_MODELS = ambientInklingModels;
 });
 
 describe('resolveGptProfile (Qwen)', () => {

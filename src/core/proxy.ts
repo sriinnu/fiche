@@ -1,12 +1,12 @@
 /**
- * pxpipe proxy as a single Web-standard fetch handler.
+ * inkling proxy as a single Web-standard fetch handler.
  * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
 import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
-import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
+import { isAnthropicMessagesPath, isInklingSupportedGptModel, isInklingSupportedModel } from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -26,6 +26,13 @@ import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerat
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint } from './codex-cache.js';
+import {
+  DEFAULT_UPSTREAM_REGISTRY,
+  isFollowRefusal,
+  refuseUnfollowedProviderHost,
+  resolveFollowTarget,
+  type UpstreamRegistry,
+} from './upstream-hosts.js';
 import { shouldImageModel } from './reader-tier.js';
 
 export interface ProxyConfig {
@@ -77,18 +84,37 @@ export interface ProxyConfig {
    *  fails open. Prevents one stalled request from permanently 409-ing its retries.
    *  0 disables dedupe entirely. */
   duplicateHoldMs?: number;
-  /** Hard ceiling, in bytes, on an inbound request body pxpipe will hold in
+  /** Hard ceiling, in bytes, on an inbound request body inkling will hold in
    *  memory. Transformable routes have to read the whole body, so without a
    *  ceiling one client decides how much the proxy allocates: a Worker or a Node
    *  instance bound to anything other than loopback is then one long request away
    *  from memory exhaustion. Over-limit bodies get a provider-shaped 413 before
-   *  any upstream call. Routes pxpipe only labels are never rejected by this -
+   *  any upstream call. Routes inkling only labels are never rejected by this -
    *  they carry uploads and audio - but their model sniff is bounded too.
    *
    *  Defaults to {@link DEFAULT_MAX_REQUEST_BYTES}. A non-integer, zero or
    *  negative value is ignored in favour of that default: an unusable limit must
    *  not silently become no limit. */
   maxRequestBytes?: number;
+  /** Undo a request `Content-Encoding` on transformable routes so the body can
+   *  be read. Codex's built-in provider zstd-compresses its Responses POST; left
+   *  encoded, the transform silently skips it. Return `undefined` when the coding
+   *  is unknown, the bytes are corrupt, or the output would pass `maxBytes`: the
+   *  original bytes and header are then forwarded untouched. A decoded body is
+   *  forwarded as plain bytes without the header, since chatgpt.com has been seen
+   *  to refuse zstd on image-heavy bodies. Core stays runtime-neutral, so the Node
+   *  entry supplies this; without it, encoded bodies pass through as before. */
+  decodeRequestBody?: (bytes: Uint8Array, encoding: string, maxBytes: number) => Uint8Array<ArrayBuffer> | undefined;
+  /** "Follow the agent": forward a request whose Host is a registered
+   *  third-party provider (as under `inkling warp`), or whose path is
+   *  `/to/<host>/...`, to that host over https instead of the configured
+   *  upstreams. Only the agent's own credential travels; configured keys,
+   *  gateway headers, bridges and baseline probes never apply. Off by default:
+   *  a public Worker with this on would relay anyone's traffic. See
+   *  core/upstream-hosts.ts. */
+  followHosts?: boolean;
+  /** Registry for `followHosts`; defaults to the built-in provider list. */
+  upstreamRegistry?: UpstreamRegistry;
 }
 
 export interface ProxyEvent {
@@ -187,7 +213,7 @@ function withIdleTimeout(
       timer = undefined;
       onIdle();
       try {
-        ctl?.error(new Error(`pxpipe: upstream stalled for ${budget}ms`));
+        ctl?.error(new Error(`inkling: upstream stalled for ${budget}ms`));
       } catch {
         /* already errored or closed */
       }
@@ -250,7 +276,7 @@ function withClientDisconnect(
   });
 }
 
-/** Cap on bodies buffered only to sniff a model name, on paths pxpipe does not
+/** Cap on bodies buffered only to sniff a model name, on paths inkling does not
  *  transform. Chat requests naming a model are far below this; uploads that blow
  *  past it stream through unbuffered. */
 const MODEL_SNIFF_MAX_BYTES = 1 << 20;
@@ -339,7 +365,7 @@ async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody
  * Read at most `maxPrefix` bytes for inspection while keeping the body
  * forwardable byte-for-byte.
  *
- * Used on routes pxpipe does not transform, where the only thing wanted from the
+ * Used on routes inkling does not transform, where the only thing wanted from the
  * body is the model name for a dashboard label. Rejecting those requests is not
  * an option - the same route carries uploads and audio - so instead of buffering
  * everything, the consumed prefix is replayed ahead of the untouched remainder.
@@ -460,7 +486,7 @@ async function readStreamFieldFromClone(req: Request): Promise<boolean> {
 
 // Claude Code only admits gateway-discovered ids beginning with "claude" or
 // "anthropic". Prefix provider ids for discovery, then remove that compatibility
-// prefix before PXPIPE_MODELS matching and upstream routing.
+// prefix before INKLING_MODELS matching and upstream routing.
 const CLAUDE_GATEWAY_MODEL_PREFIX = 'claude-';
 
 function claudeGatewayModelId(model: string): string {
@@ -733,6 +759,22 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   }
 
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Event info for a request forwarded untouched because the transform threw. */
+function failOpenInfo(body: Uint8Array, message: string): TransformInfo {
+  return {
+    compressed: false,
+    reason: `transform_error_fail_open: ${message.slice(0, 200)}`,
+    origChars: body.byteLength,
+    compressedChars: body.byteLength,
+    imageCount: 0,
+    imageBytes: 0,
+    staticChars: 0,
+    dynamicChars: 0,
+    dynamicBlockCount: 0,
+    droppedChars: 0,
+  };
 }
 
 function revertedGoogleInfo(
@@ -1088,7 +1130,7 @@ const STRIP_REQ_HEADERS = new Set([
   'content-length', // we recompute
   'expect',
   'accept-encoding', // let upstream choose
-  'x-pxpipe-bypass', // pxpipe-only opt-out signal; never forwarded upstream
+  'x-inkling-bypass', // inkling-only opt-out signal; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -1151,13 +1193,27 @@ function isOpenAIResponsesPath(pathname: string): boolean {
 }
 
 /** ChatGPT endpoints used by Codex when `requires_openai_auth = true` is set
- * on a custom provider. They must go to OPENAI_UPSTREAM, never the Anthropic
- * default. Only `responses` is transformed; the models catalogue is forwarded
- * byte-for-byte so Codex can refresh its model list without noisy 404s. */
-function isChatGPTCodexPath(pathname: string): boolean {
-  return pathname === '/backend-api/codex/responses'
-    || pathname === '/backend-api/codex/models'
-    || pathname.startsWith('/backend-api/codex/models/');
+ * on a custom provider. Every `/backend-api/` path is ChatGPT's (responses,
+ * responses/compact, models, usage), so all of them go to OPENAI_UPSTREAM and
+ * never to the Anthropic default, which would swap the ChatGPT bearer for an
+ * Anthropic one and hand the conversation to the wrong provider. Only
+ * `codex/responses` is transformed; the rest are forwarded byte-for-byte. */
+function isChatGPTBackendPath(pathname: string): boolean {
+  return pathname.startsWith('/backend-api/');
+}
+
+/** Google API shapes that are not inference (countTokens, model listing,
+ *  Code Assist control calls). They go to the Google upstream untransformed. */
+function isGoogleFamilyPath(pathname: string): boolean {
+  return /^\/(?:upload\/)?v1(?:beta|alpha)\//.test(pathname)
+    || pathname.startsWith('/v1internal:')
+    || /^\/v1\/models\/[^/]+:[A-Za-z]+$/.test(pathname);
+}
+
+/** Paths the Anthropic default upstream serves. Anything outside every known
+ *  family is refused rather than sent to Anthropic with injected keys. */
+function isAnthropicFamilyPath(pathname: string): boolean {
+  return pathname.startsWith('/v1/') || pathname.startsWith('/api/');
 }
 
 function resolveAuthToken(config: ProxyConfig): string | undefined {
@@ -1167,7 +1223,7 @@ function resolveAuthToken(config: ProxyConfig): string | undefined {
 /** What the client presented, by shape only.
  *
  *  Classification never inspects a credential's contents beyond its prefix and
- *  segment structure, and never reads a local token store: pxpipe does not know
+ *  segment structure, and never reads a local token store: inkling does not know
  *  or want to know which account a token belongs to. Shape is enough to decide
  *  routing, and it is the only thing safe to decide it on. */
 export type InboundCredential =
@@ -1220,7 +1276,7 @@ export type OutboundAuth =
  *     route classifier already refuses this for the ambiguous `/v1/models` path;
  *     this applies the same rule to every OpenAI route.
  *  2. Subscription OAuth is preserved even when the host has an API key
- *     configured. A Codex user proxying through pxpipe means to spend their own
+ *     configured. A Codex user proxying through inkling means to spend their own
  *     subscription; silently substituting the host key bills the wrong account
  *     and usually fails, and the user has no way to see why.
  *  3. Otherwise a configured key replaces whatever arrived, and is used as the
@@ -1260,7 +1316,7 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
   return pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
-    || isChatGPTCodexPath(pathname)
+    || isChatGPTBackendPath(pathname)
     || (isModelsPath && looksOpenAIAuth);
 }
 
@@ -1352,7 +1408,7 @@ async function countGoogleTokensUpstream(
  * Every env-derived input is trimmed of leading/trailing whitespace before
  * URL construction, and trailing slashes are stripped so `base + path` joins
  * cleanly. The trim is defensive: a stray space in OPENAI_UPSTREAM /
- * ANTHROPIC_UPSTREAM / PXPIPE_GATEWAY_BASE_URL (commonly introduced by
+ * ANTHROPIC_UPSTREAM / INKLING_GATEWAY_BASE_URL (commonly introduced by
  * cmd.exe `set VAR=...`, a copy-paste with a trailing space, or a shell
  * quoting bug in a launcher script) would otherwise build URLs like
  * "https://api.openai.com /v1/..." — fetch() then throws
@@ -1369,7 +1425,7 @@ export function resolveUpstreams(config: ProxyConfig): {
     const base = (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '');
     if (!base) {
       throw new Error(
-        "provider 'cloudflare-ai-gateway' requires gatewayBaseUrl (PXPIPE_GATEWAY_BASE_URL)",
+        "provider 'cloudflare-ai-gateway' requires gatewayBaseUrl (INKLING_GATEWAY_BASE_URL)",
       );
     }
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
@@ -1381,7 +1437,7 @@ export function resolveUpstreams(config: ProxyConfig): {
   };
 }
 
-/** Parse PXPIPE_GATEWAY_HEADERS — JSON object or `k=v;k2=v2`. */
+/** Parse INKLING_GATEWAY_HEADERS — JSON object or `k=v;k2=v2`. */
 export function parseGatewayHeaders(spec: string | undefined): Record<string, string> {
   if (!spec) return {};
   const trimmed = spec.trim();
@@ -1447,36 +1503,6 @@ function resolveGoogleUpstream(
 }
 
 /** Build the proxy fetch handler. */
-let hybridLoader: Promise<typeof import('./hybrid.js') | null> | undefined;
-
-function loadHybrid(): Promise<typeof import('./hybrid.js') | null> {
-  hybridLoader ??= import('./hybrid.js').catch((err: unknown) => {
-    const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[pxpipe] hybrid prepass unavailable: ${message}`);
-    return null;
-  });
-  return hybridLoader;
-}
-
-async function prepareHybridBody(body: Uint8Array, model: string | undefined): Promise<{
-  body: Uint8Array;
-  tier: 'image' | 'pakt-text';
-  blocks: number;
-  savedTokens: number;
-  changed: boolean;
-}> {
-  const hybrid = await loadHybrid();
-  if (!hybrid) return { body, tier: 'image', blocks: 0, savedTokens: 0, changed: false };
-  const pre = hybrid.prepassRequest(body, model);
-  return {
-    body: pre.body,
-    tier: pre.tier,
-    blocks: pre.blocks,
-    savedTokens: pre.savedTokens,
-    changed: pre.changed,
-  };
-}
-
 export function createProxy(config: ProxyConfig = {}) {
   const modelRoutes = new Map<string, 'openai' | 'cloudflare'>();
   const inFlight = new Map<string, { lease: symbol; startedAt: number }>();
@@ -1521,6 +1547,17 @@ export function createProxy(config: ProxyConfig = {}) {
     const t0 = Date.now();
     const url = new URL(req.url);
     const path = url.pathname + url.search;
+
+    // inkling speaks HTTP only. A WebSocket handshake forwarded as a plain GET
+    // comes back 405 from chatgpt.com, and Codex's built-in provider then
+    // retries the socket several times before falling back. 426 is the answer
+    // it takes as "use HTTP" on the first try (measured, codex-cli 0.167.1).
+    if ((req.headers.get('upgrade') ?? '').toLowerCase().includes('websocket')) {
+      return new Response(JSON.stringify({ error: { type: 'websocket_unsupported', message: 'inkling proxies HTTP only; retry over HTTP' } }), {
+        status: 426,
+        headers: { 'content-type': 'application/json', connection: 'close' },
+      });
+    }
 
     // Reversibly disguise the configured upstream id for Claude Code's model
     // picker, matching CLIProxyAPI. The id decodes back to the exact provider
@@ -1650,40 +1687,55 @@ let responseContentType: string | undefined;
     // Transform only known shapes; everything else passes through.
     // Explicit per-request opt-out (#111): a subprocess that merely inherited
     // ANTHROPIC_BASE_URL (e.g. a plugin's internal `claude` probe) can send
-    // `x-pxpipe-bypass: 1` — via Claude Code's ANTHROPIC_CUSTOM_HEADERS — to
+    // `x-inkling-bypass: 1` — via Claude Code's ANTHROPIC_CUSTOM_HEADERS — to
     // have its traffic forwarded byte-for-byte untouched. Routing and auth
     // still apply; the header itself is stripped before forwarding.
-    const bypassHeader = req.headers.get('x-pxpipe-bypass');
+    const bypassHeader = req.headers.get('x-inkling-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
-    const providerPrefixed = isProviderPrefixedPath(url.pathname);
+    const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
+    const followed = config.followHosts
+      ? resolveFollowTarget(url, req.headers.get('host'), registry)
+      : refuseUnfollowedProviderHost(req.headers.get('host'), registry);
+    const followRefusal = isFollowRefusal(followed) ? followed : null;
+    /** Set when this request goes to the agent's own third-party host. */
+    const follow = isFollowRefusal(followed) ? null : followed;
+    // Followed hosts mount their API under a prefix (`/anthropic`, `/api`, ...);
+    // classify on the canonical path, forward the original one.
+    const wirePathname = follow ? follow.wirePathname : url.pathname;
+    const providerPrefixed = !follow && isProviderPrefixedPath(url.pathname);
     // Wire-shape detection stays independent from transform eligibility. A
     // bypassed Codex request is still an OpenAI Responses request for routing,
     // accounting, and response scanning; only its body transformation is off.
-    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(wirePathname);
+    const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(wirePathname);
+    const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(wirePathname);
     const isMessages = !bypass && isMessagesWire;
     const isOpenAIChat = !bypass && isOpenAIChatWire;
     const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
-    const googleModelFromPath = req.method === 'POST'
+    const googleModelFromPath = req.method === 'POST' && !follow
       ? parseGoogleModelFromPath(url.pathname)
       : null;
-    const isGoogleInference = req.method === 'POST' && isGoogleInferencePath(url.pathname);
+    const isGoogleInference = req.method === 'POST' && !follow && isGoogleInferencePath(url.pathname);
     const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
     const isGoogle = isGoogleRoute && !bypass;
-    const isOpenAIPath = isCanonicalOpenAIPath(
+    const isGoogleFamily = !follow && (isGoogleRoute || isGoogleFamilyPath(url.pathname));
+    const isOpenAIPath = !follow && isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
     const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
-    const upstreamBase = isGoogleRoute
+    const upstreamBase = follow
+      ? follow.origin
+      : isGoogleFamily
       ? googleUpstream
       : providerPrefixed
         ? passthroughUpstream
         : isOpenAIPath ? openAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
+    /** Set when `decodeRequestBody` undid the request Content-Encoding. */
+    let requestBodyDecoded = false;
     let info: TransformInfo | undefined;
     let requestModel: string | undefined = googleModelFromPath ?? undefined;
     let bridgedGptMessages = false;
@@ -1699,6 +1751,30 @@ let responseContentType: string | undefined;
     let baselineStatusApplies = false;
     let responsesStreaming = false;
 
+    // Refused here, not at resolution: fire() reads the per-request state above.
+    if (followRefusal) {
+      fire(followRefusal.status, undefined, followRefusal.message);
+      return new Response(JSON.stringify({ error: followRefusal.reason, message: followRefusal.message }), {
+        status: followRefusal.status,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+
+    // Default-deny on the stock Anthropic upstream: a path outside every known
+    // family (an agent we do not recognise, a stray browser fetch) would
+    // otherwise reach api.anthropic.com with the host's keys injected. A
+    // custom gateway upstream keeps forwarding unknown paths, since the
+    // operator chose where they go.
+    if (upstreamBase === DEFAULT_UPSTREAM
+      && !isAnthropicFamilyPath(url.pathname)
+      && !isMessagesWire && !isOpenAIChatWire && !isOpenAIResponsesWire) {
+      fire(404, undefined, `unknown_route: ${url.pathname.slice(0, 200)}`);
+      return new Response(JSON.stringify({
+        error: 'unknown_route',
+        message: `inkling does not forward ${url.pathname}; see docs/SECURITY_MODEL.md`,
+      }), { status: 404, headers: { 'content-type': 'application/json' } });
+    }
+
     if (bypass && isOpenAIResponsesWire
       && (req.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
       responsesStreaming = await readStreamFieldFromClone(req);
@@ -1713,7 +1789,7 @@ let responseContentType: string | undefined;
       const bounded = await readBodyBounded(req, maxRequestBytes);
       if (!bounded.ok) {
         const message =
-          `request body exceeds the ${maxRequestBytes}-byte pxpipe limit ` +
+          `request body exceeds the ${maxRequestBytes}-byte inkling limit ` +
           `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
           `read ${bounded.observedBytes})`;
         const error = isMessages
@@ -1727,15 +1803,31 @@ let responseContentType: string | undefined;
           headers: { 'content-type': 'application/json' },
         });
       }
-      const bodyIn = bounded.bytes;
+      let bodyIn = bounded.bytes;
+      const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
+      if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
+        const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
+        if (decoded) {
+          bodyIn = decoded;
+          requestBodyDecoded = true;
+        }
+      }
+      const encodedUndecoded =
+        contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
       try {
-        const transformOpts =
+        const baseTransformOpts =
           typeof config.transform === 'function' ? config.transform() : config.transform;
+        // Bytes still under a coding we did not undo must not be rewritten: the
+        // header would go out unchanged and the upstream would try to decompress
+        // whatever the transform produced. Forward them as they came.
+        const transformOpts = encodedUndecoded
+          ? { ...baseTransformOpts, compress: false }
+          : baseTransformOpts;
         // Fail-closed: unreadable model → no compression, not a risky guess.
         const model = googleModelFromPath ?? readModelField(bodyIn);
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
-        // A turn whose only content is `@pxpipe pin` / `@pxpipe unpin` is
+        // A turn whose only content is `@inkling pin` / `@inkling unpin` is
         // configuration, not a question. Answer it here: forwarding it would bill
         // a full prefix to have the model paraphrase a list the proxy already
         // holds, and the reply would be a guess about state it cannot see.
@@ -1763,7 +1855,8 @@ let responseContentType: string | undefined;
           .find((candidate) => claudeGatewayModelId(candidate) === model);
         const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
         const routedModel = decodedChatModel ?? model;
-        const modelRoute = routedModel ? modelRoutes.get(routedModel) : undefined;
+        // A followed host answers for its own models; never bridge them elsewhere.
+        const modelRoute = routedModel && !follow ? modelRoutes.get(routedModel) : undefined;
         modelRouteForRequest = modelRoute;
         const forceChat = isMessages && modelRoute === 'cloudflare';
         const messagesAnthropic = isMessages
@@ -1778,14 +1871,14 @@ let responseContentType: string | undefined;
         const chatStamp = bridgedChatMessages ? routedModel : undefined;
         const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
         // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
-        // allowlist gates it so PXPIPE_MODELS / the chip can opt out.
+        // allowlist gates it so INKLING_MODELS / the chip can opt out.
         const modelOk = isGoogle
-          ? (isGeminiModel(model) && isPxpipeSupportedModel(model))
+          ? (isGeminiModel(model) && isInklingSupportedModel(model))
           : isMessages
-            ? (messagesAnthropic && isPxpipeSupportedModel(model))
+            ? (messagesAnthropic && isInklingSupportedModel(model))
               || bridgedGptMessages
-              || (bridgedChatMessages && isPxpipeSupportedGptModel(effectiveModel))
-            : isPxpipeSupportedGptModel(model);
+              || (bridgedChatMessages && isInklingSupportedGptModel(effectiveModel))
+            : isInklingSupportedGptModel(model);
         // Compression eligibility and telemetry follow the model that actually
         // receives the request, not Claude Code's local gateway alias.
         if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
@@ -1803,68 +1896,42 @@ let responseContentType: string | undefined;
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
         const routeModel = effectiveModel ?? model ?? undefined;
-        const allowBreakpoints = supportsExplicitPromptCacheBreakpoint({
+        // Third-party hosts never get the OpenAI-only breakpoint field.
+        const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
           pathname: url.pathname,
           upstream: openAIUpstream,
         });
-        // Cache-safe PAKT on the original bytes. Images, when the model is
-        // allowlisted, are rendered from those same original bytes. The cheaper
-        // of raw, PAKT text, and images is what we forward.
-        const hybridMod = await loadHybrid();
-        const pre = hybridMod
-          ? hybridMod.prepassRequest(bridgeBody, routeModel)
-          : {
-              body: bridgeBody,
-              changed: false,
-              tier: 'image' as const,
-              blocks: 0,
-              savedTokens: 0,
-              originalTokens: 0,
-              packedTokens: 0,
-              vias: [] as Array<'none' | 'compress' | 'context-engine' | 'mixed'>,
-            };
-        const imageThisRequest = shouldImageModel(routeModel, modelOk) && transformOpts?.compress !== false;
-        const effectiveOpts = {
-          ...transformOpts,
-          explicitPromptCacheBreakpoints: allowBreakpoints,
-          compress: imageThisRequest,
-        };
+        // Allowlisted models image, except weak or unmeasured readers (Claude
+        // 5.5, Grok, Gemini 4 hydrogen/carbon), which pass through as text until
+        // INKLING_FORCE_IMAGES. That flag does not itself add a model to the
+        // allowlist. Opus 5 still images once named.
+        const imageThisRequest = shouldImageModel(routeModel, modelOk);
+        const effectiveOpts = imageThisRequest
+          ? { ...transformOpts, explicitPromptCacheBreakpoints: allowBreakpoints }
+          : { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
         // Local render+encode cost only. The Google branch below issues upstream
         // count_tokens probes, so the timer closes here rather than after them —
         // otherwise network latency would be charged to our own CPU.
         const tTransform = Date.now();
-        const renderBody = imageThisRequest ? bridgeBody : (pre.changed ? pre.body : bridgeBody);
-        let rendered = isGoogle
-          ? await transformGoogleGenerateContent(renderBody, model!, effectiveOpts)
-          : isMessages
-            ? bridgedGptMessages
-              ? await transformOpenAIResponses(renderBody, effectiveOpts)
-              : bridgedChatMessages
-                ? await transformOpenAIChatCompletions(renderBody, effectiveOpts)
-                : await transformRequest(renderBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
-            : isOpenAIChat
-              ? await transformOpenAIChatCompletions(renderBody, effectiveOpts)
-              : await transformOpenAIResponses(renderBody, effectiveOpts);
-        if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
-          rendered = { ...rendered, body: scrubPromptCacheBreakpoint(rendered.body) };
+        // Fail open: a renderer or transform bug must never cost the user a
+        // turn. The request goes out as it arrived (after any wire bridge, which
+        // the upstream needs), and the event row records why.
+        let r: { body: Uint8Array; info: TransformInfo };
+        try {
+          r = isGoogle
+            ? await transformGoogleGenerateContent(bridgeBody, model!, effectiveOpts)
+            : isMessages
+              ? bridgedGptMessages
+                ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
+                : bridgedChatMessages
+                  ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+                  : await transformRequest(bridgeBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
+              : isOpenAIChat
+                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
+                : await transformOpenAIResponses(bridgeBody, effectiveOpts);
+        } catch (e) {
+          r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
         }
-        const picked = hybridMod
-          ? hybridMod.pickCheapest(
-              bridgeBody,
-              pre,
-              imageThisRequest ? rendered : undefined,
-              routeModel,
-            )
-          : { body: rendered.body, info: rendered.info, choice: 'image' as const };
-        let chosenBody = picked.body;
-        if (!imageThisRequest) {
-          // compress:false still normalizes Gemini thought signatures.
-          chosenBody = rendered.body;
-        } else if (isGoogle && picked.choice !== 'image') {
-          const stamped = await transformGoogleGenerateContent(picked.body, model!, { ...effectiveOpts, compress: false });
-          chosenBody = stamped.body;
-        }
-        let r = { body: chosenBody, info: picked.info };
         if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
           r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
         }
@@ -1886,28 +1953,14 @@ let responseContentType: string | undefined;
           ]);
           if (baseline !== null && transformed !== null) {
             if (transformed >= baseline) {
-              // The probed body was not cheaper. An image miss can still keep
-              // a PAKT rewrite. A PAKT body that itself lost the probe cannot.
-              const probedWasPakt = r.info.reason === 'pakt_text';
-              const keepPakt = !probedWasPakt && pre.changed;
               r = {
-                body: keepPakt ? pre.body : bodyIn,
+                body: bodyIn,
                 info: revertedGoogleInfo(
                   r.info,
                   `not_profitable (${transformed} >= ${baseline} tokens)`,
                   'ok',
                 ),
               };
-              if (keepPakt) {
-                r.info.compressed = true;
-                r.info.reason = 'pakt_text';
-                r.info.hybrid = {
-                  readerTier: pre.tier,
-                  paktBlocks: pre.blocks,
-                  paktSavedTokens: pre.savedTokens,
-                  imaged: false,
-                };
-              }
             } else {
               r.info.baselineTokens = baseline;
               r.info.baselineProbeStatus = 'ok';
@@ -1918,7 +1971,7 @@ let responseContentType: string | undefined;
             r.info.baselineProbeStatus = 'failed';
           }
         }
-        if (!modelOk && r.info.reason !== 'pakt_text') r.info.reason = 'unsupported_model';
+        if (!modelOk) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
@@ -1933,7 +1986,7 @@ let responseContentType: string | undefined;
         if (r.info.compressed && requestByteLimit !== undefined) {
           if (r.body.byteLength > requestByteLimit) {
             r.info.sizeLimitOutcome = 'rejected';
-            const message = `pxpipe serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+            const message = `inkling serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
             fire(413, r.info, message);
             const error = isMessages
               ? { type: 'error', error: { type: 'request_too_large', message } }
@@ -1947,7 +2000,9 @@ let responseContentType: string | undefined;
           }
         }
 
-        if (isMessages && messagesAnthropic) {
+        // Probes go to the configured Anthropic upstream with the host's keys; a
+        // followed request's prompt must not be copied there.
+        if (isMessages && messagesAnthropic && !follow) {
           baselineStatusApplies = true;
           // Probes fire on the ORIGINAL body before the main forward so all three overlap.
           // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
@@ -1988,7 +2043,7 @@ let responseContentType: string | undefined;
           }), { status: 400, headers: { 'content-type': 'application/json' } });
         }
         fire(502, undefined, `transform_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'pxpipe transform failed' }), {
+        return new Response(JSON.stringify({ error: 'inkling transform failed' }), {
           status: 502,
           headers: { 'content-type': 'application/json' },
         });
@@ -2029,7 +2084,16 @@ let responseContentType: string | undefined;
     }
 
     const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
+    // The body now travels as plain bytes; a stale coding header would make
+    // the upstream try to decompress JSON.
+    if (requestBodyDecoded) outHeaders.delete('content-encoding');
+    if (follow) {
+      // The agent addressed this host with this credential; it is the only one
+      // that may travel. No configured key, no gateway header, and never an
+      // Anthropic-issued credential, which no third party should ever see.
+      if (/^Bearer\s+sk-ant-/i.test(outHeaders.get('authorization') ?? '')) outHeaders.delete('authorization');
+      if (/^sk-ant-/i.test(outHeaders.get('x-api-key') ?? '')) outHeaders.delete('x-api-key');
+    } else if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
       // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
       outHeaders.delete('x-api-key');
       const anthropicHeaders: string[] = [];
@@ -2059,7 +2123,7 @@ let responseContentType: string | undefined;
         else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
         // 'keep-inbound' leaves the header filterHeaders already copied.
       }
-    } else if (isGoogleRoute) {
+    } else if (isGoogleFamily) {
       // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
     } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
       if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
@@ -2067,7 +2131,7 @@ let responseContentType: string | undefined;
       if (bearer) outHeaders.set('authorization', `Bearer ${bearer}`);
     }
 
-    applyGatewayHeaders(outHeaders);
+    if (!follow) applyGatewayHeaders(outHeaders);
 
     // Claude Code smuggles its volatile per-turn billing line inside system
     // text. transform.ts strips it from the body (no body position is both
@@ -2091,7 +2155,9 @@ let responseContentType: string | undefined;
     // a /v1 base, or a full …/chat/completions URL). Every other route appends
     // a path to its resolved base.
     let upstreamUrl: string;
-    if (bridgedChatMessages) {
+    if (follow) {
+      upstreamUrl = follow.origin + follow.outboundPath;
+    } else if (bridgedChatMessages) {
       upstreamUrl = chatCompletionsUrl(config.cloudflareUpstream ?? '');
     } else {
       const outPath = bridgedGptMessages
@@ -2159,7 +2225,7 @@ let responseContentType: string | undefined;
       headersTimer = setTimeout(() => {
         headersTimer = undefined;
         timeoutKind = 'headers';
-        upstreamAbort.abort(new Error('pxpipe: upstream headers timeout'));
+        upstreamAbort.abort(new Error('inkling: upstream headers timeout'));
         resolve(HEADERS_TIMEOUT);
       }, headersTimeoutMs);
     });
@@ -2175,6 +2241,9 @@ let responseContentType: string | undefined;
       const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
+        // A followed host's redirect goes back to the agent; following it here
+        // would carry the credential to wherever the 3xx points.
+        ...(follow ? { redirect: 'manual' as const } : {}),
         body: bodyOut,
         signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body
@@ -2186,13 +2255,13 @@ let responseContentType: string | undefined;
       if (raced === HEADERS_TIMEOUT) {
         // Abandoned: keep its eventual rejection from surfacing as unhandled.
         void upstreamFetch.catch(() => undefined);
-        throw new Error('pxpipe: upstream headers timeout');
+        throw new Error('inkling: upstream headers timeout');
       }
       upstreamRes = raced;
       // Watch the raw upstream stream, before any bridge re-encodes it.
       upstreamRes = withIdleTimeout(upstreamRes, headersTimeoutMs, idleTimeoutMs, () => {
         timeoutKind = 'idle';
-        upstreamAbort.abort(new Error('pxpipe: upstream stalled'));
+        upstreamAbort.abort(new Error('inkling: upstream stalled'));
       });
       if (bridgedGptMessages) {
         upstreamRes = await openAIResponsesToAnthropicResponse(upstreamRes, requestModel ?? '');
@@ -2207,13 +2276,13 @@ let responseContentType: string | undefined;
           ? `no response headers within ${headersTimeoutMs}ms`
           : `no upstream bytes for ${idleTimeoutMs}ms`;
         fire(504, info, `upstream_timeout: ${detail}`);
-        return new Response(JSON.stringify({ error: `pxpipe upstream timeout (${detail})` }), {
+        return new Response(JSON.stringify({ error: `inkling upstream timeout (${detail})` }), {
           status: 504,
           headers: { 'content-type': 'application/json' },
         });
       }
       fire(502, info, `upstream_error: ${(e as Error).message}`);
-      return new Response(JSON.stringify({ error: 'pxpipe upstream unreachable' }), {
+      return new Response(JSON.stringify({ error: 'inkling upstream unreachable' }), {
         status: 502,
         headers: { 'content-type': 'application/json' },
       });
@@ -2286,7 +2355,7 @@ let teed: Response;
           clearHeadersTimer();
           releaseInFlight();
           if (!upstreamAbort.signal.aborted) {
-            upstreamAbort.abort(new Error('pxpipe: client disconnected'));
+            upstreamAbort.abort(new Error('inkling: client disconnected'));
           }
         })
       : null;

@@ -1,4 +1,4 @@
-# How pxpipe sizes rendered images
+# How inkling sizes rendered images
 
 Image geometry is selected by the exact model id. `/v1/responses` is only a
 wire protocol: Claude, GPT, and Grok on that path do not share a renderer.

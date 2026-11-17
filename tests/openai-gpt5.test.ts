@@ -3,63 +3,63 @@
  * Chat Completions transformer, and Responses API transformer.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { isPxpipeSupportedGptModel } from '../src/core/applicability.js';
+import { isInklingSupportedGptModel } from '../src/core/applicability.js';
 import { openAIVisionTokens, visionTokensForModel, isClaudeModel, resolveVisionCost, transformOpenAIChatCompletions, transformOpenAIResponses } from '../src/core/openai.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-let ambientPxpipeModels: string | undefined;
+let ambientInklingModels: string | undefined;
 beforeEach(() => {
-  ambientPxpipeModels = process.env.PXPIPE_MODELS;
-  delete process.env.PXPIPE_MODELS;
+  ambientInklingModels = process.env.INKLING_MODELS;
+  delete process.env.INKLING_MODELS;
 });
 afterEach(() => {
-  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
-  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+  if (ambientInklingModels === undefined) delete process.env.INKLING_MODELS;
+  else process.env.INKLING_MODELS = ambientInklingModels;
 });
 
 // ── Task 1: applicability gate ──────────────────────────────────────────────
 
-describe('isPxpipeSupportedGptModel', () => {
+describe('isInklingSupportedGptModel', () => {
   it('keeps GPT 5.6 Sol and sibling models opt-in by default', () => {
-    expect(isPxpipeSupportedGptModel('gpt-5')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.5')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5-mini')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-nano')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol-codex')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol[1m]')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.5')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6-sol')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6-terra')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5-mini')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6-nano')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6-sol-codex')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6-sol[1m]')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol-codex')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol[1m]')).toBe(false);
   });
 
   it('enables only exact Sol ids and suffix aliases when explicitly opted in', () => {
-    process.env.PXPIPE_MODELS = 'gpt-5.6-sol,gpt-6.1-sol';
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol[1m]')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-sol-codex[1m]')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol-codex')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol[1m]')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-sol-codex[1m]')).toBe(true);
-    expect(isPxpipeSupportedGptModel('gpt-5.6')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-5.6-terra')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-6.1')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-6.1-terra')).toBe(false);
+    process.env.INKLING_MODELS = 'gpt-5.6-sol,gpt-6.1-sol';
+    expect(isInklingSupportedGptModel('gpt-5.6-sol')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-5.6-sol-codex')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-5.6-sol[1m]')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-5.6-sol-codex[1m]')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol-codex')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol[1m]')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-6.1-sol-codex[1m]')).toBe(true);
+    expect(isInklingSupportedGptModel('gpt-5.6')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-5.6-terra')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-6.1')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-6.1-terra')).toBe(false);
   });
 
   it('rejects non-GPT-5 models', () => {
-    expect(isPxpipeSupportedGptModel('gpt-4o')).toBe(false);
-    expect(isPxpipeSupportedGptModel('gpt-50')).toBe(false);
-    expect(isPxpipeSupportedGptModel('')).toBe(false);
-    expect(isPxpipeSupportedGptModel(null)).toBe(false);
-    expect(isPxpipeSupportedGptModel(undefined)).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-4o')).toBe(false);
+    expect(isInklingSupportedGptModel('gpt-50')).toBe(false);
+    expect(isInklingSupportedGptModel('')).toBe(false);
+    expect(isInklingSupportedGptModel(null)).toBe(false);
+    expect(isInklingSupportedGptModel(undefined)).toBe(false);
   });
 });
 
@@ -678,12 +678,16 @@ describe('transformOpenAIResponses — history collapse', () => {
       );
     });
     expect(historyItems.length).toBeGreaterThan(0);
-    expect(historyItems.length).toBeLessThan(result.info.responsesComposition!.collapsedFunctionPairs ?? Infinity);
+    // Every user message opens a section (cache stability across turns), and
+    // this fixture has one user message per round, so groups <= rounds.
+    expect(historyItems.length).toBeLessThanOrEqual(result.info.responsesComposition!.collapsedFunctionPairs ?? Infinity);
     const firstHistoryIdx = out.input.indexOf(historyItems[0]!);
     expect(firstHistoryIdx).toBeGreaterThan(0); // slab and opening user state stay first
     const serialized = JSON.stringify(out.input);
-    // Old conversation text is now covered by the image instead of remaining native.
-    expect(serialized).not.toContain(`${OPENING_PROMPT_MARKER} ${OPENING_PROMPT_MARKER}`);
+    // User messages stay native barriers (cross-turn cache stability), so the
+    // opening prompt is still text; the old rounds around it are imaged.
+    expect(serialized).toContain(`${OPENING_PROMPT_MARKER} ${OPENING_PROMPT_MARKER}`);
+    expect(serialized).not.toContain('Working on step 0. Working on step 0.');
     expect(serialized).toContain(LIVE_PROMPT_MARKER);
     // The recent tail is still raw text items (function_call / user), not collapsed.
     const lastUser = [...out.input].reverse().find(
@@ -1148,9 +1152,9 @@ describe('resolveGptProfile (GPT-5.6 Sol)', () => {
 
 describe('resolveGptProfile style overrides', () => {
   it('merges every render knob into the selected model profile', () => {
-    const prev = process.env.PXPIPE_GPT_PROFILES;
+    const prev = process.env.INKLING_GPT_PROFILES;
     try {
-      process.env.PXPIPE_GPT_PROFILES = JSON.stringify({
+      process.env.INKLING_GPT_PROFILES = JSON.stringify({
         'gpt-5.6-sol': {
           stripCols: 100,
           minCompressTokens: 900,
@@ -1203,8 +1207,8 @@ describe('resolveGptProfile style overrides', () => {
         },
       });
     } finally {
-      if (prev === undefined) delete process.env.PXPIPE_GPT_PROFILES;
-      else process.env.PXPIPE_GPT_PROFILES = prev;
+      if (prev === undefined) delete process.env.INKLING_GPT_PROFILES;
+      else process.env.INKLING_GPT_PROFILES = prev;
     }
   });
 });

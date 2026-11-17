@@ -1,12 +1,12 @@
 export {
   getAllowedModelBases,
   getConfiguredModelBases,
-  isPxpipeSupportedGptModel,
-  isPxpipeSupportedModel,
+  isInklingSupportedGptModel,
+  isInklingSupportedModel,
   setAllowedModelBases,
   shouldTransformAnthropicMessages,
-  type PxpipeApplicabilityInput,
-  type PxpipeApplicabilityReason,
+  type InklingApplicabilityInput,
+  type InklingApplicabilityReason,
 } from './applicability.js';
 export {
   buildCountTokensBodies,
@@ -18,26 +18,25 @@ export {
 export {
   transformAnthropicMessages,
   renderTextToImages,
-  type PxpipeOptions,
-  type PxpipeReason,
-  type PxpipeTransformInput,
-  type PxpipeTransformResult,
+  type InklingOptions,
+  type InklingReason,
+  type InklingTransformInput,
+  type InklingTransformResult,
   type RenderTextToImagesOptions,
   type RenderedTextImage,
   type RenderTextToImagesResult,
 } from './library.js';
 export {
   transformRequest,
-  type TransformInfo as PxpipeTransformInfo,
+  type TransformInfo as InklingTransformInfo,
   type TransformOptions,
   type KeepSharpBlock,
   type RecoverableBlock,
 } from './transform.js';
 export { transformOpenAIChatCompletions, transformOpenAIResponses, resolveVisionCost, openAIVisionTokens } from './openai.js';
-export { hybridTransform, prepassRequest, countBillable } from './hybrid.js';
+export { transformAnyRequest, countBillable } from './request-transform.js';
 export { readerTier } from './reader-tier.js';
 export { supportsExplicitPromptCacheBreakpoint, scrubPromptCacheBreakpoint } from './codex-cache.js';
-export { packStructured } from './pakt-stage.js';
 export { createProxy, type ProxyConfig, type ProxyEvent } from './proxy.js';
 export {
   createProviderRouter,

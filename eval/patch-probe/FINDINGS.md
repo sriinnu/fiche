@@ -14,7 +14,7 @@
   grid, so there is no ~1.15 MP cap kicking in — what we render is exactly what
   the model sees.
 
-## Geometry consequences for pxpipe (CELL 5×8, PAD_X = PAD_Y = 4)
+## Geometry consequences for inkling (CELL 5×8, PAD_X = PAD_Y = 4)
 
 - Height = 8 + 8·rows → hits a 28-multiple iff **rows ≡ 6 (mod 7)**
   (every 7 rows = 56 px = exactly 2 patch rows).

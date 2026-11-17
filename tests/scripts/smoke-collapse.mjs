@@ -26,11 +26,11 @@ const upstream = http.createServer((req, res) => {
 await new Promise((r) => upstream.listen(UP_PORT, '127.0.0.1', r));
 
 const px = spawn(process.execPath, ['dist/node.js'], {
-  cwd: '/home/lm/repos/pxpipe',
+  cwd: '/home/lm/repos/inkling',
   env: { ...process.env, PORT: String(PX_PORT), HOST: '127.0.0.1',
          ANTHROPIC_UPSTREAM: `http://127.0.0.1:${UP_PORT}`,
-         PXPIPE_LOG: '/tmp/pxpipe-smoke-events.jsonl',
-         PXPIPE_DASH_PORT: '0' },
+         INKLING_LOG: '/tmp/inkling-smoke-events.jsonl',
+         INKLING_DASH_PORT: '0' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const pxlog=[];
@@ -51,7 +51,7 @@ const send = (msgs) => fetch(`http://127.0.0.1:${PX_PORT}/v1/messages`, {
   body: JSON.stringify({ model:'claude-opus-5', max_tokens:16, messages: msgs }),
 });
 
-// pxpipe also forwards /health and count_tokens baseline probes, and the probe
+// inkling also forwards /health and count_tokens baseline probes, and the probe
 // can land AFTER the message it belongs to — `lastMessage()` therefore races and
 // occasionally measures the probe (0 images) instead of the real request.
 const lastMessage = () => [...seen].reverse().find((s) => s.path === '/v1/messages');
@@ -82,13 +82,13 @@ ck('post-500 turn is not larger than pre-500', s4.imgs <= Math.max(s1.imgs, s2.i
 ck('proxy survived the upstream 500', r4.status === 200, `status=${r4.status}`);
 
 // 4. the client's OWN images count against the same provider cap: a wire that is
-//    already full must come back valid, with pxpipe adding exactly nothing.
+//    already full must come back valid, with inkling adding exactly nothing.
 const img = () => ({ type:'image', source:{ type:'base64', media_type:'image/png', data:'iVBORw0KGgo=' }});
 const full = [{ role:'user', content: Array.from({length:100}, img) }, ...convo(200).slice(1)];
 const r5 = await send(full);
 const s5 = lastMessage();
 ck('client-image-saturated request returns 2xx', r5.status === 200, `status=${r5.status}`);
-ck('pxpipe added no images to a full wire', s5.imgs === 100, `imgs=${s5.imgs} (client sent 100)`);
+ck('inkling added no images to a full wire', s5.imgs === 100, `imgs=${s5.imgs} (client sent 100)`);
 
 ck('collapse actually ran (not a passthrough smoke)', s1.imgs > 0, `imgs=${s1.imgs}`);
 { const sk = pxlog.join('').includes('unsupported='); ck('no unsupported-model skips', !sk, sk ? 'proxy logged skip(unsupported=...)' : 'none'); }

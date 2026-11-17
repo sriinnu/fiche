@@ -1,5 +1,5 @@
 // Render GSM8K problems through a specific model's profile geometry,
-// so the benchmark tests pxpipe as that model would actually see it.
+// so the benchmark tests inkling as that model would actually see it.
 //
 // Usage: MODEL=claude-opus-5 [GSM_IMGS=./imgs] node render_all.mjs [N] [OFFSET]
 //

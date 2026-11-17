@@ -208,7 +208,7 @@ describe('provider router', () => {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
-          'x-pxpipe-provider': 'openai-alt',
+          'x-inkling-provider': 'openai-alt',
         },
         body: JSON.stringify({ provider: 'openai-alt', messages: [] }),
       },

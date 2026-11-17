@@ -1,6 +1,6 @@
 # Grok density / image-recall sweep
 
-**Question:** prior pxpipe recall work covered Fable 5, Opus 4.8, and GPT notes.
+**Question:** prior inkling recall work covered Fable 5, Opus 4.8, and GPT notes.
 If Grok is explicitly enabled on the OpenAI Responses path, does it read the
 shared dense profile, or does it need lower-density geometry?
 
@@ -54,7 +54,7 @@ pnpm run build
 node eval/grok-density/run.mjs
 
 # Live: needs OPENAI_BASE_URL + OPENAI_API_KEY pointing at an OpenAI-compatible
-# Responses endpoint that serves the Grok model. Bypass pxpipe so the eval
+# Responses endpoint that serves the Grok model. Bypass inkling so the eval
 # measures raw image reading, not compression.
 GROK_DENSITY_LIVE=1 node eval/grok-density/run.mjs
 

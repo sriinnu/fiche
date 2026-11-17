@@ -29,8 +29,8 @@ Build the baseline revision separately, then build the candidate normally. From
 the candidate checkout:
 
 ```sh
-PXPIPE_GPT_PROFILES='' BENCH_ROUNDS=96 BENCH_BASELINE_DIST=/path/to/baseline/dist node eval/model-quality/local-preprocess-bench.mjs
-PXPIPE_GPT_PROFILES='' BENCH_ROUNDS=96 BENCH_COLD_EACH=1 BENCH_BASELINE_DIST=/path/to/baseline/dist node eval/model-quality/local-preprocess-bench.mjs
+INKLING_GPT_PROFILES='' BENCH_ROUNDS=96 BENCH_BASELINE_DIST=/path/to/baseline/dist node eval/model-quality/local-preprocess-bench.mjs
+INKLING_GPT_PROFILES='' BENCH_ROUNDS=96 BENCH_COLD_EACH=1 BENCH_BASELINE_DIST=/path/to/baseline/dist node eval/model-quality/local-preprocess-bench.mjs
 ```
 
 [Measurements and source fingerprints](preprocess-summary.json).

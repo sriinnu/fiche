@@ -3,7 +3,7 @@
 # Grok 4.5 quality results
 
 Model: `grok-4.5` through the Codex Responses provider. Image calls bypassed
-pxpipe (`OPENAI_BASE_URL` upstream, port 47821 rejected) and used the **live
+inkling (`OPENAI_BASE_URL` upstream, port 47821 rejected) and used the **live
 production profile** resolved by `resolveGptProfile('grok-4.5')`.
 
 ## Current shipped profile — native 14px / 84 cols / maxH 512 (2026-07-23)

@@ -8,7 +8,7 @@ function request(secret?: string): Request {
     'content-type': 'application/json',
     'x-api-key': 'client-key',
   };
-  if (secret !== undefined) headers['x-pxpipe-secret'] = secret;
+  if (secret !== undefined) headers['x-inkling-secret'] = secret;
   return new Request('https://proxy.example/v1/messages', {
     method: 'POST',
     headers,
@@ -40,7 +40,7 @@ describe('Worker caller authentication', () => {
     vi.stubGlobal('fetch', upstream);
     const env: Env = {
       ANTHROPIC_API_KEY: 'provider-key',
-      PXPIPE_WORKER_SECRET: 'correct-secret',
+      INKLING_WORKER_SECRET: 'correct-secret',
     };
 
     expect((await worker.fetch(request(), env, ctx)).status).toBe(401);
@@ -59,14 +59,14 @@ describe('Worker caller authentication', () => {
     }));
     const env: Env = {
       ANTHROPIC_API_KEY: 'provider-key',
-      PXPIPE_WORKER_SECRET: 'correct-secret',
-      PXPIPE_TRACK: '0',
+      INKLING_WORKER_SECRET: 'correct-secret',
+      INKLING_TRACK: '0',
     };
 
     const res = await worker.fetch(request('correct-secret'), env, ctx);
 
     expect(res.status).toBe(200);
-    expect(forwarded?.headers.get('x-pxpipe-secret')).toBeNull();
+    expect(forwarded?.headers.get('x-inkling-secret')).toBeNull();
     expect(forwarded?.headers.get('x-api-key')).toBe('provider-key');
   });
 });

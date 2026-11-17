@@ -2,7 +2,7 @@
  * DECODED IMAGE BYTES are a second budget, and the count cap does not stand in
  * for them.
  *
- * The provider's documented limit is 100 images, and pxpipe enforced only that.
+ * The provider's documented limit is 100 images, and inkling enforced only that.
  * A long session can assemble a request that is legal by count and fails by
  * weight: production traffic degrades sharply somewhere around 20 MiB, and it
  * degrades as 500s, 502s, empty 200s and stalls, which read as flakiness rather

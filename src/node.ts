@@ -16,6 +16,8 @@ import * as os from 'node:os';
 import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import { guardProxyRequest, parseAllowedHosts } from './core/request-guard.js';
+import { buildUpstreamRegistry, parseUpstreamHosts } from './core/upstream-hosts.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -26,6 +28,7 @@ import {
   type ExportResult,
 } from './core/export.js';
 import { readExportTextFile } from './export-collect.js';
+import { decodeRequestBody } from './request-decoding.js';
 import {
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
@@ -68,7 +71,7 @@ interface RuntimeConfig {
   /** Where the per-session cache pins survive a restart; undefined = off. */
   sessionStateFile?: string;
   /** Persist 4xx request and upstream error bodies for debugging. Off unless
-   *  PXPIPE_DEBUG_CAPTURE_4XX=1. */
+   *  INKLING_DEBUG_CAPTURE_4XX=1. */
   captureErrorReqBody: boolean;
   /** Ceiling on a buffered inbound request body. Unset leaves the core default
    *  (16 MiB). Raise it only if a real client needs more; the default binding is
@@ -76,13 +79,13 @@ interface RuntimeConfig {
   maxRequestBytes?: number;
 }
 
-const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'pxpipe', 'config.json');
-const DEFAULT_EVENTS_FILE = path.join(os.homedir(), '.pxpipe', 'events.jsonl');
-const DEFAULT_SESSION_STATE_FILE = path.join(os.homedir(), '.pxpipe', 'session-state.json');
+const DEFAULT_CONFIG_FILE = path.join(os.homedir(), '.config', 'inkling', 'config.json');
+const DEFAULT_EVENTS_FILE = path.join(os.homedir(), '.inkling', 'events.jsonl');
+const DEFAULT_SESSION_STATE_FILE = path.join(os.homedir(), '.inkling', 'session-state.json');
 
-/** PXPIPE_SESSION_STATE: a path, or 0/off/false/no to disable. */
+/** INKLING_SESSION_STATE: a path, or 0/off/false/no to disable. */
 function resolveSessionStateFile(): string | undefined {
-  const raw = process.env.PXPIPE_SESSION_STATE?.trim();
+  const raw = process.env.INKLING_SESSION_STATE?.trim();
   if (raw === undefined || raw === '') return DEFAULT_SESSION_STATE_FILE;
   if (/^(0|off|false|no)$/i.test(raw)) return undefined;
   return raw;
@@ -135,13 +138,13 @@ function normalizeModelsConfig(value: unknown): string | undefined {
 }
 
 function applyConfigFileDefaults(): void {
-  const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
+  const file = process.env.INKLING_CONFIG ?? DEFAULT_CONFIG_FILE;
   if (!fs.existsSync(file)) return;
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
   } catch (e) {
-    console.warn(`[pxpipe] ignored invalid config ${file}: ${(e as Error).message}`);
+    console.warn(`[inkling] ignored invalid config ${file}: ${(e as Error).message}`);
     return;
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
@@ -149,30 +152,30 @@ function applyConfigFileDefaults(): void {
 
   // Env wins over file config. The dashboard can still override the scope at
   // runtime (in-memory) for an emergency live flip.
-  if (process.env.PXPIPE_MODELS === undefined) {
+  if (process.env.INKLING_MODELS === undefined) {
     const models = normalizeModelsConfig(cfg.models);
-    if (models !== undefined) process.env.PXPIPE_MODELS = models;
+    if (models !== undefined) process.env.INKLING_MODELS = models;
   }
 }
 
 /** Dashboard persistence hook: write the runtime model scope back to the
  *  config file's `models` key so chip toggles survive a restart. Other keys
  *  are preserved; an invalid existing file is left untouched.
- *  NOTE: on the next start an explicit PXPIPE_MODELS env still wins over the
+ *  NOTE: on the next start an explicit INKLING_MODELS env still wins over the
  *  persisted value (same precedence as every other config-file default). */
 function persistModelBasesToConfig(bases: readonly string[]): void {
-  const file = process.env.PXPIPE_CONFIG ?? DEFAULT_CONFIG_FILE;
+  const file = process.env.INKLING_CONFIG ?? DEFAULT_CONFIG_FILE;
   let cfg: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      console.warn(`[pxpipe] could not persist model scope: invalid config object ${file}`);
+      console.warn(`[inkling] could not persist model scope: invalid config object ${file}`);
       return;
     }
     cfg = parsed as Record<string, unknown>;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.warn(`[pxpipe] could not persist model scope: invalid config ${file}: ${(e as Error).message}`);
+      console.warn(`[inkling] could not persist model scope: invalid config ${file}: ${(e as Error).message}`);
       return;
     }
   }
@@ -193,13 +196,13 @@ function persistModelBasesToConfig(bases: readonly string[]): void {
     } catch {
       // The write may have failed before the temporary file was created.
     }
-    console.warn(`[pxpipe] could not persist model scope to ${file}: ${(e as Error).message}`);
+    console.warn(`[inkling] could not persist model scope to ${file}: ${(e as Error).message}`);
   }
 }
 
 function parseCli(argv: string[]): RuntimeConfig {
   // Only flags accepted are --help and --version. Anything else is an
-  // error — there is exactly ONE way to run pxpipe and the dashboard
+  // error — there is exactly ONE way to run inkling and the dashboard
   // exposes every metric the operator might want to inspect.
   for (const a of argv) {
     if (a === '-h' || a === '--help') {
@@ -211,13 +214,13 @@ function parseCli(argv: string[]): RuntimeConfig {
       process.exit(0);
     }
     if (a.startsWith('-')) {
-      console.error(`[pxpipe] unknown option: ${a}`);
-      console.error(`[pxpipe] this build accepts no flags; run \`pxpipe --help\` for env vars`);
+      console.error(`[inkling] unknown option: ${a}`);
+      console.error(`[inkling] this build accepts no flags; run \`inkling --help\` for env vars`);
       process.exit(2);
     }
   }
   applyConfigFileDefaults();
-  const sharedUpstream = process.env.PXPIPE_UPSTREAM;
+  const sharedUpstream = process.env.INKLING_UPSTREAM;
   const cfAccount = process.env.CLOUDFLARE_ACCOUNT_ID?.trim();
   const cfToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
   const parseModels = (value: string | undefined): string[] | undefined => {
@@ -239,15 +242,15 @@ function parseCli(argv: string[]): RuntimeConfig {
     cloudflareApiKey: cfToken,
     openAIModels: parseModels(process.env.OPENAI_MODELS),
     cloudflareModels: parseModels(process.env.CLOUDFLARE_MODELS),
-    provider: parseProvider(process.env.PXPIPE_PROVIDER),
-    gatewayBaseUrl: process.env.PXPIPE_GATEWAY_BASE_URL,
-    gatewayHeaders: parseGatewayHeaders(process.env.PXPIPE_GATEWAY_HEADERS),
-    eventsFile: process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE,
+    provider: parseProvider(process.env.INKLING_PROVIDER),
+    gatewayBaseUrl: process.env.INKLING_GATEWAY_BASE_URL,
+    gatewayHeaders: parseGatewayHeaders(process.env.INKLING_GATEWAY_HEADERS),
+    eventsFile: process.env.INKLING_LOG ?? DEFAULT_EVENTS_FILE,
     sessionStateFile: resolveSessionStateFile(),
     // Off by default: either side of a 4xx may hold prompts or secrets.
     // Opt in for debugging only. (issue #69)
-    captureErrorReqBody: process.env.PXPIPE_DEBUG_CAPTURE_4XX === '1',
-    maxRequestBytes: parseMaxRequestBytes(process.env.PXPIPE_MAX_REQUEST_BYTES),
+    captureErrorReqBody: process.env.INKLING_DEBUG_CAPTURE_4XX === '1',
+    maxRequestBytes: parseMaxRequestBytes(process.env.INKLING_MAX_REQUEST_BYTES),
   };
 }
 
@@ -260,7 +263,7 @@ function parseMaxRequestBytes(value: string | undefined): number | undefined {
   const bytes = Number(raw);
   if (!Number.isSafeInteger(bytes) || bytes <= 0) {
     console.error(
-      `[pxpipe] PXPIPE_MAX_REQUEST_BYTES must be a positive whole number of bytes, got: ${value}`,
+      `[inkling] INKLING_MAX_REQUEST_BYTES must be a positive whole number of bytes, got: ${value}`,
     );
     process.exit(2);
   }
@@ -270,18 +273,18 @@ function parseMaxRequestBytes(value: string | undefined): number | undefined {
 function parseProvider(v: string | undefined): 'cloudflare-ai-gateway' | undefined {
   if (v === undefined || v === '') return undefined;
   if (v === 'cloudflare-ai-gateway') return v;
-  console.error(`[pxpipe] unknown PXPIPE_PROVIDER: ${v}`);
+  console.error(`[inkling] unknown INKLING_PROVIDER: ${v}`);
   process.exit(2);
 }
 
 function printHelp(): void {
-  console.log(`inkling — token-saving proxy (pxpipe fork) for coding agents
+  console.log(`inkling — token-saving proxy for Claude Code
 
 Usage:
-  pxpipe                run the proxy (no flags)
-  pxpipe export [...]   render files/diff to PNG pages + cost report (see pxpipe export --help)
-  pxpipe mcp [--http PORT]     MCP server for every agent (stdio, or Streamable HTTP)
-  pxpipe warp [--route PATTERN=TARGET]... -- CMD
+  inkling                run the proxy (no flags)
+  inkling export [...]   render files/diff to PNG pages + cost report (see inkling export --help)
+  inkling mcp [--http PORT]     MCP server for every agent (stdio, or Streamable HTTP)
+  inkling warp [--route PATTERN=TARGET]... -- CMD
                         run CMD behind the proxy without a custom base URL, so
                         client-side first-party gates (/remote-control,
                         claude.ai connectors) keep working.
@@ -289,9 +292,9 @@ Usage:
                         --route adds rules for agents that talk to another
                         base URL, e.g.
                           --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821'
-  pxpipe stats [--json] [--file <p>]
+  inkling stats [--json] [--file <p>]
                         summarize the events log offline (no server needed),
-                        incl. measured savings; defaults to $PXPIPE_LOG
+                        incl. measured savings; defaults to $INKLING_LOG
 
 The proxy compresses eligible tools, schemas, reminders, tool_results,
 and history; tracks events to disk; and measures real saved_pct via
@@ -299,7 +302,7 @@ and history; tracks events to disk; and measures real saved_pct via
 
 Live sessions and cleanup tools live in the dashboard at
   http://127.0.0.1:<port>/  (default port 47821)
-For after-the-fact analysis without the server running, use pxpipe stats.
+For after-the-fact analysis without the server running, use inkling stats.
 
 Flags:
   -h, --help              show this help
@@ -310,10 +313,20 @@ Environment:
   HOST                    interface to bind (default 127.0.0.1, loopback only).
                           Non-loopback bindings expose only the proxy API;
                           dashboard routes remain loopback-only.
-  PXPIPE_UPSTREAM         upstream API base for every API family
-  ANTHROPIC_UPSTREAM      Anthropic API base; overrides PXPIPE_UPSTREAM
+  INKLING_ALLOWED_HOSTS    extra Host/Origin names the proxy API accepts
+                          (comma list; '*' turns the check off). Browser
+                          requests from non-loopback pages, and Hosts that are
+                          public DNS names (DNS rebinding), are refused.
+  INKLING_FOLLOW_HOSTS     0 to stop following agents to their own provider
+                          host (warp Host, or base URL .../to/<host>/). On by
+                          default; only registered hosts, https:443, the
+                          agent's own credential.
+  INKLING_UPSTREAM_HOSTS   extra provider hosts to follow (comma list of
+                          host[/api-prefix], e.g. llm.example.com/anthropic)
+  INKLING_UPSTREAM         upstream API base for every API family
+  ANTHROPIC_UPSTREAM      Anthropic API base; overrides INKLING_UPSTREAM
                            (default https://api.anthropic.com)
-  OPENAI_UPSTREAM         OpenAI API base; overrides PXPIPE_UPSTREAM
+  OPENAI_UPSTREAM         OpenAI API base; overrides INKLING_UPSTREAM
                            (default https://api.openai.com)
   OPENAI_API_KEY          optional OpenAI key override; otherwise forwarded
   OPENAI_MODELS           comma-separated exact model ids routed to OpenAI
@@ -321,32 +334,34 @@ Environment:
   CLOUDFLARE_MODELS       comma-separated exact model ids routed to Cloudflare
   CLOUDFLARE_ACCOUNT_ID   with CLOUDFLARE_API_TOKEN, zero-config Cloudflare
   CLOUDFLARE_API_TOKEN    Workers AI endpoint and bearer token
-  PXPIPE_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
+  INKLING_PROVIDER         optional: 'cloudflare-ai-gateway' — route both API
                           families through one gateway base URL
-  PXPIPE_GATEWAY_BASE_URL gateway base URL (required with PXPIPE_PROVIDER)
-  PXPIPE_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
-  PXPIPE_MODELS           comma-separated model bases that may be imaged
-                          (default claude-fable-5,claude-opus-5-5,gemini).
-                          Each request sends the cheaper of raw text, cache-safe
-                          PAKT, and images. Models not in the list stay text.
-  PXPIPE_FORCE_IMAGES     Does not add a model to PXPIPE_MODELS and does not
+  INKLING_GATEWAY_BASE_URL gateway base URL (required with INKLING_PROVIDER)
+  INKLING_GATEWAY_HEADERS  extra upstream headers: JSON object or k=v;k2=v2
+  INKLING_MODELS           comma-separated model bases allowed to compress
+                          (default claude-fable-5,gemini).
+                          Out-of-scope models pass through untouched. Weak or
+                          unmeasured readers (Claude 5.5, Grok, Gemini 4
+                          hydrogen/carbon) pass through as text, not images,
+                          unless INKLING_FORCE_IMAGES=1.
+  INKLING_FORCE_IMAGES     1 images weak readers too (Claude 5.5, Grok). Does not
                           re-enable prompt_cache_breakpoint on ChatGPT Codex.
-  PXPIPE_CONFIG           JSON config path (default ~/.config/pxpipe/config.json)
+  INKLING_CONFIG           JSON config path (default ~/.config/inkling/config.json)
                           supports {"models": [...]} or {"models": "off"}
-  PXPIPE_LOG              JSONL events path (default ~/.pxpipe/events.jsonl)
-  PXPIPE_SESSION_STATE    where per-session cache pins (freeze-step floor, cache
+  INKLING_LOG              JSONL events path (default ~/.inkling/events.jsonl)
+  INKLING_SESSION_STATE    where per-session cache pins (freeze-step floor, cache
                           liveness) survive a restart; 0/off disables
-                          (default ~/.pxpipe/session-state.json). Without it a
+                          (default ~/.inkling/session-state.json). Without it a
                           restart drops every live session's floor.
-  PXPIPE_DUMP_DIR         debug: write every rendered PNG here (what the model
+  INKLING_DUMP_DIR         debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
-  PXPIPE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
+  INKLING_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
                           (default 64 MiB here; 8 MiB on Workers, where the
                           isolate has ~128 MiB for everything). Frozen history
                           chunks are byte-identical across turns, so
                           re-rendering them is wasted CPU; 0 disables the cache.
                           Live counters at /proxy-stats under render_cache.
-  PXPIPE_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
+  INKLING_DEBUG_CAPTURE_4XX  debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
 
@@ -362,12 +377,12 @@ Use with OpenAI-compatible GPT clients:
 // `define`. Under a non-bundled dev runner (tsx) the identifier is not defined;
 // `typeof` returns "undefined" instead of throwing (ECMA-262 §13.5.3), so the
 // guard is safe. `npm_package_version` is only a dev fallback: npm sets it just
-// inside its own run-script env, so for `npx pxpipe-proxy` or a global bin it is
+// inside its own run-script env, so for `npx @sriinnu/inkling` or a global bin it is
 // undefined (or reflects the *consumer's* package), never this tool's version.
-declare const __PXPIPE_VERSION__: string | undefined;
+declare const __INKLING_VERSION__: string | undefined;
 
 function printVersion(): void {
-  const injected = typeof __PXPIPE_VERSION__ === 'string' ? __PXPIPE_VERSION__ : undefined;
+  const injected = typeof __INKLING_VERSION__ === 'string' ? __INKLING_VERSION__ : undefined;
   console.log(injected ?? process.env.npm_package_version ?? 'unknown');
 }
 
@@ -632,7 +647,7 @@ async function dispatchDashboard(
         return dashboard.serveFragment('toggle', url, port);
       }
       // /fragments/models POSTs one chip flip {model, on}, or a whole-scope
-      // rewrite {list: "csv"} from the PXPIPE_MODELS textbox. Server mutates
+      // rewrite {list: "csv"} from the INKLING_MODELS textbox. Server mutates
       // the runtime compress scope and returns the re-rendered rows.
       if (route.name === 'models' && method === 'POST') {
         let model = '';
@@ -730,7 +745,7 @@ class FileTracker implements Tracker {
     } catch (err) {
       if (!this.brokenLogged) {
         console.error(
-          `[pxpipe] FileTracker disabled — cannot open ${this.filePath}: ${(err as Error).message}`,
+          `[inkling] FileTracker disabled — cannot open ${this.filePath}: ${(err as Error).message}`,
         );
         this.brokenLogged = true;
       }
@@ -767,7 +782,7 @@ class FileTracker implements Tracker {
     } catch (err) {
       if (!this.brokenLogged) {
         console.error(
-          `[pxpipe] FileTracker write failed: ${(err as Error).message}`,
+          `[inkling] FileTracker write failed: ${(err as Error).message}`,
         );
         this.brokenLogged = true;
       }
@@ -839,13 +854,13 @@ async function maybeWriteBodySidecar(
   }
 }
 
-// ---- pxpipe export -------------------------------------------------------
+// ---- inkling export -------------------------------------------------------
 
 function printExportHelp(): void {
-  console.log(`pxpipe export — render code/text to PNG pages for compressed LLM context
+  console.log(`inkling export — render code/text to PNG pages for compressed LLM context
 
 Usage:
-  pxpipe export [target ...]    default target is "." (current directory)
+  inkling export [target ...]    default target is "." (current directory)
 
 Targets:
   Files or directories to include. Multiple targets are joined with a header
@@ -865,7 +880,7 @@ Options:
   -h, --help         show this help
 
 Output:
-  <out>/pxpipe-export-<hash>/
+  <out>/inkling-export-<hash>/
     page-001.png ...  rendered image pages
     factsheet.txt     verbatim precision tokens (paths, SHAs, ids, numbers)
     manifest.json     metadata + token report
@@ -877,12 +892,12 @@ Report columns:
   % saved       (text − image) / text × 100
 
 Examples:
-  pxpipe export .                              # whole directory
-  pxpipe export --include "*.ts" src/          # TypeScript files only
-  pxpipe export --git                          # uncommitted changes
-  pxpipe export --diff HEAD~3                  # last 3 commits
-  pxpipe export --open src/                    # render src/, then reveal the folder
-  cat big-file.txt | pxpipe export --stdin
+  inkling export .                              # whole directory
+  inkling export --include "*.ts" src/          # TypeScript files only
+  inkling export --git                          # uncommitted changes
+  inkling export --diff HEAD~3                  # last 3 commits
+  inkling export --open src/                    # render src/, then reveal the folder
+  cat big-file.txt | inkling export --stdin
 `);
 }
 
@@ -936,7 +951,7 @@ function collectFilesFromTargets(
   for (const target of targets) {
     let st: fs.Stats;
     try { st = fs.statSync(target); } catch {
-      console.warn(`[pxpipe export] skipping inaccessible target: ${target}`);
+      console.warn(`[inkling export] skipping inaccessible target: ${target}`);
       continue;
     }
     if (st.isDirectory()) {
@@ -946,7 +961,7 @@ function collectFilesFromTargets(
       const r = readExportTextFile(target, rel, include, exclude);
       if (r.kind === 'ok') files.push({ relPath: rel, content: r.content });
       else if (r.kind !== 'excluded') {
-        console.warn(`[pxpipe export] skipping ${r.kind} file: ${target}`);
+        console.warn(`[inkling export] skipping ${r.kind} file: ${target}`);
       }
     }
   }
@@ -977,7 +992,7 @@ async function collectSource(opts: ExportParsed): Promise<[string, string[]]> {
     const cwd = opts.targets.length > 0 ? opts.targets[0]! : process.cwd();
     const diff = gitRun(['diff', opts.diff], cwd);
     if (diff === null) {
-      console.error(`[pxpipe export] git diff ${opts.diff} failed`);
+      console.error(`[inkling export] git diff ${opts.diff} failed`);
       process.exit(1);
     }
     return [diff, []];
@@ -1002,7 +1017,7 @@ async function collectSource(opts: ExportParsed): Promise<[string, string[]]> {
       const r = readExportTextFile(full, rel, opts.include, opts.exclude);
       if (r.kind === 'ok') untracked += `\n===== ${rel} =====\n` + r.content;
       else if (r.kind !== 'excluded') {
-        console.warn(`[pxpipe export] skipping ${r.kind} untracked file: ${rel}`);
+        console.warn(`[inkling export] skipping ${r.kind} untracked file: ${rel}`);
       }
     }
     const sourceText = diff + untracked;
@@ -1013,7 +1028,7 @@ async function collectSource(opts: ExportParsed): Promise<[string, string[]]> {
   const targets = opts.targets.length > 0 ? opts.targets : ['.'];
   const files = collectFilesFromTargets(targets, opts.include, opts.exclude);
   if (files.length === 0) {
-    console.warn('[pxpipe export] no files collected');
+    console.warn('[inkling export] no files collected');
   }
   const sourceText = files
     .map((f) => `===== ${f.relPath} =====\n${f.content}`)
@@ -1058,7 +1073,7 @@ function printExportReport(opts: ExportParsed, outDir: string, sourceFiles: stri
     ? ` (${tokenReport.factsheetDropped} dropped)`
     : '';
   console.log(
-    `\npxpipe export\n` +
+    `\ninkling export\n` +
     `  out:            ${outDir}\n` +
     `  files:          ${formatNumber(sourceFiles.length)}\n` +
     `  source chars:   ${formatNumber(manifest.sourceChars)}\n` +
@@ -1084,8 +1099,8 @@ async function runExport(argv: string[]): Promise<void> {
     process.exit(0);
   }
   if (parseResult.kind === 'error') {
-    console.error(`[pxpipe export] ${parseResult.message}`);
-    console.error(`[pxpipe export] run \`pxpipe export --help\` for usage`);
+    console.error(`[inkling export] ${parseResult.message}`);
+    console.error(`[inkling export] run \`inkling export --help\` for usage`);
     process.exit(2);
   }
 
@@ -1094,10 +1109,10 @@ async function runExport(argv: string[]): Promise<void> {
   // Collect source text
   const [sourceText, sourceFiles] = await collectSource(opts);
 
-  // Unique output dir: <out>/pxpipe-export-XXXXXX/. mkdtemp guarantees a fresh, random
+  // Unique output dir: <out>/inkling-export-XXXXXX/. mkdtemp guarantees a fresh, random
   // directory so concurrent runs never collide and stale page-NNN.png never bleed in.
   fs.mkdirSync(opts.out, { recursive: true });
-  const outDir = fs.mkdtempSync(path.join(opts.out, 'pxpipe-export-'));
+  const outDir = fs.mkdtempSync(path.join(opts.out, 'inkling-export-'));
 
   // Run core export
   const result = await runExportCore(sourceText, {
@@ -1138,15 +1153,15 @@ async function main(): Promise<void> {
   }
   if (argv[0] === 'stats') {
     // Offline log analysis — reads the events JSONL without a running proxy.
-    // The live dashboard covers the same data while pxpipe is up.
-    const defaultFile = process.env.PXPIPE_LOG ?? DEFAULT_EVENTS_FILE;
+    // The live dashboard covers the same data while inkling is up.
+    const defaultFile = process.env.INKLING_LOG ?? DEFAULT_EVENTS_FILE;
     const { code, out, err } = await runStats(argv.slice(1), defaultFile);
     if (out) process.stdout.write(out + '\n');
     if (err) process.stderr.write(err + '\n');
     process.exit(code); // server never starts
   }
   // `warp` runs an agent behind a CONNECT proxy and redirects its inference
-  // traffic into the pxpipe already running. It starts no proxy of its own, so
+  // traffic into the inkling already running. It starts no proxy of its own, so
   // it exits through its own branch below rather than falling through here.
   let warpCommand: string[] | undefined;
   const warpRoutes: string[] = [];
@@ -1163,7 +1178,7 @@ async function main(): Promise<void> {
       if (a === '--route') {
         const spec = warpArgv[i + 1];
         if (spec === undefined) {
-          console.error('[pxpipe] warp: --route needs PATTERN=TARGET');
+          console.error('[inkling] warp: --route needs PATTERN=TARGET');
           process.exit(2);
         }
         warpRoutes.push(spec);
@@ -1183,7 +1198,7 @@ async function main(): Promise<void> {
   const opts = parseCli(cliArgv);
 
   // warp only redirects traffic: it decrypts the agent's TLS and re-points the
-  // inference path at the pxpipe you already have running, so that instance
+  // inference path at the inkling you already have running, so that instance
   // does the transforming, the tracking and the dashboard. Everything below —
   // tracker, proxy pipeline, listener — belongs to that instance, not to us.
   if (warpCommand) {
@@ -1191,9 +1206,9 @@ async function main(): Promise<void> {
     return;
   }
   // A/B harness passthrough switch (see the `transform` callback below).
-  const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.PXPIPE_DISABLE ?? '');
+  const forcePassthrough = /^(1|true|yes|on)$/i.test(process.env.INKLING_DISABLE ?? '');
   if (forcePassthrough) {
-    console.log('[pxpipe] PXPIPE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
+    console.log('[inkling] INKLING_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
   // Subscription bearers expire. A client that froze its bearer at startup — a
   // container handed CLAUDE_CODE_OAUTH_TOKEN as an env var — cannot renew one,
@@ -1219,21 +1234,21 @@ async function main(): Promise<void> {
       }
     : undefined;
   if (authTokenFile) {
-    console.log(`[pxpipe] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
+    console.log(`[inkling] ANTHROPIC_OAUTH_TOKEN_FILE set — bearer resolved per request from ${authTokenFile}`);
   }
-  // Debug aid: when PXPIPE_DUMP_DIR is set, persist every rendered PNG this
+  // Debug aid: when INKLING_DUMP_DIR is set, persist every rendered PNG this
   // process emits, so you can eyeball exactly what the model received (OCR /
   // legibility audits, demo inspection). Best-effort — never affects requests.
-  // Note: the PXPIPE_DISABLE arm renders nothing, so only the compress proxy
+  // Note: the INKLING_DISABLE arm renders nothing, so only the compress proxy
   // produces files here.
-  let imageDumpDir: string | undefined = process.env.PXPIPE_DUMP_DIR?.trim() || undefined;
+  let imageDumpDir: string | undefined = process.env.INKLING_DUMP_DIR?.trim() || undefined;
   let imageDumpSeq = 0;
   if (imageDumpDir) {
     try {
       ensurePrivateDirectory(imageDumpDir);
-      console.log(`[pxpipe] PXPIPE_DUMP_DIR set — dumping rendered PNGs to ${imageDumpDir}`);
+      console.log(`[inkling] INKLING_DUMP_DIR set — dumping rendered PNGs to ${imageDumpDir}`);
     } catch (err) {
-      console.warn(`[pxpipe] PXPIPE_DUMP_DIR unusable (${(err as Error).message}) — image dumping disabled`);
+      console.warn(`[inkling] INKLING_DUMP_DIR unusable (${(err as Error).message}) — image dumping disabled`);
       imageDumpDir = undefined;
     }
   }
@@ -1242,7 +1257,7 @@ async function main(): Promise<void> {
   // reminders, tool_results, and history compression all run
   // unconditionally; the per-block break-even gate decides per-call
   // whether to actually image each piece. The function-form `transform`
-  // below is ONLY a kill switch (PXPIPE_DISABLE / dashboard toggle →
+  // below is ONLY a kill switch (INKLING_DISABLE / dashboard toggle →
   // compress:false); on the active path it returns {}, so the gate always
   // runs on static DEFAULTS — charsPerToken=4, priorWarm*=0 — which leaves
   // the warm-baseline and anti-flapping burn terms inert. That is
@@ -1253,9 +1268,9 @@ async function main(): Promise<void> {
   // change decisions. Re-run that reconciliation before wiring one in.
   if (opts.sessionStateFile) {
     const restored = configureSessionStateStore(fileSessionStateStore(opts.sessionStateFile));
-    console.log(`[pxpipe] session state: ${restored} session(s) restored from ${opts.sessionStateFile}`);
+    console.log(`[inkling] session state: ${restored} session(s) restored from ${opts.sessionStateFile}`);
   } else {
-    console.log('[pxpipe] session state: persistence off (PXPIPE_SESSION_STATE)');
+    console.log('[inkling] session state: persistence off (INKLING_SESSION_STATE)');
   }
 
   const tracker: Tracker = new FileTracker(opts.eventsFile);
@@ -1281,6 +1296,9 @@ async function main(): Promise<void> {
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
+  // Follow the agent to its own third-party host (warp Host, or /to/<host>/).
+  const upstreamRegistry = buildUpstreamRegistry(parseUpstreamHosts(process.env.INKLING_UPSTREAM_HOSTS));
+  const followHosts = !/^(?:0|false|off|no)$/i.test((process.env.INKLING_FOLLOW_HOSTS ?? '').trim());
   const config: ProxyConfig = {
     authToken: anthropicAuthToken,
     provider: opts.provider,
@@ -1296,6 +1314,9 @@ async function main(): Promise<void> {
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
     maxRequestBytes: opts.maxRequestBytes,
+    decodeRequestBody,
+    followHosts,
+    upstreamRegistry,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1303,9 +1324,9 @@ async function main(): Promise<void> {
     //      when upstream is unhealthy without restarting.
     //   2. Otherwise use DEFAULTS in transform.ts for break-even gating.
     transform: () => {
-      // A/B harness: PXPIPE_DISABLE=1 forces passthrough (compress=false) for the
+      // A/B harness: INKLING_DISABLE=1 forces passthrough (compress=false) for the
       // whole process, so the "normal" arm can be scripted on its own port while
-      // still logging real usage + count_tokens baselines to its own PXPIPE_LOG.
+      // still logging real usage + count_tokens baselines to its own INKLING_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
       // Active path: use DEFAULTS in transform.ts for break-even gating.
@@ -1315,7 +1336,7 @@ async function main(): Promise<void> {
       // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
       // info.firstImagePng, so capturing has to happen on the raw event.
       dashboard.update(e);
-      // Debug: persist this request's rendered PNGs (see PXPIPE_DUMP_DIR above).
+      // Debug: persist this request's rendered PNGs (see INKLING_DUMP_DIR above).
       // Filenames sort by request order: <stamp>_reqNNN_<model>_pNN.png.
       if (imageDumpDir && e.info?.imagePngs && e.info.imagePngs.length > 0) {
         const seq = ++imageDumpSeq;
@@ -1327,7 +1348,7 @@ async function main(): Promise<void> {
           try {
             fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!, { mode: 0o600 });
           } catch (err) {
-            console.warn(`[pxpipe] PNG dump write failed: ${(err as Error).message}`);
+            console.warn(`[inkling] PNG dump write failed: ${(err as Error).message}`);
             break; // dir vanished / full — stop hammering it this request
           }
         }
@@ -1371,20 +1392,20 @@ async function main(): Promise<void> {
         `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
       );
 
-      // Upstream error bodies are present only under PXPIPE_DEBUG_CAPTURE_4XX;
+      // Upstream error bodies are present only under INKLING_DEBUG_CAPTURE_4XX;
       // custom gateways may echo prompt fragments or credentials in them.
       if (e.errorBody) {
         const trimmed = e.errorBody.length > 400
           ? e.errorBody.slice(0, 400) + '…'
           : e.errorBody;
-        console.warn(`[pxpipe ${e.status}] upstream body: ${trimmed}`);
+        console.warn(`[inkling ${e.status}] upstream body: ${trimmed}`);
       }
 
       // Canary: surface unknown tag-shaped blocks so a Claude Code release
       // that adds a new dynamic tag is caught within hours.
       if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
         console.warn(
-          `[pxpipe warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
+          `[inkling warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
             `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
         );
       }
@@ -1406,11 +1427,12 @@ async function main(): Promise<void> {
         // it (still too big to inline). We never lose the sha8 / error_body.
       }
 
-      // Persistent JSONL event for offline analysis (pxpipe stats etc.).
+      // Persistent JSONL event for offline analysis (inkling stats etc.).
       tracker.emit(toTrackEvent(e));
     },
   };
   const handle = createProxy(config);
+  const allowedHosts = parseAllowedHosts(process.env.INKLING_ALLOWED_HOSTS);
 
   const server = createServer((req, res) => {
     req.socket?.setNoDelay?.(true);
@@ -1436,13 +1458,26 @@ async function main(): Promise<void> {
             return;
           }
         }
+        // Proxy API: refuse browser cross-site requests and rebound Hosts, which
+        // would otherwise spend the configured keys (see core/request-guard.ts).
+        const denial = guardProxyRequest(
+          { host: req.headers.host, origin: req.headers.origin },
+          { allowedHosts, providerHosts: new Set(upstreamRegistry.keys()) },
+        );
+        if (denial) {
+          await writeWebResponse(new Response(JSON.stringify({ error: denial.reason, message: denial.message }), {
+            status: denial.status,
+            headers: { 'content-type': 'application/json' },
+          }), res);
+          return;
+        }
         const webReq = toWebRequest(req);
         const webRes = await handle(webReq);
         await writeWebResponse(webRes, res);
       })
       .catch((err) => {
         if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
-        console.error('[pxpipe] handler error:', err);
+        console.error('[inkling] handler error:', err);
         if (!res.headersSent) res.statusCode = 500;
         if (!res.writableEnded) res.end();
       });
@@ -1454,18 +1489,18 @@ async function main(): Promise<void> {
     opts.host === '127.0.0.1' || opts.host === 'localhost' || opts.host === '::1';
   const announce = () => {
     const routes = resolveUpstreams(config);
-    console.log(`[pxpipe] anthropic upstream → ${routes.anthropic}`);
-    console.log(`[pxpipe] openai upstream → ${routes.openai}`);
+    console.log(`[inkling] anthropic upstream → ${routes.anthropic}`);
+    console.log(`[inkling] openai upstream → ${routes.openai}`);
     if (opts.cloudflareUpstream !== undefined) {
       console.log(
-        `[pxpipe] cloudflare upstream → ${chatCompletionsUrl(opts.cloudflareUpstream)} ` +
+        `[inkling] cloudflare upstream → ${chatCompletionsUrl(opts.cloudflareUpstream)} ` +
           `(models: ${opts.cloudflareModels?.join(', ') || 'none'})`,
       );
     }
-    console.log(`[pxpipe] tracking events → ${opts.eventsFile}`);
+    console.log(`[inkling] tracking events → ${opts.eventsFile}`);
     if (opts.captureErrorReqBody) {
       console.warn(
-        `[pxpipe] PXPIPE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request and ` +
+        `[inkling] INKLING_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request and ` +
           `upstream error bodies (prompts + any secrets in context) to ${bodySidecarDir}. ` +
           `Debugging only.`,
       );
@@ -1473,15 +1508,15 @@ async function main(): Promise<void> {
   };
 
   server.listen(opts.port, opts.host, () => {
-    console.log(`[pxpipe] listening on http://${displayHost}:${opts.port}`);
+    console.log(`[inkling] listening on http://${displayHost}:${opts.port}`);
     if (!isLoopbackHost) {
       console.warn(
-        `[pxpipe] bound to ${opts.host}; proxy API is reachable off-host, ` +
+        `[inkling] bound to ${opts.host}; proxy API is reachable off-host, ` +
           `but dashboard routes remain loopback-only.`,
       );
     }
     announce();
-    console.log(`[pxpipe] dashboard → http://127.0.0.1:${opts.port}/`);
+    console.log(`[inkling] dashboard → http://127.0.0.1:${opts.port}/`);
   });
 
   // server.close() only stops accepting new connections and waits for open
@@ -1493,11 +1528,11 @@ async function main(): Promise<void> {
   let shuttingDown = false;
   const shutdown = (sig: string) => {
     if (shuttingDown) {
-      console.log(`[pxpipe] ${sig} again — forcing exit`);
+      console.log(`[inkling] ${sig} again — forcing exit`);
       process.exit(130);
     }
     shuttingDown = true;
-    console.log(`[pxpipe] ${sig} — shutting down`);
+    console.log(`[inkling] ${sig} — shutting down`);
     // Pins first: losing a freeze-step floor re-keys a whole prefix.
     flushSessionState();
     // Flush+close the tracker so we don't drop the last few events on exit.
@@ -1518,6 +1553,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error('[pxpipe] fatal:', err);
+  console.error('[inkling] fatal:', err);
   process.exit(1);
 });

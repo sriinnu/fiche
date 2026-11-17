@@ -1,15 +1,15 @@
-/** Applicability helpers for pxpipe's production-safe model scope. */
+/** Applicability helpers for inkling's production-safe model scope. */
 
 import { isMisresolvedModelId } from './gpt-model-profiles.js';
 
-export type PxpipeApplicabilityReason =
+export type InklingApplicabilityReason =
   | 'eligible'
   | 'unsupported_model'
   | 'unsupported_method'
   | 'unsupported_path'
   | 'empty_body';
 
-export interface PxpipeApplicabilityInput {
+export interface InklingApplicabilityInput {
   readonly model?: string | null;
   readonly method?: string | null;
   readonly path?: string | null;
@@ -23,14 +23,14 @@ function baseModelId(model: string): string {
   return model.replace(VARIANT_TAG, '');
 }
 
-/** Dashboard runtime override; null = fall back to PXPIPE_MODELS env / built-in default. In-memory only. */
+/** Dashboard runtime override; null = fall back to INKLING_MODELS env / built-in default. In-memory only. */
 let runtimeModelBases: readonly string[] | null = null;
 
-/** Built-in default scope when PXPIPE_MODELS is unset: Fable 5, Opus 5.5, and every Gemini model.
- *  This fork still lists Opus 5.5 so the chip stays visible, but the proxy
- *  routes Claude 5.5 and Grok to lossless PAKT text instead of images
- *  unless PXPIPE_FORCE_IMAGES=1. Fable and Gemini still image.
- *  Everything else is opt-in via dashboard chips or PXPIPE_MODELS:
+/** Built-in default scope when INKLING_MODELS is unset: Fable 5 and Gemini.
+ *  Opus 5.5 is not listed: it misreads dense glyphs (3/15 hex), so imaging it
+ *  is not a saving. Gemini 4 hydrogen/carbon are in scope but stay text until
+ *  measured (reader-tier.ts).
+ *  Everything else is opt-in via dashboard chips or INKLING_MODELS:
  *  - Opus 4.7/4.8 — worse at reading imaged content (FINDINGS.md 2026-06-16:
  *    Opus 4.8 ~2pp arithmetic, 6/15 dense-hex vs Fable 100/100).
  *  - GPT 5.5 — degrades on imaged history/context.
@@ -49,23 +49,23 @@ let runtimeModelBases: readonly string[] | null = null;
  *  reader following the docs believed a model was being imaged that was not. */
 /*  `gemini` is a family base: the prefix match below covers `gemini-3.6-flash`,
  *  `gemini-4`, `gemini-pro`, ... so every Gemini id is on by default. Opting out
- *  is the ordinary path — drop `gemini` from PXPIPE_MODELS or click the chip off —
+ *  is the ordinary path — drop `gemini` from INKLING_MODELS or click the chip off —
  *  which only works because the Google gate in proxy.ts/dashboard.ts consults
  *  this list and nothing else. */
-export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'claude-opus-5-5', 'gemini'];
+export const DEFAULT_MODEL_BASES = ['claude-fable-5', 'gemini'];
 
 function falsey(v: string): boolean {
   return /^(0|false|no|off|none)$/i.test(v.trim());
 }
 
-/** PXPIPE_MODELS env / built-in default, ignoring the runtime override. One CSV
+/** INKLING_MODELS env / built-in default, ignoring the runtime override. One CSV
  *  controls every family (Claude + GPT). Resolution (read per-call so scope flips LIVE):
  *  - unset or empty        → built-in default (Fable 5, Opus 5.5, every Gemini)
  *  - `off`/`0`/`false`/... → compress nothing
  *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {
   // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
-  const raw = typeof process !== 'undefined' ? process.env?.PXPIPE_MODELS : undefined;
+  const raw = typeof process !== 'undefined' ? process.env?.INKLING_MODELS : undefined;
   if (raw === undefined) return [...DEFAULT_MODEL_BASES];
   const trimmed = raw.trim();
   if (!trimmed) return [...DEFAULT_MODEL_BASES];
@@ -83,7 +83,7 @@ export function getAllowedModelBases(): string[] {
   return allowedModelBases();
 }
 
-/** PXPIPE_MODELS env / default scope, independent of runtime override.
+/** INKLING_MODELS env / default scope, independent of runtime override.
  *  Dashboard unions this into its chip set so env-enabled models are always shown as toggles. */
 export function getConfiguredModelBases(): string[] {
   return envOrDefaultBases();
@@ -100,7 +100,7 @@ export function setAllowedModelBases(list: readonly string[] | null): void {
  *    workers-ai/@cf/moonshotai/kimi-k3
  *
  *  The vendor picks the upstream, not the reader, so scope matching also
- *  compares the segment after the last slash. Otherwise PXPIPE_MODELS entries
+ *  compares the segment after the last slash. Otherwise INKLING_MODELS entries
  *  never match behind a gateway. */
 function unqualifiedModelId(base: string): string | null {
   const slash = base.lastIndexOf('/');
@@ -124,17 +124,17 @@ function isAllowed(model: string | null | undefined): boolean {
   });
 }
 
-/** True when pxpipe may transform this Anthropic model. */
-export function isPxpipeSupportedModel(model: string | null | undefined): boolean {
+/** True when inkling may transform this Anthropic model. */
+export function isInklingSupportedModel(model: string | null | undefined): boolean {
   return isAllowed(model);
 }
 
-/** True when pxpipe may transform this GPT model. Shares the single PXPIPE_MODELS scope. */
-export function isPxpipeSupportedGptModel(model: string | null | undefined): boolean {
+/** True when inkling may transform this GPT model. Shares the single INKLING_MODELS scope. */
+export function isInklingSupportedGptModel(model: string | null | undefined): boolean {
   return isAllowed(model);
 }
 
-/** Canonical set of Anthropic Messages routes pxpipe transforms. Shared with
+/** Canonical set of Anthropic Messages routes inkling transforms. Shared with
  *  createProxy (src/core/proxy.ts) so the public applicability helper and the
  *  proxy router can never disagree on which paths are eligible — they did: the
  *  proxy accepts /anthropic/messages, but the helper's old `endsWith` check
@@ -147,8 +147,8 @@ export function isAnthropicMessagesPath(pathname: string): boolean {
 }
 
 export function shouldTransformAnthropicMessages(
-  input: PxpipeApplicabilityInput,
-): { eligible: boolean; reason: PxpipeApplicabilityReason } {
+  input: InklingApplicabilityInput,
+): { eligible: boolean; reason: InklingApplicabilityReason } {
   if (input.method !== undefined && input.method !== null && input.method.toUpperCase() !== 'POST') {
     return { eligible: false, reason: 'unsupported_method' };
   }
@@ -158,7 +158,7 @@ export function shouldTransformAnthropicMessages(
   if (input.bodyBytes !== undefined && input.bodyBytes !== null && input.bodyBytes <= 0) {
     return { eligible: false, reason: 'empty_body' };
   }
-  if (!isPxpipeSupportedModel(input.model)) {
+  if (!isInklingSupportedModel(input.model)) {
     return { eligible: false, reason: 'unsupported_model' };
   }
   return { eligible: true, reason: 'eligible' };

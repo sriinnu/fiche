@@ -1,7 +1,7 @@
 # Grok 4.5 native JetBrains Mono 8–16px blind sweep
 
 Date: 2026-07-23. Model: `grok-4.5` via direct Responses (`OPENAI_BASE_URL`
-upstream local gateway; pxpipe port 47821 rejected by the client).
+upstream local gateway; inkling port 47821 rejected by the client).
 
 ## Protocol (same spirit as Opus / Sol native sweeps)
 

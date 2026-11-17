@@ -9,7 +9,7 @@
     {
       "name": "inkling",
       "source": "./",
-      "description": "Stdio MCP server for compress_text, inspect_savings, transform_request, health, and stats. Calling a tool does not shrink the turn that called it.",
+      "description": "Stdio MCP server for check_model, transform_request, health, and stats. Calling a tool does not shrink the turn that called it.",
       "category": "development"
     }
   ]

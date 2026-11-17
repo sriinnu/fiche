@@ -6,12 +6,12 @@
  * same calls.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { DashboardState, dashboardPath, dashboardHostLabel } from '../src/dashboard.js';
-import { getAllowedModelBases, isPxpipeSupportedModel, setAllowedModelBases } from '../src/core/applicability.js';
+import { getAllowedModelBases, isInklingSupportedModel, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
@@ -22,7 +22,7 @@ import {
 } from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inkling-dashapi-'));
   return {
     eventsFile: path.join(dir, 'events.jsonl'),
     sidecarDir: path.join(dir, '4xx-bodies'),
@@ -116,10 +116,10 @@ describe('serveSessionsJson', () => {
 
   it('respects ?project filtering', async () => {
     writeEvents(tmp, [
-      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pxpipe' }),
+      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/inkling' }),
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
-    const res = await dash.serveSessionsJson({ project: 'pxpipe' });
+    const res = await dash.serveSessionsJson({ project: 'inkling' });
     const body = await res.json();
     expect(body.count).toBe(1);
     expect(body.sessions[0].id).toBe('aaaaaaaa');
@@ -183,16 +183,16 @@ describe('serveFragment', () => {
   });
 
   it('renders opt-in GPT 5.5/5.6 chips and mutates the single model scope', async () => {
-    const prev = process.env.PXPIPE_MODELS;
+    const prev = process.env.INKLING_MODELS;
     try {
-      delete process.env.PXPIPE_MODELS;
+      delete process.env.INKLING_MODELS;
       setAllowedModelBases(null); // reset to built-in Fable-only default
       const off = await (await dash.serveFragment('models', url, 1234)).text();
       expect(off).toContain('Image OpenAI Responses models');
       expect(off).not.toContain('<div class="models" style="display:none">');
-      // PXPIPE_MODELS textbox mirrors the live scope as CSV.
+      // INKLING_MODELS textbox mirrors the live scope as CSV.
       expect(off).toContain('name="list"');
-      expect(off).toContain('value="claude-fable-5,claude-opus-5-5,gemini"');
+      expect(off).toContain('value="claude-fable-5,gemini"');
       expect(off).toContain('GPT 5.6 Sol</button>');
       expect(off).toContain('GPT 5.5</button>');
       // Family chip is lit by default; per-version chips exist for narrowing.
@@ -213,25 +213,25 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('gpt-5.5');
       expect(getAllowedModelBases()).toContain('gpt-5.6-sol');
       // Chip flips are reflected back into the textbox CSV.
-      expect(onBoth).toContain('value="claude-fable-5,claude-opus-5-5,gemini,gpt-5.6-sol,gpt-5.5"');
+      expect(onBoth).toContain('value="claude-fable-5,gemini,gpt-5.6-sol,gpt-5.5"');
       // Opting the Gemini family off is a real opt-out: the chip unlights and
       // the base leaves the scope.
       dash.handleModelsToggle('gemini', false);
       const geminiOff = await (await dash.serveFragment('models', url, 1234)).text();
       expect(geminiOff).toContain('Gemini (all versions)</button>');
       expect(getAllowedModelBases()).not.toContain('gemini');
-      expect(isPxpipeSupportedModel('gemini-4')).toBe(false);
+      expect(isInklingSupportedModel('gemini-4')).toBe(false);
     } finally {
       setAllowedModelBases(null);
-      if (prev === undefined) delete process.env.PXPIPE_MODELS;
-      else process.env.PXPIPE_MODELS = prev;
+      if (prev === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prev;
     }
   });
 
-  it('replaces the whole scope from the PXPIPE_MODELS textbox CSV', async () => {
-    const prev = process.env.PXPIPE_MODELS;
+  it('replaces the whole scope from the INKLING_MODELS textbox CSV', async () => {
+    const prev = process.env.INKLING_MODELS;
     try {
-      delete process.env.PXPIPE_MODELS;
+      delete process.env.INKLING_MODELS;
       dash.handleModelsSet(' claude-fable-5 , grok-4.5 ,');
       expect(getAllowedModelBases()).toEqual(['claude-fable-5', 'grok-4.5']);
       const html = await (await dash.serveFragment('models', url, 1234)).text();
@@ -244,15 +244,15 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toEqual([]);
     } finally {
       setAllowedModelBases(null);
-      if (prev === undefined) delete process.env.PXPIPE_MODELS;
-      else process.env.PXPIPE_MODELS = prev;
+      if (prev === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prev;
     }
   });
 
   it('invokes the host persistence hook on scope mutations', () => {
-    const prev = process.env.PXPIPE_MODELS;
+    const prev = process.env.INKLING_MODELS;
     try {
-      delete process.env.PXPIPE_MODELS;
+      delete process.env.INKLING_MODELS;
       setAllowedModelBases(null);
       const saved: string[][] = [];
       const persisting = new DashboardState(tmp, async () => new Map(), (bases) => {
@@ -260,7 +260,7 @@ describe('serveFragment', () => {
       });
 
       persisting.handleModelsToggle('gpt-5.6-sol', true);
-      expect(saved.at(-1)).toEqual(['claude-fable-5', 'claude-opus-5-5', 'gemini', 'gpt-5.6-sol']);
+      expect(saved.at(-1)).toEqual(['claude-fable-5', 'gemini', 'gpt-5.6-sol']);
       persisting.handleModelsSet('claude-fable-5');
       expect(saved.at(-1)).toEqual(['claude-fable-5']);
       // Empty scope persists too (round-trips as 'off' on load).
@@ -281,8 +281,8 @@ describe('serveFragment', () => {
       expect(getAllowedModelBases()).toContain('grok-4.5');
     } finally {
       setAllowedModelBases(null);
-      if (prev === undefined) delete process.env.PXPIPE_MODELS;
-      else process.env.PXPIPE_MODELS = prev;
+      if (prev === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prev;
     }
   });
 
@@ -381,14 +381,14 @@ describe('serveFragment', () => {
 describe('dashboard host label', () => {
   it('names the host in the title and topbar so two hosts are distinguishable', () => {
     const html = renderPage(47821, 'ber-dev-lm-ai');
-    expect(html).toContain('<title>ber-dev-lm-ai · pxpipe dashboard</title>');
+    expect(html).toContain('<title>ber-dev-lm-ai · inkling dashboard</title>');
     expect(html).toContain('class="hostchip"');
     expect(html).toContain('>ber-dev-lm-ai<');
   });
 
   it('renders the unlabelled page when no host label is given', () => {
     const html = renderPage(47821);
-    expect(html).toContain('<title>pxpipe — live dashboard</title>');
+    expect(html).toContain('<title>inkling — live dashboard</title>');
     expect(html).not.toContain('class="hostchip"');
   });
 
@@ -398,19 +398,19 @@ describe('dashboard host label', () => {
     expect(html).toContain('&lt;img src=x');
   });
 
-  it('prefers PXPIPE_DASH_LABEL and shortens an FQDN hostname', () => {
-    const prev = process.env.PXPIPE_DASH_LABEL;
+  it('prefers INKLING_DASH_LABEL and shortens an FQDN hostname', () => {
+    const prev = process.env.INKLING_DASH_LABEL;
     try {
-      process.env.PXPIPE_DASH_LABEL = 'edi-prod';
+      process.env.INKLING_DASH_LABEL = 'edi-prod';
       expect(dashboardHostLabel()).toBe('edi-prod');
       // An explicitly empty override opts out of the chip entirely.
-      process.env.PXPIPE_DASH_LABEL = '';
+      process.env.INKLING_DASH_LABEL = '';
       expect(dashboardHostLabel()).toBe('');
-      delete process.env.PXPIPE_DASH_LABEL;
+      delete process.env.INKLING_DASH_LABEL;
       expect(dashboardHostLabel()).toBe(os.hostname().split('.')[0]);
     } finally {
-      if (prev === undefined) delete process.env.PXPIPE_DASH_LABEL;
-      else process.env.PXPIPE_DASH_LABEL = prev;
+      if (prev === undefined) delete process.env.INKLING_DASH_LABEL;
+      else process.env.INKLING_DASH_LABEL = prev;
     }
   });
 });
@@ -422,7 +422,7 @@ describe('dashboard page help UI', () => {
     expect(html).toContain('content: attr(data-tip)');
   });
 
-  it('compares imaged requests with their own without-pxpipe counterfactual', () => {
+  it('compares imaged requests with their own without-inkling counterfactual', () => {
     const html = renderHeaderFragment({
       compressed_paid_requests: 600,
       compressed_actual_usd: 96.42,
@@ -435,8 +435,8 @@ describe('dashboard page help UI', () => {
     } as StatsPayload, 47821);
 
     expect(html).toContain('$0.1607');
-    expect(html).toContain('vs $0.4854 without pxpipe');
-    expect(html).not.toContain('vs $0.0722 without pxpipe');
+    expect(html).toContain('vs $0.4854 without inkling');
+    expect(html).not.toContain('vs $0.0722 without inkling');
     expect(html).toContain('same paid imaged requests');
   });
 });
@@ -586,6 +586,44 @@ describe('GPT savings split', () => {
     expect(stats.baseline_input_weighted).toBe(19000);
     expect(stats.saved_input_tokens).toBe(14000);
     expect(stats.saved_usd).toBe(0.14);
+  });
+
+  it('INKLING_PRICES=kosha prices each Claude row at its own read rate and input price', async () => {
+    const savedMode = process.env.INKLING_PRICES;
+    const row = (model: string, sid: string) => ({
+      method: 'POST', path: '/v1/messages', model, status: 200, durationMs: 1,
+      usage: { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 10000 },
+      info: {
+        compressed: true, baselineTokens: 30000, baselineCacheableTokens: 20000,
+        baselineProbeStatus: 'ok', firstUserSha8: sid,
+      },
+    });
+    try {
+      setAllowedModelBases(['claude-opus-5-5', 'claude-mystery-9']);
+      // Legacy: 0.1x read, $10/MTok. actual 100 + 1000, text 2000 + 10000.
+      delete process.env.INKLING_PRICES;
+      dash.update(row('claude-opus-5-5', 'legacy1') as never);
+      let stats = (await dash.serveStats().json()) as StatsPayload;
+      expect(stats.actual_input_weighted).toBe(1100);
+      expect(stats.saved_usd).toBe(0.109);
+
+      // Kosha: Opus 5.5 reads at 0.05x and costs $4/MTok input.
+      process.env.INKLING_PRICES = 'kosha';
+      dash = new DashboardState(tmp);
+      dash.update(row('claude-opus-5-5', 'kosha1') as never);
+      dash.update(row('claude-mystery-9', 'kosha2') as never);
+      stats = (await dash.serveStats().json()) as StatsPayload;
+      // Opus row: actual 100 + 500, text 1000 + 10000, saved 10400 at $4.
+      // Mystery row: unpriced, keeps 0.1x (actual 1100) and stays out of dollars.
+      expect(stats.actual_input_weighted).toBe(600 + 1100);
+      expect(stats.saved_usd).toBe(0.0416);
+      const pa = stats.pricing_assumptions as unknown as Record<string, unknown>;
+      expect(pa.price_mode).toBe('kosha');
+      expect(pa.usd_priced_requests).toBe(1);
+      expect(pa.usd_unpriced_requests).toBe(1);
+    } finally {
+      if (savedMode === undefined) delete process.env.INKLING_PRICES; else process.env.INKLING_PRICES = savedMode;
+    }
   });
 
   it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
@@ -848,8 +886,8 @@ describe('Gemini savings split', () => {
 describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
   // The text path is warm when the actual request read cache (cr>0), or when a
   // same-session prior with the same system + tools hash completed inside the
-  // TTL. The second case covers pxpipe busting its own image cache: the text
-  // request would still have hit its prefix, so that miss is pxpipe's cost.
+  // TTL. The second case covers inkling busting its own image cache: the text
+  // request would still have hit its prefix, so that miss is inkling's cost.
   function antEvt(
     usage: {
       input_tokens: number;
@@ -917,26 +955,26 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
         'warmsess',
         'stable-system',
         undefined,
-        'px-b', // pxpipe sent a different image prefix → its own bust
+        'px-b', // inkling sent a different image prefix → its own bust
       ) as never,
     );
 
     const recent = (await dash.serveRecent().json()) as RecentPayload;
     const miss = recent.recent.at(-1)!;
 
-    // pxpipe's image really did miss — it paid the cold create this turn.
+    // inkling's image really did miss — it paid the cold create this turn.
     expect(miss.cache_read).toBe(0);
 
-    // actual = 100 + 20000×1.25 = 25100 (what pxpipe actually paid this turn).
+    // actual = 100 + 20000×1.25 = 25100 (what inkling actually paid this turn).
     expect(miss.actual_input).toBe(25100);
 
     // Warm text baseline: 20000×0.1 reused + 10000 tail = 12000. The re-create
-    // is charged to pxpipe instead of being booked as savings.
+    // is charged to inkling instead of being booked as savings.
     expect(miss.baseline_input).toBe(12000);
     expect(miss.session_saved_so_far_delta).toBe(-13100);
   });
 
-  it('keeps text cold on cache_read=0 when pxpipe re-sent the same prefix (server eviction)', async () => {
+  it('keeps text cold on cache_read=0 when inkling re-sent the same prefix (server eviction)', async () => {
     const usageWarm = {
       input_tokens: 100,
       output_tokens: 50,
@@ -1030,7 +1068,7 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
         duration_ms: 7502,
         compressed: true,
         model: 'claude-opus-5-5',
-        cache_prefix_sha8: '58d9b560', // real log: pxpipe changed its prefix
+        cache_prefix_sha8: '58d9b560', // real log: inkling changed its prefix
         first_user_sha8: 'c4fa7142',
         system_sha8: '8d36a7a6',
         cache_prefix_tools_sha8: '80a31dc9',
@@ -1053,6 +1091,62 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
     expect(row.actual_input).toBe(64518.3);
     expect(row.baseline_input).toBe(26524.9);
     expect(row.baseline_input! - row.actual_input!).toBeCloseTo(-37993.4, 1);
+  });
+
+  it('live: a 1h-tier prior keeps text warm 20 minutes on; a 5m-tier prior does not', async () => {
+    const missAfter = async (sid: string, oneHour: boolean) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(new Date('2026-05-19T00:00:00Z'));
+        dash.update(antEvt({
+          input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 500, cache_read_input_tokens: 20000,
+          ...{ cache_creation: oneHour
+            ? { ephemeral_1h_input_tokens: 500, ephemeral_5m_input_tokens: 0 }
+            : { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 500 } },
+        } as never, 20000, sid, 'stable-system', undefined, 'px-a') as never);
+        vi.setSystemTime(new Date('2026-05-19T00:20:00Z'));
+        dash.update(antEvt({
+          input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 20000, cache_read_input_tokens: 0,
+        }, 20000, sid, 'stable-system', undefined, 'px-b') as never);
+      } finally {
+        vi.useRealTimers();
+      }
+      const recent = (await dash.serveRecent().json()) as RecentPayload;
+      return recent.recent.at(-1)!.baseline_input;
+    };
+    // Warm text: 20000×0.1 + 10000 tail. Cold text: 20000×1.25 + 10000.
+    expect(await missAfter('hoursess', true)).toBe(12000);
+    expect(await missAfter('fivesess', false)).toBe(35000);
+  });
+
+  it('replay: a 1h-tier prior keeps the golden self-bust warm 20 minutes on', async () => {
+    const row = (ts: string, extra: Record<string, unknown>) => ev({
+      ts,
+      compressed: true,
+      model: 'claude-opus-5-5',
+      first_user_sha8: 'c4fa7142',
+      system_sha8: '8d36a7a6',
+      cache_prefix_tools_sha8: '80a31dc9',
+      baseline_probe_status: 'ok',
+      ...extra,
+    } as never);
+    writeEvents(tmp, [
+      row('2026-10-19T05:51:53.466Z', {
+        duration_ms: 4248, cache_prefix_sha8: '4e4c9ca6',
+        baseline_tokens: 231849, baseline_cacheable_tokens: 231849,
+        input_tokens: 2, output_tokens: 172, cache_create_tokens: 401,
+        cache_create_1h_tokens: 401, cache_create_5m_tokens: 0, cache_read_tokens: 68024,
+      }),
+      row('2026-10-19T06:12:01.803Z', {
+        duration_ms: 7502, cache_prefix_sha8: '58d9b560',
+        baseline_tokens: 234521, baseline_cacheable_tokens: 234521,
+        input_tokens: 2, output_tokens: 193, cache_create_tokens: 51613, cache_read_tokens: 0,
+      }),
+    ]);
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    // Same warm text price as the 8-second golden above.
+    expect(recent.recent.at(-1)!.baseline_input).toBe(26524.9);
   });
 
   it('does not let an overlapping request warm the text counterfactual before it completed', async () => {
@@ -1176,7 +1270,7 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
 
   it('prices a warm read warm even with NO prior warmth state (post-restart)', async () => {
     // The cache is already warm on Anthropic's side (cr>0), but this process has
-    // never seen the session — exactly the first turn after a pxpipe restart or a
+    // never seen the session — exactly the first turn after a inkling restart or a
     // SESSION_CAP eviction. The OLD code required
     // an in-memory warmthPrev entry, so it fell through to the COLD branch and
     // billed the known-cached prefix the 1.25× CREATE rate — fabricating the

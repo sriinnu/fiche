@@ -2,7 +2,7 @@
  * Gateway-prefixed OpenAI wire shapes must be recognized as OpenAI-shaped.
  *
  * Regression: `/compat/chat/completions` (Cloudflare AI Gateway's
- * OpenAI-compatible route — how non-Anthropic models reach pxpipe) and
+ * OpenAI-compatible route — how non-Anthropic models reach inkling) and
  * `/grok/chat/completions` matched neither isOpenAIChatPath nor
  * isOpenAIResponsesPath, so the proxy skipped the parse block entirely: the
  * emitted event carried no `model` and defaulted to `anthropic` accounting.
@@ -15,16 +15,16 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { createProxy, type ProxyEvent } from '../src/core/proxy.js';
 
-let ambientPxpipeModels: string | undefined;
+let ambientInklingModels: string | undefined;
 beforeAll(() => {
-  ambientPxpipeModels = process.env.PXPIPE_MODELS;
+  ambientInklingModels = process.env.INKLING_MODELS;
   // Deliberately narrow: none of the ids below are in scope, so every request
   // here is a passthrough. Telemetry must still be complete.
-  process.env.PXPIPE_MODELS = 'claude-fable-5';
+  process.env.INKLING_MODELS = 'claude-fable-5';
 });
 afterAll(() => {
-  if (ambientPxpipeModels === undefined) delete process.env.PXPIPE_MODELS;
-  else process.env.PXPIPE_MODELS = ambientPxpipeModels;
+  if (ambientInklingModels === undefined) delete process.env.INKLING_MODELS;
+  else process.env.INKLING_MODELS = ambientInklingModels;
 });
 
 const realFetch = globalThis.fetch;

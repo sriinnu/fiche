@@ -1,7 +1,7 @@
 # Grok 4.7 — profile-aligned v2 (Spleen 5×8 control)
 
 2026-10-31. Model `grok-4.7`, Responses transport, reasoning **high**.
-Runtime override (`PXPIPE_GPT_PROFILES`): Spleen **5×8**, **152 columns**, max height **512px**, monochrome AA, reflow enabled, compact native factsheet, megapixel vision regime (`mpix`, 1000 tokens/MP).
+Runtime override (`INKLING_GPT_PROFILES`): Spleen **5×8**, **152 columns**, max height **512px**, monochrome AA, reflow enabled, compact native factsheet, megapixel vision regime (`mpix`, 1000 tokens/MP).
 
 ## Results vs shipped 14px profile
 

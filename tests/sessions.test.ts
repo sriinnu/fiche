@@ -14,7 +14,7 @@ import { transformRequest } from '../src/core/transform.js';
 
 /** Build a tmpdir with a fresh events.jsonl and 4xx-bodies/ for each test. */
 function makeTmp(): SessionsPaths {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-sessions-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'inkling-sessions-'));
   const eventsFile = path.join(dir, 'events.jsonl');
   const sidecarDir = path.join(dir, '4xx-bodies');
   return { eventsFile, sidecarDir };
@@ -132,7 +132,7 @@ describe('aggregateSessions', () => {
 
   it('credits the real prefix compression (image prefix fewer tokens than text prefix)', async () => {
     writeEvents(tmp, [
-      // First TRACKED turn, but cr=100 > 0 ⇒ the cache was OBSERVABLY warm (pxpipe
+      // First TRACKED turn, but cr=100 > 0 ⇒ the cache was OBSERVABLY warm (inkling
       //   started mid-session / the prefix was warmed before this process booted).
       //   Honest math prices the text counterfactual WARM too — not cold. With no
       //   fresh in-memory prior we assume the cacheable prefix was fully reused:
@@ -195,7 +195,7 @@ describe('aggregateSessions', () => {
         input_tokens: 5,
         cache_read_tokens: 90_000,
       }),
-      // Genuine loss turn: tiny body (2000) but pxpipe wrote 5000 cache_create.
+      // Genuine loss turn: tiny body (2000) but inkling wrote 5000 cache_create.
       //   cr=0, so text is cold too and re-creates 1900 prefix at 1.25x:
       //   baseline = 1900*1.25 + 100 = 2475 ; actual = 3000 + 5000*1.25
       //   = 9250. saved = 2475 - 9250 = -6775. Honest formula, no clamp.
@@ -370,7 +370,7 @@ describe('aggregateSessions', () => {
         ...base,
         ts: '2026-10-19T05:52:01.803Z',
         duration_ms: 7502,
-        cache_prefix_sha8: '58d9b560', // real log: pxpipe changed its prefix
+        cache_prefix_sha8: '58d9b560', // real log: inkling changed its prefix
         baseline_tokens: 234521,
         baseline_cacheable_tokens: 234521,
         input_tokens: 2,
@@ -383,6 +383,75 @@ describe('aggregateSessions', () => {
     // Row 40: 23184.9 - 7305.65 = +15879.25 (rounds to 15879).
     // Row 41: 26524.9 - 64518.25 = -37993.35 (0.15.0 said +228,633).
     expect(sessions.get('c4fa7142')!.tokensSavedEst).toBe(15_879 - 37_993);
+  });
+
+  it('keeps a 1h-tier prefix warm for an hour, a 5m-tier prefix for five minutes', async () => {
+    // Same self-bust pair as the golden above; only the prior's write tier and
+    // the gap change. A 1h prefix 20 minutes old was still cached for text, so
+    // inkling's re-render is its own cost. A 5m prefix that old was gone.
+    const run = async (sid: string, tier: '5m' | '1h', secondTs: string) => {
+      const base = {
+        compressed: true,
+        first_user_sha8: sid,
+        system_sha8: '8d36a7a6',
+        cache_prefix_tools_sha8: '80a31dc9',
+        model: 'claude-opus-5-5',
+        baseline_probe_status: 'ok' as const,
+      };
+      writeEvents(tmp, [
+        ev({
+          ...base,
+          ts: '2026-10-19T05:51:53.466Z',
+          duration_ms: 4248,
+          cache_prefix_sha8: '4e4c9ca6',
+          baseline_tokens: 231849,
+          baseline_cacheable_tokens: 231849,
+          input_tokens: 2,
+          output_tokens: 172,
+          cache_create_tokens: 401,
+          ...(tier === '1h' ? { cache_create_1h_tokens: 401, cache_create_5m_tokens: 0 } : { cache_create_5m_tokens: 401, cache_create_1h_tokens: 0 }),
+          cache_read_tokens: 68024,
+        }),
+        ev({
+          ...base,
+          ts: secondTs,
+          duration_ms: 7502,
+          cache_prefix_sha8: '58d9b560',
+          baseline_tokens: 234521,
+          baseline_cacheable_tokens: 234521,
+          input_tokens: 2,
+          output_tokens: 193,
+          cache_create_tokens: 51613,
+          ...(tier === '1h' ? { cache_create_1h_tokens: 51613, cache_create_5m_tokens: 0 } : { cache_create_5m_tokens: 51613, cache_create_1h_tokens: 0 }),
+          cache_read_tokens: 0,
+        }),
+      ]);
+      const { sessions } = await aggregateSessions(tmp);
+      return sessions.get(sid)!.tokensSavedEst;
+    };
+    const soon = '2026-10-19T05:52:01.803Z';
+    const later = '2026-10-19T06:12:01.803Z'; // 20 minutes on
+    expect(await run('a1111111', '1h', later)).toBe(await run('a1111111', '1h', soon));
+    // 5m prior 20 minutes old: text would have missed too, so no self-bust charge.
+    expect(await run('b2222222', '5m', later)).toBeGreaterThan(await run('b2222222', '5m', soon));
+  });
+
+  it('INKLING_PRICES=kosha prices the Claude read at the model rate', async () => {
+    const saved = process.env.INKLING_PRICES;
+    const one = (sid: string, model: string) => ev({
+      ts: '2026-05-18T00:00:00.000Z', compressed: true, first_user_sha8: sid, model,
+      system_sha8: 's', baseline_probe_status: 'ok', baseline_tokens: 30_000, baseline_cacheable_tokens: 20_000,
+      input_tokens: 100, output_tokens: 0, cache_create_tokens: 0, cache_read_tokens: 10_000,
+    });
+    try {
+      delete process.env.INKLING_PRICES;
+      writeEvents(tmp, [one('k1111111', 'claude-opus-5-5')]);
+      expect((await aggregateSessions(tmp)).sessions.get('k1111111')!.tokensSavedEst).toBe(10_900); // 0.1x
+      process.env.INKLING_PRICES = 'kosha';
+      expect((await aggregateSessions(tmp)).sessions.get('k1111111')!.tokensSavedEst).toBe(10_400); // 0.05x
+    } finally {
+      if (saved === undefined) delete process.env.INKLING_PRICES; else process.env.INKLING_PRICES = saved;
+    }
   });
 
   it('keeps text cold on an image miss when the tools hash changed', async () => {
@@ -427,11 +496,11 @@ describe('aggregateSessions', () => {
 describe('filterSessions', () => {
   it('filters by project (substring match)', async () => {
     writeEvents(tmp, [
-      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/pxpipe' }),
+      ev({ first_user_sha8: 'aaaaaaaa', cwd: '/Users/me/code/inkling' }),
       ev({ first_user_sha8: 'bbbbbbbb', cwd: '/Users/me/code/other' }),
     ]);
     const { sessions } = await aggregateSessions(tmp);
-    expect(filterSessions(sessions, { project: 'pxpipe' }).map((s) => s.id)).toEqual([
+    expect(filterSessions(sessions, { project: 'inkling' }).map((s) => s.id)).toEqual([
       'aaaaaaaa',
     ]);
     expect(filterSessions(sessions, { project: 'other' }).map((s) => s.id)).toEqual([
@@ -474,7 +543,7 @@ describe('Claude Code session map', () => {
   /** Build a synthetic `~/.claude/projects/<proj>/<session>.jsonl` tree under
    *  a tmpdir and return the root path. */
   function makeCCRoot(): string {
-    return fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-ccmap-'));
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'inkling-ccmap-'));
   }
 
   it('returns an empty map when the directory does not exist', async () => {
@@ -484,7 +553,7 @@ describe('Claude Code session map', () => {
 
   it('fingerprints the first user message and maps to the session id', async () => {
     const root = makeCCRoot();
-    const proj = path.join(root, '-Users-me-code-pxpipe');
+    const proj = path.join(root, '-Users-me-code-inkling');
     fs.mkdirSync(proj, { recursive: true });
     const firstUser = 'hello, this is the start of a conversation';
     const sessionFile = path.join(proj, 'abc-123.jsonl');
@@ -502,7 +571,7 @@ describe('Claude Code session map', () => {
     const ref = m.get(expectedSha);
     expect(ref).toBeDefined();
     expect(ref!.sessionId).toBe('abc-123');
-    expect(ref!.projectPath).toBe('/Users/me/code/pxpipe');
+    expect(ref!.projectPath).toBe('/Users/me/code/inkling');
     expect(ref!.firstUserPreview).toContain('hello');
   });
 

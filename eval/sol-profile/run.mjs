@@ -4,7 +4,7 @@
  *
  * Default mode is render-only and cannot call a model. Live mode is guarded by
  * both SOL_PROFILE_LIVE=1 and a literal approval acknowledgement. Requests go
- * directly to OPENAI_BASE_URL / Responses and refuse pxpipe's known local port,
+ * directly to OPENAI_BASE_URL / Responses and refuse inkling's known local port,
  * so the images under test are not recursively transformed.
  */
 import { createHash } from 'node:crypto';
@@ -372,9 +372,9 @@ function responsesEndpoint() {
   const raw = process.env.SOL_PROFILE_BASE_URL || process.env.OPENAI_BASE_URL || '';
   if (!raw) throw new Error('OPENAI_BASE_URL (or SOL_PROFILE_BASE_URL) is required for a live run');
   const url = new URL(raw);
-  // Current pxpipe listener from the pilot brief. The eval must hit the direct
-  // upstream Responses endpoint (the configured gateway upstream), not pxpipe.
-  invariant(url.port !== '47821', 'Refusing pxpipe port 47821: raw image eval must bypass pxpipe');
+  // Current inkling listener from the pilot brief. The eval must hit the direct
+  // upstream Responses endpoint (the configured gateway upstream), not inkling.
+  invariant(url.port !== '47821', 'Refusing inkling port 47821: raw image eval must bypass inkling');
   const base = raw.replace(/\/$/, '');
   return base.endsWith('/responses') ? base : `${base}/responses`;
 }
@@ -590,7 +590,7 @@ const preflight = {
   totals: totalsFor(callArms),
   finalRetuneCandidate: summarizeArm(preparedByKey.get('alpha/retuned_sol_9x12')),
   tokenNotes: {
-    image: 'pxpipe production visionTokensForModel(gpt-5.6-sol, width, height) patch estimate',
+    image: 'inkling production visionTokensForModel(gpt-5.6-sol, width, height) patch estimate',
     nonImage: 'gpt-tokenizer(prompt) plus a small Responses-envelope allowance; provider usage may differ',
     textBaseline: 'source chars/4, used only for estimated image-vs-text savings',
   },

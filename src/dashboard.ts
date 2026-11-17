@@ -1,7 +1,7 @@
 /**
  * Live dashboard for the Node host. Serves the main HTML page and JSON
  * polling endpoints. All "/api/*.json" endpoints recompute from disk on
- * every request — pxpipe doesn't have a query layer, but a 1.5 MB JSONL
+ * every request — inkling doesn't have a query layer, but a 1.5 MB JSONL
  * streams in well under 100 ms.
  *
  * Legacy live-poll endpoints (left in place, the existing tick() loop uses
@@ -15,7 +15,7 @@
  * Session endpoints (read-only telemetry — no destructive operations):
  *
  *   GET  /api/sessions.json          → grouped sessions (sha8 + project + counts)
- *   GET  /api/stats.json             → full-history aggregate (formerly `pxpipe stats`)
+ *   GET  /api/stats.json             → full-history aggregate (formerly `inkling stats`)
  *
  * Metric formulas and HTML shell originally ported from the Python reference
  * implementation (deleted after live cache-rate validation hit 98.7% by tokens).
@@ -33,10 +33,12 @@ import * as os from 'node:os';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
+import { anthropicReadRate, inputUsdPerMtok, priceMode, PRICE_SNAPSHOT } from './core/pricing.js';
 import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
+  observedCacheTtlSec,
   type BaselineWarmthPrev,
 } from './core/baseline.js';
 import {
@@ -74,7 +76,7 @@ import {
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
-  isPxpipeSupportedModel,
+  isInklingSupportedModel,
   setAllowedModelBases,
 } from './core/applicability.js';
 import type {
@@ -165,7 +167,7 @@ export interface RecentRow {
  *      cold_tail = baseline_tokens − cacheable        (always-cold input on both paths)
  *      warm      = did THIS request read a warm cache? (cache_read > 0)
  *      The text counterfactual is WARMTH-AWARE and grounded in OBSERVED cache
- *      state: pxpipe images the cached prefix in place (moves the caller's
+ *      state: inkling images the cached prefix in place (moves the caller's
  *      cache_control marker onto the image), so image and text share cache fate.
  *      cache_read>0 ⇒ a warm cache existed for both paths; cache_read===0 ⇒ cold
  *      for both, so text re-creates its prefix too (no phantom warm read on a
@@ -220,7 +222,7 @@ interface SessionTotals {
   // the headline; the weighted $ figures are diagnostics below it.
   rawActualTokens: number;
   rawBaselineTokens: number;
-  // Raw output tokens (the model's reply). pxpipe does NOT compress output, so
+  // Raw output tokens (the model's reply). inkling does NOT compress output, so
   // the HONEST total reduction adds it to BOTH sides:
   //   1 − (rawActual + rawOutput) / (rawBaseline + rawOutput)
   // Headlining input-only would cherry-pick the part that compresses.
@@ -249,18 +251,23 @@ interface Totals {
   pricedActualInputWeighted: number;
   pricedBaselineInputWeighted: number;
   pricedOutputWeighted: number;
+  /** Kosha mode: saved dollars at each row's own input price. */
+  pricedSavedUsd: number;
+  /** Rows converted to dollars at their own price / rows with no price. */
+  usdPricedRequests: number;
+  usdUnpricedRequests: number;
   /** Sum of weighted COUNTERFACTUAL input tokens across ALL requests
    *  with a usage block. For measured rows: cache-aware baseline (what the
    *  unproxied path would have billed). For unmeasured/probe-failed rows:
    *  actual_input_eff (best available estimate — these rows didn't run
-   *  pxpipe or we can't measure what it would have cost, so the
+   *  inkling or we can't measure what it would have cost, so the
    *  counterfactual ≈ actual).
    *
    *  This is the right denominator for "share of bill saved": dividing
    *  by what-you-would-have-paid is bounded at 100% (you can't save more
    *  than you would have spent). Dividing by what-you-DID-pay is not
    *  bounded — a single big cold-miss compressed request can make
-   *  saved/actual exceed 100% because pxpipe shrunk the actual to
+   *  saved/actual exceed 100% because inkling shrunk the actual to
    *  near zero. */
   allBaselineEquivalentWeighted: number;
   /** Sum of weighted ACTUAL input tokens across the same all-rows set.
@@ -319,6 +326,9 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     pricedActualInputWeighted: 0,
     pricedBaselineInputWeighted: 0,
     pricedOutputWeighted: 0,
+    pricedSavedUsd: 0,
+    usdPricedRequests: 0,
+    usdUnpricedRequests: 0,
     allBaselineEquivalentWeighted: 0,
     allActualInputWeighted: 0,
     allOutputWeighted: 0,
@@ -504,7 +514,8 @@ export class DashboardState {
    *  replay() from persisted timestamps, so live and restored numbers agree.
    *  Capped with sessions. */
   private baselineWarmth: Map<string, BaselineWarmthPrev> = new Map();
-  /** Max age of a prior row that can still make the text path warm. */
+  /** Default max age of a prior row that can still make the text path warm.
+   *  A prior that wrote 1h-tier tokens carries its own 3600 s window instead. */
   private static readonly CACHE_TTL_SEC = 300;
   /** Hard cap on `sessions` Map entries. Keeps memory bounded in
    *  long-running deployments. 50 sessions × ~13 numeric fields each is
@@ -586,7 +597,7 @@ export class DashboardState {
   private enabledTotals(): Totals {
     const combined = emptyTotals(this.startedAt);
     for (const [model, totals] of this.totalsByModel) {
-      if (!isPxpipeSupportedModel(model)) continue;
+      if (!isInklingSupportedModel(model)) continue;
       for (const key of Object.keys(combined) as Array<keyof Totals>) {
         if (key !== 'startedAt') combined[key] += totals[key];
       }
@@ -745,10 +756,10 @@ export class DashboardState {
 
       // Weighted INPUT cost we actually paid this turn.
       actualInputEff = haveUsage
-        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(ev.model))
         : 0;
 
-      // pxpipe only reduces input by imaging the static slab. An UNCOMPRESSED
+      // inkling only reduces input by imaging the static slab. An UNCOMPRESSED
       // row had its body forwarded untouched, so its unproxied counterfactual
       // IS exactly what it paid — crediting the cache-modeled baseline there
       // (which prices the prefix at the cache-READ rate) fabricates savings on
@@ -756,10 +767,10 @@ export class DashboardState {
       // actually compressed AND we have a usable probe.
       creditSaving = haveBaseline && haveUsage && compressed;
 
-      // Cache-aware baseline. INVARIANT: pxpipe is credited ONLY for the text it
+      // Cache-aware baseline. INVARIANT: inkling is credited ONLY for the text it
       // imaged away — NEVER for caching. The imagined text path is warm when
       // cr>0, or when a same-prefix prior completed within the TTL (text would
-      // have read its own cache even if pxpipe's image busted the real one).
+      // have read its own cache even if inkling's image busted the real one).
       // Uncompressed rows fall back to actualInputEff → zero savings.
       const cacheable = info?.baselineCacheableTokens ?? 0;
       // Use request start for the prior lookup; an overlapping request that had
@@ -795,6 +806,7 @@ export class DashboardState {
             prevCacheable,
             cc1h,
             cc5m,
+            anthropicReadRate(ev.model),
           )
         : actualInputEff;
       // Record this completed turn's prefix for later warmth/split decisions.
@@ -807,6 +819,7 @@ export class DashboardState {
           toolsSha: toolsShaNow ?? warmthPrev?.toolsSha,
           pxPrefixSha: info?.cachePrefixSha8 ?? warmthPrev?.pxPrefixSha,
           model: ev.model ?? warmthPrev?.model,
+          ttlSec: observedCacheTtlSec(cc1h, warmthPrev?.ttlSec),
         });
         if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
           const firstKey = this.baselineWarmth.keys().next().value;
@@ -886,13 +899,22 @@ export class DashboardState {
         totals.pricedBaselineInputWeighted += baselineInputEff;
         totals.pricedActualInputWeighted += actualInputEff;
         totals.pricedOutputWeighted += outputEquiv;
+        // Kosha mode: dollars at this model's own input price. Unpriced rows
+        // are counted, never converted at a guessed rate.
+        const usdPerMtok = inputUsdPerMtok(ev.model);
+        if (usdPerMtok !== undefined) {
+          totals.pricedSavedUsd += ((baselineInputEff - actualInputEff) * usdPerMtok) / 1e6;
+          totals.usdPricedRequests += 1;
+        } else {
+          totals.usdUnpricedRequests += 1;
+        }
       }
     }
     // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
-    // denominator for "did pxpipe move my real bill". Measured rows
+    // denominator for "did inkling move my real bill". Measured rows
     // contribute their cache-aware baseline (what the unproxied path
     // would have billed); unmeasured/probe-failed/passthrough rows
-    // contribute their actual input (pxpipe either didn't run or we
+    // contribute their actual input (inkling either didn't run or we
     // can't measure the counterfactual, so actual ≈ baseline). This
     // keeps the ratio bounded at 100% — you can't save more than you
     // would have paid.
@@ -1123,7 +1145,7 @@ export class DashboardState {
           || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
         haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
         actualInputEff = haveUsage
-          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m)
+          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(t.model))
           : 0;
         // Mirror update(): only credit the cache-modeled counterfactual on
         // compressed rows. Uncompressed/passthrough rows fall back to the
@@ -1159,6 +1181,7 @@ export class DashboardState {
               prevCacheableR,
               cc1h,
               cc5m,
+              anthropicReadRate(t.model),
             )
           : actualInputEff;
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
@@ -1169,6 +1192,7 @@ export class DashboardState {
             toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
             pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
             model: t.model ?? warmthPrevR?.model,
+            ttlSec: observedCacheTtlSec(cc1h, warmthPrevR?.ttlSec),
           });
           if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
             const firstKey = this.baselineWarmth.keys().next().value;
@@ -1331,13 +1355,13 @@ export class DashboardState {
     // estimation), but the denominator MUST include every request the user
     // actually paid for — including passthrough rows, probe-failed rows,
     // and untransformed turns the gate said no to. Otherwise the headline
-    // answers "did pxpipe help on the rows where it ran" instead of
-    // "did pxpipe move my real bill". The first is a cherry-pick.
+    // answers "did inkling help on the rows where it ran" instead of
+    // "did inkling move my real bill". The first is a cherry-pick.
     const allBaselineEquiv = totals.allBaselineEquivalentWeighted;
     const allActual = totals.allActualInputWeighted;
     const allOutput = totals.allOutputWeighted;
     // Denominator = counterfactual all-rows bill: what the user would have
-    // paid with no pxpipe. Bounded ratio at 100%; a single cold-miss
+    // paid with no inkling. Bounded ratio at 100%; a single cold-miss
     // compressed request on an otherwise empty session shows ~99% saved,
     // not 280%.
     const allCounterfactualBill = allBaselineEquiv + allOutput;
@@ -1394,7 +1418,7 @@ export class DashboardState {
       // Honest "share of total bill saved" — measured-rows numerator over
       // ALL paid requests in the denominator (compressed + passthrough +
       // probe-failed). This is the number users actually want when they
-      // ask "is pxpipe helping". Negative when flap-pollution from
+      // ask "is inkling helping". Negative when flap-pollution from
       // passthrough turns exceeds the collapse win on measured turns.
       saved_pct_of_all_spend: round1(pctAllSpend),
       all_baseline_equivalent_weighted: Math.round(allBaselineEquiv),
@@ -1414,7 +1438,11 @@ export class DashboardState {
       compressed_minus_passthrough_avg_usd: round4(splitDeltaUsd),
       split_sufficient_sample: splitSufficient,
       split_min_sample_per_bucket: SUFFICIENT,
-      saved_usd: round4((pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
+      // Legacy: every saved token at the assumed $10/MTok. Kosha: each row at
+      // its own model's input price; unpriced rows are left out and counted.
+      saved_usd: round4(priceMode() === 'kosha'
+        ? totals.pricedSavedUsd
+        : (pricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6),
       output_weighted: Math.round(output),
       baseline_token_equivalent: Math.round(baselineTotal),
       actual_token_equivalent: Math.round(actualTotal),
@@ -1425,6 +1453,10 @@ export class DashboardState {
         cache_write_1h_multiplier: 2.0,
         cache_read_multiplier: 0.1,
         source: 'docs.anthropic.com/en/docs/about-claude/pricing (verified 2026-05-19)',
+        price_mode: priceMode(),
+        price_snapshot: PRICE_SNAPSHOT,
+        usd_priced_requests: totals.usdPricedRequests,
+        usd_unpriced_requests: totals.usdUnpricedRequests,
       },
       // Honest output measurement — char counts from the SSE/JSON scanner,
       // independent of Anthropic's `usage.output_tokens`. Surfaces the gap
@@ -1614,7 +1646,7 @@ export class DashboardState {
   }
 
   /** GET /api/stats.json — full-history aggregate. Migrated from the
-   *  former `pxpipe stats` CLI. */
+   *  former `inkling stats` CLI. */
   async serveApiStats(): Promise<Response> {
     if (!this.paths) return notConfigured('stats');
     const result = await aggregateEventsFile(this.paths.eventsFile);
@@ -1644,7 +1676,7 @@ export class DashboardState {
    *  runtime compress scope. The model checks read this live. Persisted via
    *  the host's `persistModelBases` hook when provided (Node writes the
    *  config file); otherwise in-memory only and restart resets to the
-   *  PXPIPE_MODELS env / built-in default. */
+   *  INKLING_MODELS env / built-in default. */
   handleModelsToggle(model: string, on: boolean): void {
     const next = new Set(getAllowedModelBases());
     if (on) next.add(model);
@@ -1653,7 +1685,7 @@ export class DashboardState {
   }
 
   /** POST /fragments/models with {list} — replace the WHOLE runtime compress
-   *  scope from the PXPIPE_MODELS textbox. Same CSV shape as the env var;
+   *  scope from the INKLING_MODELS textbox. Same CSV shape as the env var;
    *  empty or off/false/0/no/none = compress nothing. Persistence as above. */
   handleModelsSet(csv: string): void {
     const trimmed = csv.trim();
@@ -1732,11 +1764,11 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
 }
 
 /** Name of the machine serving this dashboard, shown in the title and topbar.
- *  PXPIPE_DASH_LABEL overrides it for hosts whose system hostname says nothing
+ *  INKLING_DASH_LABEL overrides it for hosts whose system hostname says nothing
  *  useful (containers, "localhost"); an explicitly empty label opts out and
  *  renders the unlabelled page. */
 export function dashboardHostLabel(): string {
-  const override = process.env.PXPIPE_DASH_LABEL;
+  const override = process.env.INKLING_DASH_LABEL;
   if (override !== undefined) return override.trim();
   try {
     const h = os.hostname().trim();

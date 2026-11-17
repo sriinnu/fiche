@@ -74,12 +74,12 @@ Live run: **2026-07-09**
 
 Model: **`gpt-5.6-sol`**
 
-Endpoint: direct OpenAI-compatible Responses path, bypassing pxpipe
+Endpoint: direct OpenAI-compatible Responses path, bypassing inkling
 
 Image detail: **`original`**
 
 This pilot tests raw reading of rendered terminal text. It does not include
-pxpipe's verbatim fact-sheet, and it does not compare Sol directly with Fable.
+inkling's verbatim fact-sheet, and it does not compare Sol directly with Fable.
 
 ## Acceptance bar
 
@@ -170,7 +170,7 @@ provider usage totals 4,639 input tokens and 623 output tokens.
    failed; it does not establish a population failure rate or compare Sol with
    Fable.
 3. Production Responses transforms attach a verbatim fact-sheet for paths and
-   identifiers. That defense may preserve covered exact strings in real pxpipe
+   identifiers. That defense may preserve covered exact strings in real inkling
    traffic, but it does not turn this raw-image result into a pass.
 4. Local token savings are cost evidence only: approximately 73.5% for 6×11 and
    83.8% for 5×8 versus this fixture's chars/4 text estimate.
@@ -183,7 +183,7 @@ only positive token savings. The exact Sol profile remains available for
 explicit operator opt-in:
 
 ```bash
-PXPIPE_MODELS='claude-fable-5,gpt-5.6-sol'
+INKLING_MODELS='claude-fable-5,gpt-5.6-sol'
 ```
 
 Re-enabling it by default requires a retuned paid arm to pass 4/4 exact, zero

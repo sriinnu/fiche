@@ -1,7 +1,7 @@
 /**
  * SSL_CERT_FILE / CURL_CA_BUNDLE / REQUESTS_CA_BUNDLE replace the trust store
  * rather than extend it. A warp CA file holding only our root made every
- * non-pxpipe HTTPS client in the child fail verification (#245). The bundle
+ * non-inkling HTTPS client in the child fail verification (#245). The bundle
  * handed to those variables must carry the system roots after our CA.
  *
  * Run just this file:  pnpm vitest run tests/warp-ca-bundle.test.ts
@@ -25,7 +25,7 @@ describe('warp CA bundle (#245)', () => {
     else process.env.SSL_CERT_FILE = savedEnv;
   });
   const tmp = (): string => {
-    const d = mkdtempSync(join(tmpdir(), 'pxpipe-warp-ca-'));
+    const d = mkdtempSync(join(tmpdir(), 'inkling-warp-ca-'));
     dirs.push(d);
     return d;
   };
@@ -78,7 +78,7 @@ describe('warp CA bundle (#245)', () => {
   });
 
   // Windows has no root bundle file, so every warp child there got a CA-only
-  // SSL_CERT_FILE and failed verification against any host pxpipe passes through.
+  // SSL_CERT_FILE and failed verification against any host inkling passes through.
   it('falls back to the OS certificate store when no bundle file exists', () => {
     delete process.env.SSL_CERT_FILE;
     const store = readFileSync(CertificateAuthority.loadOrCreate(tmp()).certPath, 'utf8').repeat(2);

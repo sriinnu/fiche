@@ -4,7 +4,7 @@
  *
  * All three JSON.parse the client body and do no per-element shape validation —
  * deliberately, since the upstream API is the authority on what a valid request
- * is and pxpipe's contract is that anything it cannot improve is forwarded
+ * is and inkling's contract is that anything it cannot improve is forwarded
  * byte-identical. But every stage after the parse reads `.role` / `.content` off
  * each element, so a non-object element threw a TypeError straight out of the
  * transform:
@@ -15,7 +15,7 @@
  *
  * All three transform calls sit inside one try/catch in proxy.ts (the calls at
  * proxy.ts:1776-1782, caught at :1880), so each threw TypeError became
- * `502 {"error":"pxpipe transform failed"}` — replacing the 400 the real API
+ * `502 {"error":"inkling transform failed"}` — replacing the 400 the real API
  * would have returned with a gateway error that blames the proxy.
  *
  * `[null, ...]` is not a shape any client should send, but it is one a client
@@ -98,11 +98,11 @@ describe('/v1/messages — malformed messages array', () => {
     const body = enc({
       model: 'claude-sonnet-5',
       system: SYSTEM,
-      messages: [null, { role: 'user', content: '@pxpipe pin always use tabs' }],
+      messages: [null, { role: 'user', content: '@inkling pin always use tabs' }],
     });
     const out = await transformRequest(body, { compress: true });
     expect(out.info.reason).toBe('invalid_messages');
-    expect(dec(out.body)).toContain('@pxpipe pin always use tabs');
+    expect(dec(out.body)).toContain('@inkling pin always use tabs');
   });
 
   it('still compresses the same body once the bad element is removed', async () => {

@@ -1,7 +1,7 @@
 /**
  * tool_result imaging must not depend on the system slab clearing its gate.
  *
- * Claude Code >= 2.1.281 on a first-party host (pxpipe warp) uses server-side
+ * Claude Code >= 2.1.281 on a first-party host (inkling warp) uses server-side
  * threads: after the first `thread: {type:"create"}` request, every follow-up is
  * `thread: {type:"continue", previous_message_id}` carrying only the delta - no
  * `tools`, and a `system` that is just the billing line. The slab is therefore

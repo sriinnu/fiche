@@ -1,9 +1,9 @@
 // DeepSeek V4.1 Flash Workers AI client through a local OpenAI-compatible gateway
 // (e.g. a Cloudflare AI Gateway). Requires OPENAI_BASE_URL, and OPENAI_API_KEY
-// or PXPIPE_GATEWAY_HEADERS when the gateway authenticates. DeepSeek V4.1 Flash
+// or INKLING_GATEWAY_HEADERS when the gateway authenticates. DeepSeek V4.1 Flash
 // is a reasoning model: completion tokens are spent on reasoning_content before
 // content, so maxOutputTokens must leave room for both.
-process.env.PXPIPE_GPT_PROFILES ??= JSON.stringify({
+process.env.INKLING_GPT_PROFILES ??= JSON.stringify({
   'deepseek-v4.1': {
     vision: { regime: 'mpix', tokensPerMegapixel: 1000 },
     stripCols: 84,
@@ -17,7 +17,7 @@ function getAuthToken() {
 }
 
 function getExtraHeaders() {
-  const raw = process.env.PXPIPE_GATEWAY_HEADERS?.trim();
+  const raw = process.env.INKLING_GATEWAY_HEADERS?.trim();
   if (!raw) return {};
   try {
     return JSON.parse(raw);

@@ -113,9 +113,9 @@ export function renderModelsFragment(
   const labelOf = new Map(
     [...MODEL_CATALOG, ...GPT_MODEL_CATALOG, ...GROK_MODEL_CATALOG, ...GEMINI_MODEL_CATALOG].map((m) => [m.id, m.label]),
   );
-  // Union the catalog with env-configured + active ids so PXPIPE_MODELS-enabled
+  // Union the catalog with env-configured + active ids so INKLING_MODELS-enabled
   // families always show as toggles, then split into chip rows (Claude /
-  // OpenAI Responses / Gemini) plus the PXPIPE_MODELS CSV textbox that mirrors the scope.
+  // OpenAI Responses / Gemini) plus the INKLING_MODELS CSV textbox that mirrors the scope.
   const ids: string[] = [];
   const seen = new Set<string>();
   for (const id of [
@@ -171,7 +171,7 @@ export function renderModelsFragment(
     `<span class="hint">opt-in · no Anthropic cache_control</span>` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">PXPIPE_MODELS</span>` +
+    `<span class="models-label">INKLING_MODELS</span>` +
     `<input class="models-csv" id="models-csv" type="text" name="list" ` +
     `value="${escapeHtml(active.join(','))}" spellcheck="false" autocomplete="off" ` +
     `hx-post="/fragments/models" hx-target="#frag-models" hx-trigger="change">` +
@@ -189,7 +189,7 @@ void INPUT_USD_PER_MTOK; // suppress unused-var; renderHeaderFragment uses the s
 // Lifetime hero. Reads the SAME cumulative weighted totals as the header strip
 // (serveStats), so the headline and the "$ saved" tiles can never disagree, and
 // the number stops swinging on tiny per-session samples. Cache-weighted on
-// purpose ("lifeweight"): it answers "did pxpipe move my real, cache-discounted
+// purpose ("lifeweight"): it answers "did inkling move my real, cache-discounted
 // bill since this proxy started", not a raw token count.
 export function renderSessionSummaryFragment(s: StatsPayload): string {
   const measured = s.compressed_requests ?? 0;
@@ -198,7 +198,7 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
       `<div class="hero hero-empty">` +
       `<div class="hero-eyebrow">Since start</div>` +
       `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch it with <code>pxpipe warp -- claude</code> to keep <code>/remote-control</code> and claude.ai connectors working. Send a message and your running savings show up right here.</div>` +
+      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch it with <code>inkling warp -- claude</code> to keep <code>/remote-control</code> and claude.ai connectors working. Send a message and your running savings show up right here.</div>` +
       `</div>`
     );
   }
@@ -206,7 +206,7 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   // Raw count_tokens would over-claim: most of the text baseline would have been
   // cheap cache-reads (~0.1×), not full-price tokens. Weighting both sides at their
   // real cache rate is the only comparison that can't contradict the Saved column.
-  // Input-only: pxpipe never touches output, so lumping it in just dampened the %.
+  // Input-only: inkling never touches output, so lumping it in just dampened the %.
   const baselineW = s.baseline_input_weighted ?? 0; // same context as text, cache-aware
   const actualW = s.actual_input_weighted ?? 0; // what we actually sent, cache-aware
   const outMult = s.pricing_assumptions?.output_multiplier || 5;
@@ -273,7 +273,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
 
   // Compare the same imaged requests on both sides. Passthrough requests are
   // generally smaller because the profitability gate selected them, so their
-  // average is not a valid "without pxpipe" counterfactual.
+  // average is not a valid "without inkling" counterfactual.
   const cAvg = s.compressed_avg_usd_per_request ?? 0;
   const paidImaged = s.compressed_paid_requests ?? 0;
   const withoutAvg = paidImaged > 0 ? cAvg + (s.saved_usd ?? 0) / paidImaged : 0;
@@ -281,7 +281,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     ? statTile(
         'Cost per request',
         `$${cAvg.toFixed(4)}`,
-        `vs $${withoutAvg.toFixed(4)} without pxpipe`,
+        `vs $${withoutAvg.toFixed(4)} without inkling`,
         cAvg <= withoutAvg ? 'pos' : 'neg',
         'Average cost of paid imaged requests versus the cache-aware text counterfactual for those same requests. Unmeasured requests are assigned zero savings.',
       )
@@ -354,12 +354,12 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
 
   const costPerRequestMath =
-    `<div><span class="k">formula:</span> <span class="v">without_pxpipe = actual_imaged + measured_savings</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">without_inkling = actual_imaged + measured_savings</span></div>` +
     `<div><span class="k">why:</span> <span class="v">both averages cover the same paid imaged requests. Passthrough requests are not used because the profitability gate selects a different, generally smaller population.</span></div>` +
     `<div class="sp"></div>` +
     mathRow(`actual imaged (n=${paidImaged})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${cAvg.toFixed(4)}/req`) +
     mathRow('measured savings', `$${(s.saved_usd || 0).toFixed(4)}`, 'cache-aware input-side total') +
-    mathRow('without pxpipe', `$${withoutAvg.toFixed(4)}/req`, '<span class="op">=</span> (actual imaged + measured savings) / n') +
+    mathRow('without inkling', `$${withoutAvg.toFixed(4)}/req`, '<span class="op">=</span> (actual imaged + measured savings) / n') +
     `<span class="src">unmeasured imaged rows remain in n and actual cost, with zero assumed savings</span>`;
 
   const pctMath =
@@ -561,7 +561,7 @@ export function renderContextMapFragment(
         : `<span class="ctx-big">${-pct}%</span> bigger — images billed as <strong>${kFmt(real)}</strong> input tokens vs <strong>${kFmt(base)}</strong> for ${textNoun}`;
   // Clarifying sub-line. It must match the actual request's cache state: claiming
   // a 0.1× read discount when cache_read===0 would count hypothetical cache as a
-  // pxpipe effect, so cold rows price both paths cold.
+  // inkling effect, so cold rows price both paths cold.
   const subnote = !showCompare
     ? 'Billed tokens count cache discounts (reads at 0.1×) — no trustworthy text baseline for this request yet.'
     : google
@@ -605,7 +605,7 @@ export function renderContextMapFragment(
     `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
     (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
     capNote +
-    `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
+    `<div class="split-note">inkling can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
     `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
@@ -730,7 +730,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
     // When source pane is open the image appears inside the pairing — don't duplicate it.
     main = showSource ? '' : `<div class="frame"><img src="${imgSrc}" alt="rendered page" /></div>`;
   } else {
-    main = `<div class="empty-note">No images yet — they appear the instant pxpipe compresses a request.</div>`;
+    main = `<div class="empty-note">No images yet — they appear the instant inkling compresses a request.</div>`;
   }
 
   const showBtn = pin != null ? !pinnedEvicted : hasPreview;
@@ -1249,7 +1249,7 @@ export function renderPage(port: number, hostLabel = ''): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${host ? `${host} · pxpipe dashboard` : 'pxpipe — live dashboard'}</title>
+<title>${host ? `${host} · inkling dashboard` : 'inkling — live dashboard'}</title>
 <link rel="icon" href="${FAVICON}" />
 <style>${CSS}</style>
 <script>
@@ -1270,7 +1270,7 @@ export function renderPage(port: number, hostLabel = ''): string {
     <span class="flame-dot"></span>
     <div>
       <div class="wordmark-row">
-        <div class="wordmark">pxpipe</div>
+        <div class="wordmark">inkling</div>
         ${host ? `<span class="hostchip" title="proxy host">${host}</span>` : ''}
       </div>
       <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
@@ -1285,16 +1285,16 @@ export function renderPage(port: number, hostLabel = ''): string {
 <details class="models-collapse">
   <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
   <p>Warp starts the agent with the proxy already wired, no env or config edits:</p>
-  <pre>pxpipe warp -- claude
-pxpipe warp -- codex
-pxpipe warp -- cursor-agent</pre>
-  <p>Aliases work too (<code>pxpipe warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
+  <pre>inkling warp -- claude
+inkling warp -- codex
+inkling warp -- cursor-agent</pre>
+  <p>Aliases work too (<code>inkling warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
   <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
-  <pre>@pxpipe pin be concise, no walls of text
-@pxpipe unpin 2
-@pxpipe unpin all</pre>
-  <p><code>@pxpipe pin</code> with no text lists what is pinned.</p>
-  <p>A <code>@pxpipe pin …</code> line in your global or project <code>CLAUDE.md</code> (<code>AGENTS.md</code> under Codex / OpenCode) is relocated the same way, on every session, with no typing. Those are file-backed, so <code>unpin</code> and <code>unpin all</code> never touch them — edit the file to remove one.</p>
+  <pre>@inkling pin be concise, no walls of text
+@inkling unpin 2
+@inkling unpin all</pre>
+  <p><code>@inkling pin</code> with no text lists what is pinned.</p>
+  <p>A <code>@inkling pin …</code> line in your global or project <code>CLAUDE.md</code> (<code>AGENTS.md</code> under Codex / OpenCode) is relocated the same way, on every session, with no typing. Those are file-backed, so <code>unpin</code> and <code>unpin all</code> never touch them — edit the file to remove one.</p>
 </details>
 
 <details class="models-collapse">
@@ -1306,7 +1306,7 @@ pxpipe warp -- cursor-agent</pre>
 
 <dialog id="routing-help" onclick="if (event.target === this) this.close()">
   <h3>Routing Claude Code to OpenAI / Cloudflare models</h3>
-  <p>Claude models use Anthropic by default. Two optional routes can run together — set on the <strong>pxpipe process</strong> (keep provider credentials out of Claude Code):</p>
+  <p>Claude models use Anthropic by default. Two optional routes can run together — set on the <strong>inkling process</strong> (keep provider credentials out of Claude Code):</p>
   <ul>
     <li><code>OPENAI_MODELS</code> — exact model IDs routed to OpenAI Responses (<code>OPENAI_UPSTREAM</code> + <code>OPENAI_API_KEY</code>)</li>
     <li><code>CLOUDFLARE_MODELS</code> — exact model IDs routed to Cloudflare's OpenAI-compatible endpoint (<code>CLOUDFLARE_ACCOUNT_ID</code> + <code>CLOUDFLARE_API_TOKEN</code>)</li>
@@ -1318,9 +1318,9 @@ OPENAI_MODELS=gpt-5.6-sol \\
 CLOUDFLARE_ACCOUNT_ID=your-account-id \\
 CLOUDFLARE_API_TOKEN=your-cloudflare-token \\
 CLOUDFLARE_MODELS=moonshotai/kimi-k3 \\
-npx pxpipe-proxy</pre>
-  <p>Non-Anthropic IDs are advertised with a <code>claude-</code> prefix because Claude Code needs a Claude-shaped ID; pxpipe strips it before forwarding. Switch to one inside Claude Code with <code>/model claude-&lt;model&gt;</code> — e.g. <code>/model claude-moonshotai/kimi-k3</code> — or launch with <code>claude --model claude-moonshotai/kimi-k3</code>. Verify discovery with <code>curl …/v1/models</code>.</p>
-  <p><code>PXPIPE_MODELS</code> above is separate: it controls image compression, not routing. Kimi K3 on Cloudflare is the only non-Anthropic model tested end to end — see <code>docs/CLAUDE_CODE_PROVIDER_ROUTING.md</code>.</p>
+npx @sriinnu/inkling</pre>
+  <p>Non-Anthropic IDs are advertised with a <code>claude-</code> prefix because Claude Code needs a Claude-shaped ID; inkling strips it before forwarding. Switch to one inside Claude Code with <code>/model claude-&lt;model&gt;</code> — e.g. <code>/model claude-moonshotai/kimi-k3</code> — or launch with <code>claude --model claude-moonshotai/kimi-k3</code>. Verify discovery with <code>curl …/v1/models</code>.</p>
+  <p><code>INKLING_MODELS</code> above is separate: it controls image compression, not routing. Kimi K3 on Cloudflare is the only non-Anthropic model tested end to end — see <code>docs/CLAUDE_CODE_PROVIDER_ROUTING.md</code>.</p>
   <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">close</button>
 </dialog>
 

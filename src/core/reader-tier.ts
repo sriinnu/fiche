@@ -1,16 +1,17 @@
 /**
- * Who may receive pxpipe images.
+ * Who may receive inkling images.
  *
- * Strong readers (measured by upstream on dense or 14px pages): Gemini, Fable 5
- * including 5.1/5.2 at the spaced profile, and Sol 5.6 / 6.1 on the native 14px
- * profile. Everyone else — Claude 5.5, Opus 5, Grok, unmeasured ids — defaults
- * to PAKT text. Images of glyphs those models cannot read are not a saving.
+ * Strong readers (measured on dense or 14px pages, see FINDINGS.md): Gemini,
+ * Fable 5 including 5.1/5.2 at the spaced profile, and Sol 5.6 / 6.1 on the
+ * native 14px profile. Everyone else (Claude 5.5, Grok, unmeasured ids) gets
+ * its request as plain text. Images of glyphs a model cannot read are not a
+ * saving.
  *
- * `PXPIPE_FORCE_IMAGES=1` overrides the tier. It does not override the Codex
+ * `INKLING_FORCE_IMAGES=1` overrides the tier. It does not override the Codex
  * breakpoint ban.
  */
 
-export type ReaderTier = 'image' | 'pakt-text';
+export type ReaderTier = 'image' | 'text';
 
 const IMAGE_READER = [
   /(?:^|\/)gemini(?:-|$|\[)/,
@@ -19,7 +20,7 @@ const IMAGE_READER = [
 ];
 
 export function forceImagesEnabled(): boolean {
-  const v = (typeof process !== 'undefined' ? process.env?.PXPIPE_FORCE_IMAGES : '') ?? '';
+  const v = (typeof process !== 'undefined' ? process.env?.INKLING_FORCE_IMAGES : '') ?? '';
   return /^(1|true|yes|on)$/i.test(v.trim());
 }
 
@@ -30,35 +31,40 @@ function modelIds(model: string | null | undefined): string[] {
   return slash >= 0 ? [raw, raw.slice(slash + 1)] : [raw];
 }
 
-/** Labels only. The cost check decides whether an allowlisted model is
- *  actually sent images. Claude 5.5 and Grok are not strong page readers;
- *  Haiku 4.x is not in this list (the 5.5 pattern already covers Haiku 5.5). */
-const PAKT_ONLY = [
-  /claude-(?:opus|sonnet|haiku)-5-5(?:-|$)/,
-  /(?:^|\/)grok(?:-|$)/,
+/** Weak or unmeasured readers stay text even when a chip or INKLING_MODELS
+ *  lists them. Other opt-in readers (Opus 5, Sol) still image once named. */
+const TEXT_ONLY = [
+  // Dash, dot or Vertex `@version` spellings: claude-opus-5-5, claude-opus-5.5,
+  // claude-opus-5-5@20261001.
+  /claude-(?:opus|sonnet|haiku)-5[-.]5(?:[-@.:]|$)/,
+  /claude-haiku(?:[-@.:]|$)/,
+  // grok-4.7, x-ai/grok-4.7, x-ai.grok-4.7.
+  /(?:^|[/.])grok(?:-|$)/,
+  // Gemini 4 hydrogen and carbon have no reading measurements yet; the
+  // `gemini` image rule would otherwise give them argon's profile blind.
+  /gemini-4-(?:hydrogen|carbon)/,
 ];
 
-export function prefersPaktText(model: string | null | undefined, forceImages?: boolean): boolean {
+export function prefersText(model: string | null | undefined, forceImages?: boolean): boolean {
   if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return false;
   const ids = modelIds(model);
-  return ids.some((id) => PAKT_ONLY.some((re) => re.test(id)));
+  return ids.some((id) => TEXT_ONLY.some((re) => re.test(id)));
 }
 
 export function readerTier(model: string | null | undefined, forceImages?: boolean): ReaderTier {
   if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return 'image';
   const ids = modelIds(model);
-  if (ids.length === 0) return 'pakt-text';
-  if (ids.some((id) => PAKT_ONLY.some((re) => re.test(id)))) return 'pakt-text';
-  return ids.some((id) => IMAGE_READER.some((re) => re.test(id))) ? 'image' : 'pakt-text';
+  if (ids.length === 0) return 'text';
+  if (ids.some((id) => TEXT_ONLY.some((re) => re.test(id)))) return 'text';
+  return ids.some((id) => IMAGE_READER.some((re) => re.test(id))) ? 'image' : 'text';
 }
 
 /**
- * An allowlisted model is an image candidate. The caller prices that candidate
- * against raw text and cache-safe PAKT and sends the cheapest. `forceImages`
- * does not add a model that failed the allowlist: Grok and Sonnet stay out
- * until `PXPIPE_MODELS` names them.
+ * Imaging requires the model allowlist (`INKLING_MODELS` / default scope) AND
+ * a reader that is not text-only. `INKLING_FORCE_IMAGES` lifts the text-only
+ * veto. It does not add a model to the allowlist: Grok, Sonnet 5.5, and Haiku
+ * stay text until they are also named in `INKLING_MODELS`.
  */
-export function shouldImageModel(model: string | null | undefined, allowed: boolean, _forceImages?: boolean): boolean {
-  void model;
-  return allowed;
+export function shouldImageModel(model: string | null | undefined, allowed: boolean, forceImages?: boolean): boolean {
+  return allowed && !prefersText(model, forceImages);
 }

@@ -53,8 +53,8 @@ function claudeCodeMessages(rules: string, typed = 'hello'): Message[] {
 const AGENTS_MD = [
   '# Rules',
   '',
-  '@pxpipe pin be concise, no walls of text',
-  '@pxpipe pin never commit without asking',
+  '@inkling pin be concise, no walls of text',
+  '@inkling pin never commit without asking',
   '',
   'Some prose that is not a pin.',
 ].join('\n');
@@ -82,41 +82,41 @@ describe('foldPins: system prompt ingestion (OpenCode)', () => {
   });
 
   it('accepts a plain-string system field', () => {
-    const pins = foldPins([], `preamble\n@pxpipe pin stay on task`);
+    const pins = foldPins([], `preamble\n@inkling pin stay on task`);
     expect(pins.map((p) => p.text)).toEqual(['stay on task']);
   });
 
   it('folds system before messages, so pins read in wire order', () => {
-    const msgs: Message[] = [{ role: 'user', content: '@pxpipe pin typed last' }];
-    const pins = foldPins(msgs, opencodeSystem('@pxpipe pin from file'));
+    const msgs: Message[] = [{ role: 'user', content: '@inkling pin typed last' }];
+    const pins = foldPins(msgs, opencodeSystem('@inkling pin from file'));
     expect(pins.map((p) => p.text)).toEqual(['from file', 'typed last']);
   });
 
   it('ignores non-text system blocks without throwing', () => {
     const sys = [
       { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'x' } },
-      { type: 'text', text: '@pxpipe pin survives' },
+      { type: 'text', text: '@inkling pin survives' },
     ] as unknown as SystemField;
     expect(foldPins([], sys).map((p) => p.text)).toEqual(['survives']);
   });
 
   it('refuses to let unpin drop a file-tier pin', () => {
     // It is inlined from AGENTS.md every request, so "removing" it would be a lie.
-    const msgs: Message[] = [{ role: 'user', content: '@pxpipe unpin be concise' }];
+    const msgs: Message[] = [{ role: 'user', content: '@inkling unpin be concise' }];
     const pins = foldPins(msgs, opencodeSystem(AGENTS_MD));
     expect(pins.map((p) => p.text)).toContain('be concise, no walls of text');
   });
 
-  it('folds markdown quote-prefixed pin commands (>pxpipe pin and > pxpipe pin)', () => {
+  it('folds markdown quote-prefixed pin commands (>inkling pin and > inkling pin)', () => {
     const markdownAgents = [
       '# Personal Rules',
       '',
-      '>pxpipe pin ## npm Auth',
-      '>pxpipe pin',
-      '>pxpipe pin Every shell command must begin with token refresh',
-      '> pxpipe pin - Be concise',
-      '> @pxpipe pin - No walls of text',
-      'pxpipe pin - Lead with results',
+      '>inkling pin ## npm Auth',
+      '>inkling pin',
+      '>inkling pin Every shell command must begin with token refresh',
+      '> inkling pin - Be concise',
+      '> @inkling pin - No walls of text',
+      'inkling pin - Lead with results',
     ].join('\n');
     const pins = foldPins([], opencodeSystem(markdownAgents));
     expect(pins.map((p) => p.text)).toEqual([
@@ -134,7 +134,7 @@ describe('stripPinCommandsFromSystem', () => {
   it('removes the command lines and keeps the surrounding rules', () => {
     const out = stripPinCommandsFromSystem(opencodeSystem(AGENTS_MD)) as TextBlock[];
     const text = out.map((b) => b.text).join('\n');
-    expect(text).not.toContain('@pxpipe pin');
+    expect(text).not.toContain('@inkling pin');
     expect(text).toContain('# Rules');
     expect(text).toContain('Some prose that is not a pin.');
   });
@@ -147,14 +147,14 @@ describe('stripPinCommandsFromSystem', () => {
   });
 
   it('strips a plain-string system field', () => {
-    expect(stripPinCommandsFromSystem('keep\n@pxpipe pin go')).toBe('keep');
-    expect(stripPinCommandsFromSystem('keep\n>pxpipe pin go\n> pxpipe pin also')).toBe('keep');
+    expect(stripPinCommandsFromSystem('keep\n@inkling pin go')).toBe('keep');
+    expect(stripPinCommandsFromSystem('keep\n>inkling pin go\n> inkling pin also')).toBe('keep');
   });
 
   it('hands cache_control forward when a block is emptied', () => {
     const sys: SystemField = [
       { type: 'text', text: 'preamble' },
-      { type: 'text', text: '@pxpipe pin only this', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: '@inkling pin only this', cache_control: { type: 'ephemeral' } },
     ];
     const out = stripPinCommandsFromSystem(sys) as TextBlock[];
     // The emptied block cannot stay (`{text: ''}` is rejected), but dropping its
@@ -166,7 +166,7 @@ describe('stripPinCommandsFromSystem', () => {
 
   it('keeps an emptied leading block rather than lose its breakpoint', () => {
     const sys: SystemField = [
-      { type: 'text', text: '@pxpipe pin alone', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: '@inkling pin alone', cache_control: { type: 'ephemeral' } },
     ];
     const out = stripPinCommandsFromSystem(sys) as TextBlock[];
     expect(out[0]!.cache_control).toEqual({ type: 'ephemeral' });
@@ -175,7 +175,7 @@ describe('stripPinCommandsFromSystem', () => {
   it('drops an emptied block that carried no breakpoint', () => {
     const sys: SystemField = [
       { type: 'text', text: 'preamble' },
-      { type: 'text', text: '@pxpipe pin only this' },
+      { type: 'text', text: '@inkling pin only this' },
     ];
     expect(stripPinCommandsFromSystem(sys)).toHaveLength(1);
   });
@@ -201,7 +201,7 @@ describe('Claude Code path is unaffected', () => {
 
   it('still strips the commands out of message 0', () => {
     const out = stripPinCommands(claudeCodeMessages(AGENTS_MD));
-    expect(JSON.stringify(out)).not.toContain('@pxpipe pin');
+    expect(JSON.stringify(out)).not.toContain('@inkling pin');
     expect(JSON.stringify(out)).toContain('hello');
   });
 });
@@ -212,7 +212,7 @@ describe('stripPinCommands: malformed input', () => {
     // (that every sibling has) blocks[0].type throws, silently disabling pinning
     // for the whole request instead of passing the malformed turn through.
     const messages: Message[] = [
-      { role: 'user', content: '@pxpipe pin be concise' },
+      { role: 'user', content: '@inkling pin be concise' },
       { role: 'assistant', content: [null as unknown as TextBlock] },
     ];
     expect(() => stripPinCommands(messages)).not.toThrow();
@@ -223,7 +223,7 @@ describe('emission', () => {
   it('renders file pins unbulleted, preserving the user’s own markdown', () => {
     // Pinning is per line and opt-in: unmarked prose stays in the file, and a
     // marked line keeps the formatting the user wrote instead of being bulleted.
-    const sys = opencodeSystem('# Rules\n@pxpipe pin ## Style\n@pxpipe pin | a | b |');
+    const sys = opencodeSystem('# Rules\n@inkling pin ## Style\n@inkling pin | a | b |');
     const text = pinBlockText(foldPins([], sys));
     expect(text).toContain('## Style');
     expect(text).toContain('| a | b |');
@@ -236,7 +236,7 @@ describe('emission', () => {
     const pins = foldPins(msgs, opencodeSystem(AGENTS_MD));
     expect(appendPinBlock(msgs, pins)).toBeGreaterThan(0);
     const blocks = msgs[0]!.content as TextBlock[];
-    expect(blocks[blocks.length - 1]!.text).toContain('[pxpipe pin]');
+    expect(blocks[blocks.length - 1]!.text).toContain('[inkling pin]');
     expect(blocks[blocks.length - 1]!.text).toContain('be concise, no walls of text');
   });
 });

@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="assets/inkling-logo.svg" alt="Inkling" width="420">
+  <img src="assets/inkling-logo.svg" alt="inkling" width="420">
 </p>
 
-<h1 align="center">Inkling</h1>
+<h1 align="center">inkling</h1>
 
-<p align="center"><strong>PAKT for structured text. Images only when the model can read them.</strong></p>
+<p align="center"><strong>Images for the context a model can read. Everything else untouched.</strong></p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-6D5BFF.svg"></a>
@@ -14,93 +14,16 @@
   <a href="https://github.com/sriinnu/inkling/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sriinnu/inkling/actions/workflows/ci.yml/badge.svg"></a>
 </p>
 
-## What it is
+inkling is a local proxy for coding agents (Claude Code, Codex, OpenCode, pi, and anything that speaks the Anthropic, OpenAI or Gemini wire formats). Providers bill an image by its pixel area, not by the characters drawn on it, so inkling renders the stale, bulky parts of a request (the system and tool slab, old closed tool-call history, large tool results) as dense PNG pages. A 1568×728 page bills about 1,456 tokens on Anthropic and holds about 28k characters.
 
-Inkling is a context-compression proxy and the `inkling-mcp` server for coding agents. The image proxy is a fork of [pxpipe](https://github.com/teamchong/pxpipe) by Steven ([teamchong](https://github.com/teamchong)), imported at **v0.16.0** (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`). [PAKT](https://github.com/sriinnu/clipforge-PAKT) (`@sriinnu/pakt@0.10.0`), the routing in front of that proxy, and `inkling-mcp` are ours.
+- **Strong readers get images:** Gemini, Fable 5 (including 5.1/5.2 at the spaced profile) and opt-in Sol 5.6/6.1. The live tail, any open tool sequence and your current message stay text, and a short verbatim factsheet of paths, hashes and numbers rides next to each image.
+- **Everyone else passes through byte-for-byte:** Claude 5.5 (Opus, Sonnet, Haiku), Grok, and unmeasured models such as Gemini 4 hydrogen and carbon. They understand rendered pages but misread single characters, so imaging them is not a saving.
 
-- **Lossless PAKT first.** JSON, YAML, CSV, and markdown data blocks are rewritten with PAKT L1–L3 before anything is rasterized. A packed string is kept only when `decompress` restores the original values.
-- **Images only for strong vision readers.** Gemini, Fable 5 (including 5.1/5.2), and Sol 5.6/6.1 get the usual pxpipe image pages. Claude 5.5 (Opus, Sonnet, Haiku) and Grok stay on PAKT text, which they read reliably, instead of dense glyphs they do not.
-- **ChatGPT Codex fix.** `prompt_cache_breakpoint` is not sent to `chatgpt.com` / `/backend-api/codex/responses`, which reject it with HTTP 400.
-- **`inkling-mcp`.** `compress_text`, `inspect_savings`, `transform_request`, `health`, and `stats` over stdio or Streamable HTTP. This server is ours. It is not part of the pxpipe import.
+Only in-scope models are touched (`INKLING_MODELS`, default `claude-fable-5,gemini`). Everything else passes through untouched. `compress: false` and `INKLING_MODELS=off` turn compression off. Old pages stay byte-identical from turn to turn, so they are read from the prompt cache instead of being re-billed.
 
-L4 (lossy) stays off unless a caller passes `lossy: true` and a positive `semanticBudget`. PAKT 0.10.0's delta encoding can corrupt cyclic integers; Inkling drops those results and keeps the original JSON.
+`inkling` starts the proxy. `inkling-mcp` (or `inkling mcp`) is the MCP server. How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Inkling is not an official teamchong release. The npm package name is still `pxpipe-fork` (so it cannot be installed over upstream `pxpipe-proxy`). The proxy bins are `pxpipe` and `pxpipe-fork`. The MCP bin is `inkling-mcp`.
-
-## Status
-
-**Experimental.** See [REVIEW.md](REVIEW.md) for the full deep review. In short: fine to try with ChatGPT Codex, and Grok will not be billed for images by accident, but it is **not yet ready as a daily Claude Code proxy on Opus 5.5**. Two high-severity issues are still open (Opus 5.5 sits in the default image list but is then refused images and sent raw text; a PAKT hit re-serializes the whole request and can break the cached prefix). On mixed prose and code, plain imaging can beat the hybrid for some models; the big wins are on repetitive structured logs.
-
-## Quick start
-
-Requires Node.js >= 20.19 and pnpm.
-
-```bash
-git clone https://github.com/sriinnu/inkling.git
-cd inkling
-pnpm install
-pnpm build
-
-# Proxy on 127.0.0.1:47821
-node dist/node.js
-
-# Point Claude Code at it
-ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
-```
-
-### MCP server
-
-```bash
-node dist/node.js mcp                 # stdio
-node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
-```
-
-`bin/mcp.js` (the `inkling-mcp` bin) starts the same stdio server. The process reports its name as `inkling-mcp`. Replace `<checkout>` with the absolute path of your clone.
-
-Claude Code (`.mcp.json`) and Cursor (`.cursor/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "inkling-mcp": {
-      "command": "node",
-      "args": ["<checkout>/dist/node.js", "mcp"]
-    }
-  }
-}
-```
-
-Codex CLI (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers."inkling-mcp"]
-command = "node"
-args = ["<checkout>/dist/node.js", "mcp"]
-```
-
-More clients (Claude Desktop, Pi, Grok Bot, Ribhu, OpenCode) are covered in [MCP for every agent](#mcp-for-every-agent) below.
-
-## Credits
-
-- **[pxpipe](https://github.com/teamchong/pxpipe)** by Steven ([teamchong](https://github.com/teamchong)), MIT. The image pipeline, proxy, fonts, profiles, and the benchmarks in the inherited guide below are upstream work.
-- **[PAKT](https://github.com/sriinnu/clipforge-PAKT)** (`@sriinnu/pakt`) by Srinivas Pendela, MIT. PAKT's L1 syntax is inspired by [TOON Format](https://github.com/toon-format/spec).
-- Fork changes (hybrid PAKT pipeline, Codex breakpoint fix, MCP server) by Srinivas Pendela.
-
----
-
-## What is better than upstream, on one fixture
-
-Not a universal 90%. This is one repetitive agent log (360 monotonic JSON rows plus a short system prompt). Text tokens are `@sriinnu/pakt` `countTokens` (cl100k unless the id is a registered o200k model) after base64 is removed; image tokens come from the pixel profiles. They are not provider usage. Reproduce with `pnpm exec tsx scripts/measure-hybrid.mts`.
-
-| path | pages | billable tokens | vs 17,705 raw |
-| --- | ---: | ---: | ---: |
-| Raw JSON | 0 | 17,705 | — |
-| Upstream-style images only (Fable 5) | 4 | 3,875 | 78.1% fewer |
-| Hybrid, Fable 5 (PAKT text; cheaper than the image) | 0 | 936 | 94.7% fewer |
-| Hybrid, Claude Sonnet 5.5 (PAKT text, no images) | 0 | 939 | 94.7% fewer |
-| Hybrid, Grok 4.7 (PAKT text, no images) | 0 | 936 | 94.7% fewer |
-
-On this fixture PAKT text is cheaper than imaging (936 vs 3,875) and the packed tool result round-trips through `decompress`. The request is not turned into an image of the packed notation. Prose with no repetition is left alone. A deeply nested config can expand; the negative-savings guard keeps the original. Cyclic counters that fail the round-trip guard are kept as JSON. No live API call was made here. Sonnet and Grok are not in the default allowlist, so code stays text, matching upstream. Naming them in `PXPIPE_MODELS` makes images a candidate and the cheaper of the three is sent. Claude 5.5 and Grok pages are still weak on dense hex; that is why they are not in the default list.
+inkling is built on [pxpipe](https://github.com/teamchong/pxpipe); see [Credits](#credits).
 
 ## Run the proxy
 
@@ -111,41 +34,52 @@ pnpm typecheck
 pnpm exec tsx src/node.ts
 ```
 
-Proxy listens on `127.0.0.1:47821`. After `pnpm build`, `node dist/node.js` is the same server. The `pxpipe` bin still works; `pxpipe-fork` is the fork name.
+Proxy listens on `127.0.0.1:47821`. After `pnpm build`, `node dist/node.js` is the same server. The `inkling` bin is the same server.
 
 ```bash
-# Claude Code. Allowlisted models (Fable, Opus 5.5, Gemini) get whichever
-# of raw, cache-safe PAKT, and images is cheaper on that request.
+# Claude Code: images for Fable, Opus 5.5 passes through
 ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
 
 # ChatGPT Codex. Do not point this at api.openai.com.
-# The fork omits prompt_cache_breakpoint on this route.
+# inkling omits prompt_cache_breakpoint on this route.
 PORT=47821 OPENAI_UPSTREAM=https://chatgpt.com \
-  PXPIPE_MODELS=gpt-5.6-sol \
+  INKLING_MODELS=gpt-5.6-sol \
   pnpm exec tsx src/node.ts
 
-# Naming Grok makes images a candidate. The request still sends the cheapest
-# of raw, PAKT text, and images.
-PXPIPE_MODELS=claude-fable-5,gemini,grok-4.7 pnpm exec tsx src/node.ts
+# Grok passes through as text even when named in scope.
+INKLING_MODELS=claude-fable-5,gemini,grok-4.7 pnpm exec tsx src/node.ts
 # Warp the xAI host yourself:
-# pxpipe-fork warp --route 'api.x.ai/v1/*=http://127.0.0.1:47821' -- <grok-cli>
+# inkling warp --route 'api.x.ai/v1/*=http://127.0.0.1:47821' -- <grok-cli>
 ```
 
 Codex `~/.codex/config.toml` provider (the proxy, not the MCP server):
 
 ```toml
 model = "gpt-5.6-sol"
-model_provider = "pxpipe-fork"
+model_provider = "inkling"
 
-[model_providers.pxpipe-fork]
-name = "pxpipe-fork"
+[model_providers.inkling]
+name = "inkling"
 base_url = "http://127.0.0.1:47821/backend-api/codex"
 wire_api = "responses"
 requires_openai_auth = true
 supports_websockets = false
 ```
 
-Allowlisted models are priced three ways and the cheapest is sent: the original bytes, cache-safe PAKT text, or images of the original. Opus 5.5 is in the default scope, so images are a candidate without `PXPIPE_FORCE_IMAGES`. Sonnet 5.5, Haiku 5.5, and Grok are not, until `PXPIPE_MODELS` names them. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com. PAKT edits are spliced in after the last `cache_control` block, so that prefix stays byte-identical.
+Codex 0.167+ rejects `[profiles.*]` in `config.toml`. For an opt-in profile, put `model_provider = "inkling"` and the provider table in `~/.codex/inkling.config.toml` and run `codex -p inkling`. Setting `openai_base_url = "http://127.0.0.1:47821/backend-api/codex"` on the built-in provider also works. That provider tries a WebSocket first; inkling answers 426, so Codex falls back to HTTP and sends a zstd body, which inkling decodes before compressing.
+
+`INKLING_FORCE_IMAGES=1` lifts the text-only veto for a model that is already in scope. Opus 5.5, Sonnet 5.5, Haiku 5.5, Grok and Gemini 4 hydrogen/carbon also need to be named in `INKLING_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
+
+## Follow the agent (third-party providers)
+
+One inkling serves every provider the agent talks to. A request for a registered third-party host goes back to that host over https, carrying only the agent's own credential. inkling's configured keys, gateway headers, bridges and `count_tokens` probes never apply to it.
+
+- Under `inkling warp`, the agent keeps addressing its provider (for example `api.deepseek.com`). warp diverts that host's inference paths into inkling and keeps the Host header, so inkling follows it.
+- For base-URL agents, put the provider host in the path: `ANTHROPIC_BASE_URL=http://127.0.0.1:47821/to/api.deepseek.com/anthropic`.
+
+The built-in hosts are DeepSeek, Moonshot/Kimi, z.ai/BigModel, MiniMax, Qwen DashScope, OpenRouter and xAI. Add more with `INKLING_UPSTREAM_HOSTS=host[/api-prefix],...`. Set `INKLING_FOLLOW_HOSTS=0` to turn following off.
+
+Anything else is refused before any upstream call: unknown hosts, IP literals, local names, non-443 ports, `user@host` tricks, and first-party hosts named through `/to/`. With following off, a third-party Host is refused, never re-routed to Anthropic. Redirects are returned to the agent, not followed. An Anthropic-issued credential (`sk-ant-…`) is stripped before it can reach a third party. Models outside `INKLING_MODELS` pass through byte-identical, as everywhere else.
 
 ## MCP for every agent
 
@@ -157,22 +91,21 @@ node dist/node.js mcp                 # stdio
 node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
 ```
 
-The package name on npm is `pxpipe-fork`, and it is not published. `npx -y inkling` is a different package. This checkout installs from git with:
+`npx -y @sriinnu/inkling mcp` is the same binary once the package is published. Use the scoped name: the unscoped `inkling` on npm is an unrelated package. Until you publish or `npm install` this checkout, point clients at `node` and the `dist/node.js` path below, or install from git:
 
 ```bash
 npx --yes --package github:sriinnu/inkling inkling-mcp
 ```
 
-`prepare` builds `dist/node.js` on that install. A local checkout can still use `node dist/node.js mcp` after `pnpm build`. Claude Code can also load this repo as a plugin: `.claude-plugin/plugin.json` plus `.mcp.json`, and `.claude-plugin/marketplace.json` is the marketplace manifest (`claude plugin marketplace add sriinnu/inkling`). The HTTP proxy, not these tools, is what reduces the provider bill. A tool call sends the text in as an argument and gets a result back, so the turn that calls it is larger, and the tool list itself is extra cached prefix.
+`prepare` builds `dist/node.js` on that install. Claude Code can also load this repo as a plugin: `.claude-plugin/plugin.json` plus `.mcp.json`, and `.claude-plugin/marketplace.json` is the marketplace manifest (`claude plugin marketplace add sriinnu/inkling`). The HTTP proxy, not these tools, is what reduces the provider bill. A tool call sends its argument in and gets a result back, so the turn that calls it is larger, and the tool list itself is extra cached prefix.
 
 Tools (`readOnlyHint`, not destructive, `openWorldHint: false`; `stats` is not idempotent):
 
 | tool | what it does |
 | --- | --- |
-| `compress_text` | Lossless PAKT on one string. L4 only if `lossy` and `semanticBudget` > 0. |
-| `inspect_savings` | Token counts and which route a model would take. |
-| `transform_request` | Full hybrid on a request object. Pass `upstream: "https://chatgpt.com"` or `pathname: "/backend-api/codex/responses"` to strip `prompt_cache_breakpoint`. |
-| `health` | Version, upstream commit, PAKT version. No payloads. |
+| `check_model` | Whether a model is in scope and gets images or passes through as text. |
+| `transform_request` | Run inkling on a request object and report estimated tokens before and after. Pass `upstream: "https://chatgpt.com"` or any `/backend-api/codex/` path to strip `prompt_cache_breakpoint`. |
+| `health` | Version and the Codex breakpoint policy. No payloads. |
 | `stats` | Process counters only. |
 
 Example stdio exchange after `initialize`:
@@ -194,7 +127,7 @@ Replace `<checkout>` with the absolute path of this repo.
 ```json
 {
   "mcpServers": {
-    "inkling-mcp": {
+    "inkling": {
       "command": "node",
       "args": ["<checkout>/dist/node.js", "mcp"]
     }
@@ -207,18 +140,18 @@ Replace `<checkout>` with the absolute path of this repo.
 `~/.codex/config.toml`. This block starts the MCP server. It does not send `prompt_cache_breakpoint`; the proxy fix and the tool both refuse that field on chatgpt.com.
 
 ```toml
-[mcp_servers."inkling-mcp"]
+[mcp_servers.inkling]
 command = "node"
 args = ["<checkout>/dist/node.js", "mcp"]
 
-[mcp_servers."inkling-mcp".env]
-PXPIPE_FORCE_IMAGES = "0"
+[mcp_servers.inkling.env]
+INKLING_FORCE_IMAGES = "0"
 ```
 
 Streamable HTTP, after `node dist/node.js mcp --http 47823`:
 
 ```toml
-[mcp_servers."inkling-mcp"]
+[mcp_servers.inkling]
 url = "http://127.0.0.1:47823/mcp"
 ```
 
@@ -227,8 +160,8 @@ url = "http://127.0.0.1:47823/mcp"
 Pi reads `~/.pi/agent/mcp.json` and `.pi/mcp.json` using the same `mcpServers` shape as Claude. Stdio and Streamable HTTP are both supported. From a shell:
 
 ```bash
-pi mcp add inkling-mcp -- node <checkout>/dist/node.js mcp
-pi mcp add inkling-mcp-http --url http://127.0.0.1:47823/mcp
+pi mcp add inkling -- node <checkout>/dist/node.js mcp
+pi mcp add inkling-http --url http://127.0.0.1:47823/mcp
 pi mcp list
 ```
 
@@ -236,52 +169,37 @@ Or paste the Claude JSON entry into `~/.pi/agent/mcp.json`.
 
 ### Cursor
 
-`.cursor/mcp.json` is the same `mcpServers` object as Claude Code. One-click install, which prompts before it writes `~/.cursor/mcp.json`:
-
-```text
-cursor://anysphere.cursor-deeplink/mcp/install?name=inkling-mcp&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyItLXllcyIsIi0tcGFja2FnZSIsImdpdGh1Yjpzcmlpbm51L2lua2xpbmciLCJpbmtsaW5nLW1jcCJdfQ
-```
-
-Paste that link into a browser. Cursor prompts before it writes `~/.cursor/mcp.json`. The config is the git `npx` command above, not a local path.
-
-### Gemini CLI
-
-`~/.gemini/settings.json` or `.gemini/settings.json`:
+`.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "inkling-mcp": {
-      "command": "npx",
-      "args": ["--yes", "--package", "github:sriinnu/inkling", "inkling-mcp"]
+    "inkling": {
+      "command": "node",
+      "args": ["<checkout>/dist/node.js", "mcp"]
     }
   }
 }
 ```
 
-Gemini's HTTP field is `httpUrl`, not `url`: `"httpUrl": "http://127.0.0.1:47823/mcp"`.
+### Grok Bot
 
-### Grok CLI
+Add a custom MCP server (Cursor's Add MCP Server uses the same command and args):
 
-`~/.grok/config.toml`, or `grok mcp add inkling-mcp -- npx --yes --package github:sriinnu/inkling inkling-mcp`:
+- command: `node`
+- args: `<checkout>/dist/node.js` `mcp`
 
-```toml
-[mcp_servers."inkling-mcp"]
-command = "npx"
-args = ["--yes", "--package", "github:sriinnu/inkling", "inkling-mcp"]
-```
-
-This is the grok CLI. It is not Cursor's Add MCP dialog.
+HTTP URL, if the client asks for one: `http://127.0.0.1:47823/mcp`
 
 ### Ribhu
 
-Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subprocess from an extension JSON `mcp` block. User scope is `~/.ribhu/agent/extensions/inkling-mcp.json`. A trusted repo can use `<git-root>/.ribhu/extensions/inkling-mcp.json`. Restart after install; `/mcp` lists it.
+Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subprocess from an extension JSON `mcp` block. User scope is `~/.ribhu/agent/extensions/inkling.json`. A trusted repo can use `<git-root>/.ribhu/extensions/inkling.json`. Restart after install; `/mcp` lists it. Tools show up as `mcp__inkling__<tool>`.
 
 ```json
 {
-  "slash": "/inkling-mcp",
-  "description": "inkling-mcp: PAKT packing and route estimates",
-  "prompt": "Use inkling's inspect_savings when you need an estimate. Do not call compress_text on text already in the conversation; that adds tokens. The proxy is what saves them. {args}",
+  "slash": "/inkling",
+  "description": "inkling context tools",
+  "prompt": "Use the inkling MCP tools to check which models inkling images and to inspect a request. {args}",
   "mcp": {
     "command": "node",
     "args": ["<checkout>/dist/node.js", "mcp"]
@@ -296,7 +214,7 @@ Ribhu (https://github.com/sriinnu/ribhu, sriinnu, Apache-2.0) loads an MCP subpr
 ```json
 {
   "mcp": {
-    "inkling-mcp": {
+    "inkling": {
       "type": "local",
       "command": ["node", "<checkout>/dist/node.js", "mcp"],
       "enabled": true
@@ -309,17 +227,11 @@ OpenCode's remote form is `"type": "remote"` and a `url` of `http://127.0.0.1:47
 
 ## Codex breakpoint
 
-pxpipe 0.16.0 injects `prompt_cache_breakpoint: { mode: "explicit" }` for Sol and GPT-6 profiles. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. This fork does not inject that field when the path is `/backend-api/codex/responses` or the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `PXPIPE_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` now actually turns it off. PAKT is not asked for a cache-breakpoint hint, and any `prompt_cache_breakpoint` key on a Codex response is stripped before the bytes leave the proxy.
+The Sol and GPT-6 profiles inject `prompt_cache_breakpoint: { mode: "explicit" }`. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. inkling does not inject that field on any `/backend-api/codex/` path (`/responses`, `/responses/compact`) or when the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` turns it off. An injected `prompt_cache_breakpoint` on a Codex request is removed as a text edit before the bytes leave the proxy, so nothing else in the body is reserialized.
 
 ---
 
-## Inherited upstream guide
-
-The rest of this file is the pxpipe v0.16.0 README. Where it says Opus 5.5 is imaged by default, this fork sends Claude 5.5 and Grok through PAKT text instead. Commands that say `npx pxpipe-proxy` mean the upstream package; use `pnpm exec tsx src/node.ts` or `node dist/node.js` here.
-
-
-### Upstream pxpipe README
-
+## Image compression
 
 **Cut coding-agent input tokens by rendering bulky context as images — the same system prompt, tool docs, and history, in a fraction of the tokens.**
 
@@ -327,7 +239,7 @@ An image's token cost is fixed by its pixel dimensions, not by how much text
 is inside it. Dense content (code, JSON, tool output) packs ~3.1 chars per
 image-token vs ~1 char per text-token on real Claude Code traffic. The
 reader is the same vision channel that Anthropic's computer use already
-relies on for screenshots. pxpipe is a local proxy that uses that channel
+relies on for screenshots. inkling is a local proxy that uses that channel
 for context: it rewrites the bulky parts of each request into compact PNGs
 before it leaves your machine. On the original June 2026 **`claude-fable-5`**
 runs, that landed as a **~59–70% lower end-to-end bill** (10/10 SWE-bench Lite,
@@ -338,11 +250,11 @@ on dense pixel reading (0/15–3/15 hex; `claude-fable-5-1` and `claude-fable-5-
 11/15–14/15 with +2px row spacing; see
 [The honest part](#the-honest-part)). Durable token savings are measured
 per-request against a free `count_tokens` counterfactual in
-`~/.pxpipe/events.jsonl`.
+`~/.inkling/events.jsonl`.
 
 This is what the model sees instead of text:
 
-![example: a real `transformRequest` output: system prompt + tool docs reflowed into one dense page, instruction banner on top, ↵ marking original newlines](https://raw.githubusercontent.com/teamchong/pxpipe/main/docs/assets/example-render.png)
+![example: a real `transformRequest` output: system prompt + tool docs reflowed into one dense page, instruction banner on top, ↵ marking original newlines](docs/assets/example-render.png)
 
 *~48k chars of system prompt + tool docs: ≈25k tokens as text, ≈2.7k image
 tokens as this page. Real pipeline output; **Gemini 4 Argon (`15/15` pure-image hex, `100/100`
@@ -350,50 +262,50 @@ pure-image arithmetic)**, **Gemini 3.6–3.8 Flash (`14/15` hex)**, and original
 **Fable 5 (`13/15` hex)** read renders like this at full fidelity, whereas later
 Claude 5.5 / Fable 5.1 releases do not (see [model tiers](#the-honest-part)).*
 
-![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + pxpipe ~19.0M (4.8×) and Gemini 3.6 Flash + pxpipe ~21.3M (5.3×)](docs/assets/context-window-chars.png)
+![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + inkling ~19.0M (4.8×) and Gemini 3.6 Flash + inkling ~21.3M (5.3×)](docs/assets/context-window-chars.png)
 
 *Eight years of context growth, in characters. Every text line tops out near
 ~4M chars (a 1M-token window at ~4 chars/token); **Grok 4.5** is shown as a
 text-window point only (500K). The orange overlays are the **same 1M
-windows** read through pxpipe images — ~19.0M chars for Fable 5 (**4.8×**) and ~21.3M chars for Gemini 3.6 Flash (**5.3×** text capacity). Density is measured from a live render at
+windows** read through inkling images — ~19.0M chars for Fable 5 (**4.8×**) and ~21.3M chars for Gemini 3.6 Flash (**5.3×** text capacity). Density is measured from a live render at
 generation time, not hand-typed: regenerate with
 `npx tsx scripts/gen-context-chart.ts`
 ([source](scripts/gen-context-chart.ts)).*
 
 ## Demo
 
-**`claude-fable-5` (June 2026 release, 13/15 hex / 100/100 arithmetic reader) — plain left, pxpipe right:**
+**`claude-fable-5` (June 2026 release, 13/15 hex / 100/100 arithmetic reader) — plain left, inkling right:**
 
 https://github.com/user-attachments/assets/1c8ee63a-fcd7-4958-917b-da788d718349
 
-On original `claude-fable-5`, pxpipe counts an exact token **10/10** across 39 imaged filler files
+On original `claude-fable-5`, inkling counts an exact token **10/10** across 39 imaged filler files
 (matches `grep` line-for-line), gets the multi-step ledger arithmetic right,
 and ends the session at **$6.06** with context to spare (73.5k/1M) vs
 **$42.21** at 96% full. Note: these headline Claude numbers are from **`claude-fable-5`**,
 *not* `claude-opus-5-5`, `claude-sonnet-5-5`, or `claude-haiku-5-5`
-(which regressed to 0/15–3/15 on dense pixel reading). One caveat visible in the clip: the pxpipe arm
+(which regressed to 0/15–3/15 on dense pixel reading). One caveat visible in the clip: the inkling arm
 needed a nudge to match the requested one-line output format.
 
 ## Try it (30 seconds)
 
 ```bash
-npx pxpipe-proxy                                  # proxy on 127.0.0.1:47821
-pxpipe warp -- agy                                # Gemini 4 / Antigravity CLI (15/15 pure-image reader)
-pxpipe warp -- omp                                # omp / OpenCode / Claude Code (pxpipe warp -- claude)
+npx @sriinnu/inkling                                  # proxy on 127.0.0.1:47821
+inkling warp -- agy                                # Gemini 4 / Antigravity CLI (15/15 pure-image reader)
+inkling warp -- omp                                # omp / OpenCode / Claude Code (inkling warp -- claude)
 ```
 
 Dashboard at <http://127.0.0.1:47821/>: tokens saved, every text→image
 conversion side by side, kill switch, live model chips. Responses stream
-normally — pxpipe compresses the *request* only, never the model's output.
+normally — inkling compresses the *request* only, never the model's output.
 Recent turns stay text; the system prompt, tool docs, and older bulk history
 are imaged.
 
-### `pxpipe warp`
+### `inkling warp`
 
 ```bash
-pxpipe warp -- agy             # Antigravity CLI (Gemini 4 / 3.8 Flash via CloudCode PA)
-pxpipe warp -- omp             # omp (Anthropic Messages, OpenAI Responses, or Google CloudCode PA)
-pxpipe warp -- opencode        # OpenCode (or: claude, codex, cursor-agent, or any shell alias)
+inkling warp -- agy             # Antigravity CLI (Gemini 4 / 3.8 Flash via CloudCode PA)
+inkling warp -- omp             # omp (Anthropic Messages, OpenAI Responses, or Google CloudCode PA)
+inkling warp -- opencode        # OpenCode (or: claude, codex, cursor-agent, or any shell alias)
 ```
 
 Zero base-URL overrides (`ANTHROPIC_BASE_URL` / `GEMINI_API_BASE` stay unset),
@@ -406,7 +318,7 @@ Built-in default routes divert:
 - `daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*` and `:generateContent*` (`agy` / Antigravity CLI)
 - `generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*` and `:generateContent*` (Gemini CLI / Google AI Studio)
 
-When `agy` or a Gemini client runs **Gemini 4** (`gemini-4-argon`, `gemini-4-pro`, `gemini-4-flash`), pxpipe automatically selects `GEMINI_PROFILE`: 312-col Spleen 5×8, 96-page history cap, and a compact factsheet alongside a vision encoder that reads dense 5×8 pages at **15/15** verbatim hex and **100/100** arithmetic directly from pixels.
+When `agy` or a Gemini client runs **Gemini 4** (`gemini-4-argon`, `gemini-4-pro`, `gemini-4-flash`), inkling automatically selects `GEMINI_PROFILE`: 312-col Spleen 5×8, 96-page history cap, and a compact factsheet alongside a vision encoder that reads dense 5×8 pages at **15/15** verbatim hex and **100/100** arithmetic directly from pixels.
 
 Agents that reach their provider over a custom or local gateway base URL (such
 as `omp` or `opencode` using an OpenAI/Cloudflare gateway, or `codex` on a local
@@ -414,7 +326,7 @@ port) can either point their provider `baseURL` at `http://127.0.0.1:47821` or
 pass a `--route` rule (a rule that names a port matches only that port):
 
 ```bash
-pxpipe warp --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821' -- codex
+inkling warp --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821' -- codex
 ```
 
 ## Offline export (no proxy)
@@ -423,15 +335,15 @@ You can render text, files, or diffs to PNG pages without running the proxy or
 connecting Claude Code:
 
 ```bash
-npx pxpipe-proxy export src/
-cat prompt.txt | npx pxpipe-proxy export --stdin
-npx pxpipe-proxy export --git
+npx @sriinnu/inkling export src/
+cat prompt.txt | npx @sriinnu/inkling export --stdin
+npx @sriinnu/inkling export --git
 ```
 
-If the package is installed, use `pxpipe export` instead of
-`npx pxpipe-proxy export`.
+If the package is installed, use `inkling export` instead of
+`npx @sriinnu/inkling export`.
 
-Each run writes a fresh `pxpipe-export-XXXXXX/` output folder (the exact path
+Each run writes a fresh `inkling-export-XXXXXX/` output folder (the exact path
 is printed when the command finishes) containing `page-*.png`, `factsheet.txt`,
 `manifest.json`, and `prompt.txt`. Upload the PNG pages and paste the prompt
 into image-upload clients such as Cursor when you want dense visual context
@@ -446,25 +358,25 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
 | **Tier 1 — Full-fidelity readers** | `gemini-4-argon` (`gemini-4*`) | **15/15** | **98/98** | **100/100** | **On by default.** First model to hit 15/15 hex and 100/100 arithmetic on pure images; 96-page history cap + compact factsheet. |
 | **Tier 1 — Full-fidelity readers** | `google/gemini-3.6-flash`, `3.7-flash`, `3.8-flash` | **14/15** | **98/98** | **100/100** | **On by default** (compact factsheet). ~5.0–5.3× text capacity. |
 | **Tier 1 — Full-fidelity readers** | `claude-fable-5` (original June 2026) | **13/15** | **98/98** | **100/100** | **On by default.** SWE-bench Lite 10/10, SWE-bench Pro 14/19. |
-| **Tier 2 — Gist & agentic history only** (not byte-exact on dense logs/JSON) | `claude-opus-5-5` (default), `claude-fable-5-1` / `claude-fable-5-2` (default, spaced profile), `claude-opus-5` (opt-in), `grok-4.5` / `grok-4.6` (opt-in), `gpt-5.6-sol` (opt-in) | 0/15–14/15 | 83/98–**98/98** | 98/100–**100/100** | **Do not use for tool-less document/log extraction.** Safe only in live agent sessions where recent turns stay text and the agent has tools (`Read`/`Grep`) to re-fetch exact IDs/numbers. |
-| **Unsupported — Do not image** | `claude-haiku-5-5` (`claude-haiku-*`), `claude-sonnet-5-5`, `claude-opus-4-8`, `gpt-6.1-sol`, `grok-4.7`, `gpt-6-astra`, `kimi-k3`, `glm-5.3-flash`, `deepseek-v4.1-flash-1017` | 0/15–2/15 | 14/98–98/98 | 36/100–100/100 | **Not in default scope** (or loses money after cache discount). Weak readers guess plausible wrong numbers/IDs or misbind factsheet tokens when tools are disabled. |
+| **Tier 2 — Gist & agentic history only** (not byte-exact on dense logs/JSON) | `claude-opus-5-5` (opt-in, text by default), `claude-fable-5-1` / `claude-fable-5-2` (default, spaced profile), `claude-opus-5` (opt-in), `grok-4.5` / `grok-4.6` (opt-in), `gpt-5.6-sol` (opt-in) | 0/15–14/15 | 83/98–**98/98** | 98/100–**100/100** | **Do not use for tool-less document/log extraction.** Safe only in live agent sessions where recent turns stay text and the agent has tools (`Read`/`Grep`) to re-fetch exact IDs/numbers. |
+| **Unsupported — Do not image** | `claude-haiku-5-5` (`claude-haiku-*`), `claude-sonnet-5-5`, `claude-opus-4-8`, `gpt-6.1-sol` at 5×8 (its shipped 14px profile is a strong reader), `grok-4.7`, `gpt-6-astra`, `kimi-k3`, `glm-5.3-flash`, `deepseek-v4.1-flash-1017` | 0/15–2/15 | 14/98–98/98 | 36/100–100/100 | **Not in default scope** (or loses money after cache discount). Weak readers guess plausible wrong numbers/IDs or misbind factsheet tokens when tools are disabled. |
 
 - **Independent 6-document benchmark (`TokenSave` / `johnisking` corpus — English/Korean/Japanese prose, JS code, 60-record JSON, 230-line log):** That benchmark tested only `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, and `claude-fable-5-1` with `--tools ""`, where `images only` scored **3/60 to 14/60** on planted hex IDs, **6/60 to 29/60** on planted numbers, **0/80** on unplanted log/JSON IDs, and **3/10** on Korean prose numbers (`94392` misread as `9392`). Running the exact same 6-document, 80-item benchmark on **`gemini-4-argon` pure images (no factsheet)** scores **28/30 (93.3%)** on planted hex IDs (**10/10** on English + Code, **10/10** on Korean `prose_ko` including `94392` exact, **5/5** on Japanese hex), **27/30 (90.0%)** on planted numbers, and **13/20** on unplanted JSON/log items (including **4/5** on unplanted 230-line log `req=` IDs where all four Claude models scored 0/20).
 - **We tested removing the factsheet on Gemini 4 (`68/80` pure-image) — and put it back:** Because `gemini-4-argon` scored **15/15** on our 12-char `verbatim-hex` benchmark and **100/100** on pure-image arithmetic, we tested removing the text factsheet completely (`factSheetFormat: 'none'`) on the 6-document TokenSave corpus. Even at 85% overall (`28/30` planted hex, `27/30` planted numbers), 5 of the 12 pure-image misses were single-pixel `0`↔`8` / `6`↔`8` substitutions inside 22-char `req_<18-hex>` strings (`req_709b2b8ff97e92994a` → `req_709b2b0ff97e92994a`) or `30141` → `38141`. In Spleen 5×8, `0` and `8` differ by one interior pixel. When a strong reader (`gemini-4-argon` or `claude-fable-5`) reads the image, it already sees which ticket/row goes with which value and uses the bounded 96-token factsheet to disambiguate `0` vs `8` (recovering the planted misses to **30/30** hex and **29/30** numbers), so we kept the factsheet in production. On weak readers (`opus-5-5`, `sonnet-5-5`, `fable-5-1`), the model cannot read the image rows at all, so it guesses pairings from the factsheet and fails 0/80 on any ID past the 96-token cap ([FINDINGS.md](FINDINGS.md), 2026-10-25 entry).
-- **Escape hatch:** subagents on non-allowlisted models pass through as text — route byte-exact work there (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in agent frontmatter), or restrict `PXPIPE_MODELS=gemini,claude-fable-5` if you do not want `claude-opus-5-5` imaged.
+- **Escape hatch:** subagents on non-allowlisted models pass through as text — route byte-exact work there (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in agent frontmatter), or restrict `INKLING_MODELS=gemini,claude-fable-5` if you do not want `claude-opus-5-5` imaged.
 - **Real work (measured on `claude-fable-5`):** SWE-bench Lite pilot **10/10 both arms** at −65% request size; SWE-bench Pro **14/19 ON vs 15/19 OFF** at −60%, verdicts agree 18/19, and the single split re-resolved 3/3 on replication — run-to-run variance, not compression. Small n; receipts in `eval/`. Later Claude releases (`fable-5-1`, `opus-5-5`, `sonnet-5-5`) have weaker pixel recall than `claude-fable-5`.
 - **Workload-dependent.** Wins on token-dense content (~1 char/token), loses money on sparse prose (~3.5 chars/token); a profitability gate (calibrated on N=391 production rows) images only where the math wins.
 - **Client-dependent.** Savings track uncached bulk the client still re-sends as text. Claude Code re-sends system + tools + history on `/anthropic/messages` and typically lands ~60–70%. Details and measured splits: [docs/CACHING_AND_SAVINGS.md](docs/CACHING_AND_SAVINGS.md).
 
 <details>
-<summary><strong>Configuration, `PXPIPE_MODELS`, and per-model rendering details</strong></summary>
+<summary><strong>Configuration, `INKLING_MODELS`, and per-model rendering details</strong></summary>
 
-- **Model scope:** default `PXPIPE_MODELS=claude-fable-5,claude-opus-5-5,gemini`. The `gemini`
+- **Model scope:** default `INKLING_MODELS=claude-fable-5,gemini`. The `gemini`
   base covers every Gemini id (3.6/3.7/3.8 Flash, Pro, 4, 5, and future
-  versions); to opt Gemini out, drop `gemini` from `PXPIPE_MODELS` or click the
-  chip off. Opus 5, Sonnet 5.5, Sol, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
-  `PXPIPE_MODELS`). Haiku is never enabled. The exact Sol id still matters: sibling variants such as
-  `gpt-5.6-terra` do not inherit Sol's allowlist or render profile. `PXPIPE_MODELS=off` disables
+  versions); to opt Gemini out, drop `gemini` from `INKLING_MODELS` or click the
+  chip off. Gemini 4 hydrogen and carbon are in that scope but pass through as text until they are measured. Opus 5, Opus 5.5, Sonnet 5.5, Sol, GPT 5.5, and **Grok** are opt-in only (dashboard chips or
+  `INKLING_MODELS`). Haiku is never enabled. The exact Sol id still matters: sibling variants such as
+  `gpt-5.6-terra` do not inherit Sol's allowlist or render profile. `INKLING_MODELS=off` disables
   imaging. Everything else passes through byte-identical. On the GPT path,
   tool definitions stay native JSON and no Anthropic `cache_control`
   markers are used. Responses history compression recognizes completed
@@ -474,15 +386,15 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
   keeps the newest six completed pairs and allows 32 images; Sol keeps one pair
   and allows 64 images, while Grok allows 24 images. Opt-in long-session
   coverage can be changed (defensive cap 100) with
-  `PXPIPE_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
-- **`claude-opus-5-5` & `claude-opus-5`:** `claude-opus-5-5` is on by default at spaced 5×8 (+2px row height, ~25% more image tokens than Fable's layout, still ~50%+ live savings). Good for gist/reasoning (94/98 gist, 100/100 arithmetic, 0/16 never-stated), weak on dense verbatim hex (3/15 on Opus 5.5, 2/15 on Opus 5); agents must re-fetch exact IDs via tools. Details: [FINDINGS.md](FINDINGS.md).
+  `INKLING_GPT_HISTORY_MAX_IMAGES=48` after validating the provider's request cap.
+- **`claude-opus-5-5` & `claude-opus-5`:** `claude-opus-5-5` passes through as text by default; `INKLING_FORCE_IMAGES=1` with the model named in scope images it at spaced 5×8 (+2px row height, ~25% more image tokens than Fable's layout). Good for gist/reasoning (94/98 gist, 100/100 arithmetic, 0/16 never-stated), weak on dense verbatim hex (3/15 on Opus 5.5, 2/15 on Opus 5); agents must re-fetch exact IDs via tools. Details: [FINDINGS.md](FINDINGS.md).
 - **Per-model rendering:** Gemini 4 (`GEMINI_PROFILE`) uses 312-column, 1568×728 5×8 Spleen with 96 max history pages, `mixed` history grouping, and a compact factsheet; Gemini 3.x uses the same 5×8 canvas with a 32-page cap. Claude uses 312-column 5×8 Spleen (dense for Fable, +2px row spacing for Opus/Sonnet). Opt-in `gpt-5.6-sol` and Grok use native 14px JetBrains Mono glyphs in a 9×16 cell, 84 columns, and a 764px full-width strip.
   [Sol receipts](eval/sol-profile/QUALITY_RESULTS.md) and
   [profile evidence](docs/MODEL_RENDER_PROFILES.md).
 - **Grok 4.5 / 4.6 (opt-in):** native 14px / 84 cols / maxH 512 (100/100 arith, 97/98 gist).
   Off by default (dense hex still 0/15). History uses mixed collapse so Codex
   assistant messages between tool rounds still image. Enable with
-  `PXPIPE_MODELS=claude-fable-5,grok-4.6` or the dashboard chip.
+  `INKLING_MODELS=claude-fable-5,grok-4.6` or the dashboard chip.
   [eval/grok-density/QUALITY_RESULTS.md](eval/grok-density/QUALITY_RESULTS.md).
 
 </details>
@@ -506,9 +418,9 @@ numbers predate it).
 | `claude-fable-5` (default) | Spleen 5×8, 312 cols (shipped) | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | June 2026 production profiles: [arithmetic + hex](FINDINGS.md), [gist/state/guards](eval/gist-recall/) |
 | `claude-fable-5-1` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | **14/15** | spaced profile; was 6/15 hex and 95/98 gist on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](eval/sol-profile/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
 | `claude-fable-5-2` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | spaced profile; 13/15 and 11/15 over two hex runs, was 7/15 and 5/15 on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](eval/model-quality/), [dense hex](eval/verbatim-15/), [gist/state/guards](eval/gist-recall/) |
-| `claude-opus-5-5` (default, gist-only) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `claude-opus-5-5` (opt-in, text by default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `claude-opus-5` (opt-in) | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](eval/gsm8k/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
-| `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `PXPIPE_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
+| `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `INKLING_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](eval/sol-profile/), [gist/state/guards](eval/gist-recall/), [dense hex](eval/verbatim-15/) |
 | `grok-4.5` (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](eval/grok-density/QUALITY_RESULTS.md), [native-sweep](eval/grok-density/native-sweep/RESULTS.md) |
 | `grok-4.6` high (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](eval/grok-profile/QUALITY_RESULTS.md) |
 | `gpt-5.6-sol` (opt-in) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](eval/sol-profile/README.md) |
@@ -549,10 +461,10 @@ These are not cross-model comparisons. Every unlisted model is **not run**.
 
 | test | model | result | evaluation and receipts |
 | --- | --- | --- | --- |
-| SWE-bench Lite | `claude-fable-5` | pxpipe 10/10; text 10/10; −65% request size | [paired pilot](eval/swe-bench/) |
-| SWE-bench Pro | `claude-fable-5` | pxpipe 14/19; text 15/19; −60% request size | [paired pilot](eval/swe-bench-pro/) |
-| production-history row localization | `google/gemini-3.6-flash` | text 17/30; pxpipe 18/30 | [positional retrieval](eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
-| production-history exact row | `google/gemini-3.6-flash` | text 3/30; pxpipe 3/30 | [positional retrieval](eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
+| SWE-bench Lite | `claude-fable-5` | inkling 10/10; text 10/10; −65% request size | [paired pilot](eval/swe-bench/) |
+| SWE-bench Pro | `claude-fable-5` | inkling 14/19; text 15/19; −60% request size | [paired pilot](eval/swe-bench-pro/) |
+| production-history row localization | `google/gemini-3.6-flash` | text 17/30; inkling 18/30 | [positional retrieval](eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
+| production-history exact row | `google/gemini-3.6-flash` | text 3/30; inkling 3/30 | [positional retrieval](eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
 
 The SWE-bench runner is Claude Code/Fable-specific; no other model has an ON/OFF
 run. Gemini's positional-retrieval sweep is directional evidence, not a general
@@ -564,7 +476,7 @@ Measured by rendering this repo’s dense fixture through the real pipeline and
 pricing pixels at each family’s vision rate. Multiplier = measured
 chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 
-| family | window | as text (@4 c/tok) | as pxpipe images | density | multiplier |
+| family | window | as text (@4 c/tok) | as inkling images | density | multiplier |
 |---|---:|---:|---:|---:|---:|
 | **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (exact 28px patches) | **~4.7×** |
 | **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.1M** | ~20.1 c/vt (1,078 tok/page) | **~5.0×** |
@@ -588,12 +500,12 @@ blocks and forwards the provider-native request, or bridges Anthropic Messages
 to a configured OpenAI-compatible provider. On Anthropic, the static prefix and
 prompt-cache boundary are preserved. Model-specific profiles control geometry,
 factsheets, history retention, and profitability, so sparse prose stays text.
-Events log to `~/.pxpipe/events.jsonl`.
+Events log to `~/.inkling/events.jsonl`.
 
 ## Library use (no proxy)
 
 ```ts
-import { renderTextToImages, transformAnthropicMessages } from "pxpipe-proxy";
+import { renderTextToImages, transformAnthropicMessages } from "inkling";
 
 const { pages } = await renderTextToImages(toolResultText);     // pages[i].png: Uint8Array
 const { body, applied, info } = await transformAnthropicMessages({
@@ -608,16 +520,16 @@ edge/Workers); `@napi-rs/canvas` is build-time only. Full API:
 `src/core/index.ts`.
 
 <details>
-<summary><strong>Offline stats (no proxy): <code>pxpipe stats</code></strong></summary>
+<summary><strong>Offline stats (no proxy): <code>inkling stats</code></strong></summary>
 
 The live dashboard shows savings while the proxy is running. To read the same
 event log **after the fact** — with no server up — summarize it straight from
 disk:
 
 ```bash
-pxpipe stats                   # human report from ~/.pxpipe/events.jsonl
-pxpipe stats --json            # same aggregate as machine-readable JSON
-pxpipe stats --file /path/to/events.jsonl
+inkling stats                   # human report from ~/.inkling/events.jsonl
+inkling stats --json            # same aggregate as machine-readable JSON
+inkling stats --file /path/to/events.jsonl
 ```
 
 Alongside request counts, compression ratios, latency percentiles, and
@@ -626,10 +538,10 @@ cache-hit rates, the report prints a **measured savings** headline —
 only (unmeasured requests are excluded, never counted as zero). This is a
 **raw-token** figure (cache reads at face value, not cost-weighted), so it is
 deliberately a different quantity from the dashboard's cost-weighted saved %.
-Point it at a non-default log with `--file`, or set `PXPIPE_LOG`.
+Point it at a non-default log with `--file`, or set `INKLING_LOG`.
 
 Exit codes: `0` report printed, `1` events file not found, `2` file present but
-no valid events. `pxpipe stats --help` prints usage.
+no valid events. `inkling stats --help` prints usage.
 
 </details>
 
@@ -649,7 +561,7 @@ Windows is community-supported: primary development targets macOS/Linux, and Win
 
 End-to-end, the whole bill. Most compression tools report savings only on
 the input slice they touched, which flatters the number. The end-to-end
-denominator is *every* production request: the small ones pxpipe correctly
+denominator is *every* production request: the small ones inkling correctly
 left untouched, all cache writes and reads, and all output tokens (which the
 proxy never compresses). On a 13,709-request snapshot that was 59% ($100 →
 ~$41); a later 8,904-compressed-request trace measured ~70%. Compressed-only
@@ -665,7 +577,7 @@ Both sides of the same request, at the same moment. For every `/v1/messages`
 POST the proxy fires a free `count_tokens` probe on the original uncompressed
 body (the counterfactual) in parallel with the real forward, and reads
 Anthropic's actually-billed usage block off the response. Both land in the
-same row of `~/.pxpipe/events.jsonl`, so there is no turn-count or
+same row of `~/.inkling/events.jsonl`, so there is no turn-count or
 run-to-run confound. Dollar conversion uses Fable 5 list ratios: input ×1.0,
 cache write ×1.25, cache read ×0.1, output ×5. Cache pricing is applied
 identically to both sides, so the caching discount cancels and cannot be
@@ -741,7 +653,7 @@ numbers: [docs/NOT-OCR.md](docs/NOT-OCR.md).
 <summary><strong>Why does the README read like an AI wrote it?</strong></summary>
 
 Because one did. Most of this repo's commits — the code and the docs — were
-authored by Opus/Fable agent sessions running behind pxpipe itself, reading
+authored by Opus/Fable agent sessions running behind inkling itself, reading
 their own collapsed history as image pages while they worked.
 
 </details>
@@ -767,14 +679,18 @@ Effective-context benefits remain unproven. The production-history results
 above are directional evidence, not a general context-window or long-task
 accuracy claim.
 
-## Community projects
+## Credits
 
-Third-party projects listed here are not maintained or supported by pxpipe.
+inkling's image pipeline, renderer, evals and most of the research in [FINDINGS.md](FINDINGS.md) come from **[pxpipe](https://github.com/teamchong/pxpipe)** by Steven ([teamchong](https://github.com/teamchong)), MIT. inkling started from pxpipe v0.16.0 (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`). The "context as images" idea, the fonts and atlases, the count_tokens counterfactual and the model-tier measurements are his work. Thank you, Steven.
+
+Other projects built on pxpipe, not maintained by inkling:
+
 
 - [pxpipe-windows](https://github.com/DivyeshPatro/pxpipe-windows) — Windows support for `pxpipe mitm` (node-forge CA in place of openssl, Task Scheduler autostart).
 - [OmniGlyph](https://github.com/diegosouzapw/OmniGlyph) — A community-maintained project derived from pxpipe and used by [OmniRoute](https://github.com/diegosouzapw/OmniRoute).
 - [pxpipe-go](https://github.com/evan-choi/pxpipe-go) — A Go port of pxpipe's core with a CLI wrapper, standalone proxy, and embeddable library for Anthropic Messages and OpenAI Chat/Responses.
 
+
 ## License
 
-[MIT](LICENSE). The upstream pxpipe copyright notice is kept intact in [LICENSE](LICENSE); fork changes are Copyright (c) 2026 Srinivas Pendela under the same license. See [NOTICE](NOTICE) for full attribution to pxpipe and PAKT.
+MIT. See [LICENSE](LICENSE), which keeps pxpipe's original copyright notice as the license requires.

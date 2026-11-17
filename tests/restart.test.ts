@@ -96,9 +96,9 @@ describe('resolveTarget', () => {
 
 describe('process matching', () => {
   it('matches proxy command lines with either path separator', () => {
-    expect(matchesProxyCommand('node /home/u/pxpipe/bin/cli.js')).toBe(true);
+    expect(matchesProxyCommand('node /home/u/inkling/bin/cli.js')).toBe(true);
     expect(
-      matchesProxyCommand('"C:\\Program Files\\nodejs\\node.exe" "D:\\pxpipe\\bin\\cli.js"'),
+      matchesProxyCommand('"C:\\Program Files\\nodejs\\node.exe" "D:\\inkling\\bin\\cli.js"'),
     ).toBe(true);
   });
 

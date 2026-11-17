@@ -8,6 +8,8 @@ import {
   CACHE_CREATE_RATE,
   CACHE_READ_RATE,
   CACHE_TTL_SEC,
+  CACHE_TTL_1H_SEC,
+  observedCacheTtlSec,
 } from '../src/core/baseline.js';
 
 /**
@@ -175,5 +177,28 @@ describe('deriveBaselineWarmth (server-observed: cr>0 only)', () => {
     const warmEff = computeBaselineInputEff(5000, cacheable, 0, 0, 0, warm, prevCacheable);
     const coldEff = computeBaselineInputEff(5000, cacheable, 0, 0, 0, false, 0);
     expect(warmEff).toBeLessThanOrEqual(coldEff);
+  });
+});
+
+describe('cache tier TTL for the warmth window', () => {
+  it('a 1h write sets the hour window and sticks', () => {
+    expect(observedCacheTtlSec(0, undefined)).toBe(CACHE_TTL_SEC);
+    expect(observedCacheTtlSec(undefined, undefined)).toBe(CACHE_TTL_SEC);
+    expect(observedCacheTtlSec(10, undefined)).toBe(CACHE_TTL_1H_SEC);
+    // A read-only or 5m-append row after a 1h prefix keeps the hour.
+    expect(observedCacheTtlSec(0, CACHE_TTL_1H_SEC)).toBe(CACHE_TTL_1H_SEC);
+  });
+
+  it("the prior's observed TTL replaces the default window", () => {
+    const prior = {
+      ts: 1000, cacheable: 8000, prefixSha: 's', toolsSha: 't', pxPrefixSha: 'old', model: 'm',
+    };
+    const opts = { pxPrefixSha: 'new', model: 'm' };
+    const at = 1000 + 1200; // 20 minutes later, image path missed (cr 0)
+    expect(deriveBaselineWarmth(prior, at, 5000, 0, CACHE_TTL_SEC, 's', 't', opts).warm).toBe(false);
+    expect(deriveBaselineWarmth({ ...prior, ttlSec: CACHE_TTL_1H_SEC }, at, 5000, 0, CACHE_TTL_SEC, 's', 't', opts))
+      .toEqual({ warm: true, prevCacheable: 8000 });
+    expect(deriveBaselineWarmth({ ...prior, ttlSec: CACHE_TTL_1H_SEC }, 1000 + 3700, 5000, 0, CACHE_TTL_SEC, 's', 't', opts).warm)
+      .toBe(false);
   });
 });

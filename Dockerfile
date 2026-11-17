@@ -8,8 +8,6 @@ RUN corepack enable
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-# The prepare lifecycle script runs on install. It no-ops until src/ is copied.
-COPY scripts/prepare.mjs ./scripts/prepare.mjs
 RUN pnpm install --frozen-lockfile
 
 COPY bin ./bin
@@ -28,28 +26,16 @@ LABEL org.opencontainers.image.source="https://github.com/sriinnu/inkling" \
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=47821
-ENV PXPIPE_CONFIG=/data/config.json
-ENV PXPIPE_LOG=/data/events.jsonl
-ENV PNPM_HOME=/pnpm
-ENV PATH=$PNPM_HOME:$PATH
-
-RUN corepack enable
+ENV INKLING_CONFIG=/data/config.json
+ENV INKLING_LOG=/data/events.jsonl
 
 WORKDIR /app
-
-# dist/node.js imports @sriinnu/pakt at runtime. The bundle marks it external,
-# so the image has to install production dependencies or the process exits
-# with ERR_MODULE_NOT_FOUND before it listens.
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-# prepare runs on install and exits 0 here because src/ is not in this stage.
-COPY scripts/prepare.mjs ./scripts/prepare.mjs
-RUN pnpm install --frozen-lockfile --prod
 
 COPY --from=build --chown=node:node /app/dist/node.js ./dist/node.js
 COPY --chown=node:node LICENSE ./licenses/LICENSE
 COPY --chown=node:node assets/*LICENSE.txt ./licenses/
 
-RUN mkdir /data && chown -R node:node /app /data
+RUN mkdir /data && chown node:node /data
 
 USER node
 

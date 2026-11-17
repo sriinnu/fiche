@@ -5,7 +5,7 @@
 // Usage: MODEL=claude-opus-5-5 node render_model.mjs [work work2 work3]
 //
 // Uses renderForModel() from eval/lib/render-bridge.mjs, so the geometry is
-// exactly what pxpipe ships for MODEL (resolveClaudeProfile -> stripCols,
+// exactly what inkling ships for MODEL (resolveClaudeProfile -> stripCols,
 // style, maxHeightPx). Old s*_p*.png pages are removed first so a shorter
 // render cannot leave stale trailing pages behind.
 import { renderForModel } from '../lib/render-bridge.mjs';

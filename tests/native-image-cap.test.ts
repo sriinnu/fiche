@@ -1,13 +1,13 @@
 /**
- * The provider's image cap is a property of the WIRE, not of pxpipe: it counts
+ * The provider's image cap is a property of the WIRE, not of inkling: it counts
  * the client's own images (screenshots, pasted pictures, images a tool already
- * returned) together with every image pxpipe adds. Pricing only our own is what
+ * returned) together with every image inkling adds. Pricing only our own is what
  * let a request carrying 100+ client images get imaged further and come back
  * 400/500 — a session the user then could not resume at all.
  *
  * These tests pin the two halves of the fix:
  *   1. `countNativeImages` sees the client's images, at both nesting levels,
- *   2. once they fill the cap, every pxpipe imaging path degrades to text
+ *   2. once they fill the cap, every inkling imaging path degrades to text
  *      instead of adding one more image block.
  *
  * Run just this file:  pnpm vitest run tests/native-image-cap.test.ts
@@ -56,7 +56,7 @@ function clientImages(n: number): Message {
   return { role: 'user', content: Array.from({ length: n }, img) };
 }
 
-/** A tool_result big enough that pxpipe would normally image it. */
+/** A tool_result big enough that inkling would normally image it. */
 function toolResult(id: string, chars = 40_000): Message {
   return {
     role: 'user',

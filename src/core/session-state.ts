@@ -156,7 +156,7 @@ function evictToCapacity(): void {
 
 /**
  * Host-supplied storage for the session map. The core stays filesystem-free;
- * `node.ts` backs this with `~/.pxpipe/session-state.json`, tests with a string.
+ * `node.ts` backs this with `~/.inkling/session-state.json`, tests with a string.
  * `load` returns the last saved text or `undefined` when nothing was saved yet.
  * `save` must be atomic from the reader's point of view (write-then-rename).
  */

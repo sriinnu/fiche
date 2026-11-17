@@ -15,7 +15,7 @@ node eval/sol-profile/gist-recall.mjs
 node eval/sol-profile/verbatim-hex.mjs
 ```
 
-The harnesses post directly to the provider and reject pxpipe's local port, so
+The harnesses post directly to the provider and reject inkling's local port, so
 the measured images are not transformed again. They use the model's resolved
 production profile: Spleen 5×8, IDS rows, and the adjacent factsheet where the
 production path supplies one.
