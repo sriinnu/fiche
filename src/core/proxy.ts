@@ -26,6 +26,13 @@ import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerat
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint } from './codex-cache.js';
+import {
+  DEFAULT_UPSTREAM_REGISTRY,
+  isFollowRefusal,
+  refuseUnfollowedProviderHost,
+  resolveFollowTarget,
+  type UpstreamRegistry,
+} from './upstream-hosts.js';
 import { shouldImageModel } from './reader-tier.js';
 
 export interface ProxyConfig {
@@ -98,6 +105,16 @@ export interface ProxyConfig {
    *  to refuse zstd on image-heavy bodies. Core stays runtime-neutral, so the Node
    *  entry supplies this; without it, encoded bodies pass through as before. */
   decodeRequestBody?: (bytes: Uint8Array, encoding: string, maxBytes: number) => Uint8Array<ArrayBuffer> | undefined;
+  /** "Follow the agent": forward a request whose Host is a registered
+   *  third-party provider (as under `inkling warp`), or whose path is
+   *  `/to/<host>/...`, to that host over https instead of the configured
+   *  upstreams. Only the agent's own credential travels; configured keys,
+   *  gateway headers, bridges and baseline probes never apply. Off by default:
+   *  a public Worker with this on would relay anyone's traffic. See
+   *  core/upstream-hosts.ts. */
+  followHosts?: boolean;
+  /** Registry for `followHosts`; defaults to the built-in provider list. */
+  upstreamRegistry?: UpstreamRegistry;
 }
 
 export interface ProxyEvent {
@@ -1675,30 +1692,42 @@ let responseContentType: string | undefined;
     // still apply; the header itself is stripped before forwarding.
     const bypassHeader = req.headers.get('x-inkling-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
-    const providerPrefixed = isProviderPrefixedPath(url.pathname);
+    const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
+    const followed = config.followHosts
+      ? resolveFollowTarget(url, req.headers.get('host'), registry)
+      : refuseUnfollowedProviderHost(req.headers.get('host'), registry);
+    const followRefusal = isFollowRefusal(followed) ? followed : null;
+    /** Set when this request goes to the agent's own third-party host. */
+    const follow = isFollowRefusal(followed) ? null : followed;
+    // Followed hosts mount their API under a prefix (`/anthropic`, `/api`, ...);
+    // classify on the canonical path, forward the original one.
+    const wirePathname = follow ? follow.wirePathname : url.pathname;
+    const providerPrefixed = !follow && isProviderPrefixedPath(url.pathname);
     // Wire-shape detection stays independent from transform eligibility. A
     // bypassed Codex request is still an OpenAI Responses request for routing,
     // accounting, and response scanning; only its body transformation is off.
-    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(url.pathname);
-    const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(url.pathname);
-    const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(url.pathname);
+    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(wirePathname);
+    const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(wirePathname);
+    const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(wirePathname);
     const isMessages = !bypass && isMessagesWire;
     const isOpenAIChat = !bypass && isOpenAIChatWire;
     const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
-    const googleModelFromPath = req.method === 'POST'
+    const googleModelFromPath = req.method === 'POST' && !follow
       ? parseGoogleModelFromPath(url.pathname)
       : null;
-    const isGoogleInference = req.method === 'POST' && isGoogleInferencePath(url.pathname);
+    const isGoogleInference = req.method === 'POST' && !follow && isGoogleInferencePath(url.pathname);
     const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
     const isGoogle = isGoogleRoute && !bypass;
-    const isGoogleFamily = isGoogleRoute || isGoogleFamilyPath(url.pathname);
-    const isOpenAIPath = isCanonicalOpenAIPath(
+    const isGoogleFamily = !follow && (isGoogleRoute || isGoogleFamilyPath(url.pathname));
+    const isOpenAIPath = !follow && isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
     const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
-    const upstreamBase = isGoogleFamily
+    const upstreamBase = follow
+      ? follow.origin
+      : isGoogleFamily
       ? googleUpstream
       : providerPrefixed
         ? passthroughUpstream
@@ -1721,6 +1750,15 @@ let responseContentType: string | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
     let responsesStreaming = false;
+
+    // Refused here, not at resolution: fire() reads the per-request state above.
+    if (followRefusal) {
+      fire(followRefusal.status, undefined, followRefusal.message);
+      return new Response(JSON.stringify({ error: followRefusal.reason, message: followRefusal.message }), {
+        status: followRefusal.status,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
 
     // Default-deny on the stock Anthropic upstream: a path outside every known
     // family (an agent we do not recognise, a stray browser fetch) would
@@ -1817,7 +1855,8 @@ let responseContentType: string | undefined;
           .find((candidate) => claudeGatewayModelId(candidate) === model);
         const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
         const routedModel = decodedChatModel ?? model;
-        const modelRoute = routedModel ? modelRoutes.get(routedModel) : undefined;
+        // A followed host answers for its own models; never bridge them elsewhere.
+        const modelRoute = routedModel && !follow ? modelRoutes.get(routedModel) : undefined;
         modelRouteForRequest = modelRoute;
         const forceChat = isMessages && modelRoute === 'cloudflare';
         const messagesAnthropic = isMessages
@@ -1857,7 +1896,8 @@ let responseContentType: string | undefined;
             ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
             : bodyIn;
         const routeModel = effectiveModel ?? model ?? undefined;
-        const allowBreakpoints = supportsExplicitPromptCacheBreakpoint({
+        // Third-party hosts never get the OpenAI-only breakpoint field.
+        const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
           pathname: url.pathname,
           upstream: openAIUpstream,
         });
@@ -1960,7 +2000,9 @@ let responseContentType: string | undefined;
           }
         }
 
-        if (isMessages && messagesAnthropic) {
+        // Probes go to the configured Anthropic upstream with the host's keys; a
+        // followed request's prompt must not be copied there.
+        if (isMessages && messagesAnthropic && !follow) {
           baselineStatusApplies = true;
           // Probes fire on the ORIGINAL body before the main forward so all three overlap.
           // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
@@ -2045,7 +2087,13 @@ let responseContentType: string | undefined;
     // The body now travels as plain bytes; a stale coding header would make
     // the upstream try to decompress JSON.
     if (requestBodyDecoded) outHeaders.delete('content-encoding');
-    if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
+    if (follow) {
+      // The agent addressed this host with this credential; it is the only one
+      // that may travel. No configured key, no gateway header, and never an
+      // Anthropic-issued credential, which no third party should ever see.
+      if (/^Bearer\s+sk-ant-/i.test(outHeaders.get('authorization') ?? '')) outHeaders.delete('authorization');
+      if (/^sk-ant-/i.test(outHeaders.get('x-api-key') ?? '')) outHeaders.delete('x-api-key');
+    } else if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
       // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
       outHeaders.delete('x-api-key');
       const anthropicHeaders: string[] = [];
@@ -2083,7 +2131,7 @@ let responseContentType: string | undefined;
       if (bearer) outHeaders.set('authorization', `Bearer ${bearer}`);
     }
 
-    applyGatewayHeaders(outHeaders);
+    if (!follow) applyGatewayHeaders(outHeaders);
 
     // Claude Code smuggles its volatile per-turn billing line inside system
     // text. transform.ts strips it from the body (no body position is both
@@ -2107,7 +2155,9 @@ let responseContentType: string | undefined;
     // a /v1 base, or a full …/chat/completions URL). Every other route appends
     // a path to its resolved base.
     let upstreamUrl: string;
-    if (bridgedChatMessages) {
+    if (follow) {
+      upstreamUrl = follow.origin + follow.outboundPath;
+    } else if (bridgedChatMessages) {
       upstreamUrl = chatCompletionsUrl(config.cloudflareUpstream ?? '');
     } else {
       const outPath = bridgedGptMessages
@@ -2191,6 +2241,9 @@ let responseContentType: string | undefined;
       const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
+        // A followed host's redirect goes back to the agent; following it here
+        // would carry the credential to wherever the 3xx points.
+        ...(follow ? { redirect: 'manual' as const } : {}),
         body: bodyOut,
         signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body

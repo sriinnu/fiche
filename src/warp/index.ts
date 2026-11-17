@@ -23,6 +23,7 @@ import { CertificateAuthority } from './ca.js';
 import { createWarpHandlers } from './connect.js';
 import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
+import { buildUpstreamRegistry, parseUpstreamHosts } from '../core/upstream-hosts.js';
 
 export interface WarpRuntimeOptions {
   /** Port the inkling proxy is already serving on: where matches are sent. */
@@ -54,7 +55,28 @@ function defaultRoutes(port: number): Route[] {
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
+    ...compatRoutes(port),
   ];
+}
+
+/** Inference endpoints, relative to a provider's API prefix. */
+const COMPAT_INFERENCE_PATHS = ['/v1/messages', '/messages', '/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses'];
+
+/**
+ * Third-party providers from the same registry inkling follows, so warp diverts
+ * exactly the hosts inkling will forward back to their owner (and refuses the
+ * rest). Only inference paths under each registered API prefix are diverted.
+ */
+export function compatRoutes(port: number): Route[] {
+  const registry = buildUpstreamRegistry(parseUpstreamHosts(process.env.INKLING_UPSTREAM_HOSTS));
+  const specs = new Set<string>();
+  for (const entry of registry.values()) {
+    if (entry.family !== 'compat') continue;
+    for (const prefix of entry.prefixes) {
+      for (const tail of COMPAT_INFERENCE_PATHS) specs.add(`${entry.host}${prefix}${tail}*`);
+    }
+  }
+  return [...specs].map((pattern) => parseRoute(`${pattern}=http://127.0.0.1:${port}`));
 }
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {

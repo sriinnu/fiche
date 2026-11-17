@@ -17,6 +17,7 @@ import { isIP } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import { guardProxyRequest, parseAllowedHosts } from './core/request-guard.js';
+import { buildUpstreamRegistry, parseUpstreamHosts } from './core/upstream-hosts.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -316,6 +317,12 @@ Environment:
                           (comma list; '*' turns the check off). Browser
                           requests from non-loopback pages, and Hosts that are
                           public DNS names (DNS rebinding), are refused.
+  INKLING_FOLLOW_HOSTS     0 to stop following agents to their own provider
+                          host (warp Host, or base URL .../to/<host>/). On by
+                          default; only registered hosts, https:443, the
+                          agent's own credential.
+  INKLING_UPSTREAM_HOSTS   extra provider hosts to follow (comma list of
+                          host[/api-prefix], e.g. llm.example.com/anthropic)
   INKLING_UPSTREAM         upstream API base for every API family
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides INKLING_UPSTREAM
                            (default https://api.anthropic.com)
@@ -1289,6 +1296,9 @@ async function main(): Promise<void> {
   // doesn't reset what you can see in the UI. Best-effort; ignored on error.
   await dashboard.replay(opts.eventsFile).catch(() => {});
 
+  // Follow the agent to its own third-party host (warp Host, or /to/<host>/).
+  const upstreamRegistry = buildUpstreamRegistry(parseUpstreamHosts(process.env.INKLING_UPSTREAM_HOSTS));
+  const followHosts = !/^(?:0|false|off|no)$/i.test((process.env.INKLING_FOLLOW_HOSTS ?? '').trim());
   const config: ProxyConfig = {
     authToken: anthropicAuthToken,
     provider: opts.provider,
@@ -1305,6 +1315,8 @@ async function main(): Promise<void> {
     captureErrorReqBody: opts.captureErrorReqBody,
     maxRequestBytes: opts.maxRequestBytes,
     decodeRequestBody,
+    followHosts,
+    upstreamRegistry,
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards
@@ -1450,7 +1462,7 @@ async function main(): Promise<void> {
         // would otherwise spend the configured keys (see core/request-guard.ts).
         const denial = guardProxyRequest(
           { host: req.headers.host, origin: req.headers.origin },
-          { allowedHosts },
+          { allowedHosts, providerHosts: new Set(upstreamRegistry.keys()) },
         );
         if (denial) {
           await writeWebResponse(new Response(JSON.stringify({ error: denial.reason, message: denial.message }), {

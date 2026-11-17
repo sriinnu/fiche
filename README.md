@@ -58,6 +58,17 @@ Codex 0.167+ rejects `[profiles.*]` in `config.toml`. For an opt-in profile, put
 
 `INKLING_FORCE_IMAGES=1` lifts the text-only veto for a model that is already in scope. Opus 5.5, Sonnet 5.5, Haiku 5.5, Grok and Gemini 4 hydrogen/carbon also need to be named in `INKLING_MODELS`. The flag does not put `prompt_cache_breakpoint` back on chatgpt.com.
 
+## Follow the agent (third-party providers)
+
+One inkling serves every provider the agent talks to. A request for a registered third-party host goes back to that host over https, carrying only the agent's own credential. inkling's configured keys, gateway headers, bridges and `count_tokens` probes never apply to it.
+
+- Under `inkling warp`, the agent keeps addressing its provider (for example `api.deepseek.com`). warp diverts that host's inference paths into inkling and keeps the Host header, so inkling follows it.
+- For base-URL agents, put the provider host in the path: `ANTHROPIC_BASE_URL=http://127.0.0.1:47821/to/api.deepseek.com/anthropic`.
+
+The built-in hosts are DeepSeek, Moonshot/Kimi, z.ai/BigModel, MiniMax, Qwen DashScope, OpenRouter and xAI. Add more with `INKLING_UPSTREAM_HOSTS=host[/api-prefix],...`. Set `INKLING_FOLLOW_HOSTS=0` to turn following off.
+
+Anything else is refused before any upstream call: unknown hosts, IP literals, local names, non-443 ports, `user@host` tricks, and first-party hosts named through `/to/`. With following off, a third-party Host is refused, never re-routed to Anthropic. Redirects are returned to the agent, not followed. An Anthropic-issued credential (`sk-ant-…`) is stripped before it can reach a third party. Models outside `INKLING_MODELS` pass through byte-identical, as everywhere else.
+
 ## MCP for every agent
 
 One server. Stdio is the default. Streamable HTTP is stateless `POST /mcp` on loopback (no SSE session; `GET` returns 405).

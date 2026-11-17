@@ -1,3 +1,4 @@
+import { DEFAULT_UPSTREAM_REGISTRY } from './upstream-hosts.js';
 /**
  * Who may talk to the local proxy API.
  *
@@ -20,19 +21,16 @@
  * registered publicly, so they cannot be rebound.
  */
 
-/** Hosts `inkling warp` diverts by default, plus the other first-party APIs. */
-const PROVIDER_HOSTS = new Set([
-  'api.anthropic.com',
-  'api.openai.com',
-  'chatgpt.com',
-  'generativelanguage.googleapis.com',
-  'cloudcode-pa.googleapis.com',
-  'daily-cloudcode-pa.googleapis.com',
-]);
+/** Provider hosts an agent under `inkling warp` may name as Host. Derived from
+ *  the upstream registry so the guard and the router cannot drift apart. */
+const PROVIDER_HOSTS: ReadonlySet<string> = new Set(DEFAULT_UPSTREAM_REGISTRY.keys());
 
 export interface RequestGuardOptions {
   /** Extra Host/Origin names to accept (INKLING_ALLOWED_HOSTS). `*` disables the Host and Origin checks. */
   allowedHosts?: readonly string[];
+  /** Provider hosts to trust as Host names; defaults to the built-in registry.
+   *  The Node entry passes the registry extended by INKLING_UPSTREAM_HOSTS. */
+  providerHosts?: ReadonlySet<string>;
 }
 
 export interface RequestGuardDenial {
@@ -65,14 +63,18 @@ export function isLoopbackHostname(host: string): boolean {
 }
 
 /** True when no public DNS name can resolve to this hostname on an attacker's say-so. */
-export function isTrustedHostname(host: string, allowed: readonly string[] = []): boolean {
+export function isTrustedHostname(
+  host: string,
+  allowed: readonly string[] = [],
+  providerHosts: ReadonlySet<string> = PROVIDER_HOSTS,
+): boolean {
   if (host === '') return true; // HTTP/1.0 without Host: nothing to rebind
   if (allowed.includes(host)) return true;
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (isIpLiteral(host)) return true;
   if (!host.includes('.')) return true; // single label: container, compose service
   if (host.endsWith('.internal')) return true; // host.docker.internal and friends
-  return PROVIDER_HOSTS.has(host);
+  return providerHosts.has(host);
 }
 
 export function parseAllowedHosts(spec: string | undefined): string[] {
@@ -110,7 +112,7 @@ export function guardProxyRequest(
     }
   }
   const host = hostnameOf(headers.host ?? '');
-  if (!isTrustedHostname(host, allowed)) {
+  if (!isTrustedHostname(host, allowed, options.providerHosts)) {
     return {
       status: 421,
       reason: 'untrusted_host',
