@@ -60,7 +60,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepublishOnly": "pnpm run typecheck && pnpm test && pnpm run build",
-    "vendor:ui": "node scripts/vendor-ui.mjs"
+    "vendor:ui": "node scripts/vendor-ui.mjs",
+    "prices:gen": "tsx scripts/gen-prices.ts",
+    "prices:check": "tsx scripts/gen-prices.ts --check"
   },
   "keywords": [
     "claude",

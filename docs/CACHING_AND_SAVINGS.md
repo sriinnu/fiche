@@ -62,6 +62,29 @@ Images must be placed in a user message because Anthropic does not accept images
 
 ---
 
+## Where The Price Ratios Come From
+
+Every ratio the gate and the savings math use (cache read, cache write and
+output, each over the uncached input price) comes from `src/core/pricing.ts`.
+`INKLING_PRICES` picks the source:
+
+- `legacy` (default): the ratios inkling has always used. The gate prices
+  every model at Anthropic's 5-minute tier (1.25x write, 0.1x read); the
+  savings math reads the model profile. These are not the official per-model
+  prices: Opus 5.5 and Sonnet 5.5 read at 0.05x, Fable at 0.025x.
+- `kosha`: `src/core/prices.generated.ts`, a build-time table of first-party
+  rows from a kosha registry snapshot (`pnpm prices:gen [registry.json]`;
+  `pnpm prices:check` fails on drift). Reseller rows are never used. A row is
+  refused for ratios when the read is at or above input or the write is
+  outside 1x-3x input; a write of 0 or none means no write premium. An
+  explicit `cacheReadRate`, `cacheWriteRate` or `outputRate` in
+  `INKLING_GPT_PROFILES` still wins, field by field. A model with no usable
+  row is unpriced: the gate passes it through untouched.
+
+Not yet modelled in kosha mode: TTL write tiers (Anthropic 1h at 2x, OpenAI
+12h at 2.5x) and long-context tiers (OpenAI >272K, xAI >=200K). kosha does not
+carry them yet; the gate prices the short-TTL write until it does.
+
 ## Gate And One-Time Burn
 
 The raw compression gate compares image token cost with text token cost. For Anthropic, image cost is estimated from pixel area and text cost comes from the configured chars/token estimate for the relevant bucket.

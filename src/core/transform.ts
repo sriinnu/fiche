@@ -430,7 +430,7 @@ export function evalCompressionProfitability(
   priorWarmImageTokens: number = 0,
   shrinkWidth: boolean = true,
   geometry?: GateGeometry,
-  rates: Readonly<PriceRates> = ANTHROPIC_GATE_RATES,
+  rates: Readonly<PriceRates> | null = ANTHROPIC_GATE_RATES,
 ): {
   imageTokens: number;
   textTokens: number;
@@ -439,6 +439,8 @@ export function evalCompressionProfitability(
   profitable: boolean;
 } | null {
   if (typeof text !== 'string' || text.length === 0) return null;
+  // Unpriced model (kosha mode): no ratios to weigh, so no decision to report.
+  if (rates === null) return null;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
@@ -469,9 +471,11 @@ export function isCompressionProfitable(
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   geometry?: GateGeometry,
-  rates: Readonly<PriceRates> = ANTHROPIC_GATE_RATES,
+  rates: Readonly<PriceRates> | null = ANTHROPIC_GATE_RATES,
 ): boolean {
   if (typeof text !== 'string' || text.length === 0) return false;
+  // Unpriced model (kosha mode): pass the text through untouched.
+  if (rates === null) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;
@@ -510,13 +514,14 @@ export function isCompressionProfitableAmortized(
   shrinkWidth: boolean = true,
   maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
   geometry?: GateGeometry,
-  rates: Readonly<PriceRates> = ANTHROPIC_GATE_RATES,
+  rates: Readonly<PriceRates> | null = ANTHROPIC_GATE_RATES,
 ): boolean {
   if (!Number.isFinite(horizon) || horizon <= 1) {
     return isCompressionProfitable(text, cols, imageCountCap, charsPerToken, priorWarmTokens, priorWarmImageTokens, shrinkWidth, maxCharsPerImage, geometry, rates);
   }
   const N = Math.max(2, Math.floor(horizon));
   if (typeof text !== 'string' || text.length === 0) return false;
+  if (rates === null) return false;
   const cpt = Number.isFinite(charsPerToken) && charsPerToken > 0
     ? charsPerToken
     : CHARS_PER_TOKEN;

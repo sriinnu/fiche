@@ -655,6 +655,39 @@ function envProfiles(): Map<string, GptModelProfile> {
   return envMap;
 }
 
+/** Pricing fields an operator set EXPLICITLY in INKLING_GPT_PROFILES for this
+ *  model (longest matching key), or undefined. The kosha-backed resolver lets
+ *  these win, so an existing override keeps working when the price source
+ *  changes. Built-in profile values are not overrides. */
+export function envPricingOverride(
+  model: string | null | undefined,
+): { cacheReadRate?: number; cacheWriteRate?: number; outputRate?: number } | undefined {
+  const raw = (typeof process !== 'undefined' && process.env && process.env.INKLING_GPT_PROFILES) || '';
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return undefined; }
+  if (!parsed || typeof parsed !== 'object') return undefined;
+  const m = (model ?? '').toLowerCase().replace(/\[[^\]]*\]/g, '');
+  const ids = candidateIds(m);
+  let best: Record<string, unknown> | undefined;
+  let bestLen = -1;
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    const key = k.toLowerCase();
+    if (!v || typeof v !== 'object') continue;
+    if (ids.some((id) => id.startsWith(key)) && key.length > bestLen) {
+      best = v as Record<string, unknown>;
+      bestLen = key.length;
+    }
+  }
+  if (!best) return undefined;
+  const out: { cacheReadRate?: number; cacheWriteRate?: number; outputRate?: number } = {};
+  for (const f of ['cacheReadRate', 'cacheWriteRate', 'outputRate'] as const) {
+    const v = best[f];
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) out[f] = v;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 /** Vendor segments select an upstream, not a geometry, so both spellings of an
  *  id must resolve to one profile — otherwise `moonshotai/kimi-k3` skips its measured
  *  entry and lands on DEFAULT_GPT_PROFILE's OpenAI tile math. Mirrors
