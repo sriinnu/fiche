@@ -3,19 +3,19 @@
  * One tool surface for every client. Tools are local, deterministic, and do
  * not send the payload anywhere.
  */
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { readerTier } from '../core/reader-tier.js';
 import { isInklingSupportedModel } from '../core/applicability.js';
 import { transformAnyRequest, countBillable, type RequestWire } from '../core/request-transform.js';
 import { supportsExplicitPromptCacheBreakpoint } from '../core/codex-cache.js';
 
 export const MCP_PROTOCOL = '2025-03-26';
-export const SERVER_NAME = 'inkling';
+export const SERVER_NAME = 'inkling-mcp';
 export const SERVER_VERSION = '0.17.0';
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
-const ANNOTATIONS = {
+const READ_ONLY = {
   readOnlyHint: true,
   destructiveHint: false,
   idempotentHint: true,
@@ -45,7 +45,15 @@ const stats: McpStats = {
   tokensSaved: 0,
 };
 
-function tool(name: string, description: string, properties: Record<string, unknown>, required: string[]) {
+const COST_NOTE = ' Calling this does not remove text already in the conversation. The argument and this result are both billed. The proxy is what saves tokens on live traffic.';
+
+function tool(
+  name: string,
+  description: string,
+  properties: Record<string, unknown>,
+  required: string[],
+  annotations: { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean } = READ_ONLY,
+) {
   return {
     name,
     description,
@@ -56,7 +64,7 @@ function tool(name: string, description: string, properties: Record<string, unkn
       required,
       additionalProperties: false,
     },
-    annotations: ANNOTATIONS,
+    annotations,
   };
 }
 
@@ -71,7 +79,7 @@ export const MCP_TOOLS = [
   ),
   tool(
     'transform_request',
-    'Run inkling on an LLM request JSON object: bulky context becomes images only if the model is a strong page reader (Gemini, Fable 5, Sol 5.6/6.1); weak readers (Claude 5.5, Grok) get the request back unchanged. Set upstream to https://chatgpt.com or wire path /backend-api/codex/responses to force-strip prompt_cache_breakpoint.',
+    'Run inkling on an LLM request JSON object: bulky context becomes images only if the model is a strong page reader (Gemini, Fable 5, Sol 5.6/6.1); weak readers (Claude 5.5, Grok) get the request back unchanged. Set upstream to https://chatgpt.com or any /backend-api/codex/ path to force-strip prompt_cache_breakpoint.' + COST_NOTE,
     {
       request: { type: 'object', description: 'Provider request JSON (Anthropic messages, OpenAI responses, chat completions, or Gemini).' },
       model: { type: 'string', description: 'Model id. Overrides request.model when set.' },
@@ -90,9 +98,10 @@ export const MCP_TOOLS = [
   ),
   tool(
     'stats',
-    'In-memory counters for this MCP process: calls and tokens saved. No payloads.',
+    'In-memory counters for this MCP process: calls and tokens saved. No payloads. This call increments the counters.',
     {},
     [],
+    { ...READ_ONLY, idempotentHint: false },
   ),
 ];
 
@@ -183,7 +192,11 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
   }
   const id = rpc.id ?? null;
   const notify = rpc.id === undefined;
-  if (rpc.method === 'notifications/initialized' || rpc.method === 'notifications/cancelled') return null;
+  if (rpc.method === 'notifications/initialized' || rpc.method === 'notifications/cancelled') {
+    // A client that sends these with an id still expects a reply.
+    if (rpc.id === undefined) return null;
+    return { jsonrpc: '2.0', id: rpc.id, result: {} };
+  }
   if (rpc.method === 'initialize') {
     const requested = typeof rpc.params?.protocolVersion === 'string' ? rpc.params.protocolVersion : MCP_PROTOCOL;
     const protocolVersion = requested === '2024-11-05' || requested === '2025-03-26' || requested === '2025-06-18'
@@ -216,6 +229,14 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
 /** Newline-delimited JSON, plus LSP Content-Length frames if a client sends them. */
 export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message: unknown, framed: boolean) => void): string {
   let rest = buffer + chunk;
+  if (rest.length > MCP_MAX_BYTES) {
+    onMessage({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32600, message: `message exceeds ${MCP_MAX_BYTES} bytes` },
+    }, false);
+    return '';
+  }
   while (rest.length > 0) {
     // Only a leading header is framing. A JSON payload that mentions
     // "Content-Length:" must not flip the session into LSP mode.
@@ -316,7 +337,7 @@ export function hostHeaderAllowed(hostHeader: string | undefined): boolean {
 }
 
 export function startHttpServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const onRequest = (req: IncomingMessage, res: ServerResponse) => {
     const origin = req.headers.origin;
     const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
     if ((typeof origin === 'string' && !originAllowed(origin)) || !hostHeaderAllowed(host)) {
@@ -380,16 +401,33 @@ export function startHttpServer(port: number): Promise<{ port: number; close: ()
         }
       })();
     });
+  };
+  // Listen on ::1 too, so a client that resolves localhost to IPv6 connects.
+  const server = createServer(onRequest);
+  const v6 = createServer(onRequest);
+  const closeServer = (target: Server) => new Promise<void>((done, fail) => {
+    if (!target.listening) { done(); return; }
+    target.close((err) => err ? fail(err) : done());
   });
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', () => {
       const address = server.address();
       const bound = address && typeof address === 'object' ? address.port : port;
-      resolve({
-        port: bound,
-        close: () => new Promise((done, fail) => server.close((err) => err ? fail(err) : done())),
-      });
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          port: bound,
+          close: async () => {
+            await closeServer(server);
+            await closeServer(v6);
+          },
+        });
+      };
+      v6.once('error', finish);
+      v6.listen(bound, '::1', finish);
     });
   });
 }

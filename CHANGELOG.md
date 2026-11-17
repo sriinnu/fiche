@@ -42,3 +42,29 @@ the README's Credits section.
   `stats`. Stdio `Content-Length` frames are counted in UTF-8 bytes.
 - Text-only reader matching covers `claude-opus-5.5`, Vertex
   `claude-opus-5-5@…` and `x-ai.grok-…` spellings.
+- Follow the agent: a request for a registered compat host (DeepSeek, Kimi,
+  z.ai, MiniMax, DashScope, OpenRouter, xAI, plus `INKLING_UPSTREAM_HOSTS`)
+  goes to that host with only the agent's own credential. https on 443 only,
+  no IPs or local names, redirects handled manually. An unfollowed compat
+  Host gets 421 and is never re-routed to Anthropic. `INKLING_FOLLOW_HOSTS=0`
+  turns it off.
+- Codex: only leading system/developer items enter the GPT static slab, user
+  messages stay native, and history runs seal at a user message, so late
+  images never land high in the cached prefix. WebSocket upgrades get 426 so
+  Codex falls back to HTTP. gzip/deflate/br/zstd request bodies are decoded
+  with a size limit; a body inkling can't decode is never rewritten.
+- No `prompt_cache_breakpoint` on any `/backend-api/codex/` path, including
+  `/responses/compact`.
+- Savings accounting: the text baseline's warmth window follows the cache
+  tier the session writes (3600 s after a 1h-tier write, else 300 s). The gate
+  and the savings math price from one resolver.
+- `INKLING_PRICES=kosha` (opt-in) prices from a build-time table of
+  first-party rows in a kosha registry snapshot (`pnpm prices:gen`,
+  `pnpm prices:check`). Unpriced models pass through, and dashboard dollars
+  use each model's own input price, with unpriced rows counted apart.
+- `inkling-mcp` reports its name as `inkling-mcp`, answers a notification sent
+  with an id, caps a buffered stdio message at 8 MiB, and also listens on
+  `::1`. Installs from git with `npx --yes --package github:sriinnu/inkling
+  inkling-mcp`; `prepare` builds `dist/`. Claude Code plugin and marketplace
+  manifests in `.claude-plugin/`.
+- Logo and README header.

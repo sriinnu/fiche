@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  MCP_MAX_BYTES,
   MCP_TOOLS,
   encodeMcpMessage,
   handleMcpMessage,
@@ -33,8 +34,10 @@ describe('MCP server', () => {
     }));
     const initBody = init as { result: { protocolVersion: string; serverInfo: { name: string } } };
     expect(initBody.result.protocolVersion).toBe('2025-03-26');
-    expect(initBody.result.serverInfo.name).toBe('inkling');
+    expect(initBody.result.serverInfo.name).toBe('inkling-mcp');
     expect(await handleMcpMessage({ jsonrpc: '2.0', method: 'notifications/initialized' })).toBeNull();
+    const withId = await handleMcpMessage({ jsonrpc: '2.0', id: 9, method: 'notifications/initialized' });
+    expect(withId).toEqual({ jsonrpc: '2.0', id: 9, result: {} });
 
     const listed = await handleMcpMessage(rpc('tools/list'));
     const tools = (listed as { result: { tools: typeof MCP_TOOLS } }).result.tools;
@@ -45,13 +48,16 @@ describe('MCP server', () => {
       'stats',
     ]);
     for (const tool of tools) {
-      expect(tool.annotations).toEqual({
+      expect(tool.annotations).toMatchObject({
         readOnlyHint: true,
         destructiveHint: false,
-        idempotentHint: true,
         openWorldHint: false,
       });
+      expect(tool.annotations.idempotentHint).toBe(tool.name !== 'stats');
       expect(tool.inputSchema.type).toBe('object');
+      if (tool.name === 'transform_request') {
+        expect(tool.description).toContain('does not remove text already in the conversation');
+      }
     }
   });
 
@@ -95,6 +101,9 @@ describe('MCP server', () => {
     buffer = pushMcpChunk(buffer, raw, (message) => frames.push(message));
     expect(buffer).toBe('');
     expect(frames).toHaveLength(2);
+    const tooBig: unknown[] = [];
+    pushMcpChunk('', 'x'.repeat(MCP_MAX_BYTES + 1), (message) => tooBig.push(message));
+    expect(JSON.stringify(tooBig[0])).toContain('message exceeds');
 
     const http = await startHttpServer(0);
     try {
@@ -105,7 +114,7 @@ describe('MCP server', () => {
       });
       expect(res.status).toBe(200);
       const json = await res.json() as { result: { structuredContent: { name: string; codex: string } } };
-      expect(json.result.structuredContent.name).toBe('inkling');
+      expect(json.result.structuredContent.name).toBe('inkling-mcp');
       expect(json.result.structuredContent.codex).toContain('chatgpt.com');
       const denied = await fetch(`http://127.0.0.1:${http.port}/mcp`, {
         method: 'POST',

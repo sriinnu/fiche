@@ -41,6 +41,10 @@ describe('ChatGPT Codex prompt_cache_breakpoint', () => {
       upstream: 'https://api.openai.com',
     })).toBe(true);
     expect(supportsExplicitPromptCacheBreakpoint({ pathname: '/v1/responses' })).toBe(true);
+    expect(supportsExplicitPromptCacheBreakpoint({
+      pathname: '/backend-api/codex/responses/compact',
+      upstream: 'https://api.openai.com',
+    })).toBe(false);
   });
 
   it('still injects the breakpoint for api.openai.com Sol profiles', async () => {

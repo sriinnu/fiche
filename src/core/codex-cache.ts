@@ -23,9 +23,8 @@ function hostOf(upstream: string): string {
 /** True when this route may receive an explicit prompt_cache_breakpoint. */
 export function supportsExplicitPromptCacheBreakpoint(route: PromptCacheRoute = {}): boolean {
   const path = route.pathname ?? '';
-  if (path === '/backend-api/codex/responses' || path.endsWith('/backend-api/codex/responses')) {
-    return false;
-  }
+  // Every Codex path (/responses, /responses/compact, ...), bare or prefixed.
+  if (/(^|\/)backend-api\/codex(\/|$)/.test(path)) return false;
   const host = hostOf(route.upstream ?? '');
   if (host === 'chatgpt.com' || host.endsWith('.chatgpt.com')) return false;
   return true;

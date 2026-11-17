@@ -1,6 +1,18 @@
-# inkling
+<p align="center">
+  <img src="assets/inkling-logo.svg" alt="inkling" width="420">
+</p>
 
-**Images for the context a model can read. Everything else untouched.**
+<h1 align="center">inkling</h1>
+
+<p align="center"><strong>Images for the context a model can read. Everything else untouched.</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-6D5BFF.svg"></a>
+  <img alt="Node >= 20.19" src="https://img.shields.io/badge/node-%3E%3D20.19-339933.svg?logo=node.js&logoColor=white">
+  <img alt="pnpm 10" src="https://img.shields.io/badge/pnpm-10.21.0-F69220.svg?logo=pnpm&logoColor=white">
+  <img alt="MCP server" src="https://img.shields.io/badge/MCP-server-1E1B4B.svg">
+  <a href="https://github.com/sriinnu/inkling/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sriinnu/inkling/actions/workflows/ci.yml/badge.svg"></a>
+</p>
 
 inkling is a local proxy for coding agents (Claude Code, Codex, OpenCode, pi, and anything that speaks the Anthropic, OpenAI or Gemini wire formats). Providers bill an image by its pixel area, not by the characters drawn on it, so inkling renders the stale, bulky parts of a request (the system and tool slab, old closed tool-call history, large tool results) as dense PNG pages. A 1568×728 page bills about 1,456 tokens on Anthropic and holds about 28k characters.
 
@@ -79,14 +91,20 @@ node dist/node.js mcp                 # stdio
 node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
 ```
 
-`npx -y @sriinnu/inkling mcp` is the same binary once the package is published. Use the scoped name: the unscoped `inkling` on npm is an unrelated package. Until you publish or `npm install` this checkout, point clients at `node` and the `dist/node.js` path below.
+`npx -y @sriinnu/inkling mcp` is the same binary once the package is published. Use the scoped name: the unscoped `inkling` on npm is an unrelated package. Until you publish or `npm install` this checkout, point clients at `node` and the `dist/node.js` path below, or install from git:
 
-Tools (all `readOnlyHint`, not destructive, idempotent, `openWorldHint: false`):
+```bash
+npx --yes --package github:sriinnu/inkling inkling-mcp
+```
+
+`prepare` builds `dist/node.js` on that install. Claude Code can also load this repo as a plugin: `.claude-plugin/plugin.json` plus `.mcp.json`, and `.claude-plugin/marketplace.json` is the marketplace manifest (`claude plugin marketplace add sriinnu/inkling`). The HTTP proxy, not these tools, is what reduces the provider bill. A tool call sends its argument in and gets a result back, so the turn that calls it is larger, and the tool list itself is extra cached prefix.
+
+Tools (`readOnlyHint`, not destructive, `openWorldHint: false`; `stats` is not idempotent):
 
 | tool | what it does |
 | --- | --- |
 | `check_model` | Whether a model is in scope and gets images or passes through as text. |
-| `transform_request` | Run inkling on a request object and report estimated tokens before and after. Pass `upstream: "https://chatgpt.com"` or `pathname: "/backend-api/codex/responses"` to strip `prompt_cache_breakpoint`. |
+| `transform_request` | Run inkling on a request object and report estimated tokens before and after. Pass `upstream: "https://chatgpt.com"` or any `/backend-api/codex/` path to strip `prompt_cache_breakpoint`. |
 | `health` | Version and the Codex breakpoint policy. No payloads. |
 | `stats` | Process counters only. |
 
@@ -209,7 +227,7 @@ OpenCode's remote form is `"type": "remote"` and a `url` of `http://127.0.0.1:47
 
 ## Codex breakpoint
 
-The Sol and GPT-6 profiles inject `prompt_cache_breakpoint: { mode: "explicit" }`. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. inkling does not inject that field when the path is `/backend-api/codex/responses` or the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` turns it off. An injected `prompt_cache_breakpoint` on a Codex request is removed as a text edit before the bytes leave the proxy, so nothing else in the body is reserialized.
+The Sol and GPT-6 profiles inject `prompt_cache_breakpoint: { mode: "explicit" }`. ChatGPT Codex (`https://chatgpt.com/backend-api/codex/responses`) answers HTTP 400 `prompt_cache_breakpoint is not supported on this model` for `gpt-5.6-sol`, `gpt-6.1-sol`, and `gpt-6-astra`. inkling does not inject that field on any `/backend-api/codex/` path (`/responses`, `/responses/compact`) or when the upstream host is `chatgpt.com`. `https://api.openai.com/v1/responses` still gets the field when the profile sets `cacheBreakpoints`. `INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"cacheBreakpoints":false}}'` turns it off. An injected `prompt_cache_breakpoint` on a Codex request is removed as a text edit before the bytes leave the proxy, so nothing else in the body is reserialized.
 
 ---
 

@@ -4,6 +4,7 @@
 !package.json
 !pnpm-lock.yaml
 !pnpm-workspace.yaml
+!.npmrc
 !tsconfig.json
 !LICENSE
 !assets/
@@ -12,5 +13,6 @@
 !bin/**
 !scripts/
 !scripts/build.mjs
+!scripts/prepare.mjs
 !src/
 !src/**
