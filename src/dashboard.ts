@@ -37,6 +37,7 @@ import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
+  observedCacheTtlSec,
   type BaselineWarmthPrev,
 } from './core/baseline.js';
 import {
@@ -504,7 +505,8 @@ export class DashboardState {
    *  replay() from persisted timestamps, so live and restored numbers agree.
    *  Capped with sessions. */
   private baselineWarmth: Map<string, BaselineWarmthPrev> = new Map();
-  /** Max age of a prior row that can still make the text path warm. */
+  /** Default max age of a prior row that can still make the text path warm.
+   *  A prior that wrote 1h-tier tokens carries its own 3600 s window instead. */
   private static readonly CACHE_TTL_SEC = 300;
   /** Hard cap on `sessions` Map entries. Keeps memory bounded in
    *  long-running deployments. 50 sessions × ~13 numeric fields each is
@@ -807,6 +809,7 @@ export class DashboardState {
           toolsSha: toolsShaNow ?? warmthPrev?.toolsSha,
           pxPrefixSha: info?.cachePrefixSha8 ?? warmthPrev?.pxPrefixSha,
           model: ev.model ?? warmthPrev?.model,
+          ttlSec: observedCacheTtlSec(cc1h, warmthPrev?.ttlSec),
         });
         if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
           const firstKey = this.baselineWarmth.keys().next().value;
@@ -1169,6 +1172,7 @@ export class DashboardState {
             toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
             pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
             model: t.model ?? warmthPrevR?.model,
+            ttlSec: observedCacheTtlSec(cc1h, warmthPrevR?.ttlSec),
           });
           if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
             const firstKey = this.baselineWarmth.keys().next().value;

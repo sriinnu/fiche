@@ -6,7 +6,7 @@
  * same calls.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -1053,6 +1053,62 @@ describe('baseline warmth: cache_read or a fresh same-prefix prior', () => {
     expect(row.actual_input).toBe(64518.3);
     expect(row.baseline_input).toBe(26524.9);
     expect(row.baseline_input! - row.actual_input!).toBeCloseTo(-37993.4, 1);
+  });
+
+  it('live: a 1h-tier prior keeps text warm 20 minutes on; a 5m-tier prior does not', async () => {
+    const missAfter = async (sid: string, oneHour: boolean) => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(new Date('2026-05-19T00:00:00Z'));
+        dash.update(antEvt({
+          input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 500, cache_read_input_tokens: 20000,
+          ...{ cache_creation: oneHour
+            ? { ephemeral_1h_input_tokens: 500, ephemeral_5m_input_tokens: 0 }
+            : { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 500 } },
+        } as never, 20000, sid, 'stable-system', undefined, 'px-a') as never);
+        vi.setSystemTime(new Date('2026-05-19T00:20:00Z'));
+        dash.update(antEvt({
+          input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 20000, cache_read_input_tokens: 0,
+        }, 20000, sid, 'stable-system', undefined, 'px-b') as never);
+      } finally {
+        vi.useRealTimers();
+      }
+      const recent = (await dash.serveRecent().json()) as RecentPayload;
+      return recent.recent.at(-1)!.baseline_input;
+    };
+    // Warm text: 20000×0.1 + 10000 tail. Cold text: 20000×1.25 + 10000.
+    expect(await missAfter('hoursess', true)).toBe(12000);
+    expect(await missAfter('fivesess', false)).toBe(35000);
+  });
+
+  it('replay: a 1h-tier prior keeps the golden self-bust warm 20 minutes on', async () => {
+    const row = (ts: string, extra: Record<string, unknown>) => ev({
+      ts,
+      compressed: true,
+      model: 'claude-opus-5-5',
+      first_user_sha8: 'c4fa7142',
+      system_sha8: '8d36a7a6',
+      cache_prefix_tools_sha8: '80a31dc9',
+      baseline_probe_status: 'ok',
+      ...extra,
+    } as never);
+    writeEvents(tmp, [
+      row('2026-10-19T05:51:53.466Z', {
+        duration_ms: 4248, cache_prefix_sha8: '4e4c9ca6',
+        baseline_tokens: 231849, baseline_cacheable_tokens: 231849,
+        input_tokens: 2, output_tokens: 172, cache_create_tokens: 401,
+        cache_create_1h_tokens: 401, cache_create_5m_tokens: 0, cache_read_tokens: 68024,
+      }),
+      row('2026-10-19T06:12:01.803Z', {
+        duration_ms: 7502, cache_prefix_sha8: '58d9b560',
+        baseline_tokens: 234521, baseline_cacheable_tokens: 234521,
+        input_tokens: 2, output_tokens: 193, cache_create_tokens: 51613, cache_read_tokens: 0,
+      }),
+    ]);
+    await dash.replay(tmp.eventsFile);
+    const recent = (await dash.serveRecent().json()) as RecentPayload;
+    // Same warm text price as the 8-second golden above.
+    expect(recent.recent.at(-1)!.baseline_input).toBe(26524.9);
   });
 
   it('does not let an overlapping request warm the text counterfactual before it completed', async () => {

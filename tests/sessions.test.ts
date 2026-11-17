@@ -385,6 +385,57 @@ describe('aggregateSessions', () => {
     expect(sessions.get('c4fa7142')!.tokensSavedEst).toBe(15_879 - 37_993);
   });
 
+  it('keeps a 1h-tier prefix warm for an hour, a 5m-tier prefix for five minutes', async () => {
+    // Same self-bust pair as the golden above; only the prior's write tier and
+    // the gap change. A 1h prefix 20 minutes old was still cached for text, so
+    // inkling's re-render is its own cost. A 5m prefix that old was gone.
+    const run = async (sid: string, tier: '5m' | '1h', secondTs: string) => {
+      const base = {
+        compressed: true,
+        first_user_sha8: sid,
+        system_sha8: '8d36a7a6',
+        cache_prefix_tools_sha8: '80a31dc9',
+        model: 'claude-opus-5-5',
+        baseline_probe_status: 'ok' as const,
+      };
+      writeEvents(tmp, [
+        ev({
+          ...base,
+          ts: '2026-10-19T05:51:53.466Z',
+          duration_ms: 4248,
+          cache_prefix_sha8: '4e4c9ca6',
+          baseline_tokens: 231849,
+          baseline_cacheable_tokens: 231849,
+          input_tokens: 2,
+          output_tokens: 172,
+          cache_create_tokens: 401,
+          ...(tier === '1h' ? { cache_create_1h_tokens: 401, cache_create_5m_tokens: 0 } : { cache_create_5m_tokens: 401, cache_create_1h_tokens: 0 }),
+          cache_read_tokens: 68024,
+        }),
+        ev({
+          ...base,
+          ts: secondTs,
+          duration_ms: 7502,
+          cache_prefix_sha8: '58d9b560',
+          baseline_tokens: 234521,
+          baseline_cacheable_tokens: 234521,
+          input_tokens: 2,
+          output_tokens: 193,
+          cache_create_tokens: 51613,
+          ...(tier === '1h' ? { cache_create_1h_tokens: 51613, cache_create_5m_tokens: 0 } : { cache_create_5m_tokens: 51613, cache_create_1h_tokens: 0 }),
+          cache_read_tokens: 0,
+        }),
+      ]);
+      const { sessions } = await aggregateSessions(tmp);
+      return sessions.get(sid)!.tokensSavedEst;
+    };
+    const soon = '2026-10-19T05:52:01.803Z';
+    const later = '2026-10-19T06:12:01.803Z'; // 20 minutes on
+    expect(await run('a1111111', '1h', later)).toBe(await run('a1111111', '1h', soon));
+    // 5m prior 20 minutes old: text would have missed too, so no self-bust charge.
+    expect(await run('b2222222', '5m', later)).toBeGreaterThan(await run('b2222222', '5m', soon));
+  });
+
   it('keeps text cold on an image miss when the tools hash changed', async () => {
     writeEvents(tmp, [
       ev({

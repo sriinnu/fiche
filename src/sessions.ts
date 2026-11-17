@@ -34,6 +34,7 @@ import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
+  observedCacheTtlSec,
   type BaselineWarmthPrev,
 } from './core/baseline.js';
 import { sessionAnchorText } from './core/session-state.js';
@@ -144,7 +145,7 @@ export async function aggregateSessions(
   // split. Kept out of SessionSummary so it never leaks into the
   // /api/sessions.json shape.
   const warmth = new Map<string, BaselineWarmthPrev>();
-  const CACHE_TTL_SEC = 300;
+  const CACHE_TTL_SEC = 300; // default; a 1h-tier prior carries 3600 s (observedCacheTtlSec)
 
   // Stat sidecar sizes once up front. Looking up size per event would be
   // O(N²) syscalls; the directory is small enough to read fully.
@@ -239,6 +240,7 @@ export async function aggregateSessions(
         toolsSha: ev.cache_prefix_tools_sha8 ?? prev?.toolsSha,
         pxPrefixSha: ev.cache_prefix_sha8 ?? prev?.pxPrefixSha,
         model: ev.model ?? prev?.model,
+        ttlSec: observedCacheTtlSec(ev.cache_create_1h_tokens, prev?.ttlSec),
       });
     }
     if (typeof ev.cache_read_tokens === 'number') {

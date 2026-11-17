@@ -34,6 +34,23 @@ function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
  *  request reports cr === 0 (see deriveBaselineWarmth). */
 export const CACHE_TTL_SEC = 300;
 
+/** The 1-hour cache tier's TTL (seconds). Claude Code writes its main thread,
+ *  and with `subagentPromptCacheTtl: "1h"` its subagents too, at this tier. */
+export const CACHE_TTL_1H_SEC = 3600;
+
+/**
+ * TTL a session's cached prefix lives for, as last observed. Any 1-hour write
+ * proves the caller marks its prefix with `ttl: "1h"`, and that stays true for
+ * the session: later rows that only read, or only append 5-minute blocks after
+ * the 1h prefix, do not shorten the prefix's life. Sticky on purpose. Longer
+ * is the conservative side for savings, since it lets more self-busts count
+ * against inkling.
+ */
+export function observedCacheTtlSec(cc1h: number | undefined, prevTtlSec: number | undefined): number {
+  if ((cc1h ?? 0) > 0) return CACHE_TTL_1H_SEC;
+  return prevTtlSec ?? CACHE_TTL_SEC;
+}
+
 /** This session's previous usage-bearing turn, used only for warm split sizing. */
 export interface BaselineWarmthPrev {
   /** Completion time of that turn, in wall-clock seconds. */
@@ -50,6 +67,9 @@ export interface BaselineWarmthPrev {
   pxPrefixSha?: string;
   /** Model of that turn; prompt cache does not cross models. */
   model?: string;
+  /** Cache TTL the session's prefix was observed at (see observedCacheTtlSec).
+   *  When set, it replaces the caller's default `ttlSec`. */
+  ttlSec?: number;
 }
 
 /**
@@ -73,7 +93,8 @@ export interface BaselineWarmthPrev {
  * @param cacheable  this turn's cacheable-prefix tokens (the full-reuse credit
  *                   when warm only via cr, since cr proves a read but not the split).
  * @param cr         observed cache-read tokens this turn.
- * @param ttlSec     how recently a prior must have completed to count as fresh.
+ * @param ttlSec     how recently a prior must have completed to count as fresh,
+ *                   when the prior carries no observed tier (`prev.ttlSec`).
  * @param prefixSha  system_sha8 of this row. Must match the prior's for a
  *                   cr === 0 row to be warm.
  * @param toolsSha   cache_prefix_tools_sha8 of this row; a mismatch keeps the row cold.
@@ -94,7 +115,8 @@ export function deriveBaselineWarmth(
     || prefixSha === undefined
     || prev.prefixSha === prefixSha;
   // cr is the only warm/cold signal. A prior only refines the warm split.
-  const fresh = prev !== undefined && age >= 0 && age < ttlSec;
+  const window = prev?.ttlSec !== undefined && prev.ttlSec > 0 ? prev.ttlSec : ttlSec;
+  const fresh = prev !== undefined && age >= 0 && age < window;
   const sameTools = prev === undefined
     || prev.toolsSha === undefined
     || toolsSha === undefined

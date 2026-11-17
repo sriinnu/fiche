@@ -84,7 +84,7 @@ This is separate from dashboard savings. The gate decides whether to transform. 
 The cache discount is provider behavior, not inkling savings. To avoid counting cache as savings, both sides use the same observed cache state:
 
 - If the actual request has `cr > 0`, the imagined text baseline is priced warm too.
-- If the actual request has `cr === 0`, the imagined text baseline is still priced warm when a same-session prior proves the text prefix would have been cached: that prior completed less than `CACHE_TTL_SEC` (300 s) before this request started, its `system_sha8` matches this row's, and its `cache_prefix_tools_sha8` matches this row's (or either side has none). Without such a prior, the text baseline is priced cold too.
+- If the actual request has `cr === 0`, the imagined text baseline is still priced warm when a same-session prior proves the text prefix would have been cached: that prior completed inside the session's cache TTL before this request started (300 s, or 3600 s once the session has written any 1-hour-tier tokens, since a `ttl: "1h"` prefix outlives the 5-minute window; see `observedCacheTtlSec`), its `system_sha8` matches this row's, and its `cache_prefix_tools_sha8` matches this row's (or either side has none). Without such a prior, the text baseline is priced cold too.
 
 inkling does not infer a warm text baseline from wall-clock TTL alone. A request whose image path missed the cache (`cr === 0`) after a fresh same-prefix prior is inkling busting its own image cache. The text request would have read its unchanged prefix, so that miss is a real cost of inkling, not a saving. A changed system or tools hash means the text request would have missed too, so those rows stay cold.
 
