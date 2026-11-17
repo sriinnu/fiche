@@ -1151,7 +1151,8 @@ export async function transformOpenAIChatCompletions(
 
   const authorityDocs: string[] = [];
   const systemTexts: string[] = [];
-  for (const msg of req.messages) {
+  // Leading system/developer messages only; see the Responses path.
+  for (const msg of req.messages.slice(0, firstUserIdx)) {
     if (msg.role !== 'system' && msg.role !== 'developer') continue;
     const text = contentText(msg.content);
     if (!text) continue;
@@ -1302,7 +1303,7 @@ export async function transformOpenAIChatCompletions(
     ...req.messages.slice(firstUserIdx),
   ];
 
-  for (const msg of req.messages) {
+  for (const msg of req.messages.slice(0, firstUserIdx)) {
     if (msg.role !== 'system' && msg.role !== 'developer') continue;
     if (!contentText(msg.content)) continue;
     setTextContent(msg, CHAT_POINTER);
@@ -1387,7 +1388,12 @@ export async function transformOpenAIResponses(
     systemTexts.push(req.instructions);
     info.staticChars += req.instructions.length;
   }
-  for (const item of inputItems) {
+  // Only the LEADING system/developer items are static. Codex appends small
+  // developer notes mid-session (e.g. deferred tool namespaces added/removed);
+  // hoisting those into the slab re-rendered its last page and busted the whole
+  // cached prefix behind it. Later ones stay native, in place, as barriers.
+  const leadingAuthorityEnd = inputWasString ? 0 : firstUserIdx;
+  for (const item of inputItems.slice(0, leadingAuthorityEnd)) {
     const r = (item as ResponsesInputItem).role;
     if (r !== 'system' && r !== 'developer') continue;
     const content = (item as ResponsesInputItem).content;
@@ -1524,7 +1530,7 @@ export async function transformOpenAIResponses(
     ? [{ type: 'input_text', text: slabFactSheet }]
     : [];
   const authorityPointerCount = (typeof req.instructions === 'string' && req.instructions.length > 0 ? 1 : 0)
-    + inputItems.filter((item) => {
+    + inputItems.slice(0, leadingAuthorityEnd).filter((item) => {
       const it = item as ResponsesInputItem;
       return (it.role === 'system' || it.role === 'developer')
         && responsesContentText(it.content).length > 0;
@@ -1570,7 +1576,9 @@ export async function transformOpenAIResponses(
   // input_text part array keeps its array shape with a single pointer part, so a
   // request the caller sent as parts is not silently reshaped into a string.
   if (!inputWasString) {
-    for (const item of inputItems) {
+    // The slab now sits at leadingAuthorityEnd, so indices below it are exactly
+    // the items that were collected.
+    for (const item of inputItems.slice(0, leadingAuthorityEnd)) {
       const it = item as ResponsesInputItem;
       if (it.role !== 'system' && it.role !== 'developer') continue;
       const content = it.content;
