@@ -81,9 +81,18 @@ output, each over the uncached input price) comes from `src/core/pricing.ts`.
   `INKLING_GPT_PROFILES` still wins, field by field. A model with no usable
   row is unpriced: the gate passes it through untouched.
 
-Not yet modelled in kosha mode: TTL write tiers (Anthropic 1h at 2x, OpenAI
-12h at 2.5x) and long-context tiers (OpenAI >272K, xAI >=200K). kosha does not
-carry them yet; the gate prices the short-TTL write until it does.
+In kosha mode the table also carries kosha's TTL write tiers, long-context
+bands and dated changes (kosha >= 1.17):
+
+- The gate prices the write at the TTL the request's `cache_control` markers
+  ask for: an Anthropic `ttl: "1h"` write is 2x input (Opus 5.5: $8 against $4),
+  not the 5-minute 1.25x. OpenAI requests stay on the 30-minute tier.
+- A band (OpenAI >272K, Haiku 5.5 >100K, xAI from 200K) bills the whole request
+  at its rates once the prompt, cached tokens included, crosses the line. The
+  ratios barely move, because input, read and write double together; the
+  dashboard's dollars use the band's input price. A saving that pulled a
+  request under the line is valued at the lower band, so dollars understate.
+- A dated change (Gemini 3.6 Flash on 2027-01-01) applies from its time.
 
 ## Gate And One-Time Burn
 

@@ -73,10 +73,10 @@ describe('gate functions honour the rates they are given', () => {
 
 import { afterEach, beforeEach } from 'vitest';
 import { normalizeModelId } from '../src/core/price-id.js';
-import { priceMode, priceRowFor, priceSourceFor, ratesFromRow } from '../src/core/pricing.js';
+import { effectiveRow, inputUsdPerMtok, priceMode, priceRowFor, priceSourceFor, ratesFromRow } from '../src/core/pricing.js';
 import { PRICES } from '../src/core/prices.generated.js';
 import { generate } from '../scripts/gen-prices.js';
-import { transformRequest } from '../src/core/transform.js';
+import { requestCacheTtlSec, transformRequest } from '../src/core/transform.js';
 
 describe('normalizeModelId', () => {
   it.each([
@@ -294,5 +294,72 @@ describe('INKLING_PRICES=kosha', () => {
     expect((await run('claude-mystery-9')).info.compressed).toBe(false);
     delete process.env.INKLING_PRICES;
     expect((await run('claude-mystery-9')).info.compressed).toBe(true); // legacy prices every model
+  });
+});
+
+describe('kosha tiers, bands and dated changes', () => {
+  const savedMode = process.env.INKLING_PRICES;
+  beforeEach(() => { process.env.INKLING_PRICES = 'kosha'; });
+  afterEach(() => { if (savedMode === undefined) delete process.env.INKLING_PRICES; else process.env.INKLING_PRICES = savedMode; });
+  const sol = { p: 'openai', in: 2, out: 10, cr: 0.1, cw: 2.5, cwt: [[1800, 2.5], [43200, 5]] as Array<[number, number]>,
+    bands: [{ at: 272000, in: 4, out: 15, cr: 0.2, cwt: [[1800, 5], [43200, 10]] as Array<[number, number]> }] };
+  const grok = { p: 'xai', in: 1.25, out: 2.5, cr: 0.2, cwb: 'as-input' as const, bands: [{ at: 200000, incl: true as const, in: 2.5 }] };
+
+  it('picks the write tier for the TTL: exact, else the next longer, else the longest', () => {
+    const opus = PRICES['claude-opus-5-5']!;
+    expect(ratesFromRow(opus)!.write).toBe(1.25);
+    expect(ratesFromRow(opus, 300)!.write).toBe(1.25);
+    expect(ratesFromRow(opus, 3600)!.write).toBe(2);
+    expect(ratesFromRow(opus, 600)!.write).toBe(2);       // no 10m tier: the 1h one covers it
+    expect(ratesFromRow(sol, 86400)!.write).toBe(2.5);    // past the longest: the longest
+    expect(ratesFromRow(grok, 3600)!.write).toBe(1);      // as-input has no tier premium
+  });
+
+  it('a band replaces the whole request\'s rates above its line, and only above', () => {
+    expect(effectiveRow(sol, { promptTokens: 272000 })!.in).toBe(2);
+    expect(effectiveRow(sol, { promptTokens: 272001 })).toMatchObject({ in: 4, out: 15, cr: 0.2, cw: 5 });
+    expect(ratesFromRow(effectiveRow(sol, { promptTokens: 300000 }), 43200)!.write).toBe(2.5);
+    // Inclusive line; the band lists no read, so the base read scales with input.
+    expect(effectiveRow(grok, { promptTokens: 199999 })!.in).toBe(1.25);
+    expect(effectiveRow(grok, { promptTokens: 200000 })).toMatchObject({ in: 2.5, out: 5, cr: 0.4 });
+  });
+
+  it('a dated change applies from its time, and a dated write drops the stale tiers', () => {
+    const row = { p: 'google', in: 0.75, out: 3.75, cr: 0.075, cw: 0.75, cwt: [[300, 0.75]] as Array<[number, number]>,
+      chg: [{ at: Date.parse('2027-01-01T08:00:00Z'), in: 1.5, out: 7.5, cr: 0.15, cw: 1.5 }] };
+    expect(effectiveRow(row, { at: Date.parse('2026-12-31T00:00:00Z') })!.in).toBe(0.75);
+    const after = effectiveRow(row, { at: Date.parse('2027-01-01T08:00:00Z') })!;
+    expect(after).toMatchObject({ in: 1.5, cw: 1.5 });
+    expect(after.cwt).toBeUndefined();
+  });
+
+  it('dollars follow the band: gpt-6.1-sol input doubles over 272K', () => {
+    expect(inputUsdPerMtok('gpt-6.1-sol', { promptTokens: 1000 })).toBe(2);
+    expect(inputUsdPerMtok('gpt-6.1-sol', { promptTokens: 300000 })).toBe(4);
+  });
+
+  it('reads the cache TTL a request asks for', () => {
+    expect(requestCacheTtlSec({ system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }] })).toBe(300);
+    expect(requestCacheTtlSec({ system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] })).toBe(3600);
+    expect(requestCacheTtlSec({ messages: [{ role: 'user', content: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }] })).toBe(3600);
+    expect(requestCacheTtlSec({ tools: [{ name: 't', cache_control: { type: 'ephemeral', ttl: '1h' } }] })).toBe(3600);
+  });
+
+  it('the transform gate prices a 1h-marked request at the 1h write', async () => {
+    const enc = new TextEncoder();
+    const run = (ttl?: string) => transformRequest(
+      enc.encode(JSON.stringify({
+        model: 'claude-opus-5-5',
+        system: [{ type: 'text', text: 'You are a coding agent with detailed operating instructions. '.repeat(300),
+          cache_control: ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: 'hi' }],
+      })),
+      { compress: true, minCompressChars: 1, charsPerToken: 1, model: 'claude-opus-5-5', priorWarmTokens: 1000 },
+    );
+    // burn = prior warm tokens x (write - read); Opus 5.5 reads at 0.05x.
+    expect((await run()).info.gateEval?.burnImageSide).toBeCloseTo(1000 * (1.25 - 0.05));
+    expect((await run('1h')).info.gateEval?.burnImageSide).toBeCloseTo(1000 * (2 - 0.05));
+    delete process.env.INKLING_PRICES;
+    expect((await run('1h')).info.gateEval?.burnImageSide).toBeCloseTo(1000 * (1.25 - 0.1)); // legacy unchanged
   });
 });

@@ -54,7 +54,41 @@ import {
 } from './history.js';
 import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
-import { ANTHROPIC_GATE_RATES, gateRatesFor, type PriceRates } from './pricing.js';
+import { ANTHROPIC_GATE_RATES, gateRatesFor, priceMode, type PriceRates } from './pricing.js';
+
+/** Gate rates for one request, priced once: the cache TTL its markers ask for
+ *  and its size as it arrived. Keyed by the parsed request, so every gate in
+ *  one transform uses the same rates. */
+const REQUEST_GATE_RATES = new WeakMap<object, Readonly<PriceRates> | null>();
+
+/** Longest cache TTL the request's cache_control markers ask for, in seconds.
+ *  Anthropic: `ttl: "1h"` = 3600, otherwise the 5-minute default. */
+export function requestCacheTtlSec(req: unknown): number {
+  let ttl = 300;
+  const visit = (v: unknown, depth: number): void => {
+    if (depth > 8 || !v || typeof v !== 'object') return;
+    if (Array.isArray(v)) { for (const x of v) visit(x, depth + 1); return; }
+    const o = v as Record<string, unknown>;
+    const cc = o.cache_control as Record<string, unknown> | undefined;
+    if (cc && typeof cc === 'object' && cc.ttl === '1h') ttl = 3600;
+    for (const k of ['system', 'tools', 'messages', 'content']) if (k in o) visit(o[k], depth + 1);
+  };
+  visit(req, 0);
+  return ttl;
+}
+
+function seedGateRates(req: object, model: string | undefined, bodyBytes: number, charsPerToken: number): void {
+  // Legacy prices every request alike; skip the walk over the body.
+  if (priceMode() === 'legacy') { REQUEST_GATE_RATES.set(req, ANTHROPIC_GATE_RATES); return; }
+  REQUEST_GATE_RATES.set(req, gateRatesFor(model, {
+    ttlSec: requestCacheTtlSec(req),
+    promptTokens: Math.ceil(bodyBytes / Math.max(1, charsPerToken)),
+  }));
+}
+
+function gateRates(req: object, model: string | undefined): Readonly<PriceRates> | null {
+  return REQUEST_GATE_RATES.has(req) ? REQUEST_GATE_RATES.get(req)! : gateRatesFor(model);
+}
 import { visionTokens, type VisionPricing } from './vision-cost.js';
 import { CLAUDE_PROFILE } from './claude-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -2019,7 +2053,7 @@ async function compressToolResultsInPlace(
             if (innerR.length < o.minToolResultChars) {
               bumpPassthrough(info, 'below_threshold');
               rewritten.push(blk);
-            } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo, gateRatesFor(o.model))) {
+            } else if (!isCompressionProfitable(innerR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo, gateRates(req, o.model))) {
               bumpPassthrough(info, 'not_profitable');
               rewritten.push(blk);
             } else {
@@ -2133,7 +2167,7 @@ async function compressToolResultsInPlace(
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
               }
-              if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo, gateRatesFor(o.model))) {
+              if (!isCompressionProfitable(innerTextR, denseGeo.cols, o.maxImagesPerToolResult, o.charsPerToken, 0, 0, true, denseGeo.maxChars, denseGeo, gateRates(req, o.model))) {
                 bumpPassthrough(info, 'not_profitable');
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
@@ -2263,7 +2297,7 @@ async function runHistoryCollapseAndFinalize(
       return isCompressionProfitableAmortized(
         text, historyGeometry.cols, undefined, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
-        gateRatesFor(o.model),
+        gateRates(req, o.model),
       );
     };
     // The slab needs no shield here: this path runs only when the slab did NOT
@@ -2429,6 +2463,7 @@ export async function transformRequest(
     info.reason = 'invalid_messages';
     return { body, info };
   }
+  seedGateRates(req, o.model, body.byteLength, o.charsPerToken);
 
   // Price the caller's OWN images before we rewrite anything: they occupy the
   // same wire cap we are about to spend from. Counted once, here, because every
@@ -2700,7 +2735,7 @@ export async function transformRequest(
     combinedWithHeader, slabCols, undefined, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
     denseGeo,
-    gateRatesFor(o.model),
+    gateRates(req, o.model),
   );
   if (slabGateEval) {
     info.gateEval = {
@@ -2722,7 +2757,7 @@ export async function transformRequest(
     false,
     READABLE_CHARS_PER_IMAGE,
     denseGeo,
-    gateRatesFor(o.model),
+    gateRates(req, o.model),
   )) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
@@ -2879,7 +2914,7 @@ export async function transformRequest(
       return isCompressionProfitableAmortized(
         text, historyGeometry.cols, undefined, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
-        gateRatesFor(o.model),
+        gateRates(req, o.model),
       );
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
