@@ -901,7 +901,10 @@ export class DashboardState {
         totals.pricedOutputWeighted += outputEquiv;
         // Kosha mode: dollars at this model's own input price. Unpriced rows
         // are counted, never converted at a guessed rate.
-        const usdPerMtok = inputUsdPerMtok(ev.model);
+        // The band is picked on the prompt as billed: uncached + written + read.
+        // When compression pulled a request under a band line, the saving is
+        // valued at the lower band: an understatement, never an overstatement.
+        const usdPerMtok = inputUsdPerMtok(ev.model, { promptTokens: inp + cc + cr });
         if (usdPerMtok !== undefined) {
           totals.pricedSavedUsd += ((baselineInputEff - actualInputEff) * usdPerMtok) / 1e6;
           totals.usdPricedRequests += 1;

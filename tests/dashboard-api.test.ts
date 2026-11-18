@@ -626,6 +626,29 @@ describe('GPT savings split', () => {
     }
   });
 
+  it('INKLING_PRICES=kosha values dollars at the prompt\'s band (Haiku 5.5 over 100K)', async () => {
+    const savedMode = process.env.INKLING_PRICES;
+    try {
+      process.env.INKLING_PRICES = 'kosha';
+      setAllowedModelBases(['claude-haiku-5-5']);
+      const row = (sid: string, cr: number) => ({
+        method: 'POST', path: '/v1/messages', model: 'claude-haiku-5-5', status: 200, durationMs: 1,
+        usage: { input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: cr },
+        info: { compressed: true, baselineTokens: cr * 3, baselineCacheableTokens: cr * 2, baselineProbeStatus: 'ok', firstUserSha8: sid },
+      });
+      // Under the line: $0.10/MTok. Over it (100 + 150000 > 100K): $0.50/MTok.
+      dash.update(row('small1', 50_000) as never);
+      let stats = (await dash.serveStats().json()) as StatsPayload;
+      expect(stats.saved_usd).toBeCloseTo((stats.saved_input_tokens * 0.1) / 1e6, 3);
+      dash = new DashboardState(tmp);
+      dash.update(row('large1', 150_000) as never);
+      stats = (await dash.serveStats().json()) as StatsPayload;
+      expect(stats.saved_usd).toBeCloseTo((stats.saved_input_tokens * 0.5) / 1e6, 3);
+    } finally {
+      if (savedMode === undefined) delete process.env.INKLING_PRICES; else process.env.INKLING_PRICES = savedMode;
+    }
+  });
+
   it('replay() preserves Anthropic 1-hour cache-write accounting', async () => {
     writeEvents(tmp, [
       ev({
