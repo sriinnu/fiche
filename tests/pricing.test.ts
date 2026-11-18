@@ -132,6 +132,63 @@ describe('gen-prices', () => {
   });
 });
 
+describe('gen-prices reads the kosha >= 1.17 export', () => {
+  const exportShape = {
+    schemaVersion: 1,
+    discoveredAt: 1_794_951_457_905,
+    providers: [
+      { models: [
+        { id: 'claude-haiku-5-5', provider: 'anthropic', originProvider: 'anthropic', pricing: {
+          inputPerMillion: 0.1, outputPerMillion: 0.5, cacheReadPerMillion: 0.01, cacheWritePerMillion: 0.125,
+          cacheWrites: [{ ttlSeconds: 3600, perMillion: 0.2 }, { ttlSeconds: 300, perMillion: 0.125 }],
+          cacheWriteBilling: 'premium',
+          bands: [{ aboveInputTokens: 100000, inputPerMillion: 0.5, outputPerMillion: 2.5, cacheReadPerMillion: 0.05,
+            cacheWrites: [{ ttlSeconds: 300, perMillion: 0.625 }] }],
+        } },
+      ] },
+      { models: [
+        { id: 'grok-5', provider: 'xai', originProvider: 'xai', pricing: {
+          inputPerMillion: 1.25, outputPerMillion: 2.5, cacheReadPerMillion: 0.2, cacheWritePerMillion: 1.25,
+          cacheWriteBilling: 'as-input',
+          bands: [{ aboveInputTokens: 200000, inclusive: true, inputPerMillion: 2.5, outputPerMillion: 5, cacheReadPerMillion: 0.4 }],
+        } },
+        { id: 'gemini-3.6-flash', provider: 'google', originProvider: 'google', pricing: {
+          inputPerMillion: 0.75, outputPerMillion: 3.75, cacheReadPerMillion: 0.075, cacheWriteBilling: 'as-input',
+          changes: [{ effectiveAt: '2027-01-01T00:00:00-08:00', rates: { inputPerMillion: 1.5, outputPerMillion: 7.5 } }],
+        } },
+        // Alibaba's own model; kosha names its maker qwen.
+        { id: 'qwen4-max', provider: 'alibaba', originProvider: 'qwen', pricing: { inputPerMillion: 1.5, outputPerMillion: 4.5, cacheReadPerMillion: 0.075 } },
+        // A reseller row in the same export is still dropped.
+        { id: 'qwen-plus', provider: 'openai', originProvider: 'qwen', pricing: { inputPerMillion: 9, outputPerMillion: 9, cacheReadPerMillion: 1 } },
+      ] },
+    ],
+  };
+  const out = generate(exportShape);
+  const row = (id: string) => {
+    const line = out.split('\n').find((l) => l.startsWith(`  "${id}": `));
+    return line ? JSON.parse(line.slice(line.indexOf(': ') + 2).replace(/,$/, '')) : undefined;
+  };
+
+  it('carries TTL write tiers, bands, as-input billing and dated changes', () => {
+    expect(row('claude-haiku-5-5')).toMatchObject({
+      p: 'anthropic', cw: 0.125, cwt: [[300, 0.125], [3600, 0.2]],
+      bands: [{ at: 100000, in: 0.5, out: 2.5, cr: 0.05, cwt: [[300, 0.625]] }],
+    });
+    expect(row('claude-haiku-5-5').cwb).toBeUndefined();
+    expect(row('grok-5')).toMatchObject({ cwb: 'as-input', bands: [{ at: 200000, incl: true, in: 2.5 }] });
+    expect(row('gemini-3.6-flash').chg).toEqual([{ at: Date.parse('2027-01-01T08:00:00Z'), in: 1.5, out: 7.5 }]);
+  });
+
+  it('keeps Alibaba rows whose maker is qwen, drops resellers', () => {
+    expect(row('qwen4-max')).toMatchObject({ p: 'alibaba', in: 1.5 });
+    expect(row('qwen-plus')).toBeUndefined();
+  });
+
+  it('as-input billing is no write premium', () => {
+    expect(ratesFromRow({ p: 'xai', in: 1.25, out: 2.5, cr: 0.2, cw: 2.5, cwb: 'as-input' })!.write).toBe(1);
+  });
+});
+
 describe('ratesFromRow sanity', () => {
   it('rejects the rows that would poison the gate', () => {
     expect(ratesFromRow({ p: 'openrouter', in: 0.192, out: 16, cr: 0.182, cw: 3 })).toBeUndefined(); // write 15.6x

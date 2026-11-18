@@ -82,7 +82,9 @@ export function ratesFromRow(row: PriceRow | undefined): PriceRates | undefined 
   if (typeof row.cr !== 'number') return undefined;
   const read = row.cr / row.in;
   if (!(read > 0 && read < 1)) return undefined;
-  const write = typeof row.cw === 'number' && row.cw > 0 ? row.cw / row.in : 1;
+  // `as-input`: the write bills as plain input (DeepSeek, xAI, z.ai, Google).
+  const write = row.cwb === 'as-input' ? 1
+    : typeof row.cw === 'number' && row.cw > 0 ? row.cw / row.in : 1;
   if (!(write >= 1 && write <= 3)) return undefined;
   return { read, write, output: row.out / row.in };
 }
