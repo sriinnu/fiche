@@ -32,7 +32,7 @@ import {
 } from './render.js';
 
 import { DEFAULT_GPT_PROFILE, GPT_MAX_HEIGHT_PX } from './gpt-model-profiles.js';
-import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
 
 /** Portrait-strip width for GPT history images. Mirrors GPT_STRIP_COLS in
  *  openai.ts (kept local to avoid a circular import): ≤768px wide so OpenAI
