@@ -5,7 +5,7 @@
  * passes transformed payloads to Google AI Studio.
  */
 
-import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
 import {
   READABLE_CHARS_PER_IMAGE,
   neutralizeSentinel,

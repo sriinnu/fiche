@@ -6,7 +6,7 @@
  *
  * The proxy has its own per-route wiring; the MCP server and scripts use this.
  */
-import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint, type PromptCacheRoute } from './codex-cache.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { transformGoogleGenerateContent } from './google.js';

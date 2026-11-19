@@ -48,7 +48,7 @@ import {
 import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
-import { countTokens as o200kCountTokens } from 'gpt-tokenizer/encoding/o200k_base';
+import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
