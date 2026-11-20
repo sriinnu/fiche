@@ -100,7 +100,7 @@
     "wrangler": "^4.161.0"
   },
   "dependencies": {
-    "gpt-tokenizer": "^4.1.1"
+    "gpt-tokenizer": "^4.1.2"
   },
   "author": "Srinivas Pendela (https://github.com/sriinnu)",
   "repository": {

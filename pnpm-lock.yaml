@@ -13,8 +13,8 @@ importers:
   .:
     dependencies:
       gpt-tokenizer:
-        specifier: ^4.1.1
-        version: 4.1.1
+        specifier: ^4.1.2
+        version: 4.1.2
     devDependencies:
       '@cloudflare/workers-types':
         specifier: ^5.20261110.1
@@ -844,8 +844,8 @@ packages:
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
 
-  gpt-tokenizer@4.1.1:
-    resolution: {integrity: sha512-6yHFbXHA9K72ydpjAhYzcJFYTGROwj3RyKuSs0h4tdePoghkBj29vgSDn+nfEmOmKhhy1Mad2AiiVPRwGeaJRQ==}
+  gpt-tokenizer@4.1.2:
+    resolution: {integrity: sha512-5GwcLcZd6IqCdrGTTPcoKqbJk8cCWHHsoTHR/uQGZKT29CFcnJEg69qisGbKesQpzxRq9yQO4lBgsaZ8SawcGQ==}
 
   kleur@4.1.5:
     resolution: {integrity: sha512-o+NO+8WrRiQEE4/7nwRJhN1HWpVmJm511pBHUxPLtp0BUISzlBplORYSmTclCnJvQq2tKu/sgl3xVpkc7ZWuQQ==}
@@ -1671,7 +1671,7 @@ snapshots:
   fsevents@2.3.3:
     optional: true
 
-  gpt-tokenizer@4.1.1: {}
+  gpt-tokenizer@4.1.2: {}
 
   kleur@4.1.5: {}
 
