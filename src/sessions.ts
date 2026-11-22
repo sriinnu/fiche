@@ -591,17 +591,18 @@ export async function prune(
 }
 
 function writeFilteredLine(outFd: number, line: string, toRemove: Set<string>): void {
-  if (!line.trim()) return;
+  const clean = line.replace(/\r?\n$/, '');
+  if (!clean.trim()) return;
   let ev: TrackEvent;
   try {
-    ev = JSON.parse(line) as TrackEvent;
+    ev = JSON.parse(clean) as TrackEvent;
   } catch {
     // Preserve malformed lines so we don't silently eat data we can't parse.
-    fs.writeSync(outFd, line + '\n');
+    fs.writeSync(outFd, clean + '\n');
     return;
   }
   if (toRemove.has(sessionIdOf(ev))) return;
-  fs.writeSync(outFd, line + '\n');
+  fs.writeSync(outFd, clean + '\n');
 }
 
 async function rewriteEventsFile(
@@ -625,9 +626,22 @@ async function rewriteEventsFile(
       const tmp = `${eventsFile}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
       // Open with 'w' (truncate) and 0o600 permissions so pruned logs never expose prompts.
       const outFd = fs.openSync(tmp, 'w', 0o600);
+      let outFdClosed = false;
+      let renamed = false;
       try {
         let streamBytes = 0;
+        let streamIno: number | null = null;
+        let streamDev: number | null = null;
         const stream = fs.createReadStream(eventsFile);
+        stream.on('open', (rfd: number) => {
+          try {
+            const fst = fs.fstatSync(rfd);
+            streamIno = fst.ino;
+            streamDev = fst.dev;
+          } catch {
+            /* ignore fstat error */
+          }
+        });
         stream.on('data', (chunk: string | Buffer) => {
           streamBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, 'utf8');
         });
@@ -637,16 +651,20 @@ async function rewriteEventsFile(
         }
         // Catch up any lines appended externally during async streaming before locking in rename.
         try {
-          const finalSize = fs.statSync(eventsFile).size;
-          if (finalSize > streamBytes) {
-            const extraBuf = Buffer.allocUnsafe(finalSize - streamBytes);
+          const st = fs.statSync(eventsFile);
+          const sameFile = streamIno === null || (st.ino === streamIno && st.dev === streamDev);
+          if (sameFile && st.size > streamBytes) {
+            const extraBuf = Buffer.allocUnsafe(st.size - streamBytes);
             const rfd = fs.openSync(eventsFile, 'r');
             let readTotal = 0;
             try {
-              while (readTotal < extraBuf.length) {
-                const n = fs.readSync(rfd, extraBuf, readTotal, extraBuf.length - readTotal, streamBytes + readTotal);
-                if (n <= 0) break;
-                readTotal += n;
+              const fst = fs.fstatSync(rfd);
+              if (streamIno === null || (fst.ino === streamIno && fst.dev === streamDev)) {
+                while (readTotal < extraBuf.length) {
+                  const n = fs.readSync(rfd, extraBuf, readTotal, extraBuf.length - readTotal, streamBytes + readTotal);
+                  if (n <= 0) break;
+                  readTotal += n;
+                }
               }
             } finally {
               fs.closeSync(rfd);
@@ -665,22 +683,28 @@ async function rewriteEventsFile(
           flushPending(outFd, (fd, rawLine) => writeFilteredLine(fd, rawLine, toRemove));
         }
         fs.fsyncSync(outFd);
+        fs.closeSync(outFd);
+        outFdClosed = true;
+        fs.renameSync(tmp, eventsFile);
+        renamed = true;
+        fs.chmodSync(eventsFile, 0o600);
       } catch (err) {
-        try {
-          fs.closeSync(outFd);
-        } catch {
-          /* ignore */
+        if (!outFdClosed) {
+          try {
+            fs.closeSync(outFd);
+          } catch {
+            /* ignore */
+          }
         }
-        try {
-          fs.unlinkSync(tmp);
-        } catch {
-          /* ignore cleanup error */
+        if (!renamed) {
+          try {
+            fs.unlinkSync(tmp);
+          } catch {
+            /* ignore cleanup error */
+          }
         }
         throw err;
       }
-      fs.closeSync(outFd);
-      fs.renameSync(tmp, eventsFile);
-      fs.chmodSync(eventsFile, 0o600);
     };
 
     const coordinator = eventsFileCoordinators.get(key);

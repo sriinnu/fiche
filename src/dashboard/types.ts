@@ -82,9 +82,19 @@ export interface StatsPayload {
   cliff_saved_usd?: number;
   text_hygiene_saved_tokens?: number;
   text_hygiene_saved_chars?: number;
+  allowed_models?: string[];
   by_model?: Record<string, ModelStatsPayload>;
   today?: DailySavingsPoint;
   daily?: DailySavingsPoint[];
+  render_cache?: {
+    entries: number;
+    bytes: number;
+    hits: number;
+    misses: number;
+    evictions: number;
+    oversized: number;
+    max_bytes: number;
+  };
   uptime_sec_unused?: never; // future-proof
   compression_enabled: boolean;
 }
@@ -96,6 +106,10 @@ export interface PricingAssumptions {
   cache_write_1h_multiplier: number;
   cache_read_multiplier: number;
   source: string;
+  price_mode?: 'legacy' | 'kosha';
+  price_snapshot?: string;
+  usd_priced_requests?: number;
+  usd_unpriced_requests?: number;
 }
 
 /** /proxy-recent payload. */

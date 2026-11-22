@@ -9,16 +9,15 @@ import { X509Certificate } from 'node:crypto';
 
 import {
   cleanToolOutput,
+  isCodeOrDiffProtected,
   isFileReadToolName,
   applyAnthropicTextHygiene,
   applyOpenAIChatTextHygiene,
   applyOpenAIResponsesTextHygiene,
   applyGoogleTextHygiene,
 } from '../src/core/text-hygiene.js';
-import {
-  collapseHistory,
-  type Message,
-} from '../src/core/history.js';
+import type { Message } from '../src/core/types.js';
+import { collapseHistory } from '../src/core/history.js';
 import {
   relocateOpenAIPins,
   relocateGooglePins,
@@ -29,9 +28,9 @@ import {
   extractFactSheetEntries,
 } from '../src/core/factsheet.js';
 import { CertificateAuthority } from '../src/warp/ca.js';
-import { matchRoute, parseRoute } from '../src/warp/route.js';
+import { matchRoute, normalizeRoutePath, parseRoute } from '../src/warp/route.js';
 import { createWarpHandlers } from '../src/warp/connect.js';
-import { buildWarpAppArgs, renderShellInitScript } from '../src/warp/app-launch.js';
+import { buildWarpAppArgs, renderShellInitScript, resolveMacAppBundle } from '../src/warp/app-launch.js';
 import {
   anthropicMessagesToOpenAIResponses,
   openAIResponseToAnthropicMessage,
@@ -123,7 +122,7 @@ describe('Wave 2 Step 1 — editSafe file-read & CODE_DECL_LINE_RE protection', 
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_read', content: rawJsonFile }] },
       ],
     };
-    applyAnthropicTextHygiene(antRead, { mode: 'on' });
+    applyAnthropicTextHygiene(antRead, { aggressiveToon: true });
     expect((antRead.messages[1]!.content[0] as { content: string }).content).toBe(rawJsonFile);
 
     const antBash = {
@@ -132,28 +131,30 @@ describe('Wave 2 Step 1 — editSafe file-read & CODE_DECL_LINE_RE protection', 
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_bash', content: rawJsonFile }] },
       ],
     };
-    applyAnthropicTextHygiene(antBash, { mode: 'on', enableToon: true });
+    applyAnthropicTextHygiene(antBash, { aggressiveToon: true });
     expect((antBash.messages[1]!.content[0] as { content: string }).content).not.toBe(rawJsonFile);
     expect((antBash.messages[1]!.content[0] as { content: string }).content.length).toBeLessThan(rawJsonFile.length);
 
-    // 2. OpenAI Chat wire
+    // 2. OpenAI Chat wire (compound MCP/camelCase read tool names too)
+    expect(isFileReadToolName('mcp__server__fs.read_file')).toBe(true);
+    expect(isFileReadToolName('default_api:readFile')).toBe(true);
     const chatRead = {
       messages: [
-        { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read_file', arguments: '{}' } }] },
+        { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'mcp__srv__fs.read_file', arguments: '{}' } }] },
         { role: 'tool', tool_call_id: 'c1', content: rawJsonFile },
       ],
     };
-    applyOpenAIChatTextHygiene(chatRead, { mode: 'on' });
+    applyOpenAIChatTextHygiene(chatRead, { aggressiveToon: true });
     expect(chatRead.messages[1]!.content).toBe(rawJsonFile);
 
     // 3. OpenAI Responses wire
     const respRead = {
       input: [
-        { type: 'function_call', call_id: 'fc1', name: 'view_file', arguments: '{}' },
+        { type: 'function_call', call_id: 'fc1', name: 'viewFile', arguments: '{}' },
         { type: 'function_call_output', call_id: 'fc1', output: rawJsonFile },
       ],
     };
-    applyOpenAIResponsesTextHygiene(respRead, { mode: 'on' });
+    applyOpenAIResponsesTextHygiene(respRead, { aggressiveToon: true });
     expect((respRead.input[1] as { output: string }).output).toBe(rawJsonFile);
 
     // 4. Google wire
@@ -167,22 +168,25 @@ describe('Wave 2 Step 1 — editSafe file-read & CODE_DECL_LINE_RE protection', 
         },
       ],
     };
-    applyGoogleTextHygiene(googleRead, { mode: 'on' });
+    applyGoogleTextHygiene(googleRead, { aggressiveToon: true });
     expect(
       (googleRead.contents[0]!.parts[0] as { functionResponse: { response: { content: string } } }).functionResponse.response.content,
     ).toBe(rawJsonFile);
   });
 
   it('protects Go/Java/C# declarations and stays ReDoS-safe on 10k pathological lines', () => {
-    const out = cleanToolOutput(rawCodeFile, { mode: 'on', toolName: 'grep' });
-    expect(out.text).toContain('func (s *Server) HandleHealth');
-    expect(out.text).toContain('public static void main');
-    expect(out.text).toContain('public async Task<int> FetchCountAsync');
+    expect(isCodeOrDiffProtected(rawCodeFile)).toBe(true);
+    const out = cleanToolOutput(rawCodeFile, { toolName: 'grep' });
+    expect(out.changed).toBe(false);
+    expect(out.text).toBe(rawCodeFile);
 
-    const pathological = `${'public static final async override '.repeat(300)}(${'a '.repeat(400)}`;
+    const pathologicalLines = Array.from(
+      { length: 10_000 },
+      () => 'public static final async override List<string> ItemMethod',
+    ).join('\n');
     const t0 = performance.now();
-    cleanToolOutput(pathological, { mode: 'on' });
-    expect(performance.now() - t0).toBeLessThan(100);
+    cleanToolOutput(pathologicalLines, {});
+    expect(performance.now() - t0).toBeLessThan(200);
   });
 });
 
@@ -212,14 +216,23 @@ describe('Wave 2 Step 2 — userTurnBlocks reflow & post-render hard imageBudget
     });
     expect(out.info.collapsedImages).toBeLessThanOrEqual(8);
     expect(out.info.collapsedTurns).toBeGreaterThan(0);
-    // Over-cap user prompt (>2000 chars) triggered userTurnBlocks rendering
+    // Over-cap user prompt (>2000 chars) triggered userTurnBlocks rendering (previews marker + image block)
     const synthetic = out.messages[0]?.content;
     expect(Array.isArray(synthetic)).toBe(true);
-    const hasImage = Array.isArray(synthetic) && synthetic.some((b) => (b as { type?: string }).type === 'image');
-    expect(hasImage).toBe(true);
+    const blocks = Array.isArray(synthetic) ? synthetic : [];
+    const userPromptText = blocks.find(
+      (b) =>
+        (b as { type?: string; text?: string }).type === 'text' &&
+        ((b as { text?: string }).text ?? '').includes('too long to carry as text') &&
+        ((b as { text?: string }).text ?? '').includes('<user t="0">'),
+    );
+    expect(userPromptText).toBeDefined();
+    const imgCount = blocks.filter((b) => (b as { type?: string }).type === 'image').length;
+    expect(imgCount).toBe(out.info.collapsedImages);
+    expect(imgCount).toBeGreaterThanOrEqual(2);
   });
 
-  it('enforces hard imageBudget after parallel chunk rendering without exceeding budget', async () => {
+  it('enforces hard imageBudget after parallel chunk rendering without leaking freezeStep on abort', async () => {
     const msgs: Message[] = [];
     for (let i = 0; i < 24; i++) {
       msgs.push({
@@ -237,6 +250,8 @@ describe('Wave 2 Step 2 — userTurnBlocks reflow & post-render hard imageBudget
     expect(tight.info.collapsedImages).toBeLessThanOrEqual(2);
     if (tight.info.collapsedTurns === 0) {
       expect(tight.info.reason).toBe('over_budget');
+      expect(tight.info.freezeStep).toBeUndefined();
+      expect(tight.info.budgetTrimmed).toBeUndefined();
     } else {
       expect(tight.info.collapsedImages).toBeGreaterThan(0);
     }
@@ -271,6 +286,37 @@ describe('Wave 2 Step 3 — OpenAI & Google pin relocation', () => {
     expect(tailText).toContain('always test edge cases');
     expect(tailText).toContain('from-instructions');
     expect(tailText).toContain('from-file');
+  });
+
+  it('relocateOpenAIPins strips bare file pins, preserves unrelated empty turns + legacy function_call', () => {
+    const bareFileReq: Parameters<typeof relocateOpenAIPins>[0] = {
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<system-reminder>\nfiche pin from-bare-file\n</system-reminder>' }] },
+        { type: 'message', role: 'user', content: '' },
+        { type: 'message', role: 'assistant', content: 'Must keep untouched assistant reply' },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Next prompt' }] },
+      ],
+    };
+    const bareMoved = relocateOpenAIPins(bareFileReq);
+    expect(bareMoved).toBeGreaterThan(0);
+    const serialized = JSON.stringify(bareFileReq.input);
+    expect(serialized).not.toContain('fiche pin from-bare-file');
+    expect(serialized).toContain('Must keep untouched assistant reply');
+    expect(JSON.stringify((bareFileReq.input as unknown[]).at(-1))).toContain('from-bare-file');
+
+    const chatFnCall: Record<string, unknown> = {
+      messages: [
+        { role: 'user', content: '' },
+        { role: 'assistant', content: null, function_call: { name: 'doThing', arguments: '{}' } },
+        { role: 'function', name: 'doThing', content: 'ok' },
+        { role: 'user', content: '@fiche pin keep legacy fn turn' },
+        { role: 'assistant', content: 'noted' },
+        { role: 'user', content: 'Go ahead' },
+      ],
+    };
+    const movedChat = relocateOpenAIPins(chatFnCall as Parameters<typeof relocateOpenAIPins>[0]);
+    expect(movedChat).toBeGreaterThan(0);
+    expect(JSON.stringify(chatFnCall.messages)).toContain('doThing');
   });
 
   it('relocateGooglePins splices pairs, prunes emptied systemInstruction, and preserves functionCall/thought parts', () => {
@@ -311,6 +357,7 @@ describe('Wave 2 Step 4 — FactSheet paging & MAX_SEEN repeat accounting', () =
       '/src/late_page_file.ts /src/late_page_file.ts',
       '/src/early_anchor_file.ts',
     ].join('\n');
+    expect(longDoc.length).toBeGreaterThan(FACTSHEET_PAGE_CHARS);
 
     const fn = prepareFactSheet(longDoc, 'full');
     const covered = new Set<string>(['/src/late_page_file.ts']);
@@ -321,12 +368,13 @@ describe('Wave 2 Step 4 — FactSheet paging & MAX_SEEN repeat accounting', () =
 
     const repeatedPastCap = [
       'RepeatedTokenAlpha',
-      ...Array.from({ length: 1100 }, (_, i) => `DistinctSym_${i}_zz`),
+      ...Array.from({ length: 2200 }, (_, i) => `PROJ-${10_000 + i}`),
       'RepeatedTokenAlpha',
     ].join(' ');
     const entries = extractFactSheetEntries(repeatedPastCap);
     const alpha = entries.find((e) => e.token === 'RepeatedTokenAlpha');
-    expect(alpha?.count).toBeGreaterThanOrEqual(2);
+    expect(alpha?.count).toBe(2);
+    expect(entries.find((e) => e.token === 'PROJ-12199')).toBeUndefined();
   });
 });
 
@@ -359,10 +407,35 @@ describe('Wave 2 Step 5 — Warp CA, route normalization, no-SNI TLS & app args'
     expect(mappedLeaf.subjectAltName).toMatch(/IP Address:(?:.*7F00:1|.*127\.0\.0\.1)/i);
   });
 
-  it('rejects dot-segment traversal in matchRoute', () => {
+  it('rejects dot-segment, scheme-relative, and percent-encoded traversals in normalizeRoutePath/matchRoute', () => {
+    expect(normalizeRoutePath('//evil/v1/messages')).toBe('/evil/v1/messages');
+    expect(normalizeRoutePath('/\\evil/v1/messages')).toBe('/evil/v1/messages');
+    expect(normalizeRoutePath('/v1/%2e%2e/admin')).toBe('/admin');
+
     const routes = [parseRoute('api.example.com/v1/*=http://127.0.0.1:47821')];
     expect(matchRoute(routes, 'api.example.com', '/v1/messages')).not.toBeNull();
     expect(matchRoute(routes, 'api.example.com', '/v1/../../admin/secret')).toBeNull();
+    expect(matchRoute(routes, 'api.example.com', '//evil/v1/messages')).toBeNull();
+    expect(matchRoute(routes, 'api.example.com', '/v1/%2e%2e/admin')).toBeNull();
+  });
+
+  it('detects ChatGPT/Codex app.asar bundles as Electron and renders safe bypass wrappers', () => {
+    const dir = makeTmpDir('fiche-app-');
+    const appDir = path.join(dir, 'ChatGPT.app');
+    fs.mkdirSync(path.join(appDir, 'Contents', 'MacOS'), { recursive: true });
+    fs.mkdirSync(path.join(appDir, 'Contents', 'Frameworks', 'Codex Framework.framework'), { recursive: true });
+    fs.mkdirSync(path.join(appDir, 'Contents', 'Resources'), { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, 'Contents', 'Info.plist'),
+      '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>ChatGPT</string></dict></plist>',
+    );
+    fs.writeFileSync(path.join(appDir, 'Contents', 'MacOS', 'ChatGPT'), '#!/bin/sh\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(appDir, 'Contents', 'Resources', 'app.asar'), 'asar');
+    const resolved = resolveMacAppBundle(appDir);
+    expect(resolved?.isElectron).toBe(true);
+
+    const script = renderShellInitScript({ wrap: true });
+    expect(script).toContain('if [ "${FICHE_BYPASS:-0}" = "1" ]; then command claude "$@"; else "$FICHE_BIN" warp -- claude "$@"; fi');
   });
 
   it('completes real CONNECT TLS handshake without SNI for an IP literal target', async () => {
@@ -483,10 +556,29 @@ describe('Wave 2 Step 6 — Messages bridges & fail-open proxy error typing', ()
       ),
     ) as { reasoning?: { effort?: string }; input: unknown[] };
     expect(reqHigh.reasoning?.effort).toBe('high');
+    expect((reqHigh as { temperature?: number }).temperature).toBeUndefined();
     expect(JSON.stringify(reqHigh.input)).not.toContain('secret scratchpad');
     expect(JSON.stringify(reqHigh.input)).not.toContain('redacted_thinking');
 
-    // Responses incomplete truncated JSON recovery
+    // Non-reasoning model skips reasoning field while reasoning model strips temperature
+    const reqNonReasoning = JSON.parse(
+      new TextDecoder().decode(
+        anthropicMessagesToOpenAIResponses(
+          new TextEncoder().encode(
+            JSON.stringify({
+              model: 'gpt-4o',
+              temperature: 0.7,
+              thinking: { type: 'enabled', budget_tokens: 16000 },
+              messages: [{ role: 'user', content: 'Hi' }],
+            }),
+          ),
+        ),
+      ),
+    ) as { reasoning?: unknown; temperature?: number };
+    expect(reqNonReasoning.reasoning).toBeUndefined();
+    expect(reqNonReasoning.temperature).toBe(0.7);
+
+    // Responses incomplete truncated JSON recovery returns max_tokens stop_reason
     const incompleteResp = openAIResponseToAnthropicMessage(
       {
         id: 'resp_1',
@@ -498,11 +590,14 @@ describe('Wave 2 Step 6 — Messages bridges & fail-open proxy error typing', ()
       },
       'gpt-6.2-astra',
     );
+    expect(incompleteResp.stop_reason).toBe('max_tokens');
     expect((incompleteResp.content as Array<{ input: { _raw?: string } }>)[0]!.input._raw).toContain('cut...');
 
-    // Responses eventless + headerless SSE sniffing
-    const eventlessStream = new ReadableStream<Uint8Array>({
+    // Responses fragmented + keepalive + id:-prefixed headerless SSE sniffing
+    const fragmentedStream = new ReadableStream<Uint8Array>({
       start(controller) {
+        controller.enqueue(new TextEncoder().encode('\n\n'));
+        controller.enqueue(new TextEncoder().encode('id: 1\n'));
         controller.enqueue(new TextEncoder().encode(
           'data: {"type":"response.created","response":{"id":"r1","model":"gpt-6.2-astra"}}\n\n' +
           'data: {"type":"response.output_text.delta","delta":"hello"}\n\n' +
@@ -512,7 +607,7 @@ describe('Wave 2 Step 6 — Messages bridges & fail-open proxy error typing', ()
       },
     });
     const headerlessRes = await openAIResponsesToAnthropicResponse(
-      new Response(eventlessStream, { status: 200, headers: { 'content-type': 'text/plain' } }),
+      new Response(fragmentedStream, { status: 200, headers: { 'content-type': 'text/plain' } }),
       'gpt-6.2-astra',
     );
     expect(headerlessRes.headers.get('content-type')).toContain('text/event-stream');
@@ -520,7 +615,7 @@ describe('Wave 2 Step 6 — Messages bridges & fail-open proxy error typing', ()
     expect(sseText).toContain('event: message_start');
     expect(sseText).toContain('hello');
 
-    // Chat truncated tool JSON + headerless SSE + 4 MiB guard
+    // Chat truncated tool JSON returns max_tokens stop_reason
     const chatTrunc = openAIChatToAnthropicMessage(
       {
         id: 'chat_1',
@@ -535,6 +630,7 @@ describe('Wave 2 Step 6 — Messages bridges & fail-open proxy error typing', ()
       },
       'gpt-6.2-astra',
     );
+    expect(chatTrunc.stop_reason).toBe('max_tokens');
     expect((chatTrunc.content as Array<{ input: { _raw?: string } }>)[0]!.input._raw).toBe('{"bad":true,');
 
     const hugeSse = new ReadableStream<Uint8Array>({
@@ -584,6 +680,34 @@ describe('Wave 2 Step 6 — Messages bridges & fail-open proxy error typing', ()
     expect(res.status).toBe(400);
     const json = (await res.json()) as { error: { type: string } };
     expect(json.error.type).toBe('invalid_request_error');
+
+    const unsupportedBlockRes = await handler(
+      new Request('http://127.0.0.1:47821/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'gpt-6.2-astra',
+          messages: [{ role: 'user', content: [{ type: 'document', source: {} }] }],
+        }),
+      }),
+    );
+    expect(unsupportedBlockRes.status).toBe(400);
+    const unsupportedJson = (await unsupportedBlockRes.json()) as { error: { type: string } };
+    expect(unsupportedJson.error.type).toBe('invalid_request_error');
+
+    // Broken JSON cannot declare a model so readModelField returns null and the proxy fails open
+    // to upstream (502 against unreachable 127.0.0.1:9), whereas direct bridge translation throws SyntaxError.
+    expect(() =>
+      anthropicMessagesToOpenAIResponses(new TextEncoder().encode('{"model":"gpt-6.2-astra",')),
+    ).toThrow(SyntaxError);
+    const malformedRes = await handler(
+      new Request('http://127.0.0.1:47821/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{"model":"gpt-6.2-astra",',
+      }),
+    );
+    expect(malformedRes.status).toBe(502);
   });
 });
 
@@ -634,14 +758,17 @@ describe('Wave 2 Step 7 — Stage toggles, skill slug validation & concurrent Fi
         duration_ms: 10,
         first_user_sha8: 'old11111',
       });
-      tracker.emit({
-        ts: recentTs,
-        method: 'POST',
-        path: '/v1/messages',
-        status: 200,
-        duration_ms: 10,
-        first_user_sha8: 'new22222',
-      });
+      // Seed enough records so prune streams multiple chunks while live writes buffer.
+      for (let k = 0; k < 200; k++) {
+        tracker.emit({
+          ts: recentTs,
+          method: 'POST',
+          path: '/v1/messages',
+          status: 200,
+          duration_ms: 10,
+          first_user_sha8: 'new22222',
+        });
+      }
 
       const prunePromise = prune(paths, { olderThanDays: 30, force: true });
       tracker.emit({
@@ -652,15 +779,42 @@ describe('Wave 2 Step 7 — Stage toggles, skill slug validation & concurrent Fi
         duration_ms: 15,
         first_user_sha8: 'live3333',
       });
+      tracker.emit({
+        ts: recentTs,
+        method: 'POST',
+        path: '/v1/messages',
+        status: 200,
+        duration_ms: 16,
+        first_user_sha8: 'live4444',
+      });
       const report = await prunePromise;
+      // Also directly verify FileTracker active-rewrite flush produces zero blank lines.
+      await tracker.runDuringRewrite(async (flushPending) => {
+        tracker.emit({ ts: recentTs, method: 'POST', path: '/v1/messages', status: 200, duration_ms: 1, first_user_sha8: 'mid55555' });
+        tracker.emit({ ts: recentTs, method: 'POST', path: '/v1/messages', status: 200, duration_ms: 1, first_user_sha8: 'mid66666' });
+        const fd = fs.openSync(paths.eventsFile, 'a', 0o600);
+        try {
+          flushPending(fd, (outFd, rawLine) => {
+            const clean = rawLine.replace(/\r?\n$/, '');
+            if (clean.trim()) fs.writeSync(outFd, clean + '\n');
+          });
+        } finally {
+          fs.closeSync(fd);
+        }
+      });
       tracker.close();
 
       expect(report.sessionsRemoved).toContain('old11111');
-      const lines = fs.readFileSync(paths.eventsFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as TrackEvent);
+      const rawText = fs.readFileSync(paths.eventsFile, 'utf8');
+      expect(rawText).not.toContain('\n\n');
+      const lines = rawText.trim().split('\n').map((l) => JSON.parse(l) as TrackEvent);
       const ids = new Set(lines.map((l) => l.first_user_sha8));
       expect(ids.has('old11111')).toBe(false);
       expect(ids.has('new22222')).toBe(true);
       expect(ids.has('live3333')).toBe(true);
+      expect(ids.has('live4444')).toBe(true);
+      expect(ids.has('mid55555')).toBe(true);
+      expect(ids.has('mid66666')).toBe(true);
     } finally {
       tracker.close();
     }
@@ -678,7 +832,8 @@ describe('Wave 2 Step 8 — Restart-proof replay & Tokmeter-style dashboard anal
       sidecarDir: path.join(dir, '4xx-bodies'),
     };
     const now = new Date();
-    const todayIso = now.toISOString();
+    const todayNoon = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 12, 0, 0);
+    const todayIso = todayNoon.toISOString();
     const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12, 0, 0);
     const yesterdayIso = yesterday.toISOString();
 
@@ -742,15 +897,21 @@ describe('Wave 2 Step 8 — Restart-proof replay & Tokmeter-style dashboard anal
       },
     ];
 
-    fs.writeFileSync(`${paths.eventsFile}.1`, rotatedEvents.map((e) => JSON.stringify(e)).join('\n') + '\n');
-    fs.writeFileSync(paths.eventsFile, activeEvents.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    fs.writeFileSync(
+      `${paths.eventsFile}.1`,
+      ['null', '{}', '{"ts":"bad-date","path":"/v1/messages"}', ...rotatedEvents.map((e) => JSON.stringify(e))].join('\n') + '\n',
+    );
+    fs.writeFileSync(
+      paths.eventsFile,
+      [...activeEvents.map((e) => JSON.stringify(e)), '{"ts":"' + todayIso + '","path":"/v1/messages","model":"claude-fable-5","status":"<script>x</script>","input_tokens":"nan"}'].join('\n') + '\n',
+    );
 
     setAllowedModelBases(['claude-fable-5']);
     const dash = new DashboardState(paths, async () => new Map());
     await dash.replay(paths.eventsFile);
 
     const stats = (await dash.serveStats().json()) as StatsPayload;
-    expect(stats.requests).toBe(61);
+    expect(stats.requests).toBe(62);
     expect(stats.compressed_requests).toBe(61);
     expect(stats.imaged_requests).toBe(60);
     expect(stats.text_compressed_requests).toBe(1);
@@ -759,18 +920,18 @@ describe('Wave 2 Step 8 — Restart-proof replay & Tokmeter-style dashboard anal
     expect(stats.saved_usd).toBeGreaterThan(0);
     expect(stats.daily).toHaveLength(14);
     expect(stats.daily?.at(-1)?.is_today).toBe(true);
-    expect(stats.today?.requests).toBe(31);
+    expect(stats.today?.requests).toBe(32);
     expect(stats.by_model?.['claude-fable-5']?.imaged).toBe(60);
     expect(stats.by_model?.['claude-opus-5-5']?.text_compressed).toBe(1);
 
-    // Recent ring strictly capped at 50 despite 61 replayed lifetime events
+    // Recent ring strictly capped at 50 despite 62 replayed lifetime events
     const recent = (await dash.serveRecent().json()) as { recent: Array<{ compression_mode?: string; cc_added?: number }> };
     expect(recent.recent).toHaveLength(50);
-    const tailRow = recent.recent.at(-1)!;
-    expect(tailRow.compression_mode).toBe('text');
-    expect(tailRow.cc_added).toBeUndefined();
+    const hyRow = recent.recent[recent.recent.length - 2]!;
+    expect(hyRow.compression_mode).toBe('text');
+    expect(hyRow.cc_added).toBeUndefined();
 
-    // Fragment assertions: SVG 14-day chart + text-hygiene badge
+    // Fragment assertions: SVG 14-day chart + text-hygiene badge + escaped status (no XSS)
     const analyticsHtml = await (await dash.serveFragment('analytics', new URL('http://127.0.0.1/fragments/analytics'), 47821)).text();
     expect(analyticsHtml).toContain('data-chart="daily"');
     expect(analyticsHtml).toContain('Live today');
@@ -780,5 +941,6 @@ describe('Wave 2 Step 8 — Restart-proof replay & Tokmeter-style dashboard anal
     expect(recentHtml).toContain('badge-hyg');
     expect(recentHtml).toContain('text-hygiene');
     expect(recentHtml).toContain('badge-img');
+    expect(recentHtml).not.toContain('<script>x</script>');
   });
 });

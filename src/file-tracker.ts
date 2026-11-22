@@ -24,6 +24,7 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
   private bytesWritten = 0;
   private brokenLogged = false;
   private rewriting = false;
+  private closed = false;
   private pendingDuringRewrite: string[] = [];
   private readonly unregisterCoordinator: () => void;
   private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -118,6 +119,7 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
   }
 
   emit(ev: TrackEvent): void {
+    if (this.closed) return;
     let line: string;
     try {
       line = JSON.stringify(ev) + '\n';
@@ -136,23 +138,33 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
   ): Promise<T> {
     this.rewriting = true;
     this.flush();
+    let flushedCount = 0;
     try {
-      return await fn((outFd, writeLine) => {
-        if (this.pendingDuringRewrite.length === 0) return;
-        const batch = this.pendingDuringRewrite.splice(0, this.pendingDuringRewrite.length);
+      const result = await fn((outFd, writeLine) => {
+        if (this.pendingDuringRewrite.length <= flushedCount) return;
+        const batch = this.pendingDuringRewrite.slice(flushedCount);
+        flushedCount += batch.length;
         for (const line of batch) {
           if (writeLine) writeLine(outFd, line);
           else fs.writeSync(outFd, line);
         }
       });
+      if (flushedCount > 0) {
+        this.pendingDuringRewrite.splice(0, flushedCount);
+      }
+      return result;
     } finally {
       this.closeFd();
       this.rewriting = false;
-      if (this.pendingDuringRewrite.length > 0) {
+      if (this.pendingDuringRewrite.length > 0 && !this.closed) {
         const remaining = this.pendingDuringRewrite.splice(0, this.pendingDuringRewrite.length);
         for (const line of remaining) {
           this.writeSerializedLine(line);
         }
+      }
+      if (this.closed) {
+        this.pendingDuringRewrite.length = 0;
+        this.closeFd();
       }
     }
   }
@@ -168,6 +180,7 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
   }
 
   close(): void {
+    this.closed = true;
     this.unregisterCoordinator();
     if (this.fd != null) {
       try {

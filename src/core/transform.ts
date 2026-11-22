@@ -2446,10 +2446,6 @@ async function runHistoryCollapseAndFinalize(
         minFreezeStep: tuning.minFreezeStep,
       },
     );
-    recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
-    if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
-    if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
-    if (tuning.packFill) info.historyPackFill = true;
     // Atomic admission by weight. The collapse is one semantic group: applying
     // it means every collapsed message becomes pages, so a group that does not
     // fit the byte budget is not applied at all and the original text stands.
@@ -2464,6 +2460,10 @@ async function runHistoryCollapseAndFinalize(
       info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
       info.historyReason = 'image_bytes';
     } else if (histInfo.collapsedTurns > 0) {
+      recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+      if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
+      if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
+      if (tuning.packFill) info.historyPackFill = true;
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -3196,10 +3196,6 @@ export async function transformRequest(
         minFreezeStep: tuning.minFreezeStep,
       },
     );
-    recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
-    if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
-    if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
-    if (tuning.packFill) info.historyPackFill = true;
     // Atomic admission by weight. The collapse is one semantic group: applying
     // it means every collapsed message becomes pages, so a group that does not
     // fit the byte budget is not applied at all and the original text stands.
@@ -3214,6 +3210,10 @@ export async function transformRequest(
       info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
       info.historyReason = 'image_bytes';
     } else if (histInfo.collapsedTurns > 0) {
+      recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+      if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
+      if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
+      if (tuning.packFill) info.historyPackFill = true;
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;

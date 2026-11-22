@@ -101,10 +101,11 @@ function subjectAltNameExtension(host: string, critical = false): Uint8Array {
         : ipv6Bytes(host);
     return extension(OID_SUBJECT_ALT_NAME, critical, seq(contextTag(7, octets, false)));
   }
-  // [2] IMPLICIT IA5String is the IA5String content under a different tag, so
-  // re-encode the content rather than slicing the header off ia5String(): that
-  // header is 3 bytes, not 2, once the host reaches 128 chars, and the leftover
-  // length byte lands inside the name.
+  // [2] IMPLICIT IA5String requires 7-bit ASCII characters.
+  if (/[^\x20-\x7e]/.test(host)) {
+    throw new Error(`Invalid non-ASCII DNS SAN host: ${host}`);
+  }
+  // Re-encode content rather than slicing header off ia5String() so >127-char hosts encode cleanly.
   return extension(
     OID_SUBJECT_ALT_NAME,
     critical,
@@ -166,14 +167,15 @@ function writeFileAtomic(filePath: string, content: string, mode: number): void 
 }
 
 function ipv6Bytes(host: string): Uint8Array {
-  const lastColon = host.lastIndexOf(':');
-  let normalized = host;
-  if (lastColon >= 0 && host.slice(lastColon + 1).includes('.')) {
-    const octets = host.slice(lastColon + 1).split('.').map((o) => Number.parseInt(o, 10));
+  const cleanHost = host.split('%')[0] ?? host;
+  const lastColon = cleanHost.lastIndexOf(':');
+  let normalized = cleanHost;
+  if (lastColon >= 0 && cleanHost.slice(lastColon + 1).includes('.')) {
+    const octets = cleanHost.slice(lastColon + 1).split('.').map((o) => Number.parseInt(o, 10));
     if (octets.length === 4 && octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
       const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
       const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
-      normalized = `${host.slice(0, lastColon + 1)}${hi}:${lo}`;
+      normalized = `${cleanHost.slice(0, lastColon + 1)}${hi}:${lo}`;
     }
   }
   const [head, tail] = normalized.split('::');
@@ -293,6 +295,7 @@ export function readSystemRoots(
 
 export class CertificateAuthority {
   private readonly leaves = new Map<string, SecureContext>();
+  private readonly leafSki: Uint8Array;
   readonly spkiPins: readonly string[];
 
   private constructor(
@@ -308,6 +311,7 @@ export class CertificateAuthority {
     readonly systemRootsPath: string | null,
     readonly spkiPin: string,
   ) {
+    this.leafSki = subjectKeyIdentifier(leafKey);
     this.spkiPins = [spkiSha256Base64(leafKey), spkiPin];
   }
 
@@ -331,6 +335,11 @@ export class CertificateAuthority {
    */
   static loadOrCreate(dir: string): CertificateAuthority {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      /* ignore */
+    }
     const certPath = join(dir, 'warp-ca.pem');
     const keyPath = join(dir, 'warp-ca-key.pem');
 
@@ -342,11 +351,21 @@ export class CertificateAuthority {
       const caPubFromKey = createPublicKey(caKey).export({ type: 'spki', format: 'der' });
       const caPubFromCert = parsed.publicKey.export({ type: 'spki', format: 'der' });
       const hasSki = parsed.raw.includes(SKI_OID_DER);
+      const now = Date.now();
+      const validFrom = new Date(parsed.validFrom).getTime();
+      const validTo = new Date(parsed.validTo).getTime();
       if (
-        new Date(parsed.validTo).getTime() > Date.now() &&
+        parsed.ca === true &&
+        validFrom <= now &&
+        validTo > now + 365 * 24 * 60 * 60 * 1000 &&
         hasSki &&
         Buffer.from(caPubFromKey).equals(Buffer.from(caPubFromCert))
       ) {
+        try {
+          chmodSync(keyPath, 0o600);
+        } catch {
+          /* ignore */
+        }
         const caSki = subjectKeyIdentifier(parsed.publicKey);
         const spkiPin = spkiSha256Base64(parsed.publicKey);
         const leaf = newKeyPair();
@@ -410,12 +429,12 @@ export class CertificateAuthority {
 
   /** Mint a leaf X.509 PEM certificate signed by this CA for `host`. */
   mintLeafCertPem(host: string): string {
-    const name = host.replace(/\.$/, '');
+    const stripped = host.replace(/\.$/, '');
+    const name = isIP(stripped) ? stripped : stripped.toLowerCase();
     const now = Date.now();
     // RFC 5280 caps CommonName at 64 chars; for long hosts use an empty Subject DN + critical SAN.
     const subject = name.length > 64 ? seq() : distinguishedName(name);
     const sanCritical = name.length > 64;
-    const leafSki = subjectKeyIdentifier(this.leafKey);
     const der = buildCertificate({
       subject,
       issuer: distinguishedName(CA_COMMON_NAME, CA_ORGANIZATION),
@@ -427,7 +446,7 @@ export class CertificateAuthority {
         keyUsageExtension([0]),
         extension(OID_EXT_KEY_USAGE, false, seq(oid(OID_SERVER_AUTH))),
         subjectAltNameExtension(name, sanCritical),
-        extension(OID_SUBJECT_KEY_IDENTIFIER, false, octetString(leafSki)),
+        extension(OID_SUBJECT_KEY_IDENTIFIER, false, octetString(this.leafSki)),
         extension(OID_AUTHORITY_KEY_IDENTIFIER, false, seq(contextTag(0, this.caSki, false))),
       ],
     });
@@ -441,7 +460,8 @@ export class CertificateAuthority {
    * first request to each host.
    */
   secureContextFor(host: string): SecureContext {
-    const name = host.replace(/\.$/, '');
+    const stripped = host.replace(/\.$/, '');
+    const name = isIP(stripped) ? stripped : stripped.toLowerCase();
     const cached = this.leaves.get(name);
     if (cached) {
       this.leaves.delete(name);

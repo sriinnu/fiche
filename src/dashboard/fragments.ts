@@ -26,6 +26,12 @@ function numFmt(n: number | null | undefined): string {
   return v.toLocaleString('en-US');
 }
 
+function fmtSignedUsd(v: number | null | undefined, decimals = 2): string {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n === 0) return `$${(0).toFixed(decimals)}`;
+  return n < 0 ? `-$${Math.abs(n).toFixed(decimals)}` : `$${n.toFixed(decimals)}`;
+}
+
 /** "12.3k" / "1.2M" compact formatter for headline numbers. */
 function kFmt(n: number | null | undefined): string {
   const v = Number(n) || 0;
@@ -598,9 +604,9 @@ export function renderContextMapFragment(
         `<div class="ctx-row"><span class="ctx-lbl">${label}</span><span class="ctx-val">${kFmt(n)} tok</span></div>`,
       ).join('') +
       `<div class="ctx-row"><span class="ctx-lbl">Imageable text baseline</span><span class="ctx-val">${kFmt(c.baselineImagedTokens ?? 0)} tok</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Completed tool pairs (old / recent native / imaged)</span><span class="ctx-val">${rc.completedFunctionPairs ?? 0} (${rc.oldFunctionPairs ?? 0} / ${rc.recentNativeFunctionPairs ?? 0} / ${rc.collapsedFunctionPairs ?? 0})</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Open calls kept native</span><span class="ctx-val">${rc.openFunctionCalls ?? 0}</span></div>` +
-      `<div class="ctx-row"><span class="ctx-lbl">Native image parts</span><span class="ctx-val">${rc.imageParts}</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Completed tool pairs (old / recent native / imaged)</span><span class="ctx-val">${Math.trunc(Number(rc.completedFunctionPairs) || 0)} (${Math.trunc(Number(rc.oldFunctionPairs) || 0)} / ${Math.trunc(Number(rc.recentNativeFunctionPairs) || 0)} / ${Math.trunc(Number(rc.collapsedFunctionPairs) || 0)})</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Open calls kept native</span><span class="ctx-val">${Math.trunc(Number(rc.openFunctionCalls) || 0)}</span></div>` +
+      `<div class="ctx-row"><span class="ctx-lbl">Native image parts</span><span class="ctx-val">${Math.trunc(Number(rc.imageParts) || 0)}</span></div>` +
       `<div class="ctx-row"><span class="ctx-lbl">Provider tokens not explained locally</span><span class="ctx-val">${kFmt(c.responsesUnexplainedTokens ?? 0)} tok</span></div>` +
       `<div class="split-note">This diagnostic uses local o200k counts only; it never calls Anthropic /count_tokens.</div>`
     : '';
@@ -618,7 +624,7 @@ export function renderContextMapFragment(
         .join('') +
       `</div>`
     : c.restored && c.imageCount > 0
-      ? `<div class="pages-title">${c.imageCount} image page${c.imageCount === 1 ? '' : 's'} were sent — thumbnails expired when the proxy restarted. The breakdown above is reconstructed from the saved log.</div>`
+      ? `<div class="pages-title">${Math.trunc(Number(c.imageCount) || 0)} image page${c.imageCount === 1 ? '' : 's'} were sent — thumbnails expired when the proxy restarted. The breakdown above is reconstructed from the saved log.</div>`
       : '';
 
   // Did the TEXT baseline's prefix read warm this turn? This follows the actual
@@ -683,7 +689,7 @@ export function renderContextMapFragment(
     `<div class="legend"><span class="tag tag-img">Became an image</span><span class="tag tag-txt">Stayed as text</span></div>` +
     `<div class="split">` +
     `<div class="split-col split-img">` +
-    `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
+    `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${Math.trunc(Number(c.imageCount) || 0)} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
     (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
     capNote +
     `<div class="split-note">fiche can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
@@ -751,7 +757,7 @@ export function renderRecentFragment(p: RecentPayload): string {
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
-              `<td><span class="pill pill-${statusCls(e.status)}">${e.status}</span></td>` +
+              `<td><span class="pill pill-${statusCls(e.status)}">${escapeHtml(String(e.status))}</span></td>` +
               `<td class="endp">${escapeHtml(shortPath(e.path))}</td>` +
               `<td>${e.model ? `<code>${escapeHtml(e.model)}</code>` : '<span class="muted">—</span>'}</td>` +
               `<td>${imaged}</td>` +
@@ -852,12 +858,12 @@ export function renderAnalyticsFragment(s: StatsPayload): string {
     `<div class="akpi">` +
     `<div class="akpi-lbl">Today</div>` +
     `<div class="akpi-val">${today ? `${kFmt(today.saved_tokens)} <span class="akpi-unit">wtd</span>` : '0 <span class="akpi-unit">wtd</span>'}</div>` +
-    `<div class="akpi-sub">${hasToday && today ? `${kFmt(today.raw_saved_tokens)} raw · $${today.saved_usd.toFixed(2)} · ${numFmt(today.requests)} req` : 'no requests today yet'}</div>` +
+    `<div class="akpi-sub">${hasToday && today ? `${kFmt(today.raw_saved_tokens)} raw · ${fmtSignedUsd(today.saved_usd)} · ${numFmt(today.requests)} req` : 'no requests today yet'}</div>` +
     `</div>` +
     `<div class="akpi">` +
     `<div class="akpi-lbl">Lifetime</div>` +
     `<div class="akpi-val">${kFmt(s.saved_input_tokens)} <span class="akpi-unit">wtd</span></div>` +
-    `<div class="akpi-sub">${kFmt(rawSaved)} raw · $${(s.saved_usd ?? 0).toFixed(2)} · ${numFmt(imagedCount)} img / ${numFmt(textCount)} txt</div>` +
+    `<div class="akpi-sub">${kFmt(rawSaved)} raw · ${fmtSignedUsd(s.saved_usd ?? 0)} · ${numFmt(imagedCount)} img / ${numFmt(textCount)} txt</div>` +
     `</div>` +
     `</div>`;
 
@@ -896,7 +902,7 @@ export function renderAnalyticsFragment(s: StatsPayload): string {
         const barH = v > 0 ? Math.max(3, (v / maxVal) * plotH) : 2;
         const x = padL + i * slotW + (slotW - barW) / 2;
         const y = padT + plotH - barH;
-        const tip = `${d.date}: ${kFmt(d.saved_tokens)} wtd · ${kFmt(d.raw_saved_tokens)} raw · $${d.saved_usd.toFixed(2)} · ${d.requests} req${d.is_today ? ' (Live today)' : ''}`;
+        const tip = `${d.date}: ${kFmt(d.saved_tokens)} wtd · ${kFmt(d.raw_saved_tokens)} raw · ${fmtSignedUsd(d.saved_usd)} · ${d.requests} req${d.is_today ? ' (Live today)' : ''}`;
         const fill = v > 0 ? 'var(--good)' : 'var(--border-strong)';
         const extra = d.is_today
           ? ` opacity="0.58" stroke="var(--good)" stroke-dasharray="3 2" stroke-width="1.2"`
@@ -963,12 +969,13 @@ export function renderAnalyticsFragment(s: StatsPayload): string {
             const pctW = m.saved_tokens > 0 ? Math.max(2, (m.saved_tokens / maxModelTok) * 100) : 0;
             const fill = pctW > 0 ? `<div class="bar-fill" style="width:${pctW.toFixed(1)}%"></div>` : '';
             const modeDetail = `${numFmt(m.requests)} req · ${numFmt(m.imaged)} img · ${numFmt(m.text_compressed)} txt`;
-            const valLabel = `${kFmt(m.saved_tokens)} wtd · ${kFmt(m.raw_saved_tokens)} raw · $${m.saved_usd.toFixed(2)}`;
+            const valLabel = `${kFmt(m.saved_tokens)} wtd · ${kFmt(m.raw_saved_tokens)} raw · ${fmtSignedUsd(m.saved_usd)}`;
+            const valCls = m.saved_tokens < 0 ? 'mbar-val neg' : m.saved_tokens === 0 ? 'mbar-val muted' : 'mbar-val';
             return (
               `<div class="mbar-row">` +
               `<div class="mbar-top">` +
               `<span class="mbar-name" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` +
-              `<span class="mbar-val">${valLabel}</span>` +
+              `<span class="${valCls}">${valLabel}</span>` +
               `</div>` +
               `<div class="bar-track">${fill}</div>` +
               `<div class="mbar-sub">${modeDetail}</div>` +
@@ -1429,6 +1436,8 @@ const CSS = `
   .mbar-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; font-size: 12px; }
   .mbar-name { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mbar-val { font-variant-numeric: tabular-nums; color: var(--good); font-weight: 600; font-size: 11.5px; white-space: nowrap; }
+  .mbar-val.neg { color: var(--bad, #b42318); }
+  .mbar-val.muted { color: var(--muted); }
   .mbar-sub { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
   /* inspector */
@@ -1436,6 +1445,7 @@ const CSS = `
   .mini-btn { font-size: 11px; background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong);
     border-radius: 7px; padding: 4px 10px; cursor: pointer; font-weight: 500; }
   .mini-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .metric-btn.on:hover { background: var(--accent); color: var(--surface); border-color: var(--accent); opacity: 0.9; }
   .mini-label { font-size: 11px; color: var(--muted); }
   .frame { background: #fff; border: 1px solid var(--border-strong); border-radius: 8px; padding: 5px;
     overflow: auto; max-height: 360px; scrollbar-width: thin; }

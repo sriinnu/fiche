@@ -71,6 +71,7 @@ final class DaemonController: ObservableObject {
                 return
             }
             UserDefaults.standard.set(clamped, forKey: DefaultsKey.daemonPort)
+            pollGeneration &+= 1
             Task { [weak self] in
                 await self?.pollOnce()
             }
@@ -107,8 +108,10 @@ final class DaemonController: ObservableObject {
     @Published private(set) var pluginsDir: String?
     @Published private(set) var isLoginAgentInstalled: Bool = false
     @Published private(set) var isShellAutoWrapInstalled: Bool = false
-    @Published private(set) var discoveredDesktopApps: [String] = []
+    @Published private(set) var shellRCDisplayName: String = "~/.zshrc"
+    @Published private(set) var discoveredDesktopApps: [DiscoveredDesktopApp] = []
     @Published private(set) var discoveredCLIAgents: [DiscoveredCLIAgent] = []
+    @Published private(set) var hasCompletedAgentDiscovery: Bool = false
     @Published private(set) var transientNotice: String? = nil
     @Published private(set) var isBusy: Bool = false
     @Published private(set) var lastError: String?
@@ -121,6 +124,9 @@ final class DaemonController: ObservableObject {
     private let pollBox = TaskCancellationBox()
     private var hasPerformedStartupCheck = false
     private var noticeGeneration: Int = 0
+    private var pollGeneration: Int = 0
+    private var discoveryGeneration: Int = 0
+    private var isUpdatingShellAutoWrap: Bool = false
 
     var isPreviewMode: Bool { isPreview }
 
@@ -154,8 +160,6 @@ final class DaemonController: ObservableObject {
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: config)
 
-        self.isLoginAgentInstalled = Self.checkLaunchAgentExists()
-        self.isShellAutoWrapInstalled = Self.checkShellAutoWrapInstalled()
         startPolling()
         refreshAgentDiscovery()
     }
@@ -176,7 +180,7 @@ final class DaemonController: ObservableObject {
         {
           "ok": true,
           "name": "fiche",
-          "version": "0.17.0",
+          "version": "0.18.0",
           "pid": 17130,
           "host": "127.0.0.1",
           "port": 47821,
@@ -246,12 +250,12 @@ final class DaemonController: ObservableObject {
           "by_model": {
             "gemini-4-argon-high": {
               "requests": 7,
-              "compressed_requests": 7,
+              "compressed": 7,
               "imaged": 7,
               "text_compressed": 0,
               "baseline_input_weighted": 57220,
               "actual_input_weighted": 23340,
-              "saved_input_tokens": 33880,
+              "saved_tokens": 33880,
               "raw_saved_tokens": 82300,
               "saved_pct": 59.2,
               "saved_usd": 0.094,
@@ -260,12 +264,12 @@ final class DaemonController: ObservableObject {
             },
             "claude-opus-5": {
               "requests": 4,
-              "compressed_requests": 4,
+              "compressed": 4,
               "imaged": 0,
               "text_compressed": 4,
               "baseline_input_weighted": 31200,
               "actual_input_weighted": 12800,
-              "saved_input_tokens": 18400,
+              "saved_tokens": 18400,
               "raw_saved_tokens": 41200,
               "saved_pct": 59.0,
               "saved_usd": 0.048,
@@ -274,12 +278,12 @@ final class DaemonController: ObservableObject {
             },
             "gemini-4-neon-high": {
               "requests": 3,
-              "compressed_requests": 0,
+              "compressed": 0,
               "imaged": 0,
               "text_compressed": 0,
               "baseline_input_weighted": 0,
               "actual_input_weighted": 0,
-              "saved_input_tokens": 0,
+              "saved_tokens": 0,
               "raw_saved_tokens": 0,
               "saved_pct": 0,
               "saved_usd": 0,
@@ -325,15 +329,20 @@ final class DaemonController: ObservableObject {
             PluginDescriptor(id: "skill:code-mode", name: "code-mode", description: "External code-mode workflow extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:tokmeter", name: "tokmeter", description: "External token meter inspection extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
         ]
-        self.isShellAutoWrapInstalled = false
-        self.discoveredDesktopApps = ["Antigravity", "Cursor", "Claude"]
+        self.isShellAutoWrapInstalled = true
+        self.hasCompletedAgentDiscovery = true
+        self.discoveredDesktopApps = [
+            DiscoveredDesktopApp(id: "Antigravity", name: "Antigravity", displayName: "Antigravity", bundlePath: "/Applications/Antigravity.app", isElectron: true, attachmentState: .attached, attachedPIDs: [4101], directPIDs: []),
+            DiscoveredDesktopApp(id: "Cursor", name: "Cursor", displayName: "Cursor", bundlePath: "/Applications/Cursor.app", isElectron: true, attachmentState: .runningDirect, attachedPIDs: [], directPIDs: [5210]),
+            DiscoveredDesktopApp(id: "Claude", name: "Claude", displayName: "Claude", bundlePath: "/Applications/Claude.app", isElectron: true, attachmentState: .stopped, attachedPIDs: [], directPIDs: []),
+        ]
         self.discoveredCLIAgents = [
-            DiscoveredCLIAgent(id: "claude", name: "Claude Code", command: "claude", provider: "Anthropic", installed: true, binaryPath: "/Users/demo/.local/bin/claude"),
-            DiscoveredCLIAgent(id: "codex", name: "OpenAI Codex", command: "codex", provider: "OpenAI", installed: true, binaryPath: "/usr/local/bin/codex"),
-            DiscoveredCLIAgent(id: "agy", name: "Antigravity CLI", command: "agy", provider: "Google / Multi", installed: true, binaryPath: "/Users/demo/.local/bin/agy"),
-            DiscoveredCLIAgent(id: "gemini", name: "Gemini CLI", command: "gemini", provider: "Google", installed: true, binaryPath: "/Users/demo/.local/bin/gemini"),
-            DiscoveredCLIAgent(id: "opencode", name: "OpenCode", command: "opencode", provider: "Multi", installed: true, binaryPath: "/Users/demo/.opencode/bin/opencode"),
-            DiscoveredCLIAgent(id: "aider", name: "Aider", command: "aider", provider: "Multi", installed: false, binaryPath: nil),
+            DiscoveredCLIAgent(id: "claude", name: "Claude Code", command: "claude", provider: "Anthropic", installed: true, binaryPath: "/Users/demo/.local/bin/claude", attachedCount: 1, directCount: 0),
+            DiscoveredCLIAgent(id: "codex", name: "OpenAI Codex", command: "codex", provider: "OpenAI", installed: true, binaryPath: "/usr/local/bin/codex", attachedCount: 0, directCount: 1),
+            DiscoveredCLIAgent(id: "agy", name: "Antigravity CLI", command: "agy", provider: "Google / Multi", installed: true, binaryPath: "/Users/demo/.local/bin/agy", attachedCount: 0, directCount: 0),
+            DiscoveredCLIAgent(id: "gemini", name: "Gemini CLI", command: "gemini", provider: "Google", installed: true, binaryPath: "/Users/demo/.local/bin/gemini", attachedCount: 0, directCount: 0),
+            DiscoveredCLIAgent(id: "opencode", name: "OpenCode", command: "opencode", provider: "Multi", installed: true, binaryPath: "/Users/demo/.opencode/bin/opencode", attachedCount: 0, directCount: 0),
+            DiscoveredCLIAgent(id: "aider", name: "Aider", command: "aider", provider: "Multi", installed: false, binaryPath: nil, attachedCount: 0, directCount: 0),
         ]
     }
 
@@ -443,18 +452,24 @@ final class DaemonController: ObservableObject {
 
     @discardableResult
     func pollOnce() async -> Bool {
-        isLoginAgentInstalled = Self.checkLaunchAgentExists()
+        pollGeneration &+= 1
+        let gen = pollGeneration
+        let targetPort = daemonPort
+
+        let loginInstalled = await Task.detached(priority: .utility) {
+            Self.checkLaunchAgentExists()
+        }.value
+        guard gen == pollGeneration, targetPort == daemonPort else { return false }
+        isLoginAgentInstalled = loginInstalled
 
         // Probe /api/health first; fall back to /proxy-stats if daemon predates /api/health
         let healthResult: HTTPResult<HealthResponse> = await getJSON(path: "/api/health")
+        guard gen == pollGeneration, targetPort == daemonPort else { return false }
         switch healthResult {
         case .ok(let h):
             health = h
             if let models = h.allowedModels {
                 allowedModels = models
-            }
-            if phase == .starting {
-                isBusy = false
             }
             lastError = nil
         case .httpError(let status, _) where status == 404:
@@ -462,6 +477,7 @@ final class DaemonController: ObservableObject {
             health = nil
         case .httpError(let status, let body):
             health = nil
+            lastTurn = nil
             if phase != .starting {
                 phase = .stopped
             }
@@ -470,6 +486,7 @@ final class DaemonController: ObservableObject {
         case .unreachable:
             health = nil
             stats = nil
+            lastTurn = nil
             if phase != .starting {
                 phase = .stopped
             }
@@ -482,6 +499,7 @@ final class DaemonController: ObservableObject {
         async let pluginsFetch: HTTPResult<PluginsResponse> = getJSON(path: "/api/plugins")
 
         let (statsRes, turnRes, modelsRes, pluginsRes) = await (statsFetch, turnFetch, modelsFetch, pluginsFetch)
+        guard gen == pollGeneration, targetPort == daemonPort else { return false }
 
         var anyReachable = health != nil
 
@@ -497,6 +515,7 @@ final class DaemonController: ObservableObject {
         }
 
         if !anyReachable {
+            lastTurn = nil
             if phase != .starting {
                 phase = .stopped
             }
@@ -678,6 +697,7 @@ final class DaemonController: ObservableObject {
     }
 
     func setCompression(enabled: Bool) async {
+        pollGeneration &+= 1
         struct Body: Encodable { let enabled: Bool }
         let res: HTTPResult<CompressionToggleResponse> = await postJSON(path: "/api/compression", body: Body(enabled: enabled))
         switch res {
@@ -700,6 +720,7 @@ final class DaemonController: ObservableObject {
     }
 
     private func setModel(model: String, on: Bool) async {
+        pollGeneration &+= 1
         struct ToggleBody: Encodable {
             let model: String
             let on: Bool
@@ -735,6 +756,7 @@ final class DaemonController: ObservableObject {
 
     func setModels(_ models: [String]) async {
         guard !isPreview else { return }
+        pollGeneration &+= 1
         struct ListBody: Encodable { let models: [String] }
         let res: HTTPResult<ModelsResponse> = await postJSON(path: "/api/models", body: ListBody(models: models))
         switch res {
@@ -838,6 +860,7 @@ final class DaemonController: ObservableObject {
     }
 
     private func postThirdPartyPlugins(enabled: Bool) async {
+        pollGeneration &+= 1
         struct ScopeBody: Encodable {
             let scope: String
             let enabled: Bool
@@ -872,9 +895,79 @@ final class DaemonController: ObservableObject {
         ("aider", "Aider", "Multi"),
     ]
 
-    private static let allowedCLICommands: Set<String> = Set(supportedCLICatalog.map(\.command))
+    nonisolated private static let allowedCLICommands: Set<String> = Set(supportedCLICatalog.map(\.command))
 
-    nonisolated static func discoverInstalledDesktopApps() -> [String] {
+    nonisolated static func isExecutableRegularFile(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        let fm = FileManager.default
+        return fm.fileExists(atPath: path, isDirectory: &isDir) && !isDir.boolValue && fm.isExecutableFile(atPath: path)
+    }
+
+    nonisolated private static func hasControlChars(_ s: String) -> Bool {
+        s.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F }
+    }
+
+    private struct ProcessEntry {
+        let pid: Int
+        let ppid: Int
+        let args: String
+        let tokens: [String]
+    }
+
+    nonisolated private static func listRunningProcesses() -> [ProcessEntry] {
+        let out = runProcessSync(executable: "/bin/ps", arguments: ["-axo", "pid=,ppid=,args="])
+        guard out.exitCode == 0 else { return [] }
+        var entries: [ProcessEntry] = []
+        for rawLine in out.stdout.split(whereSeparator: \.isNewline) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+            let parts = trimmed.split(maxSplits: 2, omittingEmptySubsequences: true, whereSeparator: \.isWhitespace)
+            guard parts.count == 3,
+                  let pid = Int(parts[0]),
+                  let ppid = Int(parts[1]) else { continue }
+            let args = String(parts[2])
+            let tokens = args.split(whereSeparator: \.isWhitespace).map(String.init)
+            entries.append(ProcessEntry(pid: pid, ppid: ppid, args: args, tokens: tokens))
+        }
+        return entries
+    }
+
+    nonisolated private static func findWarpCLITarget(tokens: [String]) -> String? {
+        // Match `<fiche> warp ... -- <cli>` (or `node .../cli.js warp ... -- <cli>`)
+        var warpIdx: Int?
+        for (i, tok) in tokens.enumerated() {
+            let base = URL(fileURLWithPath: tok).lastPathComponent
+            if (base == "fiche" || base == "cli.js" || base == "node.js") && i + 1 < tokens.count {
+                if let w = tokens[(i + 1)...].firstIndex(of: "warp") {
+                    warpIdx = w
+                    break
+                }
+            }
+        }
+        guard let wIdx = warpIdx else { return nil }
+        guard let dashIdx = tokens[(wIdx + 1)...].firstIndex(of: "--"),
+              dashIdx + 1 < tokens.count else { return nil }
+        return URL(fileURLWithPath: tokens[dashIdx + 1]).lastPathComponent
+    }
+
+    nonisolated private static func isWarpProcess(tokens: [String]) -> Bool {
+        for (i, tok) in tokens.enumerated() {
+            let base = URL(fileURLWithPath: tok).lastPathComponent
+            if (base == "fiche" || base == "cli.js" || base == "node.js"),
+               i + 1 < tokens.count,
+               tokens[(i + 1)...].contains("warp") {
+                return true
+            }
+        }
+        return false
+    }
+
+    nonisolated private static func discoverAgentState() -> (
+        apps: [DiscoveredDesktopApp],
+        clis: [DiscoveredCLIAgent],
+        shellRCName: String,
+        autoWrap: Bool,
+        loginAgent: Bool
+    ) {
         let candidates = [
             "Antigravity",
             "Antigravity IDE",
@@ -884,19 +977,107 @@ final class DaemonController: ObservableObject {
             "Zed",
             "OpenCode",
             "ChatGPT",
+            "Codex",
             "Runic",
         ]
         let fm = FileManager.default
-        let userApps = fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
-        return candidates.filter { name in
-            fm.fileExists(atPath: "/Applications/\(name).app")
-                || fm.fileExists(atPath: "\(userApps)/\(name).app")
-        }
-    }
-
-    nonisolated static func discoverInstalledCLIAgents() -> [DiscoveredCLIAgent] {
-        let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
+        let userApps = fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
+
+        let running = listRunningProcesses()
+        var ppidOf: [Int: Int] = [:]
+        var warpPids = Set<Int>()
+        var cliWarpAttachedCounts: [String: Int] = [:]
+
+        for proc in running {
+            ppidOf[proc.pid] = proc.ppid
+            if isWarpProcess(tokens: proc.tokens) {
+                warpPids.insert(proc.pid)
+                if let cliTarget = findWarpCLITarget(tokens: proc.tokens), allowedCLICommands.contains(cliTarget) {
+                    cliWarpAttachedCounts[cliTarget, default: 0] += 1
+                }
+            }
+        }
+
+        func hasWarpAncestor(_ pid: Int) -> Bool {
+            var cur = ppidOf[pid] ?? 0
+            var hops = 0
+            while cur > 1 && hops < 16 {
+                if warpPids.contains(cur) { return true }
+                cur = ppidOf[cur] ?? 0
+                hops += 1
+            }
+            return false
+        }
+
+        // Discover desktop apps and inspect live process attachment state.
+        var apps: [DiscoveredDesktopApp] = []
+        for name in candidates {
+            let sysPath = "/Applications/\(name).app"
+            let usrPath = "\(userApps)/\(name).app"
+            let bundlePath: String
+            if fm.fileExists(atPath: "\(sysPath)/Contents/Info.plist") {
+                bundlePath = sysPath
+            } else if fm.fileExists(atPath: "\(usrPath)/Contents/Info.plist") {
+                bundlePath = usrPath
+            } else {
+                continue
+            }
+
+            let hasCodexFramework = fm.fileExists(atPath: "\(bundlePath)/Contents/Frameworks/Codex Framework.framework")
+            let isElectron = fm.fileExists(atPath: "\(bundlePath)/Contents/Frameworks/Electron Framework.framework")
+                || hasCodexFramework
+                || fm.fileExists(atPath: "\(bundlePath)/Contents/Resources/app.asar")
+                || fm.fileExists(atPath: "\(bundlePath)/Contents/Resources/app.asar.unpacked")
+            let displayName = (name == "ChatGPT" && hasCodexFramework) ? "ChatGPT (Codex)" : name
+            let mainPrefix = "\(bundlePath)/Contents/MacOS/"
+
+            var attachedPIDs: [Int32] = []
+            var noFlagPIDs: [Int32] = []
+            var directPIDs: [Int32] = []
+
+            for proc in running {
+                guard let exeTok = proc.tokens.first else { continue }
+                guard exeTok.hasPrefix(mainPrefix) || proc.args.hasPrefix(mainPrefix) else { continue }
+                let hasProxyFlag = proc.args.contains("--proxy-server=http://127.0.0.1:")
+                    || proc.args.contains("--proxy-server=http://localhost:")
+                if hasProxyFlag {
+                    attachedPIDs.append(Int32(proc.pid))
+                } else if hasWarpAncestor(proc.pid) {
+                    if isElectron {
+                        noFlagPIDs.append(Int32(proc.pid))
+                    } else {
+                        attachedPIDs.append(Int32(proc.pid))
+                    }
+                } else {
+                    directPIDs.append(Int32(proc.pid))
+                }
+            }
+
+            let state: DesktopAppAttachmentState
+            if !attachedPIDs.isEmpty {
+                state = .attached
+            } else if !noFlagPIDs.isEmpty {
+                state = .launchedWithoutProxyFlag
+            } else if !directPIDs.isEmpty {
+                state = .runningDirect
+            } else {
+                state = .stopped
+            }
+
+            apps.append(DiscoveredDesktopApp(
+                id: name,
+                name: name,
+                displayName: displayName,
+                bundlePath: bundlePath,
+                isElectron: isElectron,
+                attachmentState: state,
+                attachedPIDs: attachedPIDs,
+                directPIDs: directPIDs
+            ))
+        }
+
+        // Discover CLIs across PATH, standard shims, and Node version managers.
         var searchDirs: [String] = []
         if let envPath = ProcessInfo.processInfo.environment["PATH"] {
             searchDirs.append(contentsOf: envPath.split(separator: ":").map(String.init))
@@ -905,6 +1086,8 @@ final class DaemonController: ObservableObject {
             "\(home)/.local/bin",
             "\(home)/.opencode/bin",
             "\(home)/.antigravity/antigravity/bin",
+            "\(home)/.volta/bin",
+            "\(home)/.local/share/mise/shims",
             "\(home)/.bun/bin",
             "\(home)/.cargo/bin",
             "\(home)/.npm-global/bin",
@@ -918,6 +1101,8 @@ final class DaemonController: ObservableObject {
         let versionRoots = [
             "\(home)/.nvm/versions/node",
             "\(home)/.fnm/node-versions",
+            "\(home)/.local/share/fnm/node-versions",
+            "\(home)/Library/Application Support/fnm/node-versions",
             "\(home)/.local/share/mise/installs/node",
             "\(home)/.volta/tools/image/node",
         ]
@@ -936,11 +1121,31 @@ final class DaemonController: ObservableObject {
             uniqueDirs.append(dir)
         }
 
-        return supportedCLICatalog.map { entry in
+        var cliDirectCounts: [String: Int] = [:]
+        for proc in running where !warpPids.contains(proc.pid) && !hasWarpAncestor(proc.pid) {
+            guard let t0 = proc.tokens.first else { continue }
+            // Skip macOS GUI helpers, ps, osascript, and shells executing one-liners.
+            if proc.args.contains("/Contents/Frameworks/") || proc.args.contains("/bin/ps ") { continue }
+            let base0 = URL(fileURLWithPath: t0).lastPathComponent
+            var matchedCmd: String?
+            if allowedCLICommands.contains(base0) {
+                matchedCmd = base0
+            } else if (base0 == "node" || base0 == "bun" || base0 == "deno") && proc.tokens.count >= 2 {
+                let base1 = URL(fileURLWithPath: proc.tokens[1]).lastPathComponent
+                if allowedCLICommands.contains(base1) {
+                    matchedCmd = base1
+                }
+            }
+            if let cmd = matchedCmd {
+                cliDirectCounts[cmd, default: 0] += 1
+            }
+        }
+
+        let clis = supportedCLICatalog.map { entry in
             var foundPath: String?
             for dir in uniqueDirs {
                 let candidate = "\(dir)/\(entry.command)"
-                if fm.isExecutableFile(atPath: candidate) {
+                if isExecutableRegularFile(candidate) {
                     foundPath = candidate
                     break
                 }
@@ -951,22 +1156,34 @@ final class DaemonController: ObservableObject {
                 command: entry.command,
                 provider: entry.provider,
                 installed: foundPath != nil,
-                binaryPath: foundPath
+                binaryPath: foundPath,
+                attachedCount: cliWarpAttachedCounts[entry.command, default: 0],
+                directCount: cliDirectCounts[entry.command, default: 0]
             )
         }
+
+        let rc = resolveShellRCURL()
+        let autoWrap = checkShellAutoWrapInstalled(at: rc.url)
+        let loginAgent = checkLaunchAgentExists()
+        return (apps, clis, rc.displayName, autoWrap, loginAgent)
     }
 
     func refreshAgentDiscovery() {
         guard !isPreview else { return }
+        discoveryGeneration &+= 1
+        let gen = discoveryGeneration
         Task.detached(priority: .utility) { [weak self] in
-            let apps = Self.discoverInstalledDesktopApps()
-            let clis = Self.discoverInstalledCLIAgents()
-            let autoWrap = Self.checkShellAutoWrapInstalled()
+            let snapshot = Self.discoverAgentState()
             await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.discoveredDesktopApps = apps
-                self.discoveredCLIAgents = clis
-                self.isShellAutoWrapInstalled = autoWrap
+                guard let self, self.discoveryGeneration == gen else { return }
+                self.discoveredDesktopApps = snapshot.apps
+                self.discoveredCLIAgents = snapshot.clis
+                self.shellRCDisplayName = snapshot.shellRCName
+                if !self.isUpdatingShellAutoWrap {
+                    self.isShellAutoWrapInstalled = snapshot.autoWrap
+                }
+                self.isLoginAgentInstalled = snapshot.loginAgent
+                self.hasCompletedAgentDiscovery = true
             }
         }
     }
@@ -1000,19 +1217,42 @@ final class DaemonController: ObservableObject {
         guard !isPreview else { return }
         lastError = nil
         let targetCli = command
+        let port = daemonPort
+        let discoveredPath = discoveredCLIAgents.first(where: { $0.command == command })?.binaryPath
         Task.detached(priority: .userInitiated) { [weak self] in
             let nodePath = Self.resolveNodeBinary()
-            let ficheCmd: String
+            var prefixParts: [String] = []
+            if let discoveredPath, !Self.hasControlChars(discoveredPath) {
+                let binDir = (discoveredPath as NSString).deletingLastPathComponent
+                if !binDir.isEmpty, binDir != "/usr/bin", binDir != "/bin" {
+                    prefixParts.append("PATH=\(Self.shellSingleQuote(binDir)):\"$PATH\"")
+                }
+            }
+            if port != 47_821 {
+                prefixParts.append("PORT=\(port)")
+            }
+            let prefix = prefixParts.isEmpty ? "" : prefixParts.joined(separator: " ") + " "
+
+            let ficheInvocation: String
             if let exe = Self.resolveFicheExecutable(nodePath: nodePath) {
                 switch exe {
                 case .binary(let bin):
-                    ficheCmd = "\(Self.shellSingleQuote(bin)) warp -- \(targetCli)"
+                    if Self.hasControlChars(bin) {
+                        ficheInvocation = "fiche warp -- \(targetCli)"
+                    } else {
+                        ficheInvocation = "\(Self.shellSingleQuote(bin)) warp -- \(targetCli)"
+                    }
                 case .nodeScript(let node, let script):
-                    ficheCmd = "\(Self.shellSingleQuote(node)) \(Self.shellSingleQuote(script)) warp -- \(targetCli)"
+                    if Self.hasControlChars(node) || Self.hasControlChars(script) {
+                        ficheInvocation = "fiche warp -- \(targetCli)"
+                    } else {
+                        ficheInvocation = "\(Self.shellSingleQuote(node)) \(Self.shellSingleQuote(script)) warp -- \(targetCli)"
+                    }
                 }
             } else {
-                ficheCmd = "fiche warp -- \(targetCli)"
+                ficheInvocation = "fiche warp -- \(targetCli)"
             }
+            let ficheCmd = prefix + ficheInvocation
 
             let script = """
             on run argv
@@ -1033,48 +1273,132 @@ final class DaemonController: ObservableObject {
                     self.showTransientNotice("Opening \(targetCli) via Fiche in Terminal…")
                 }
             }
+            if res.exitCode == 0 {
+                try? await Task.sleep(for: .milliseconds(1_500))
+                await MainActor.run { [weak self] in
+                    self?.refreshAgentDiscovery()
+                }
+            }
         }
     }
 
-    nonisolated static func checkShellAutoWrapInstalled() -> Bool {
-        let zshrcURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc")
-        guard let content = try? String(contentsOf: zshrcURL, encoding: .utf8) else { return false }
-        return content.contains("fiche shell-init") && content.contains("--wrap")
+    nonisolated static func resolveShellRCURL() -> (url: URL, displayName: String) {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let shellName = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh")
+            .lastPathComponent
+            .lowercased()
+        if shellName == "bash" {
+            let bashrc = "\(home)/.bashrc"
+            let bashProfile = "\(home)/.bash_profile"
+            if fm.fileExists(atPath: bashrc) || !fm.fileExists(atPath: bashProfile) {
+                return (URL(fileURLWithPath: bashrc), "~/.bashrc")
+            }
+            return (URL(fileURLWithPath: bashProfile), "~/.bash_profile")
+        }
+        if let rawZdot = ProcessInfo.processInfo.environment["ZDOTDIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !rawZdot.isEmpty {
+            let expanded = rawZdot.hasPrefix("~/")
+                ? home + String(rawZdot.dropFirst())
+                : rawZdot
+            let display = expanded == home ? "~/.zshrc" : "\(rawZdot)/.zshrc"
+            return (URL(fileURLWithPath: "\(expanded)/.zshrc"), display)
+        }
+        return (URL(fileURLWithPath: "\(home)/.zshrc"), "~/.zshrc")
+    }
+
+    nonisolated private static func hasAutoWrapRule(in content: String) -> Bool {
+        let pattern = #"^[ \t]*[^#\r\n]*\bfiche[ \t]+shell-init\b[^\r\n]*--wrap\b"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) else {
+            return false
+        }
+        let range = NSRange(content.startIndex..<content.endIndex, in: content)
+        return re.firstMatch(in: content, options: [], range: range) != nil
+    }
+
+    nonisolated static func checkShellAutoWrapInstalled(at url: URL? = nil) -> Bool {
+        let rcURL = (url ?? resolveShellRCURL().url).resolvingSymlinksInPath()
+        guard let data = try? Data(contentsOf: rcURL) else { return false }
+        let content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        return hasAutoWrapRule(in: content)
     }
 
     func installShellAutoWrap() {
-        guard !isPreview else { return }
+        guard !isPreview, !isUpdatingShellAutoWrap else { return }
         lastError = nil
+        isUpdatingShellAutoWrap = true
+        discoveryGeneration &+= 1
         Task.detached(priority: .userInitiated) { [weak self] in
             let fm = FileManager.default
-            let zshrcURL = fm.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc")
-            let existing = (try? String(contentsOf: zshrcURL, encoding: .utf8)) ?? ""
-            if existing.contains("fiche shell-init") && existing.contains("--wrap") {
+            let rc = Self.resolveShellRCURL()
+            let targetURL = rc.url.resolvingSymlinksInPath()
+
+            var existingData = Data()
+            let fileExists = fm.fileExists(atPath: targetURL.path)
+            if fileExists {
+                do {
+                    existingData = try Data(contentsOf: targetURL)
+                } catch {
+                    await MainActor.run { [weak self] in
+                        self?.isUpdatingShellAutoWrap = false
+                        self?.lastError = "Failed to read \(rc.displayName): \(error.localizedDescription)"
+                    }
+                    return
+                }
+                let decoded = String(data: existingData, encoding: .utf8)
+                    ?? String(data: existingData, encoding: .isoLatin1)
+                    ?? ""
+                if Self.hasAutoWrapRule(in: decoded) {
+                    await MainActor.run { [weak self] in
+                        self?.shellRCDisplayName = rc.displayName
+                        self?.isShellAutoWrapInstalled = true
+                        self?.isUpdatingShellAutoWrap = false
+                        self?.showTransientNotice("Auto-wrap already enabled in \(rc.displayName)")
+                    }
+                    return
+                }
+            }
+
+            let snippet = """
+            # >>> fiche auto-wrap >>>
+            if command -v fiche >/dev/null 2>&1; then
+              eval "$(fiche shell-init --wrap)"
+            elif [ -x "$HOME/.local/bin/fiche" ]; then
+              export PATH="$HOME/.local/bin:$PATH"
+              eval "$(fiche shell-init --wrap)"
+            fi
+            # <<< fiche auto-wrap <<<
+            """
+            let needsLeadingNewline = !existingData.isEmpty && existingData.last != 0x0A
+            let appendString = (needsLeadingNewline ? "\n\n" : "\n") + snippet + "\n"
+            guard let appendData = appendString.data(using: .utf8) else {
                 await MainActor.run { [weak self] in
-                    self?.isShellAutoWrapInstalled = true
-                    self?.showTransientNotice("Auto-wrap already enabled in ~/.zshrc")
+                    self?.isUpdatingShellAutoWrap = false
                 }
                 return
             }
 
-            let snippet = """
-
-            # Fiche: auto-route coding CLIs through local proxy (bypass anytime with FICHE_BYPASS=1)
-            if command -v fiche >/dev/null 2>&1; then
-              eval "$(fiche shell-init --wrap)"
-            fi
-            """
-            let sep = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
-            let updated = existing + sep + snippet.trimmingCharacters(in: .newlines) + "\n"
             do {
-                try updated.write(to: zshrcURL, atomically: true, encoding: .utf8)
+                if fileExists {
+                    let handle = try FileHandle(forUpdating: targetURL)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: appendData)
+                } else {
+                    try fm.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try appendData.write(to: targetURL, options: .atomic)
+                }
                 await MainActor.run { [weak self] in
+                    self?.shellRCDisplayName = rc.displayName
                     self?.isShellAutoWrapInstalled = true
-                    self?.showTransientNotice("Added auto-wrap to ~/.zshrc — open a new terminal to activate")
+                    self?.isUpdatingShellAutoWrap = false
+                    self?.showTransientNotice("Added auto-wrap to \(rc.displayName) — open a new terminal to activate")
                 }
             } catch {
                 await MainActor.run { [weak self] in
-                    self?.lastError = "Failed to update ~/.zshrc: \(error.localizedDescription)"
+                    self?.isUpdatingShellAutoWrap = false
+                    self?.lastError = "Failed to update \(rc.displayName): \(error.localizedDescription)"
                 }
             }
         }
@@ -1082,12 +1406,18 @@ final class DaemonController: ObservableObject {
 
     func launchDesktopAppViaFiche(_ appName: String) {
         guard !isPreview else { return }
+        guard !Self.hasControlChars(appName) else {
+            lastError = "Invalid desktop app name."
+            return
+        }
         lastError = nil
+        let port = daemonPort
         showTransientNotice("Launching \(appName) via Fiche…")
-        Task.detached(priority: .userInitiated) {
+        Task.detached(priority: .userInitiated) { [weak self] in
             let nodePath = Self.resolveNodeBinary()
             guard let exe = Self.resolveFicheExecutable(nodePath: nodePath) else {
                 await MainActor.run { [weak self] in
+                    self?.transientNotice = nil
                     self?.lastError = "Could not locate fiche CLI to warp \(appName)."
                 }
                 return
@@ -1104,18 +1434,44 @@ final class DaemonController: ObservableObject {
             }
 
             var env = ProcessInfo.processInfo.environment
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let existingPath = env["PATH"] ?? "/usr/bin:/bin"
-            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:\(existingPath)"
+            env["PORT"] = String(port)
+            env["PATH"] = Self.buildAugmentedPath(existing: env["PATH"], nodePath: nodePath)
             process.environment = env
             process.standardInput = FileHandle.nullDevice
             process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
+            let stderrPipe = Pipe()
+            process.standardError = stderrPipe
+            let launchedAt = Date()
+
+            process.terminationHandler = { [weak self] proc in
+                let status = proc.terminationStatus
+                let elapsed = Date().timeIntervalSince(launchedAt)
+                let errData = (try? stderrPipe.fileHandleForReading.readToEnd()) ?? Data()
+                let errText = String(data: errData, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if status != 0 && elapsed < 5.0 {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.transientNotice = nil
+                        self.lastError = errText.isEmpty
+                            ? "Failed to launch \(appName) via Fiche (exit \(status))."
+                            : errText
+                    }
+                }
+                Task { @MainActor [weak self] in
+                    self?.refreshAgentDiscovery()
+                }
+            }
 
             do {
                 try process.run()
+                try? await Task.sleep(for: .milliseconds(1_200))
+                await MainActor.run { [weak self] in
+                    self?.refreshAgentDiscovery()
+                }
             } catch {
                 await MainActor.run { [weak self] in
+                    self?.transientNotice = nil
                     self?.lastError = "Failed to launch \(appName): \(error.localizedDescription)"
                 }
             }
@@ -1123,6 +1479,7 @@ final class DaemonController: ObservableObject {
     }
 
     private func setPlugin(id: String, enabled: Bool) async {
+        pollGeneration &+= 1
         struct PluginBody: Encodable {
             let id: String
             let enabled: Bool
@@ -1423,8 +1780,10 @@ final class DaemonController: ObservableObject {
         let fixedCandidates = [
             "/opt/homebrew/bin/node",
             "/usr/local/bin/node",
+            "\(home)/.volta/bin/node",
+            "\(home)/.local/share/mise/shims/node",
         ]
-        for candidate in fixedCandidates where fm.isExecutableFile(atPath: candidate) {
+        for candidate in fixedCandidates where isExecutableRegularFile(candidate) {
             return candidate
         }
 
@@ -1432,6 +1791,8 @@ final class DaemonController: ObservableObject {
         let versionedDirs = [
             "\(home)/.nvm/versions/node",
             "\(home)/.fnm/node-versions",
+            "\(home)/.local/share/fnm/node-versions",
+            "\(home)/Library/Application Support/fnm/node-versions",
             "\(home)/.local/share/mise/installs/node",
             "\(home)/.volta/tools/image/node",
         ]
@@ -1440,9 +1801,9 @@ final class DaemonController: ObservableObject {
             let sorted = entries.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
             for ver in sorted {
                 let direct = "\(base)/\(ver)/bin/node"
-                if fm.isExecutableFile(atPath: direct) { return direct }
+                if isExecutableRegularFile(direct) { return direct }
                 let fnm = "\(base)/\(ver)/installation/bin/node"
-                if fm.isExecutableFile(atPath: fnm) { return fnm }
+                if isExecutableRegularFile(fnm) { return fnm }
             }
         }
 
@@ -1453,7 +1814,7 @@ final class DaemonController: ObservableObject {
             extraPathPrefix: "/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin"
         )
         let found = whichRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if whichRes.exitCode == 0, !found.isEmpty, fm.isExecutableFile(atPath: found) {
+        if whichRes.exitCode == 0, !found.isEmpty, isExecutableRegularFile(found) {
             return found
         }
         return nil
@@ -1467,31 +1828,51 @@ final class DaemonController: ObservableObject {
             "\(home)/.local/bin/fiche",
             "/opt/homebrew/bin/fiche",
             "/usr/local/bin/fiche",
+            "\(home)/.volta/bin/fiche",
+            "\(home)/.bun/bin/fiche",
+            "\(home)/Library/pnpm/fiche",
+            "\(home)/.pnpm-global/bin/fiche",
             "\(home)/.npm-global/bin/fiche",
         ]
+        let versionedDirs = [
+            "\(home)/.nvm/versions/node",
+            "\(home)/.fnm/node-versions",
+            "\(home)/.local/share/fnm/node-versions",
+            "\(home)/Library/Application Support/fnm/node-versions",
+            "\(home)/.local/share/mise/installs/node",
+            "\(home)/.volta/tools/image/node",
+        ]
+        for base in versionedDirs {
+            guard let entries = try? fm.contentsOfDirectory(atPath: base) else { continue }
+            let sorted = entries.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+            for ver in sorted {
+                binaryCandidates.append("\(base)/\(ver)/bin/fiche")
+                binaryCandidates.append("\(base)/\(ver)/installation/bin/fiche")
+            }
+        }
         if let nodePath {
             let nodeDir = (nodePath as NSString).deletingLastPathComponent
             binaryCandidates.insert("\(nodeDir)/fiche", at: 0)
         }
 
-        for path in binaryCandidates where fm.isExecutableFile(atPath: path) {
+        for path in binaryCandidates where isExecutableRegularFile(path) {
             return .binary(path)
         }
 
         let whichRes = runProcessSync(
             executable: "/usr/bin/which",
             arguments: ["fiche"],
-            extraPathPrefix: "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+            extraPathPrefix: "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:\(home)/.volta/bin:\(home)/.bun/bin"
         )
         let found = whichRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        if whichRes.exitCode == 0, !found.isEmpty, fm.isExecutableFile(atPath: found) {
+        if whichRes.exitCode == 0, !found.isEmpty, isExecutableRegularFile(found) {
             return .binary(found)
         }
 
         if let customCli = ProcessInfo.processInfo.environment["FICHE_CLI_PATH"],
            !customCli.isEmpty,
            fm.fileExists(atPath: customCli) {
-            if fm.isExecutableFile(atPath: customCli), !customCli.hasSuffix(".js") {
+            if isExecutableRegularFile(customCli), !customCli.hasSuffix(".js") {
                 return .binary(customCli)
             }
             if let nodePath {

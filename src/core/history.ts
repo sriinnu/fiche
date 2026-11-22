@@ -825,6 +825,20 @@ export async function collapseHistory(
   const perfectPages =
     Math.ceil(sumLen(0, msgLen.length) / pageChars) +
     Math.ceil(sumOf(userImgLen, 0, userImgLen.length) / pageChars);
+  const emptyInfo = (reason: HistoryCollapseInfo['reason'], collapsedChars = 0): HistoryCollapseInfo => ({
+    collapsedTurns: 0,
+    collapsedChars,
+    collapsedImages: 0,
+    collapsedImageBytes: 0,
+    collapsedImagePixels: 0,
+    collapsedPngs: [],
+    collapsedImageDims: [],
+    droppedChars: 0,
+    droppedCodepoints: new Map(),
+    reason,
+  });
+
+  let trimmed = false;
   if (perfectPages > budget) {
     // Even a perfectly packed render of the full range overflows. Keep the OLDEST
     // messages collapsed (the frozen prefix must stay anchored at protectedPrefix
@@ -836,28 +850,14 @@ export async function collapseHistory(
       k++;
     }
     const trimmedLen = findClosedPrefixBoundary(messages, protectedPrefix + k) + 1;
-    if (trimmedLen - protectedPrefix < o.minCollapsePrefix) {
-      info.reason = 'over_budget';
-      return { messages, info };
+    if (trimmedLen <= protectedPrefix || trimmedLen - protectedPrefix < o.minCollapsePrefix) {
+      return { messages, info: emptyInfo('over_budget') };
     }
     collapseLen = trimmedLen;
     msgLen.length = collapseLen - protectedPrefix;
     userImgLen.length = collapseLen - protectedPrefix;
-    info.budgetTrimmed = true;
+    trimmed = true;
   }
-
-  const emptyInfo = (reason: HistoryCollapseInfo['reason']): HistoryCollapseInfo => ({
-    collapsedTurns: 0,
-    collapsedChars: 0,
-    collapsedImages: 0,
-    collapsedImageBytes: 0,
-    collapsedImagePixels: 0,
-    collapsedPngs: [],
-    collapsedImageDims: [],
-    droppedChars: 0,
-    droppedCodepoints: new Map(),
-    reason,
-  });
 
   interface AssembledChunk {
     readonly chunkEnd: number;
@@ -870,6 +870,7 @@ export async function collapseHistory(
   let text = '';
   let assembledChunks: AssembledChunk[] = [];
   let carryOverEnd = -1;
+  let stepFreezeStep: number | undefined;
   const maxBudgetAttempts = 3;
 
   for (let attempt = 0; attempt < maxBudgetAttempts; attempt++) {
@@ -879,8 +880,7 @@ export async function collapseHistory(
     // Exclude slab messages (protectedPrefix) from serialization.
     text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
     if (!text || text.length === 0) {
-      info.reason = 'render_empty';
-      return { messages, info };
+      return { messages, info: emptyInfo('render_empty') };
     }
     // Reflow for RENDERING ONLY: pack short lines + mark hard breaks with ↵ so the
     // newline-heavy transcript fills full rows instead of one line per row. Same
@@ -889,9 +889,7 @@ export async function collapseHistory(
     const safeText = neutralizeSentinel(text);
     const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
     if (!isProfitable(renderText, o.cols)) { // pass string, not length — see ProfitableFn
-      info.reason = 'not_profitable';
-      info.collapsedChars = text.length; // surface what we DIDN'T compress
-      return { messages, info };
+      return { messages, info: emptyInfo('not_profitable', text.length) };
     }
     // APPEND-ONLY rendering. Render the collapse range [protectedPrefix..collapseLen)
     // as independent image blocks on an ABSOLUTE message grid anchored at
@@ -941,7 +939,7 @@ export async function collapseHistory(
     const packedPages = Math.max(1, Math.ceil(sumLen(0, rangeLen) / effPageChars));
     const goal = Math.min(budget, o.packFill ? packedPages + 1 : Infinity);
     while (step < rangeLen && pagesFor(step) + markSplits > goal) step *= 2;
-    info.freezeStep = o.minFreezeStep > 0 ? Math.max(step, o.minFreezeStep) : step;
+    stepFreezeStep = o.minFreezeStep > 0 ? Math.max(step, o.minFreezeStep) : step;
     const ends = new Set<number>();
     for (let e = protectedPrefix + step; e < collapseLen; e += step) ends.add(e);
     const markerByEnd = new Map<number, CacheControl>();
@@ -1110,10 +1108,15 @@ export async function collapseHistory(
     if (keepIdx >= 0) {
       assembledChunks.length = keepIdx + 1;
       collapseLen = assembledChunks[keepIdx]!.chunkEnd;
-      info.budgetTrimmed = true;
+      trimmed = true;
       text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
       if (!text || text.length === 0) {
         return { messages, info: emptyInfo('render_empty') };
+      }
+      const trimmedSafe = neutralizeSentinel(text);
+      const trimmedRender = o.reflow ? reflow(trimmedSafe) ?? trimmedSafe : text;
+      if (!isProfitable(trimmedRender, o.cols)) {
+        return { messages, info: emptyInfo('not_profitable', text.length) };
       }
       carryOverEnd = -1;
       for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
@@ -1150,11 +1153,11 @@ export async function collapseHistory(
     if (nextLen >= collapseLen) {
       nextLen = findClosedPrefixBoundary(messages, collapseLen - 1) + 1;
     }
-    if (nextLen - protectedPrefix < o.minCollapsePrefix) {
+    if (nextLen <= protectedPrefix || nextLen - protectedPrefix < o.minCollapsePrefix) {
       return { messages, info: emptyInfo('over_budget') };
     }
     collapseLen = nextLen;
-    info.budgetTrimmed = true;
+    trimmed = true;
   }
 
   const blocks: ContentBlock[] = [];
@@ -1183,8 +1186,7 @@ export async function collapseHistory(
     }
   }
   if (imageCount === 0) {
-    info.reason = 'render_empty';
-    return { messages, info };
+    return { messages, info: emptyInfo('render_empty') };
   }
   const latestUserPointer = latestCollapsedUserPointer(messages, collapseLen, protectedPrefix);
   const historyFactSheet = factSheetText(text);
@@ -1206,6 +1208,8 @@ export async function collapseHistory(
   info.collapsedTurns = collapseLen - protectedPrefix;
   info.collapsedChars = text.length;
   info.collapsedImages = imageCount;
+  if (stepFreezeStep !== undefined) info.freezeStep = stepFreezeStep;
+  if (trimmed) info.budgetTrimmed = true;
   if (carryOverOrdinal >= 0) info.carryOverImageOrdinal = carryOverOrdinal;
   // [slab, history image, live tail] — slab cache_control anchor stays at the front.
   return { messages: [...head, syntheticUser, ...tail], info };

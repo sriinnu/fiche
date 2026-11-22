@@ -282,12 +282,12 @@ function parseArguments(value: unknown, allowRawFallback = false): unknown {
 }
 
 function stopReason(finish: unknown, hasToolUse: boolean): string {
+  if (finish === 'length') return 'max_tokens';
+  if (finish === 'content_filter') return 'refusal';
   if (hasToolUse) return 'tool_use';
   switch (finish) {
-    case 'length': return 'max_tokens';
     case 'tool_calls':
     case 'function_call': return 'tool_use';
-    case 'content_filter': return 'refusal';
     case 'stop': return 'end_turn';
     default: return 'end_turn';
   }
@@ -489,17 +489,28 @@ function finalizeStream(state: StreamState): string {
 
 /** Incrementally translate Chat Completions SSE without buffering model output. */
 const MAX_SSE_BUFFER_CHARS = 4 * 1024 * 1024;
+const MAX_BUFFERED_RESPONSE_BYTES = 16 * 1024 * 1024;
+const SSE_PEEK_RE = /^(?:event:|data:|id:|retry:|:)/;
 
-function streamWithPrependedChunk(
-  firstChunk: Uint8Array,
+function concatUint8Arrays(chunks: readonly Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+function streamWithPrependedChunks(
+  firstChunks: readonly Uint8Array[],
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): ReadableStream<Uint8Array> {
-  let sentFirst = false;
+  let idx = 0;
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
-      if (!sentFirst) {
-        sentFirst = true;
-        controller.enqueue(firstChunk);
+      if (idx < firstChunks.length) {
+        controller.enqueue(firstChunks[idx++]!);
         return;
       }
       const next = await reader.read();
@@ -513,24 +524,27 @@ function streamWithPrependedChunk(
 }
 
 async function readRemainingBytes(
-  firstChunk: Uint8Array,
+  firstChunks: readonly Uint8Array[],
   reader: ReadableStreamDefaultReader<Uint8Array>,
 ): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [firstChunk];
-  let total = firstChunk.byteLength;
+  const chunks: Uint8Array[] = [...firstChunks];
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  if (total > MAX_BUFFERED_RESPONSE_BYTES) {
+    await reader.cancel().catch(() => {});
+    throw new Error('Upstream response exceeded maximum buffered size');
+  }
   for (;;) {
     const next = await reader.read();
     if (next.done) break;
-    chunks.push(next.value);
     total += next.value.byteLength;
+    if (total > MAX_BUFFERED_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => {});
+      throw new Error('Upstream response exceeded maximum buffered size');
+    }
+    chunks.push(next.value);
   }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const c of chunks) {
-    out.set(c, offset);
-    offset += c.byteLength;
-  }
-  return out;
+  return concatUint8Arrays(chunks, total);
 }
 
 export function openAIChatStreamToAnthropic(
@@ -573,6 +587,9 @@ export function openAIChatStreamToAnthropic(
           type: 'error', error: { type: 'api_error', message: 'OpenAI returned a malformed streaming event' },
         })));
         state.terminated = true;
+        buffer = '';
+        controller.terminate();
+        return;
       }
     }
     buffer = start > 0 ? buffer.slice(start) : buffer;
@@ -582,6 +599,7 @@ export function openAIChatStreamToAnthropic(
       })));
       state.terminated = true;
       buffer = '';
+      controller.terminate();
     }
   };
   return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
@@ -639,24 +657,53 @@ export async function openAIChatToAnthropicResponse(
   if (!contentType.includes('json')) {
     const reader = response.body.getReader();
     const peekDecoder = new TextDecoder();
+    const pendingChunks: Uint8Array[] = [];
+    let pendingBytes = 0;
+    let peekText = '';
     for (;;) {
-      const first = await reader.read();
-      if (first.done) {
+      const next = await reader.read();
+      if (next.done) {
+        const trimmed = peekText.trimStart();
+        if (SSE_PEEK_RE.test(trimmed)) {
+          headers.set('content-type', 'text/event-stream; charset=utf-8');
+          const replay = streamWithPrependedChunks(pendingChunks, reader);
+          return new Response(openAIChatStreamToAnthropic(replay, fallbackModel), {
+            status: response.status, statusText: response.statusText, headers,
+          });
+        }
+        if (pendingBytes === 0) {
+          headers.set('content-type', 'application/json');
+          return new Response(JSON.stringify(openAIChatToAnthropicMessage({}, fallbackModel)), {
+            status: response.status, statusText: response.statusText, headers,
+          });
+        }
+        const bytes = concatUint8Arrays(pendingChunks, pendingBytes);
+        const parsed = JSON.parse(new TextDecoder().decode(bytes));
+        const converted = openAIChatToAnthropicMessage(parsed, fallbackModel);
         headers.set('content-type', 'application/json');
-        return new Response(JSON.stringify(openAIChatToAnthropicMessage({}, fallbackModel)), {
+        return new Response(JSON.stringify(converted), {
           status: response.status, statusText: response.statusText, headers,
         });
       }
-      if (first.value.byteLength === 0) continue;
-      const head = peekDecoder.decode(first.value, { stream: true }).trimStart();
-      if (head.startsWith('data:') || head.startsWith('event:') || head.startsWith(':')) {
+      if (next.value.byteLength === 0) continue;
+      pendingChunks.push(next.value);
+      pendingBytes += next.value.byteLength;
+      if (pendingBytes > MAX_BUFFERED_RESPONSE_BYTES) {
+        await reader.cancel().catch(() => {});
+        throw new Error('Upstream response exceeded maximum buffered size');
+      }
+      peekText += peekDecoder.decode(next.value, { stream: true });
+      const trimmed = peekText.trimStart();
+      if (trimmed.length === 0) continue;
+      if (trimmed.length < 16 && !trimmed.includes('\n')) continue;
+      if (SSE_PEEK_RE.test(trimmed)) {
         headers.set('content-type', 'text/event-stream; charset=utf-8');
-        const replay = streamWithPrependedChunk(first.value, reader);
+        const replay = streamWithPrependedChunks(pendingChunks, reader);
         return new Response(openAIChatStreamToAnthropic(replay, fallbackModel), {
           status: response.status, statusText: response.statusText, headers,
         });
       }
-      const bytes = await readRemainingBytes(first.value, reader);
+      const bytes = await readRemainingBytes(pendingChunks, reader);
       const parsed = JSON.parse(new TextDecoder().decode(bytes));
       const converted = openAIChatToAnthropicMessage(parsed, fallbackModel);
       headers.set('content-type', 'application/json');

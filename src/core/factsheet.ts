@@ -58,7 +58,7 @@ const MAX_URLS = 8;
 const MAX_SEEN = 2048; // defensive bound on distinct tokens entering substring-collapse
 const MAX_SCAN = 262_144; // defensive input bound; tool_results are already paged
 // Match render DENSE_CONTENT_CHARS_PER_IMAGE without importing render (cycle-free).
-const FACTSHEET_PAGE_CHARS = 28_080;
+export const FACTSHEET_PAGE_CHARS = 28_080;
 const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (base64, minified) — skip
 
 const M_DIGIT = 1 << 0;

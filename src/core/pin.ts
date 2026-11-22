@@ -413,7 +413,7 @@ function isCommandOnlyTurn(m: Message, live = false): boolean {
 function isTextOnlyAssistantMsg(m: Message | undefined): boolean {
   if (!m || m.role !== 'assistant') return false;
   if (typeof m.content === 'string') return true;
-  if (!Array.isArray(m.content)) return false;
+  if (!Array.isArray(m.content) || m.content.length === 0) return false;
   return m.content.every(
     (b) => !!b && typeof b === 'object' && (b as { type?: string }).type === 'text',
   );
@@ -469,6 +469,13 @@ export function stripPinCommands(messages: Message[]): Message[] {
   return out;
 }
 
+function continuesLeadingRun(text: string): boolean {
+  if (!LEADING_REMINDER_RE.test(text)) return false;
+  let consumed = 0;
+  for (const block of reminderBlocks(text)) consumed += block.length;
+  return !text.slice(consumed).trim();
+}
+
 function stripUserTextBlock(text: string, isMsg0: boolean): string {
   if (isMsg0 && LEADING_REMINDER_RE.test(text)) {
     let consumed = 0;
@@ -502,7 +509,7 @@ function stripFromMessage(m: Message, idx = 1): Message | null | undefined {
       const tb = blk as TextBlock;
       if (typeof tb.text === 'string') {
         const text = stripUserTextBlock(tb.text, leadingRun);
-        leadingRun = false;
+        leadingRun = leadingRun ? continuesLeadingRun(tb.text) : false;
         if (text !== tb.text) {
           changed = true;
           if (!text.trim()) {
@@ -517,6 +524,8 @@ function stripFromMessage(m: Message, idx = 1): Message | null | undefined {
           blocks.push({ ...tb, text });
           continue;
         }
+        blocks.push(blk);
+        continue;
       }
     }
     leadingRun = false;
@@ -956,7 +965,8 @@ function openAIItemToMessage(item: OpenAIItem): Message | undefined {
   if (item.role !== 'user' && item.role !== 'assistant') return undefined;
   const blocks = openAIContentBlocks(item.content);
   const toolCalls = (item as { tool_calls?: unknown }).tool_calls;
-  if (item.role === 'assistant' && Array.isArray(toolCalls) && toolCalls.length > 0) {
+  const hasFnCall = Boolean((item as { function_call?: unknown }).function_call);
+  if (item.role === 'assistant' && ((Array.isArray(toolCalls) && toolCalls.length > 0) || hasFnCall)) {
     blocks.push({ type: 'tool_use', id: '', name: '', input: {} } as unknown as ContentBlock);
   }
   return { role: item.role, content: blocks };
@@ -991,13 +1001,15 @@ function stripOpenAIContent(
       const next = source === 'session'
         ? stripUserTextBlock(part.text as string, leadingRun)
         : stripLines(part.text as string, 'file');
-      leadingRun = false;
+      leadingRun = leadingRun ? continuesLeadingRun(part.text as string) : false;
       if (next !== part.text) {
         changed = true;
         if (!next.trim()) continue;
         out.push({ ...part, text: next });
         continue;
       }
+      out.push(raw);
+      continue;
     } else {
       leadingRun = false;
     }
@@ -1046,10 +1058,12 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
 
   if (typeof req.instructions === 'string') {
     const cleanedInst = stripLines(req.instructions, 'file');
-    if (!cleanedInst.trim()) {
-      delete (req as { instructions?: unknown }).instructions;
-    } else {
-      req.instructions = cleanedInst;
+    if (cleanedInst !== req.instructions) {
+      if (!cleanedInst.trim()) {
+        delete (req as { instructions?: unknown }).instructions;
+      } else {
+        req.instructions = cleanedInst;
+      }
     }
   }
   if (items) {
@@ -1060,7 +1074,7 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
       const item = raw as OpenAIItem;
       if (item.role === 'system' || item.role === 'developer') {
         const res = stripOpenAIContent(item.content, 'file', false);
-        if (res.empty) continue;
+        if (res.changed && res.empty) continue;
         if (res.changed) item.content = res.content;
         keptItems.push(item);
         continue;
@@ -1083,7 +1097,7 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
           continue;
         }
         const res = stripOpenAIContent(item.content, 'session', curMsgIdx === 0);
-        if (res.empty) {
+        if (res.changed && res.empty) {
           if (isTextOnlyAssistantMsg(nextMsg)) {
             i++;
             continue;
@@ -1108,7 +1122,7 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
   }
 
   if (stringInput) {
-    const cleaned = stripLines(req.input as string, 'session').trimEnd();
+    const cleaned = stripUserTextBlock(req.input as string, true).trimEnd();
     req.input = cleaned ? `${cleaned}\n\n${pinText}` : pinText;
   } else if (target) {
     if (typeof target.content === 'string') {
@@ -1161,13 +1175,15 @@ function stripGoogleParts(
       const next = source === 'session'
         ? stripUserTextBlock(part.text, leadingRun)
         : stripLines(part.text, 'file');
-      leadingRun = false;
+      leadingRun = leadingRun ? continuesLeadingRun(part.text) : false;
       if (next !== part.text) {
         changed = true;
         if (!next.trim()) continue;
         out.push({ ...part, text: next });
         continue;
       }
+      out.push(part);
+      continue;
     } else {
       leadingRun = false;
     }
@@ -1198,7 +1214,7 @@ export function relocateGooglePins(req: GooglePinRequest): number {
 
   if (Array.isArray(req.systemInstruction?.parts)) {
     const sysRes = stripGoogleParts(req.systemInstruction.parts, 'file', false);
-    if (sysRes.empty) {
+    if (sysRes.changed && sysRes.empty) {
       delete req.systemInstruction;
     } else if (sysRes.changed) {
       req.systemInstruction.parts = sysRes.parts;
@@ -1217,7 +1233,7 @@ export function relocateGooglePins(req: GooglePinRequest): number {
         continue;
       }
       const res = stripGoogleParts(content.parts, 'session', i === 0);
-      if (res.empty) {
+      if (res.changed && res.empty) {
         if (isTextOnlyAssistantMsg(nextMsg)) {
           i++;
           continue;

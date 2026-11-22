@@ -83,8 +83,12 @@ export const BUILTIN_STAGE_PLUGINS: readonly StagePluginDescriptor[] = [
   },
 ];
 
+const FORBIDDEN_PLUGIN_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+
 export function isValidPluginId(id: unknown): id is string {
-  return typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id.trim());
+  if (typeof id !== 'string') return false;
+  const trimmed = id.trim();
+  return !FORBIDDEN_PLUGIN_IDS.has(trimmed) && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(trimmed);
 }
 
 /** True for third-party plugins and extensions (built-in compiler stages and fiche's own skill stay excluded). */
@@ -143,7 +147,7 @@ export function parseSkillManifest(
   sourcePath?: string,
 ): StagePluginDescriptor | null {
   const cleanFallback = fallbackId.trim();
-  const slug = cleanFallback.startsWith('skill:') ? cleanFallback.slice('skill:'.length) : cleanFallback;
+  const slug = cleanFallback.startsWith('skill:') ? cleanFallback.slice('skill:'.length).trim() : cleanFallback;
   if (!isValidPluginId(slug)) return null;
   const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
   let name = slug;

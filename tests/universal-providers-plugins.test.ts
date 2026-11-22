@@ -12,6 +12,7 @@ import { compatRoutes, defaultRoutes } from '../src/warp/index.js';
 import { matchRoute } from '../src/warp/route.js';
 import {
   buildWarpAppArgs,
+  parseXmlBundleExecutable,
   renderShellInitScript,
   resolveMacAppBundle,
 } from '../src/warp/app-launch.js';
@@ -138,6 +139,18 @@ describe('CLI wrappers & macOS desktop app launcher', () => {
     writeFileSync(electronExe, '#!/bin/sh\necho ok\n');
     chmodSync(electronExe, 0o755);
 
+    const chatGptApp = join(appsDir, 'ChatGPT.app');
+    mkdirSync(join(chatGptApp, 'Contents/MacOS'), { recursive: true });
+    mkdirSync(join(chatGptApp, 'Contents/Frameworks/Codex Framework.framework'), { recursive: true });
+    mkdirSync(join(chatGptApp, 'Contents/Resources/app.asar'), { recursive: true });
+    writeFileSync(
+      join(chatGptApp, 'Contents/Info.plist'),
+      `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>ChatGPT</string></dict></plist>`,
+    );
+    const chatGptExe = join(chatGptApp, 'Contents/MacOS/ChatGPT');
+    writeFileSync(chatGptExe, '#!/bin/sh\necho ok\n');
+    chmodSync(chatGptExe, 0o755);
+
     const nativeApp = join(appsDir, 'Runic.app');
     mkdirSync(join(nativeApp, 'Contents/MacOS'), { recursive: true });
     writeFileSync(
@@ -157,12 +170,49 @@ describe('CLI wrappers & macOS desktop app launcher', () => {
       '--new-window',
     ]);
 
+    const resolvedChatGPT = resolveMacAppBundle('chatgpt', [appsDir]);
+    expect(resolvedChatGPT).not.toBeNull();
+    expect(resolvedChatGPT!.isElectron).toBe(true);
+    expect(buildWarpAppArgs(resolvedChatGPT!, 'http://127.0.0.1:55555')).toEqual([
+      chatGptExe,
+      '--proxy-server=http://127.0.0.1:55555',
+    ]);
+
     const resolvedNative = resolveMacAppBundle(nativeApp, [appsDir]);
     expect(resolvedNative).not.toBeNull();
     expect(resolvedNative!.isElectron).toBe(false);
     expect(buildWarpAppArgs(resolvedNative!, 'http://127.0.0.1:55555')).toEqual([nativeExe]);
 
     expect(resolveMacAppBundle('DoesNotExist', [appsDir])).toBeNull();
+
+    // Cross-platform Linux/no-plutil fallback when `plutil` is absent from PATH
+    const prevPath = process.env.PATH;
+    try {
+      process.env.PATH = '';
+      expect(resolveMacAppBundle('cursor', [appsDir])?.isElectron).toBe(true);
+      expect(resolveMacAppBundle('chatgpt', [appsDir])?.isElectron).toBe(true);
+    } finally {
+      if (prevPath === undefined) delete process.env.PATH;
+      else process.env.PATH = prevPath;
+    }
+
+    const binaryPlist = join(appsDir, 'binary.plist');
+    writeFileSync(binaryPlist, 'bplist00\x00\x01');
+    expect(parseXmlBundleExecutable(binaryPlist)).toBeNull();
+
+    const traversalPlist = join(appsDir, 'traversal.plist');
+    writeFileSync(
+      traversalPlist,
+      `<plist><dict><key>CFBundleExecutable</key><string>../evil</string></dict></plist>`,
+    );
+    expect(parseXmlBundleExecutable(traversalPlist)).toBeNull();
+
+    const entityPlist = join(appsDir, 'entity.plist');
+    writeFileSync(
+      entityPlist,
+      `<plist><dict><key>CFBundleExecutable</key><string>Codex &amp; App</string></dict></plist>`,
+    );
+    expect(parseXmlBundleExecutable(entityPlist)).toBe('Codex & App');
   });
 
   it('renders POSIX helpers and optional transparent CLI wrappers with recursion bypass', () => {
@@ -173,7 +223,7 @@ describe('CLI wrappers & macOS desktop app launcher', () => {
 
     const wrapped = renderShellInitScript({ wrap: true, ficheBin: '/opt/fiche/bin/fiche' });
     expect(wrapped).toContain(`export FICHE_BIN='/opt/fiche/bin/fiche'`);
-    expect(wrapped).toContain('claude() { [ "${FICHE_BYPASS:-0}" = "1" ]');
+    expect(wrapped).toContain('claude() { if [ "${FICHE_BYPASS:-0}" = "1" ]; then command claude "$@"; else "$FICHE_BIN" warp -- claude "$@"; fi; }');
     expect(wrapped).toContain('codex()');
     expect(wrapped).toContain('agy()');
   });

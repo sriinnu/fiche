@@ -278,7 +278,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     process.on('uncaughtException', die);
     process.on('unhandledRejection', die);
     child.on('error', (err) => {
-      console.error(`[fiche] warp: cannot run ${command[0]}: ${err.message}`);
+      console.error(`[fiche] warp: cannot run ${execArgv[0]}: ${err.message}`);
       process.exit(127);
     });
     // SIGHUP and SIGQUIT matter as much as the interactive two: closing the

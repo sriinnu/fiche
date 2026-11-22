@@ -98,17 +98,13 @@ const CODE_DECL_LINE_RE =
   /^\s*(?:(?:(?:export(?:\s+default)?|pub(?:\([^)]*\))?|public|private|protected|internal|static|final|abstract|override|readonly|sealed|open|suspend|async)\s+){0,4}(?:function\s+\w+|class\s+\w+|interface\s+\w+|record\s+\w+|protocol\s+\w+|actor\s+\w+|extension\s+\w+|namespace\s+[\w.]+|type\s+\w+\s*(?:=|struct\b|interface\b)|enum\s+\w+|struct\s+\w+|trait\s+\w+|impl\b|fn\s+\w+|func\s+(?:\([^)]*\)\s*)?\w+|def\s+\w+|(?:const|let|var|val)\s+\w+\s*(?::[^=\n]+)?=\s*(?:async\s+)?(?:\([^)]*\)\s*=>|function\b|class\b|\{|\[)|import\s+(?:\{|\*|"|\(|\w)|from\s+\S+\s+import\b|package\s+[\w.]+|using\s+[\w.]+\s*;|#include\s*[<"]|template\s*<)|(?:public|private|protected|internal)\s+(?:static\s+)?(?:final\s+)?(?:async\s+)?[A-Za-z_][\w.<>,[\]?]*\s+[A-Za-z_]\w*\s*\()/;
 
 const FILE_READ_TOOL_RE =
-  /^(?:read|read_file|view_file|view_file_outline|view_code_item|cat|get_file_contents|get_file|read_text_file|read_resource|open_file|fs_read|file_read|show_file|inspect_file)$/i;
+  /^(?:read|read_?file|view_?file|view_?file_?outline|view_?code_?item|cat|get_?file_?contents|get_?file|read_?text_?file|read_?resource|open_?file|fs_?read|file_?read|show_?file|inspect_?file)$/i;
 
 /** True when a tool name represents a file/resource read whose exact whitespace/JSON keys must stay untouched for Edit/apply_patch. */
 export function isFileReadToolName(name: string | undefined): boolean {
   if (!name) return false;
   const trimmed = name.trim();
-  const bare = trimmed.includes('__')
-    ? trimmed.slice(trimmed.lastIndexOf('__') + 2)
-    : trimmed.includes('.')
-      ? trimmed.slice(trimmed.lastIndexOf('.') + 1)
-      : trimmed;
+  const bare = trimmed.split(/(?:__|[.:/])/).pop() ?? trimmed;
   return FILE_READ_TOOL_RE.test(bare);
 }
 const STACK_PREFIX_RE =

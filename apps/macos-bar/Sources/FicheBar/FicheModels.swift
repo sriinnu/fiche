@@ -221,6 +221,24 @@ struct DailySavingsPoint: Decodable, Identifiable, Sendable, Equatable {
     }
 }
 
+enum DesktopAppAttachmentState: String, Sendable, Equatable {
+    case attached
+    case launchedWithoutProxyFlag
+    case runningDirect
+    case stopped
+}
+
+struct DiscoveredDesktopApp: Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+    let displayName: String
+    let bundlePath: String
+    let isElectron: Bool
+    let attachmentState: DesktopAppAttachmentState
+    let attachedPIDs: [Int32]
+    let directPIDs: [Int32]
+}
+
 struct DiscoveredCLIAgent: Identifiable, Sendable, Equatable {
     let id: String
     let name: String
@@ -228,6 +246,8 @@ struct DiscoveredCLIAgent: Identifiable, Sendable, Equatable {
     let provider: String
     let installed: Bool
     let binaryPath: String?
+    let attachedCount: Int
+    let directCount: Int
 }
 
 struct ModelStats: Decodable, Sendable, Equatable {
@@ -296,11 +316,13 @@ struct ProxyStatsResponse: Decodable, Sendable, Equatable {
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
-        self.requests = c.firstInt("requests") ?? 0
-        self.compressedRequests = c.firstInt("compressed_requests", "compressedRequests") ?? 0
+        let reqs = c.firstInt("requests") ?? 0
+        let comp = c.firstInt("compressed_requests", "compressedRequests") ?? 0
+        self.requests = reqs
+        self.compressedRequests = comp
         self.imagedRequests = c.firstInt("imaged_requests", "imagedRequests") ?? 0
         self.textCompressedRequests = c.firstInt("text_compressed_requests", "textCompressedRequests") ?? 0
-        self.passthrough = c.firstInt("passthrough") ?? 0
+        self.passthrough = c.firstInt("passthrough", "passthrough_paid_requests") ?? max(0, reqs - comp)
         self.baselineInputWeighted = c.firstDouble("baseline_input_weighted", "baselineInputWeighted") ?? 0
         self.actualInputWeighted = c.firstDouble("actual_input_weighted", "actualInputWeighted") ?? 0
         self.savedInputTokens = c.firstDouble("saved_input_tokens", "savedInputTokens") ?? 0
@@ -643,8 +665,10 @@ struct PluginsResponse: Decodable, Sendable {
 
 enum Fmt {
     static func tokens(_ raw: Double) -> String {
-        let sign = raw < 0 ? "-" : ""
+        guard raw.isFinite else { return "0" }
         let absVal = abs(raw)
+        if absVal < 0.5 { return "0" }
+        let sign = raw < 0 ? "-" : ""
         if absVal >= 1_000_000 {
             let val = absVal / 1_000_000
             return "\(sign)\(val >= 10 ? String(format: "%.1f", val) : String(format: "%.2f", val))M"
@@ -660,10 +684,28 @@ enum Fmt {
         tokens(Double(raw))
     }
 
+    /// Formats a token saving delta where >0 is reduction (`-1.2K`) and <0 is overhead (`+1.2K`).
+    static func signedTokenDelta(_ raw: Double) -> String {
+        guard raw.isFinite, abs(raw) >= 0.5 else { return "0" }
+        let mag = tokens(abs(raw))
+        return raw > 0 ? "-\(mag)" : "+\(mag)"
+    }
+
+    /// Formats a percentage saving delta where >0 is reduction (`-45%`) and <0 is overhead (`+12%`).
+    static func signedPctDelta(_ raw: Double) -> String {
+        guard raw.isFinite, abs(raw) >= 0.5 else { return "0%" }
+        let mag = pct(abs(raw))
+        return raw > 0 ? "-\(mag)" : "+\(mag)"
+    }
+
     static func usd(_ raw: Double) -> String {
+        guard raw.isFinite else { return "$0.00" }
         let absVal = abs(raw)
-        let prefix = raw < 0 ? "-$" : "$"
         if absVal == 0 { return "$0.00" }
+        if absVal < 0.001 {
+            return raw < 0 ? "-<$0.001" : "<$0.001"
+        }
+        let prefix = raw < 0 ? "-$" : "$"
         if absVal < 0.01 { return "\(prefix)\(String(format: "%.3f", absVal))" }
         if absVal < 100 { return "\(prefix)\(String(format: "%.2f", absVal))" }
         return "\(prefix)\(String(format: "%.1f", absVal))"

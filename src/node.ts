@@ -233,7 +233,7 @@ function resolvePluginsConfigFile(): string {
 const FORBIDDEN_OVERRIDE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
 let pluginOverridesCache:
-  | { file: string; mtimeMs: number; overrides: PluginOverrides }
+  | { file: string; mtimeMs: number; ino: number; size: number; overrides: PluginOverrides }
   | undefined;
 
 function loadPluginOverrides(file = resolvePluginsConfigFile()): PluginOverrides {
@@ -255,20 +255,27 @@ function loadPluginOverrides(file = resolvePluginsConfigFile()): PluginOverrides
 
 function getActivePluginOverrides(file = resolvePluginsConfigFile()): PluginOverrides {
   let mtimeMs = -1;
+  let ino = -1;
+  let size = -1;
   try {
-    mtimeMs = fs.statSync(file).mtimeMs;
+    const st = fs.statSync(file);
+    mtimeMs = st.mtimeMs;
+    ino = st.ino;
+    size = st.size;
   } catch {
     mtimeMs = -1;
   }
   if (
     pluginOverridesCache &&
     pluginOverridesCache.file === file &&
-    pluginOverridesCache.mtimeMs === mtimeMs
+    pluginOverridesCache.mtimeMs === mtimeMs &&
+    pluginOverridesCache.ino === ino &&
+    pluginOverridesCache.size === size
   ) {
     return pluginOverridesCache.overrides;
   }
   const overrides = mtimeMs >= 0 ? loadPluginOverrides(file) : (Object.create(null) as PluginOverrides);
-  pluginOverridesCache = { file, mtimeMs, overrides };
+  pluginOverridesCache = { file, mtimeMs, ino, size, overrides };
   return overrides;
 }
 
@@ -581,7 +588,7 @@ function resolvedCliVersion(): string {
       : typeof __INKLING_VERSION__ === 'string'
         ? __INKLING_VERSION__
         : undefined;
-  return injected ?? process.env.npm_package_version ?? '0.17.0';
+  return injected ?? process.env.npm_package_version ?? '0.18.0';
 }
 
 function printVersion(): void {

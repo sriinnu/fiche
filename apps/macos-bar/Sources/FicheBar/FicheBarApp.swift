@@ -47,7 +47,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? data.write(to: outURL)
         }
 
-        let aboutView = AboutPanelView(daemonVersion: "0.17.0").themed(Theme.of(.editorial))
+        let aboutView = AboutPanelView(daemonVersion: "0.18.0").themed(Theme.of(.editorial))
         if let aboutData = renderRetinaPNG(
             rootView: aboutView,
             width: 320,
