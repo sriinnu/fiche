@@ -1,7 +1,7 @@
 MIT License
 
 Copyright (c) 2026 claude-image-proxy contributors
-Copyright (c) 2026 Srinivas Pendela (Inkling fork changes)
+Copyright (c) 2026 Srinivas Pendela (Fiche / formerly Inkling fork changes)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -24,5 +24,11 @@ SOFTWARE.
 ---
 
 The copyright notice above is pxpipe's (https://github.com/teamchong/pxpipe),
-kept as the license requires. inkling's own changes are copyright (c) 2026
-Srinivas Pendela and released under the same MIT license. See NOTICE.
+kept as the license requires. fiche's (formerly inkling) own changes are
+copyright (c) 2026 Srinivas Pendela and released under the same MIT license.
+See NOTICE.
+
+Bundled font licenses (copied to `assets/*_LICENSE.txt` and `/app/licenses/`):
+- JetBrains Mono: SIL Open Font License 1.1 (`assets/JETBRAINS_MONO_LICENSE.txt`)
+- GNU Unifont: SIL Open Font License 1.1 / GPLv2+ with GNU font embedding exception (`assets/UNIFONT_LICENSE.txt`)
+- Spleen: BSD 2-Clause License (`assets/SPLEEN_LICENSE.txt`)

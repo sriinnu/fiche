@@ -43,10 +43,13 @@ await build({
   target: 'node20',
   format: 'esm',
   sourcemap: true,
-  // Inline the package version so `inkling --version` is correct for global/npx
-  // installs (see the note where `pkg` is read). esbuild replaces the bare
-  // identifier with the string literal at every reference.
-  define: { __INKLING_VERSION__: JSON.stringify(pkg.version) },
+  // Inline the package version so `fiche --version` is correct for global/npx
+  // installs (see the note where `pkg` is read). esbuild replaces both
+  // identifiers with the string literal at every reference.
+  define: {
+    __FICHE_VERSION__: JSON.stringify(pkg.version),
+    __INKLING_VERSION__: JSON.stringify(pkg.version),
+  },
   // Atlas is inlined as a base64 string in src/core/atlas.ts, so no external assets.
   banner: { js: '#!/usr/bin/env node' },
 });

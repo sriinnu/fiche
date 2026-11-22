@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1568 820" width="1568" height="820" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<defs><linearGradient id="prism" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#FF4D5A"/><stop offset="25%" stop-color="#FF6B2B"/><stop offset="55%" stop-color="#C026D3"/><stop offset="80%" stop-color="#0EA5E9"/><stop offset="100%" stop-color="#34D399"/></linearGradient></defs>
+<rect width="1568" height="820" fill="#FFFFFF"/>
+<rect width="1568" height="4" fill="url(#prism)"/>
+<text x="40" y="46" fill="#0F172A" font-size="28" font-weight="700">fiche — Token &amp; Cost Efficiency vs. Latency Frontier (16 Models)</text>
+<text x="40" y="72" fill="#94A3B8" font-size="15">Real USD saved vs. avg per-turn transform latency (log scale) · 16-turn trajectory · kosha pricing · editSafe = true</text>
+<rect x="40" y="178" width="1488" height="592" rx="12" fill="#F8FAFC" stroke="#CBD5E1"/>
+<rect x="116" y="224" width="700.5433383981975" height="244" fill="rgba(16,185,129,0.085)" stroke="rgba(16,185,129,0.35)"/>
+<text x="128" y="244" fill="#10B981" font-size="11.5" font-weight="700">PARETO SWEET SPOT: &lt;= 5 ms · &gt;= 25% USD SAVED</text>
+<line x1="116" y1="712" x2="1492" y2="712" stroke="#E2E8F0" />
+<text x="106" y="716" fill="#64748B" font-size="11" text-anchor="end">-10%</text>
+<line x1="116" y1="642.2857142857143" x2="1492" y2="642.2857142857143" stroke="#FB7185" stroke-width="1.5" stroke-dasharray="6 4"/>
+<text x="106" y="646.2857142857143" fill="#FB7185" font-size="11" text-anchor="end">0%</text>
+<line x1="116" y1="572.5714285714286" x2="1492" y2="572.5714285714286" stroke="#E2E8F0" />
+<text x="106" y="576.5714285714286" fill="#64748B" font-size="11" text-anchor="end">10%</text>
+<line x1="116" y1="502.8571428571429" x2="1492" y2="502.8571428571429" stroke="#E2E8F0" />
+<text x="106" y="506.8571428571429" fill="#64748B" font-size="11" text-anchor="end">20%</text>
+<line x1="116" y1="433.14285714285717" x2="1492" y2="433.14285714285717" stroke="#E2E8F0" />
+<text x="106" y="437.14285714285717" fill="#64748B" font-size="11" text-anchor="end">30%</text>
+<line x1="116" y1="363.42857142857144" x2="1492" y2="363.42857142857144" stroke="#E2E8F0" />
+<text x="106" y="367.42857142857144" fill="#64748B" font-size="11" text-anchor="end">40%</text>
+<line x1="116" y1="293.7142857142857" x2="1492" y2="293.7142857142857" stroke="#E2E8F0" />
+<text x="106" y="297.7142857142857" fill="#64748B" font-size="11" text-anchor="end">50%</text>
+<line x1="116" y1="224" x2="1492" y2="224" stroke="#E2E8F0" />
+<text x="106" y="228" fill="#64748B" font-size="11" text-anchor="end">60%</text>
+<line x1="192.53984166989773" y1="224" x2="192.53984166989773" y2="712" stroke="#E2E8F0" />
+<text x="192.53984166989773" y="730" fill="#64748B" font-size="11" text-anchor="middle">0.7 ms</text>
+<line x1="305.74108110624377" y1="224" x2="305.74108110624377" y2="712" stroke="#E2E8F0" />
+<text x="305.74108110624377" y="730" fill="#64748B" font-size="11" text-anchor="middle">1 ms</text>
+<line x1="434.4273080645371" y1="224" x2="434.4273080645371" y2="712" stroke="#E2E8F0" />
+<text x="434.4273080645371" y="730" fill="#64748B" font-size="11" text-anchor="middle">1.5 ms</text>
+<line x1="525.7316391328623" y1="224" x2="525.7316391328623" y2="712" stroke="#E2E8F0" />
+<text x="525.7316391328623" y="730" fill="#64748B" font-size="11" text-anchor="middle">2 ms</text>
+<line x1="654.4178660911555" y1="224" x2="654.4178660911555" y2="712" stroke="#E2E8F0" />
+<text x="654.4178660911555" y="730" fill="#64748B" font-size="11" text-anchor="middle">3 ms</text>
+<line x1="816.5433383981975" y1="224" x2="816.5433383981975" y2="712" stroke="#10B981" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="816.5433383981975" y="730" fill="#10B981" font-size="11" text-anchor="middle">5 ms</text>
+<line x1="1036.533896424816" y1="224" x2="1036.533896424816" y2="712" stroke="#E2E8F0" />
+<text x="1036.533896424816" y="730" fill="#64748B" font-size="11" text-anchor="middle">10 ms</text>
+<line x1="1256.5244544514344" y1="224" x2="1256.5244544514344" y2="712" stroke="#E2E8F0" />
+<text x="1256.5244544514344" y="730" fill="#64748B" font-size="11" text-anchor="middle">20 ms</text>
+<line x1="1476.5150124780528" y1="224" x2="1476.5150124780528" y2="712" stroke="#E2E8F0" />
+<text x="1476.5150124780528" y="730" fill="#64748B" font-size="11" text-anchor="middle">40 ms</text>
+<line x1="389.010064325393" y1="357.8514285714286" x2="320.4" y2="348" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="389.010064325393" cy="357.8514285714286" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="314" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="328" fill="#0F172A" font-size="11.5" font-weight="700">grok-4.7</text>
+<text x="135" y="341" fill="#38BDF8" font-size="10" font-weight="500">40.8% USD · 45% tok · 1.3 ms</text>
+<line x1="412.53039969651604" y1="362.7314285714286" x2="320.4" y2="362.7314285714286" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="412.53039969651604" cy="362.7314285714286" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="358" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="372" fill="#0F172A" font-size="11.5" font-weight="700">glm-5.3</text>
+<text x="135" y="385" fill="#38BDF8" font-size="10" font-weight="500">40.1% USD · 45% tok · 1.4 ms</text>
+<line x1="434.4273080645371" y1="378.06857142857143" x2="320.4" y2="402" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="434.4273080645371" cy="378.06857142857143" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="402" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="416" fill="#0F172A" font-size="11.5" font-weight="700">deepseek-v4-pro</text>
+<text x="135" y="429" fill="#38BDF8" font-size="10" font-weight="500">37.9% USD · 45% tok · 1.5 ms</text>
+<line x1="684.66734301153" y1="386.4342857142857" x2="710.66734301153" y2="386.4342857142857" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="684.66734301153" cy="386.4342857142857" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="710.66734301153" y="369.4342857142857" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="717.66734301153" y="383.4342857142857" fill="#0F172A" font-size="11.5" font-weight="700">gpt-6-astra</text>
+<text x="717.66734301153" y="396.4342857142857" fill="#38BDF8" font-size="10" font-weight="500">36.7% USD · 45% tok · 3.3 ms</text>
+<line x1="434.4273080645371" y1="394.8" x2="320.4" y2="446" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="434.4273080645371" cy="394.8" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="446" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="460" fill="#0F172A" font-size="11.5" font-weight="700">gpt-6.2-astra</text>
+<text x="135" y="473" fill="#38BDF8" font-size="10" font-weight="500">35.5% USD · 45% tok · 1.5 ms</text>
+<line x1="454.9104978941452" y1="394.8" x2="320.4" y2="490" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="454.9104978941452" cy="394.8" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="490" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="504" fill="#0F172A" font-size="11.5" font-weight="700">claude-opus-5-5</text>
+<text x="135" y="517" fill="#38BDF8" font-size="10" font-weight="500">35.5% USD · 45% tok · 1.6 ms</text>
+<line x1="454.9104978941452" y1="398.2857142857143" x2="320.4" y2="534" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="454.9104978941452" cy="398.2857142857143" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="534" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="548" fill="#0F172A" font-size="11.5" font-weight="700">kimi-k3</text>
+<text x="135" y="561" fill="#38BDF8" font-size="10" font-weight="500">35.0% USD · 45% tok · 1.6 ms</text>
+<line x1="918.7659697535471" y1="401.07428571428574" x2="942.7659697535471" y2="401.07428571428574" stroke="#FF9E64" stroke-opacity="0.5"/>
+<rect x="912.7659697535471" y="395.07428571428574" width="12" height="12" transform="rotate(45 918.7659697535471 401.07428571428574)" fill="#FF9E64" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="942.7659697535471" y="384.07428571428574" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#FF9E64"/>
+<text x="949.7659697535471" y="398.07428571428574" fill="#0F172A" font-size="11.5" font-weight="700">claude-fable-5</text>
+<text x="949.7659697535471" y="411.07428571428574" fill="#FF9E64" font-size="10" font-weight="500">34.6% USD · 44% tok · 6.9 ms</text>
+<line x1="412.53039969651604" y1="409.44" x2="320.4" y2="578" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="412.53039969651604" cy="409.44" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="578" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="592" fill="#0F172A" font-size="11.5" font-weight="700">gemini-4-hydrogen</text>
+<text x="135" y="605" fill="#38BDF8" font-size="10" font-weight="500">33.4% USD · 45% tok · 1.4 ms</text>
+<line x1="434.4273080645371" y1="409.44" x2="320.4" y2="622" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="434.4273080645371" cy="409.44" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="622" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="636" fill="#0F172A" font-size="11.5" font-weight="700">gemini-4-carbon</text>
+<text x="135" y="649" fill="#38BDF8" font-size="10" font-weight="500">33.4% USD · 45% tok · 1.5 ms</text>
+<line x1="363.6061668258201" y1="410.13714285714286" x2="320.4" y2="666" stroke="#38BDF8" stroke-opacity="0.5"/>
+<circle cx="363.6061668258201" cy="410.13714285714286" r="7" fill="#38BDF8" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="128" y="666" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#38BDF8"/>
+<text x="135" y="680" fill="#0F172A" font-size="11.5" font-weight="700">gemini-3.1-pro-preview</text>
+<text x="135" y="693" fill="#38BDF8" font-size="10" font-weight="500">33.3% USD · 45% tok · 1.2 ms</text>
+<line x1="1016.8959249032868" y1="441.50857142857143" x2="1040.8959249032869" y2="441.50857142857143" stroke="#FF9E64" stroke-opacity="0.5"/>
+<rect x="1010.8959249032868" y="435.50857142857143" width="12" height="12" transform="rotate(45 1016.8959249032868 441.50857142857143)" fill="#FF9E64" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="1040.8959249032869" y="430.07428571428574" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#FF9E64"/>
+<text x="1047.8959249032869" y="444.07428571428574" fill="#0F172A" font-size="11.5" font-weight="700">gemini-3.8-flash</text>
+<text x="1047.8959249032869" y="457.07428571428574" fill="#FF9E64" font-size="10" font-weight="500">28.8% USD · 52% tok · 9.4 ms</text>
+<line x1="1052.0188839467633" y1="447.78285714285715" x2="1076.0188839467633" y2="476.07428571428574" stroke="#FF9E64" stroke-opacity="0.5"/>
+<rect x="1046.0188839467633" y="441.78285714285715" width="12" height="12" transform="rotate(45 1052.0188839467633 447.78285714285715)" fill="#FF9E64" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="1076.0188839467633" y="476.07428571428574" width="198.7" height="34" rx="6" fill="#FFFFFF" stroke="#FF9E64"/>
+<text x="1083.0188839467633" y="490.07428571428574" fill="#0F172A" font-size="11.5" font-weight="700">gemini-4-argon</text>
+<text x="1083.0188839467633" y="503.07428571428574" fill="#FF9E64" font-size="10" font-weight="500">27.9% USD · 40% tok · 10.5 ms</text>
+<line x1="1036.533896424816" y1="607.4285714285714" x2="1060.533896424816" y2="607.4285714285714" stroke="#FF9E64" stroke-opacity="0.5"/>
+<rect x="1030.533896424816" y="601.4285714285714" width="12" height="12" transform="rotate(45 1036.533896424816 607.4285714285714)" fill="#FF9E64" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="1060.533896424816" y="590.4285714285714" width="192.4" height="34" rx="6" fill="#FFFFFF" stroke="#FF9E64"/>
+<text x="1067.533896424816" y="604.4285714285714" fill="#0F172A" font-size="11.5" font-weight="700">gpt-5.6-sol</text>
+<text x="1067.533896424816" y="617.4285714285714" fill="#FF9E64" font-size="10" font-weight="500">5.0% USD · 35% tok · 10.0 ms</text>
+<line x1="1171.5050671172244" y1="652.0457142857143" x2="1195.5050671172244" y2="652.0457142857143" stroke="#FB7185" stroke-opacity="0.5"/>
+<rect x="1165.5050671172244" y="646.0457142857143" width="12" height="12" transform="rotate(45 1171.5050671172244 652.0457142857143)" fill="#FB7185" stroke="#0F172A" stroke-width="1.5"/>
+<rect x="1195.5050671172244" y="636.4285714285714" width="198.7" height="34" rx="6" fill="#FFFFFF" stroke="#FB7185"/>
+<text x="1202.5050671172244" y="650.4285714285714" fill="#0F172A" font-size="11.5" font-weight="700">gpt-6.2-sol</text>
+<text x="1202.5050671172244" y="663.4285714285714" fill="#FB7185" font-size="10" font-weight="500">-1.4% USD · 35% tok · 15.3 ms</text>
+<text x="804" y="752" fill="#64748B" font-size="12" font-weight="600" text-anchor="middle">Average Turn Transform Latency (ms, log10 scale)</text>
+<text x="40" y="804" fill="#64748B" font-size="12">Source: bench/multiturn-all-models.mts (16 models · editSafe = true)</text>
+</svg>

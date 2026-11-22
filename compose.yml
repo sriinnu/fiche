@@ -1,5 +1,5 @@
 services:
-  inkling:
+  fiche:
     build:
       context: .
     restart: unless-stopped
@@ -9,27 +9,42 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    tmpfs:
+      - /tmp
     ports:
-      - "127.0.0.1:${INKLING_PORT:-47821}:47821"
+      - "127.0.0.1:${FICHE_PORT:-47821}:47821"
     environment:
-      - INKLING_MODELS
-      - INKLING_DISABLE
-      - INKLING_UPSTREAM
+      - FICHE_DASHBOARD_ALLOW_PRIVATE=1
+      - FICHE_CONFIG
+      - FICHE_MODELS
+      - FICHE_PRICES
+      - FICHE_TEXT_HYGIENE
+      - FICHE_FORCE_IMAGES
+      - FICHE_ALLOWED_HOSTS
+      - FICHE_MAX_REQUEST_BYTES
+      - FICHE_RENDER_CACHE_BYTES
+      - FICHE_DASH_LABEL
+      - FICHE_SESSION_STATE
+      - FICHE_LOG
+      - FICHE_FOLLOW_HOSTS
+      - FICHE_DISABLE
+      - FICHE_UPSTREAM
       - ANTHROPIC_UPSTREAM
+      - ANTHROPIC_OAUTH_TOKEN_FILE
       - OPENAI_UPSTREAM
       - OPENAI_API_KEY
       - OPENAI_MODELS
       - CLOUDFLARE_MODELS
       - CLOUDFLARE_ACCOUNT_ID
       - CLOUDFLARE_API_TOKEN
-      - INKLING_PROVIDER
-      - INKLING_GATEWAY_BASE_URL
-      - INKLING_GATEWAY_HEADERS
-      - INKLING_GPT_PROFILES
-      - INKLING_DUMP_DIR
-      - INKLING_DEBUG_CAPTURE_4XX
+      - FICHE_PROVIDER
+      - FICHE_GATEWAY_BASE_URL
+      - FICHE_GATEWAY_HEADERS
+      - FICHE_GPT_PROFILES
+      - FICHE_DUMP_DIR
+      - FICHE_DEBUG_CAPTURE_4XX
     volumes:
-      - inkling-data:/data
+      - fiche-data:/data
 
 volumes:
-  inkling-data:
+  fiche-data:

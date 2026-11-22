@@ -5,6 +5,7 @@
  * page bills at its raw 28-px patch count with no server-side downscale (WYSIWYG).
  */
 
+import { readBrandEnv } from './env.js';
 import {
   ATLAS_CELL_W,
   ATLAS_CELL_H,
@@ -90,6 +91,7 @@ interface BitAtlas {
   offsets: Uint32Array;
   wideFlags: Uint8Array;
   rank: (codepoint: number) => number;
+  asciiRank: Int16Array;
 }
 
 interface GrayAtlas {
@@ -100,6 +102,16 @@ interface GrayAtlas {
   offsets: Uint32Array;
   wideFlags: Uint8Array;
   rank: (codepoint: number) => number;
+  asciiRank: Int16Array;
+}
+
+// Direct O(1) ASCII LUT ahead of glyph search — covers printable 0x20..0x7E (~99% of terminal text).
+function buildAsciiRankLut(rankFn: (cp: number) => number): Int16Array {
+  const lut = new Int16Array(128).fill(-1);
+  for (let cp = 0x20; cp <= 0x7e; cp++) {
+    lut[cp] = rankFn(cp);
+  }
+  return lut;
 }
 
 interface AtlasSet {
@@ -116,6 +128,7 @@ const DEFAULT_ATLAS: AtlasSet = {
     offsets: ATLAS_OFFSETS,
     wideFlags: ATLAS_WIDE_FLAGS,
     rank: atlasRank,
+    asciiRank: buildAsciiRankLut(atlasRank),
   },
   gray: {
     cellW: ATLAS_GRAY_CELL_W,
@@ -125,6 +138,7 @@ const DEFAULT_ATLAS: AtlasSet = {
     offsets: ATLAS_GRAY_OFFSETS,
     wideFlags: ATLAS_GRAY_WIDE_FLAGS,
     rank: atlasGrayRank,
+    asciiRank: buildAsciiRankLut(atlasGrayRank),
   },
 };
 
@@ -137,6 +151,7 @@ const JBM10_ATLAS: AtlasSet = {
     offsets: JBM10_OFFSETS,
     wideFlags: JBM10_WIDE_FLAGS,
     rank: jbMono10Rank,
+    asciiRank: buildAsciiRankLut(jbMono10Rank),
   },
   gray: {
     cellW: JBM10_GRAY_CELL_W,
@@ -146,6 +161,7 @@ const JBM10_ATLAS: AtlasSet = {
     offsets: JBM10_GRAY_OFFSETS,
     wideFlags: JBM10_GRAY_WIDE_FLAGS,
     rank: jbMono10GrayRank,
+    asciiRank: buildAsciiRankLut(jbMono10GrayRank),
   },
 };
 
@@ -158,6 +174,7 @@ const JBM12_ATLAS: AtlasSet = {
     offsets: JBM12_OFFSETS,
     wideFlags: JBM12_WIDE_FLAGS,
     rank: jbMono12Rank,
+    asciiRank: buildAsciiRankLut(jbMono12Rank),
   },
   gray: {
     cellW: JBM12_GRAY_CELL_W,
@@ -167,6 +184,7 @@ const JBM12_ATLAS: AtlasSet = {
     offsets: JBM12_GRAY_OFFSETS,
     wideFlags: JBM12_GRAY_WIDE_FLAGS,
     rank: jbMono12GrayRank,
+    asciiRank: buildAsciiRankLut(jbMono12GrayRank),
   },
 };
 
@@ -179,6 +197,7 @@ const JBM14_ATLAS: AtlasSet = {
     offsets: JBM14_OFFSETS,
     wideFlags: JBM14_WIDE_FLAGS,
     rank: jbMono14Rank,
+    asciiRank: buildAsciiRankLut(jbMono14Rank),
   },
   gray: {
     cellW: JBM14_GRAY_CELL_W,
@@ -188,6 +207,7 @@ const JBM14_ATLAS: AtlasSet = {
     offsets: JBM14_GRAY_OFFSETS,
     wideFlags: JBM14_GRAY_WIDE_FLAGS,
     rank: jbMono14GrayRank,
+    asciiRank: buildAsciiRankLut(jbMono14GrayRank),
   },
 };
 
@@ -198,12 +218,20 @@ function atlasSet(font: RenderFont | undefined): AtlasSet {
   return DEFAULT_ATLAS;
 }
 
+function fastBitRank(atlas: BitAtlas, codepoint: number): number {
+  return codepoint >= 0 && codepoint < 128 ? atlas.asciiRank[codepoint]! : atlas.rank(codepoint);
+}
+
+function fastGrayRank(atlas: GrayAtlas, codepoint: number): number {
+  return codepoint >= 0 && codepoint < 128 ? atlas.asciiRank[codepoint]! : atlas.rank(codepoint);
+}
+
 function bitGlyph(codepoint: number, font: RenderFont | undefined): { atlas: BitAtlas; rank: number } | null {
   const selected = atlasSet(font).bit;
-  const rank = selected.rank(codepoint);
+  const rank = fastBitRank(selected, codepoint);
   if (rank >= 0) return { atlas: selected, rank };
   if (selected !== DEFAULT_ATLAS.bit) {
-    const fallbackRank = DEFAULT_ATLAS.bit.rank(codepoint);
+    const fallbackRank = fastBitRank(DEFAULT_ATLAS.bit, codepoint);
     if (fallbackRank >= 0) return { atlas: DEFAULT_ATLAS.bit, rank: fallbackRank };
   }
   return null;
@@ -211,10 +239,10 @@ function bitGlyph(codepoint: number, font: RenderFont | undefined): { atlas: Bit
 
 function grayGlyph(codepoint: number, font: RenderFont | undefined): { atlas: GrayAtlas; rank: number } | null {
   const selected = atlasSet(font).gray;
-  const rank = selected.rank(codepoint);
+  const rank = fastGrayRank(selected, codepoint);
   if (rank >= 0) return { atlas: selected, rank };
   if (selected !== DEFAULT_ATLAS.gray) {
-    const fallbackRank = DEFAULT_ATLAS.gray.rank(codepoint);
+    const fallbackRank = fastGrayRank(DEFAULT_ATLAS.gray, codepoint);
     if (fallbackRank >= 0) return { atlas: DEFAULT_ATLAS.gray, rank: fallbackRank };
   }
   return null;
@@ -347,9 +375,14 @@ function cellsFor(
 ): number {
   // Enlarged ↵ occupies markerScale cells of wrap budget instead of 1.
   if (codepoint === NL_SENTINEL_CP && markerScale > 1) return markerScale;
-  const glyph = bitGlyph(codepoint, font);
-  if (!glyph) return 1;
-  return glyph.atlas.wideFlags[glyph.rank] === 1 ? 2 : 1;
+  const selected = atlasSet(font).bit;
+  let rank = fastBitRank(selected, codepoint);
+  if (rank >= 0) return selected.wideFlags[rank] === 1 ? 2 : 1;
+  if (selected !== DEFAULT_ATLAS.bit) {
+    rank = fastBitRank(DEFAULT_ATLAS.bit, codepoint);
+    if (rank >= 0) return DEFAULT_ATLAS.bit.wideFlags[rank] === 1 ? 2 : 1;
+  }
+  return 1;
 }
 
 const TAB_WIDTH = 4; // standard 4-space tab stops (logs, code, tool output are all 4-oriented)
@@ -630,20 +663,64 @@ export function measureContentCols(
   font: RenderFont = DEFAULT_RENDER_FONT,
 ): number {
   const cap = Math.max(1, maxCols | 0);
+  const selected = atlasSet(font).bit;
+  const defaultBit = DEFAULT_ATLAS.bit;
+  const len = text.length;
   let widest = 1;
-  let start = 0;
-  for (let i = 0; i <= text.length; i++) {
-    if (i === text.length || text[i] === '\n') {
-      const w = measureLineCols(
-        escapeMissingGlyphs(padNewlineMarkers(expandTabsInLine(text.slice(start, i)))),
-        markerScale,
-        font,
-      );
-      if (w > widest) widest = w;
-      if (widest >= cap) return cap;
-      start = i + 1;
+  // Track `col` and `tabCol` independently so NL_SENTINEL keeps the same tab stops as wrapLines.
+  let col = 0;
+  let tabCol = 0;
+  let i = 0;
+
+  while (i < len) {
+    const code = text.charCodeAt(i);
+    if (code === 10) {
+      if (col > widest) widest = col;
+      col = 0;
+      tabCol = 0;
+      i += 1;
+      continue;
     }
+    if (code >= 0x20 && code <= 0x7e) {
+      let w = 1;
+      const r = selected.asciiRank[code]!;
+      if (r >= 0) {
+        w = selected.wideFlags[r] === 1 ? 2 : 1;
+      } else if (selected !== defaultBit) {
+        const dr = defaultBit.asciiRank[code]!;
+        if (dr >= 0) w = defaultBit.wideFlags[dr] === 1 ? 2 : 1;
+      }
+      col += w;
+      tabCol += w;
+      if (col >= cap) return cap;
+      i += 1;
+      continue;
+    }
+    if (code === 9) {
+      const span = TAB_WIDTH - (tabCol % TAB_WIDTH);
+      col += span;
+      tabCol += span;
+      if (col >= cap) return cap;
+      i += 1;
+      continue;
+    }
+    const cp = text.codePointAt(i)!;
+    const step = cp > 0xffff ? 2 : 1;
+    if (cp === NL_SENTINEL_CP) {
+      col += 2 * NL_SENTINEL_PAD_CELLS + (markerScale > 1 ? markerScale : 1);
+      tabCol += 1;
+    } else if (fastBitRank(defaultBit, cp) < 0 && !isEscapeExempt(cp)) {
+      const escWidth = 4 + cp.toString(16).length;
+      col += escWidth;
+      tabCol += cellsFor(cp, 1, font);
+    } else {
+      col += cellsFor(cp, markerScale, font);
+      tabCol += cellsFor(cp, 1, font);
+    }
+    if (col >= cap) return cap;
+    i += step;
   }
+  if (col > widest) widest = col;
   return Math.min(cap, widest);
 }
 
@@ -772,6 +849,7 @@ function blitGlyphGray(
   y: number,
   codepoint: number,
   font: RenderFont = DEFAULT_RENDER_FONT,
+  markerMask: Uint8Array | null = null,
 ): number {
   const glyph = grayGlyph(codepoint, font);
   if (!glyph) return 0;
@@ -789,6 +867,7 @@ function blitGlyphGray(
       if (coverage > 0) {
         const idx = dstRow + gx;
         if (coverage > fb[idx]!) fb[idx] = coverage;
+        if (markerMask) markerMask[idx] = 1;
       }
     }
   }
@@ -917,13 +996,7 @@ export async function renderChunkToPng(
    *  its ↵ markers are padded already and must not be padded again. */
   prewrapped: boolean = false,
 ): Promise<RenderedImage> {
-  const useAA = style.aa === true;
-  const selected = atlasSet(style.font);
-  const atlasH = useAA ? selected.gray.cellH : selected.bit.cellH;
-  const atlasW = useAA ? selected.gray.cellW : selected.bit.cellW;
   const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
-  const cellH = renderCellHeight(style);
-  const cellW = renderCellWidth(style);
   const lines = wrapLines(text, cols, markerScale, style.font, !prewrapped);
   // Slot string carries role attribution by position. It is width-identical to
   // `text`, so wrapLines splits it into the exact same rows — fitSlotLines[r] aligns
@@ -933,18 +1006,44 @@ export async function renderChunkToPng(
       ? wrapLines(slotText, cols, markerScale, style.font, !prewrapped)
       : null;
 
+  let fullCodepoints: number | undefined;
+  const cellH = renderCellHeight(style);
+  const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
+  if (lines.length <= maxLines) {
+    let n = 0;
+    for (const _ of text) n++;
+    fullCodepoints = n;
+  }
+  return renderLinesToPng(lines, slotLines, cols, style, maxHeightPx, fullCodepoints);
+}
+
+// Split out from `renderChunkToPng` so multi-page renders wrap once and blit pages directly.
+async function renderLinesToPng(
+  lines: readonly string[],
+  slotLines: readonly string[] | null,
+  cols: number,
+  style: RenderStyle,
+  maxHeightPx: number,
+  fullCodepoints?: number,
+): Promise<RenderedImage> {
+  const useAA = style.aa === true;
+  const selected = atlasSet(style.font);
+  const atlasH = useAA ? selected.gray.cellH : selected.bit.cellH;
+  const atlasW = useAA ? selected.gray.cellW : selected.bit.cellW;
+  const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
+  const cellH = renderCellHeight(style);
+  const cellW = renderCellWidth(style);
+
   const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
   const fitLines = lines.slice(0, maxLines);
   const fitSlotLines = slotLines ? slotLines.slice(0, maxLines) : null;
 
   // charsRendered = input codepoints covered by this image (for..of counts by codepoint, not code unit).
   let charsRendered: number;
-  if (fitLines.length === lines.length) {
-    let n = 0;
-    for (const _ of text) n++;
-    charsRendered = n;
+  if (fitLines.length === lines.length && fullCodepoints !== undefined) {
+    charsRendered = fullCodepoints;
   } else {
-    // Partial: sum kept-line codepoints + 1 separator per adjacent pair.
+    // Sum kept-line codepoints + 1 separator per adjacent pair.
     let n = 0;
     for (let i = 0; i < fitLines.length; i++) {
       for (const _ of fitLines[i]!) n++;
@@ -1011,12 +1110,12 @@ export async function renderChunkToPng(
       if (isMarker && markerScale > 1) {
         advance = blitGlyphScaled(fb, markerMask, width, height, baseX, baseY, codepoint, markerScale, style.font);
         // Scaled marker occupies whole cells, so its span is in cellW units.
-        if (colorMask) stampColorMask(baseX, baseY, advance * cellW, colorSlot);
+        if (colorMask && colorSlot > 0 && advance > 0) stampColorMask(baseX, baseY, advance * cellW, colorSlot);
       } else {
         advance = useAA
-          ? blitGlyphGray(fb, width, baseX, baseY, codepoint, style.font)
+          ? blitGlyphGray(fb, width, baseX, baseY, codepoint, style.font, isMarker ? markerMask : null)
           : blitGlyph(fb, width, baseX, baseY, codepoint, style.font, isMarker ? markerMask : null);
-        if (colorMask && advance > 0) stampColorMask(baseX, baseY, advance * atlasW, colorSlot);
+        if (colorMask && colorSlot > 0 && advance > 0) stampColorMask(baseX, baseY, advance * atlasW, colorSlot);
       }
       glyphIndex++;
       charIdx++;
@@ -1156,7 +1255,7 @@ function isWorkersRuntime(): boolean {
  *  after the module has already loaded. Node still resolves it once, below. */
 let renderCacheMaxBytesValue = (() => {
   // Edge-safe: `process` is undefined off-Node.
-  const raw = typeof process !== 'undefined' ? process.env?.INKLING_RENDER_CACHE_BYTES : undefined;
+  const raw = readBrandEnv('RENDER_CACHE_BYTES');
   const parsed = raw !== undefined && raw.trim() !== '' ? Number(raw) : NaN;
   // 0 disables the cache outright; negative/garbage falls back to the default.
   if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
@@ -1394,17 +1493,16 @@ async function renderTextToPngsUncached(
   // the slab budget (READABLE_CHARS_PER_IMAGE) keeps its shorter row cap.
   const linesPerImg = Math.min(hardLinesPerImg, Math.max(1, Math.floor(maxCharsPerImage / cols)));
 
-  const images: RenderedImage[] = [];
+  const jobs: Array<{ page: string[]; slotPage: string[] | null }> = [];
   let slotCursor = 0;
   for (const page of splitWrappedLinesIntoReadablePages(lines, linesPerImg, maxCharsPerImage)) {
-    const chunk = page.join('\n');
-    const slotChunk = slotLines
-      ? slotLines.slice(slotCursor, slotCursor + page.length).join('\n')
-      : undefined;
+    const slotPage = slotLines ? slotLines.slice(slotCursor, slotCursor + page.length) : null;
     slotCursor += page.length;
-    images.push(await renderChunkToPng(chunk, cols, style, maxHeightPx, slotChunk, true));
+    jobs.push({ page, slotPage });
   }
-  return images;
+  return Promise.all(
+    jobs.map((job) => renderLinesToPng(job.page, job.slotPage, cols, style, maxHeightPx)),
+  );
 }
 
 export async function renderTextToPngs(
@@ -1456,8 +1554,11 @@ export async function renderDensePages(
 ): Promise<RenderedImage[]> {
   const source = opts.reflow ? reflow(text) ?? text : text;
   const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
-  const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
   const style = opts.style ?? DENSE_RENDER_STYLE;
+  const cols =
+    opts.shrink === false
+      ? maxCols
+      : measureContentCols(source, maxCols, style.markerScale, style.font);
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
   const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
   return renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);

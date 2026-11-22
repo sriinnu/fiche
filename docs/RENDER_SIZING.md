@@ -1,4 +1,4 @@
-# How inkling sizes rendered images
+# How `fiche` sizes rendered images
 
 Image geometry is selected by the exact model id. `/v1/responses` is only a
 wire protocol: Claude, GPT, and Grok on that path do not share a renderer.
@@ -19,10 +19,11 @@ grows with content until the profile cap, then overflow becomes another page.
 
 | model rule | atlas / effective cell | columns | full width | max height |
 |---|---|---:|---:|---:|
-| Claude / Anthropic | JetBrains Mono 14px, native 9×16 | 172 | 1556 px | 728 px |
-| opt-in `gpt-5.6-sol` | JetBrains Mono 14px, native 9×16 | 84 | 764 px | 1954 px |
-| opt-in Grok 4.5 | JetBrains Mono 14px, native 9×16 + IDS + factsheet | 84 | 764 px | 512 px |
-| other OpenAI fallback | Spleen + Unifont, 5×8 | 152 | 768 px | 1932 px |
+| `claude-fable-5` / Gemini vision tiers | Spleen 5×8 + Unifont 8px fallback, 5×8 | 312 | 1568 px | 728 px |
+| other `claude-*` / `anthropic-*` (`fable-5-1`, `5-2`, etc.) | Spleen 5×8 +2px rows (`cellHBonus: 2`), 5×10 | 312 | 1568 px | 728 px |
+| opt-in `gpt-5.6-sol` / `gpt-6.1-sol` / `gpt-6.2-sol` | JetBrains Mono 14px (+ Unifont 14px), 9×16 | 84 | 764 px | 1954 px |
+| opt-in `grok-*` / `qwen3.8-27b` | JetBrains Mono 14px (+ Unifont 14px), 9×16 | 84 | 764 px | 512 px |
+| `gpt-6*` (non-Sol) & other OpenAI fallback | Spleen 5×8 + Unifont 8px fallback, 5×8 | 152 | 768 px | 1932 px |
 
 Complete profile values and evidence are in
 [`MODEL_RENDER_PROFILES.md`](MODEL_RENDER_PROFILES.md).
@@ -60,9 +61,16 @@ top 10% of the budget.
 
 ## Font and Unicode
 
-Atlases are generated at build time; runtime never loads font files. The compact
-JetBrains atlas contains common code/Latin/symbol ranges. Missing codepoints
-fall back to the full Spleen/Unifont atlas, preserving multilingual rendering.
+Atlases are generated at build time (`src/core/atlas*.ts`); runtime never loads
+font files. Four font profiles are compiled in (`spleen-5x8`,
+`jetbrains-mono-10`, `jetbrains-mono-12`, `jetbrains-mono-14`). The compact
+JetBrains Mono atlases contain common code/Latin/symbol ranges, and missing
+codepoints fall back to GNU Unifont (`Unifont-16.0.04.otf`), preserving
+multilingual rendering. Font licenses are bundled in `assets/*_LICENSE.txt` (and
+`/app/licenses/` in Docker):
+- JetBrains Mono — SIL OFL 1.1 (`assets/JETBRAINS_MONO_LICENSE.txt`)
+- GNU Unifont — SIL Open Font License 1.1 / GPLv2+ with GNU font embedding exception (`assets/UNIFONT_LICENSE.txt`)
+- Spleen — BSD 2-Clause (`assets/SPLEEN_LICENSE.txt`)
 
 Spacing, anti-aliasing, grid, color cycle, and newline-marker style are all part
 of the model profile. The same style object is used for static slabs and history.

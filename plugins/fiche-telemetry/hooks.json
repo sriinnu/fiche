@@ -1,0 +1,11 @@
+{
+  "fiche-turn-savings": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "node ./scripts/post-invocation.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

@@ -1,14 +1,14 @@
 {
-  "name": "inkling",
-  "displayName": "Inkling",
+  "name": "fiche",
+  "displayName": "Fiche",
   "version": "0.17.0",
-  "description": "Inkling MCP tools for coding agents. The HTTP proxy is what reduces provider tokens on live traffic. The MCP tools check a model and transform a request you pass in; they do not remove text already in the conversation.",
+  "description": "Fiche MCP tools for coding agents. The HTTP proxy is what reduces provider tokens on live traffic. The MCP tools check a model and transform a request you pass in; they do not remove text already in the conversation.",
   "author": {
     "name": "Srinivas Pendela",
     "url": "https://github.com/sriinnu"
   },
-  "homepage": "https://github.com/sriinnu/inkling",
-  "repository": "https://github.com/sriinnu/inkling",
+  "homepage": "https://github.com/sriinnu/fiche",
+  "repository": "https://github.com/sriinnu/fiche",
   "license": "MIT",
   "keywords": [
     "tokens",

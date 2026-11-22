@@ -1,11 +1,11 @@
 {
-  "name": "@sriinnu/inkling",
+  "name": "@sriinnu/fiche",
   "version": "0.17.0",
-  "description": "Local context proxy for coding agents. Renders stale context as images for models that can read them; everything else passes through untouched.",
+  "description": "Microfiche for coding agents — cache-safe hybrid optical + deterministic text context compiler & <5 ms local proxy.",
   "type": "module",
   "bin": {
-    "inkling": "bin/cli.js",
-    "inkling-mcp": "bin/mcp.js"
+    "fiche": "bin/cli.js",
+    "fiche-mcp": "bin/mcp.js"
   },
   "exports": {
     ".": {
@@ -41,8 +41,12 @@
     "bin/",
     "dist/",
     "!dist/**/*.map",
+    "plugins/",
     "assets/*LICENSE.txt",
+    "assets/fiche-*.svg",
     "README.md",
+    "CHANGELOG.md",
+    "PRIVACY.md",
     "SECURITY.md",
     "NOTICE",
     "docs/SECURITY_MODEL.md",
@@ -51,6 +55,7 @@
   "scripts": {
     "audit": "pnpm audit --prod --audit-level high",
     "build": "node scripts/build.mjs",
+    "charts:gen": "tsx scripts/gen-fiche-charts.ts && tsx scripts/gen-context-chart.ts",
     "build:atlas": "tsx scripts/gen-atlas.ts",
     "dev:node": "tsx watch src/node.ts",
     "dev:worker": "wrangler dev",
@@ -66,16 +71,17 @@
     "prices:check": "tsx scripts/gen-prices.ts --check"
   },
   "keywords": [
-    "claude",
-    "claude-code",
-    "anthropic",
-    "fable-5",
-    "proxy",
-    "token-optimization",
+    "fiche",
+    "microfiche",
+    "context-compiler",
+    "coding-agents",
+    "toon",
     "prompt-cache",
     "vision-tokens",
-    "cloudflare-workers",
-    "mcp"
+    "mcp",
+    "claude-code",
+    "codex",
+    "antigravity"
   ],
   "engines": {
     "node": ">=20.19"
@@ -105,10 +111,14 @@
   "author": "Srinivas Pendela (https://github.com/sriinnu)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sriinnu/inkling.git"
+    "url": "git+https://github.com/sriinnu/fiche.git"
   },
-  "homepage": "https://github.com/sriinnu/inkling#readme",
+  "homepage": "https://fiche.srinivas.dev",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/sriinnu"
+  },
   "bugs": {
-    "url": "https://github.com/sriinnu/inkling/issues"
+    "url": "https://github.com/sriinnu/fiche/issues"
   }
 }

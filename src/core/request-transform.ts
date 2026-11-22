@@ -20,6 +20,8 @@ export type RequestWire = 'anthropic' | 'responses' | 'chat' | 'google' | 'auto'
 export interface RequestReport {
   readerTier: ReaderTier;
   imaged: boolean;
+  textCompressed?: boolean;
+  textStages?: string[];
   /** Estimated (o200k) text tokens of the incoming body. */
   originalTokens: number;
   imageTokens: number;
@@ -91,9 +93,11 @@ function allowBreakpoints(options: RequestTransformOptions): boolean {
 }
 
 /**
- * Images only when the reader tier is `image` and compression is not switched
- * off; otherwise the body leaves byte-identical (except the Codex breakpoint
- * scrub, which is a no-op when the key is absent).
+ * Transforms an LLM request across any supported wire format:
+ *  - `image` reader tier: renders bulky stale context optically + text hygiene.
+ *  - `text` reader tier: runs 4-layer deterministic text compilation (TSCG+TOON+CASI+ACDC)
+ *    with zero image rendering (`imageCompress: false`).
+ * Leaves clean payloads byte-identical (except explicit Codex breakpoint scrubbing).
  */
 export async function transformAnyRequest(
   body: Uint8Array,
@@ -107,7 +111,7 @@ export async function transformAnyRequest(
   let outBody = body;
   let info: TransformInfo = {
     compressed: false,
-    reason: imageTier ? 'noop' : 'weak_reader',
+    reason: options.compress === false ? 'compress=false' : imageTier ? 'noop' : 'weak_reader',
     origChars: 0,
     compressedChars: 0,
     imageCount: 0,
@@ -117,26 +121,37 @@ export async function transformAnyRequest(
     dynamicBlockCount: 0,
     droppedChars: 0,
   };
-  if (imageTier) {
-    const imageOptions: TransformOptions = { ...options, model, explicitPromptCacheBreakpoints: allow };
+  if (options.compress !== false) {
+    const wireOpts: TransformOptions = {
+      ...options,
+      model,
+      imageCompress: imageTier,
+      explicitPromptCacheBreakpoints: allow,
+    };
     const result = wire === 'responses'
-      ? await transformOpenAIResponses(body, imageOptions)
+      ? await transformOpenAIResponses(body, wireOpts)
       : wire === 'chat'
-        ? await transformOpenAIChatCompletions(body, imageOptions)
+        ? await transformOpenAIChatCompletions(body, wireOpts)
         : wire === 'google'
-          ? await transformGoogleGenerateContent(body, model ?? 'gemini', imageOptions)
-          : await transformRequest(body, imageOptions);
+          ? await transformGoogleGenerateContent(body, model ?? 'gemini', wireOpts)
+          : await transformRequest(body, wireOpts);
     outBody = result.body;
     info = result.info;
+    if (!imageTier && !info.compressed && (info.reason === 'image_disabled' || info.reason === 'unsupported_model')) {
+      info = { ...info, reason: 'weak_reader' };
+    }
   }
   if (!allow) outBody = scrubPromptCacheBreakpoint(outBody);
   const imageTokens = chargedImageTokens(info, model);
   const originalTokens = countBillable(body);
   const billableTokens = countBillable(outBody, imageTokens);
   const savedVsOriginal = originalTokens - billableTokens;
+  const textStages = info.textHygieneStages ? [...info.textHygieneStages] : undefined;
+  const textCompressed = (info.textHygieneSavedTokens ?? 0) > 0 || Boolean(textStages && textStages.length > 0);
   const report: RequestReport = {
     readerTier: tier,
     imaged: imageTier && info.imageCount > 0,
+    ...(textCompressed ? { textCompressed: true, textStages } : {}),
     originalTokens,
     imageTokens,
     billableTokens,

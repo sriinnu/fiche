@@ -38,7 +38,7 @@ const PATTERNS: readonly RegExp[] = [
   /(?:^|[^\w-])(--?[A-Za-z][\w-]+)/g, // CLI flag (token in capture group 1)
   /\b\d[\d,_]{3,}\b/g, // large / separated number
   /\b\d+\.\d+\b/g, // decimal
-  /\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b/g, // CONST_IDS / env var names
+  /\b[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+\b/g, // CONST_IDS / env var names
   // camelCase / PascalCase with ≥1 lowercase run and ≥1 internal capital
   // (tokenLedgerShard, getUserById). Rejects ALL-CAPS words so history markers
   // like CURRENT/FRONTIER do not flood the sheet.
@@ -61,6 +61,87 @@ const MAX_SCAN = 262_144; // defensive input bound; tool_results are already pag
 const FACTSHEET_PAGE_CHARS = 28_080;
 const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (base64, minified) — skip
 
+const M_DIGIT = 1 << 0;
+const M_UPPER = 1 << 1;
+const M_LOWER = 1 << 2;
+const M_EQ    = 1 << 3;
+const M_SLASH = 1 << 4;
+const M_AT    = 1 << 5;
+const M_DASH  = 1 << 6;
+const M_DOT   = 1 << 7;
+const M_UNDER = 1 << 8;
+const M_CURR  = 1 << 9;
+
+// Required character-class mask per pattern in PATTERNS (same index order 0..16).
+const SAFE_PATTERN_REQ_MASK: readonly number[] = [
+  M_EQ | M_UPPER,
+  M_EQ,
+  M_SLASH | M_LOWER,
+  M_AT | M_DOT,
+  M_DASH,
+  M_UPPER | M_DIGIT,
+  M_DIGIT,
+  M_SLASH | M_DOT,
+  M_SLASH,
+  M_DIGIT,
+  M_DIGIT | M_DOT,
+  M_DASH,
+  M_DIGIT,
+  M_DIGIT | M_DOT,
+  M_UPPER | M_UNDER,
+  M_UPPER | M_LOWER,
+  M_UPPER | M_DASH | M_DIGIT,
+];
+
+function chunkCharMask(chunk: string): number {
+  let m = 0;
+  for (let i = 0; i < chunk.length; i++) {
+    const c = chunk.charCodeAt(i);
+    if (c >= 48 && c <= 57) m |= M_DIGIT;
+    else if (c >= 65 && c <= 90) m |= M_UPPER;
+    else if (c >= 97 && c <= 122) m |= M_LOWER;
+    else if (c === 61) m |= M_EQ;
+    else if (c === 47) m |= M_SLASH;
+    else if (c === 64) m |= M_AT;
+    else if (c === 45) m |= M_DASH;
+    else if (c === 46) m |= M_DOT;
+    else if (c === 95) m |= M_UNDER;
+    else if (c === 36 || c === 0x20ac || c === 0xa3 || c === 0xa5) m |= M_CURR;
+  }
+  return m;
+}
+
+const FACTSHEET_CACHE_CAP = 512;
+const factsheetDigestCache = new Map<string, readonly FactSheetEntry[]>();
+
+// Key by 128-bit digest + length so the LRU holds zero copies of large slab inputs.
+function factSheetDigestKey(scan: string): string {
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x9e3779b1 >>> 0;
+  let h3 = 0x85ebca6b >>> 0;
+  let h4 = 0xc2b2ae35 >>> 0;
+  for (let i = 0; i < scan.length; i++) {
+    const c = scan.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ ((c + i) & 0xffff), 0x01000193);
+    h3 = Math.imul(h3 ^ c, 0x85ebca77);
+    h4 = Math.imul(h4 ^ ((c << 3) | (i & 7)), 0xc2b2ae3d);
+  }
+  return (
+    (h1 >>> 0).toString(16).padStart(8, '0') +
+    (h2 >>> 0).toString(16).padStart(8, '0') +
+    (h3 >>> 0).toString(16).padStart(8, '0') +
+    (h4 >>> 0).toString(16).padStart(8, '0') +
+    ':' +
+    scan.length
+  );
+}
+
+/** Test helper: reset bounded digest cache for factsheet extraction. */
+export function clearFactSheetCache(): void {
+  factsheetDigestCache.clear();
+}
+
 /** Budget priority by token SHAPE, not length — length is anti-correlated with
  *  OCR-risk×consequence: a 70-char URL is structured and reconstructable, while a 7-char
  *  hex SHA or a port has zero redundancy and fails silently when misread. So short opaque
@@ -71,7 +152,7 @@ const SHAPE_EMAIL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-
 const SHAPE_IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{8,30}$/;
 const SHAPE_CURRENCY = /^(?:[$€£¥]|(?:USD|EUR|GBP|CAD|AUD|CHF|JPY))\d(?:[\d,_]*\d)?(?:\.\d{2})?$/;
 const SHAPE_HEX = /^(?=[0-9a-f]*\d)[0-9a-f]{7,40}$/; // git sha / opaque hex
-const SHAPE_CONST = /^[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+$/; // CONST_IDS / env vars
+const SHAPE_CONST = /^[A-Z][A-Z0-9]+(?:_[A-Z0-9]+)+$/; // CONST_IDS / env vars
 const SHAPE_TICKET = /^(?=[A-Z0-9-]*\d)[A-Z][A-Z0-9]+(?:-[A-Z0-9]+)+$/; // PROJ-1482 / CVE-2024-30078
 const SHAPE_FLAG = /^--?[A-Za-z][\w-]+$/; // CLI flag
 const SHAPE_NUM = /^\d[\d,_]*$|^\d+\.\d+$/; // port / large or separated number / decimal
@@ -140,21 +221,48 @@ export interface FactSheetEntry {
  */
 export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
+  const cacheKey = scan.length >= 64 ? factSheetDigestKey(scan) : '';
+  if (cacheKey) {
+    const cached = factsheetDigestCache.get(cacheKey);
+    if (cached !== undefined) {
+      factsheetDigestCache.delete(cacheKey);
+      factsheetDigestCache.set(cacheKey, cached);
+      // Shallow-clone entries so callers never mutate cached arrays/objects in place.
+      return cached.map((e) => ({ token: e.token, count: e.count }));
+    }
+  }
+
   const counts = new Map<string, number>();
+  const trailingPunct = /[.,;:!?]+$/;
   for (const chunk of scan.split(/\s+/)) {
     if (chunk.length < MIN_LEN || chunk.length > MAX_CHUNK) continue;
-    // Offset-level dedup WITHIN this chunk: two patterns matching the identical
-    // token at the same position must count once. Keyed by token+start offset.
-    const spanSeen = new Set<string>();
-    for (const re of PATTERNS) {
-      for (const m of chunk.matchAll(re)) {
+    const mask = chunkCharMask(chunk);
+    // Offset-level dedup WITHIN this chunk: lazily allocate Set only when >= 2 matches occur.
+    let firstKey: string | undefined;
+    let spanSeen: Set<string> | null = null;
+    for (let pIdx = 0; pIdx < PATTERNS.length; pIdx++) {
+      const req = SAFE_PATTERN_REQ_MASK[pIdx]!;
+      if ((mask & req) !== req) continue;
+      if (pIdx === 6 && !(mask & (M_CURR | M_UPPER))) continue;
+      const re = PATTERNS[pIdx]!;
+      re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(chunk)) !== null) {
         // Strip trailing sentence punctuation pulled in from prose (`pull/93.` → `pull/93`);
         // no real identifier we extract ends in these.
-        const tok = (m[1] ?? m[0]).trim().replace(/[.,;:!?]+$/, '');
+        const tok = (m[1] ?? m[0]).trim().replace(trailingPunct, '');
         if (tok.length < MIN_LEN || tok.length > MAX_LEN) continue;
-        const key = `${m.index ?? 0}\x00${tok}`;
-        if (spanSeen.has(key)) continue;
-        spanSeen.add(key);
+        const key = `${m.index}\x00${tok}`;
+        if (firstKey === undefined) {
+          firstKey = key;
+        } else if (spanSeen === null) {
+          if (key === firstKey) continue;
+          spanSeen = new Set<string>([firstKey, key]);
+        } else if (spanSeen.has(key)) {
+          continue;
+        } else {
+          spanSeen.add(key);
+        }
         counts.set(tok, (counts.get(tok) ?? 0) + 1);
       }
     }
@@ -164,9 +272,16 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
   // a URL's path-portion into the full URL. Cross-tier on purpose. Total order (length,
   // then lexical) so the result is independent of Set iteration order.
   const ordered = [...counts.keys()].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+  // `\n`-delimited buffer preserves O(K) substring dedup (tokens are whitespace-split
+  // and `ordered` is length-desc, so a shorter token matches iff it is a substring of a
+  // kept longer token without ever spanning across `\n` boundaries).
   const specific: string[] = [];
+  let joinedSpecific = '';
   for (const t of ordered) {
-    if (!specific.some((k) => k.includes(t))) specific.push(t);
+    if (!joinedSpecific.includes(t)) {
+      specific.push(t);
+      joinedSpecific += '\n' + t;
+    }
   }
   // Phase 2 — allocate the budget by priority tier (shape, not length) so short,
   // zero-redundancy tokens (SHAs, ports, flags) can never be evicted by long low-risk URLs.
@@ -181,7 +296,15 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
     if (tier === 2 && urls++ >= MAX_URLS) continue;
     kept.push(t);
   }
-  return kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
+  const result = kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
+  if (cacheKey) {
+    if (factsheetDigestCache.size >= FACTSHEET_CACHE_CAP) {
+      const oldest = factsheetDigestCache.keys().next().value;
+      if (oldest !== undefined) factsheetDigestCache.delete(oldest);
+    }
+    factsheetDigestCache.set(cacheKey, result);
+  }
+  return result;
 }
 
 /**
@@ -213,22 +336,47 @@ export function extractFactSheetEntriesAllPages(
   charsPerPage: number,
 ): { kept: FactSheetEntry[]; dropped: number } {
   const counts = new Map<string, number>();
-  const all: string[] = [];
+  const step = Math.max(1, Number.isFinite(charsPerPage) ? Math.floor(charsPerPage) : 1);
 
-  // Walk the text in page-sized chunks. Each chunk is ≤ charsPerPage < MAX_SCAN,
-  // so extractFactSheetEntries will not truncate within a chunk.
-  const pageCount = Math.max(1, Math.ceil(text.length / charsPerPage));
-  for (let i = 0; i < pageCount; i++) {
-    const chunk = text.slice(i * charsPerPage, (i + 1) * charsPerPage);
+  // Walk the text in page-sized chunks snapped to whitespace boundaries so we
+  // neither loop endlessly on small inputs nor slice an identifier in half.
+  let pos = 0;
+  while (pos < text.length || pos === 0) {
+    let end = Math.min(text.length, pos + step);
+    if (end < text.length && !/\s/.test(text[end] ?? '') && !/\s/.test(text[end - 1] ?? '')) {
+      let back = end;
+      while (back > pos && !/\s/.test(text[back - 1]!)) back--;
+      if (back > pos + Math.floor(step / 2)) {
+        end = back;
+      } else {
+        let fwd = end;
+        while (fwd < text.length && fwd - end < 128 && !/\s/.test(text[fwd]!)) fwd++;
+        if (fwd < text.length && /\s/.test(text[fwd]!)) end = fwd + 1;
+      }
+    }
+    const chunk = text.slice(pos, end);
     for (const { token, count } of extractFactSheetEntries(chunk)) {
-      if (!counts.has(token)) all.push(token);
       counts.set(token, (counts.get(token) ?? 0) + count);
+    }
+    if (end >= text.length) break;
+    pos = end;
+  }
+
+  // Re-run global substring deduplication across pages so a longer token on page 2
+  // folds an extracted path substring from page 1, then apply the global priority budget.
+  const ordered = [...counts.keys()].sort(
+    (a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0),
+  );
+  const specific: string[] = [];
+  let joinedSpecific = '';
+  for (const t of ordered) {
+    if (!joinedSpecific.includes(t)) {
+      specific.push(t);
+      joinedSpecific += '\n' + t;
     }
   }
 
-  // Re-apply the global priority budget so a tier-0 identifier on page 5
-  // is never evicted by many tier-1 tokens from page 1.
-  const ranked = all
+  const ranked = specific
     .map((t) => ({ t, tier: priorityTier(t) }))
     .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
   const kept: FactSheetEntry[] = [];
@@ -239,7 +387,7 @@ export function extractFactSheetEntriesAllPages(
     kept.push({ token: t, count: counts.get(t) ?? 1 });
   }
 
-  return { kept, dropped: all.length - kept.length };
+  return { kept, dropped: specific.length - kept.length };
 }
 
 const OPEN =

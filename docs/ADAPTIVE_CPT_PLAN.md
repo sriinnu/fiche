@@ -115,7 +115,7 @@ noise-dominated), fall back to the baked default for that bucket only.
 
 ### 3c. State file
 
-Persist learned cpts at `~/.inkling/cpt-state.jsonl`, one line per
+Persist learned cpts at `~/.fiche/cpt-state.jsonl` (historically `~/.inkling/cpt-state.jsonl`), one line per
 `system_sha8`:
 
 ```json

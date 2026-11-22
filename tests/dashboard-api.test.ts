@@ -381,14 +381,14 @@ describe('serveFragment', () => {
 describe('dashboard host label', () => {
   it('names the host in the title and topbar so two hosts are distinguishable', () => {
     const html = renderPage(47821, 'ber-dev-lm-ai');
-    expect(html).toContain('<title>ber-dev-lm-ai · inkling dashboard</title>');
+    expect(html).toContain('<title>ber-dev-lm-ai · fiche dashboard</title>');
     expect(html).toContain('class="hostchip"');
     expect(html).toContain('>ber-dev-lm-ai<');
   });
 
   it('renders the unlabelled page when no host label is given', () => {
     const html = renderPage(47821);
-    expect(html).toContain('<title>inkling — live dashboard</title>');
+    expect(html).toContain('<title>fiche — live dashboard</title>');
     expect(html).not.toContain('class="hostchip"');
   });
 
@@ -422,7 +422,7 @@ describe('dashboard page help UI', () => {
     expect(html).toContain('content: attr(data-tip)');
   });
 
-  it('compares imaged requests with their own without-inkling counterfactual', () => {
+  it('compares imaged requests with their own without-fiche counterfactual', () => {
     const html = renderHeaderFragment({
       compressed_paid_requests: 600,
       compressed_actual_usd: 96.42,
@@ -435,8 +435,8 @@ describe('dashboard page help UI', () => {
     } as StatsPayload, 47821);
 
     expect(html).toContain('$0.1607');
-    expect(html).toContain('vs $0.4854 without inkling');
-    expect(html).not.toContain('vs $0.0722 without inkling');
+    expect(html).toContain('vs $0.4854 without fiche');
+    expect(html).not.toContain('vs $0.0722 without fiche');
     expect(html).toContain('same paid imaged requests');
   });
 });

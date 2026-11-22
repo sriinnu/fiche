@@ -7,9 +7,9 @@
  *    route could match and blindly tunnels the rest. Under warp the agent
  *    believes it is talking straight to api.anthropic.com, so the less we
  *    terminate, the fewer ways that belief can break.
- *  - wardex owns its listener; warp attaches to the proxy server inkling is
+ *  - wardex owns its listener; warp attaches to the proxy server fiche is
  *    already running. CONNECT is a distinct event from a normal request, so one
- *    port serves both the origin-form traffic inkling handles and the
+ *    port serves both the origin-form traffic fiche handles and the
  *    absolute-form/CONNECT traffic a forward proxy handles.
  */
 
@@ -57,26 +57,37 @@ export interface WarpHandlers {
 }
 
 /**
- * A CONNECT handler reachable off-host is an open relay, and inkling's HOST env
+ * A CONNECT handler reachable off-host is an open relay, and fiche's HOST env
  * var permits a non-loopback bind. The dashboard already refuses non-loopback
  * callers; the proxy duty needs the same guard for the same reason.
  */
 function isLoopbackAddress(address: string | undefined): boolean {
   if (!address) return false;
+  const lower = address.toLowerCase();
   return (
-    address === '::1' || address.startsWith('127.') || address.startsWith('::ffff:127.')
+    lower === '::1' || lower.startsWith('127.') || lower.startsWith('::ffff:127.')
   );
 }
 
 function splitHostPort(value: string, fallbackPort: string): { host: string; port: string } {
   if (value.startsWith('[')) {
     const end = value.indexOf(']');
+    if (end < 0) return { host: value, port: fallbackPort };
     const rest = value.slice(end + 1);
-    return { host: value.slice(1, end), port: rest.startsWith(':') ? rest.slice(1) : fallbackPort };
+    return {
+      host: value.slice(1, end),
+      port: rest.startsWith(':') && rest.length > 1 ? rest.slice(1) : fallbackPort,
+    };
   }
   const i = value.lastIndexOf(':');
   if (i < 0) return { host: value, port: fallbackPort };
-  return { host: value.slice(0, i), port: value.slice(i + 1) };
+  return { host: value.slice(0, i), port: value.slice(i + 1) || fallbackPort };
+}
+
+function parsePort(port: string): number | null {
+  if (!/^\d+$/.test(port)) return null;
+  const n = Number(port);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
 }
 
 /** `host:port`, bracketing IPv6 literals so the result is URL-parseable. */
@@ -137,7 +148,16 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     const path = requestUri.split('?')[0] ?? '/';
     const route = matchRoute(routes, hostPort, path);
 
-    const target = new URL(route ? rewriteUrl(route, requestUri) : `${origin}${requestUri}`);
+    let target: URL;
+    try {
+      target = new URL(route ? rewriteUrl(route, requestUri) : `${origin}${requestUri}`);
+    } catch {
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.writeHead(400, { 'content-type': 'text/plain' });
+        res.end('fiche warp: bad request target');
+      }
+      return;
+    }
     if (route && !announced.has(route.pattern)) {
       announced.add(route.pattern);
       onDivert?.(hostPort, path, target.origin);
@@ -179,24 +199,32 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       upstream.pipe(res);
     });
     outbound.on('error', (err) => {
+      if (!req.destroyed) req.destroy?.();
       // Our own teardown below surfaces here as ECONNRESET; the client is
       // already gone, so writing a 502 into it would throw.
       if (res.writableEnded || res.destroyed) return;
       if (res.headersSent) {
-        res.destroy(err);
+        res.destroy?.(err);
         return;
       }
       res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end(`inkling warp: upstream error: ${err.message}`);
+      res.end(`fiche warp: upstream error: ${err.message}`);
     });
     // An SSE completion only ends when the model stops. If the agent is killed
     // mid-stream nothing else cancels the upstream: the response keeps draining
     // into a dead socket, and the keepAlive agent later hands that same
     // half-consumed connection to the next request.
-    res.on('close', () => {
-      if (res.writableFinished) return;
+    const cleanup = () => {
       upstreamRes?.destroy();
       outbound.destroy();
+    };
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      cleanup();
+    });
+    res.on('error', cleanup);
+    req.on('error', (err) => {
+      if (!outbound.destroyed) outbound.destroy(err);
     });
     req.pipe(outbound);
   };
@@ -219,7 +247,16 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
     const servername = (req.socket as TLSSocket).servername || '';
     const { host, port } = splitHostPort(req.headers.host || servername, '443');
-    const upstream = tlsConnect({ host, port: Number(port), servername: host }, () => {
+    const portNum = parsePort(port);
+    if (!host || portNum === null) {
+      clientSocket.destroy();
+      return;
+    }
+    const upstream = tlsConnect({ host, port: portNum, servername: host }, () => {
+      if (clientSocket.destroyed) {
+        upstream.destroy();
+        return;
+      }
       const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
       for (const [key, value] of Object.entries(req.headers)) {
         for (const v of Array.isArray(value) ? value : [value]) {
@@ -232,6 +269,9 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     });
     upstream.on('error', () => clientSocket.destroy());
     clientSocket.on('error', () => upstream.destroy());
+    clientSocket.once('close', () => {
+      if (!upstream.destroyed) upstream.destroy();
+    });
   };
 
   // Forcing http/1.1 via ALPN keeps the decrypted stream parseable by
@@ -258,15 +298,27 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
     const { host, port } = splitHostPort(req.url ?? '', '443');
+    const portNum = parsePort(port);
+    if (!host || portNum === null) {
+      clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+      return;
+    }
 
     if (!hostCouldMatch(routes, authority(host, port))) {
-      const upstream = netConnect({ host, port: Number(port) }, () => {
+      const upstream = netConnect({ host, port: portNum }, () => {
+        if (clientSocket.destroyed) {
+          upstream.destroy();
+          return;
+        }
         clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
         if (head?.length) upstream.write(head);
         pipeSockets(clientSocket, upstream);
       });
       upstream.on('error', () => clientSocket.destroy());
       clientSocket.on('error', () => upstream.destroy());
+      clientSocket.once('close', () => {
+        if (!upstream.destroyed) upstream.destroy();
+      });
       return;
     }
 
@@ -280,7 +332,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const handleAbsoluteForm = (req: IncomingMessage, res: ServerResponse): void => {
     if (!isLoopbackAddress(req.socket.remoteAddress)) {
       res.writeHead(403, { 'content-type': 'text/plain' });
-      res.end('inkling warp: forward proxy is loopback-only');
+      res.end('fiche warp: forward proxy is loopback-only');
       return;
     }
     let target: URL;
@@ -288,12 +340,12 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       target = new URL(req.url ?? '');
     } catch {
       res.writeHead(400, { 'content-type': 'text/plain' });
-      res.end('inkling warp: bad absolute URI');
+      res.end('fiche warp: bad absolute URI');
       return;
     }
     if (target.protocol !== 'http:' && target.protocol !== 'https:') {
       res.writeHead(400, { 'content-type': 'text/plain' });
-      res.end('inkling warp: unsupported scheme');
+      res.end('fiche warp: unsupported scheme');
       return;
     }
     // A pattern that names a port is matched against "host:port", and the

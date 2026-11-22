@@ -236,7 +236,7 @@ describe('emission', () => {
     const pins = foldPins(msgs, opencodeSystem(AGENTS_MD));
     expect(appendPinBlock(msgs, pins)).toBeGreaterThan(0);
     const blocks = msgs[0]!.content as TextBlock[];
-    expect(blocks[blocks.length - 1]!.text).toContain('[inkling pin]');
+    expect(blocks[blocks.length - 1]!.text).toContain('[fiche pin]');
     expect(blocks[blocks.length - 1]!.text).toContain('be concise, no walls of text');
   });
 });

@@ -46,6 +46,14 @@ export interface TrackEvent {
   image_pixels?: number;
   /** Provider-estimated vision tokens billed for rendered images. */
   image_tokens?: number;
+  /** Chars/tokens removed by prefix-safe deterministic tool-output hygiene. */
+  text_hygiene_saved_chars?: number;
+  text_hygiene_saved_tokens?: number;
+  text_hygiene_blocks?: number;
+  text_hygiene_stages?: string[];
+  /** Set when compression pulled the prompt below a long-context pricing cliff. */
+  cliff_avoided_at?: number;
+  cliff_saved_usd?: number;
   /** Provider-specific text-token estimate for imaged/stripped content. */
   baseline_imaged_tokens?: number;
   /** Provider-specific estimate of inkling-added native text. */
@@ -264,6 +272,22 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.imageTokens !== undefined && info.imageTokens > 0) {
       out.image_tokens = info.imageTokens;
+    }
+    if ((info.textHygieneSavedChars ?? 0) > 0) {
+      out.text_hygiene_saved_chars = info.textHygieneSavedChars;
+    }
+    if ((info.textHygieneSavedTokens ?? 0) > 0) {
+      out.text_hygiene_saved_tokens = info.textHygieneSavedTokens;
+    }
+    if ((info.textHygieneBlocks ?? 0) > 0) {
+      out.text_hygiene_blocks = info.textHygieneBlocks;
+    }
+    if (info.textHygieneStages && info.textHygieneStages.length > 0) {
+      out.text_hygiene_stages = [...info.textHygieneStages];
+    }
+    if (info.cliffAvoided && info.cliffAvoided.savedUsd > 0) {
+      out.cliff_avoided_at = info.cliffAvoided.at;
+      out.cliff_saved_usd = Math.round(info.cliffAvoided.savedUsd * 1e6) / 1e6;
     }
     if (info.baselineImagedTokens !== undefined && info.baselineImagedTokens > 0) {
       out.baseline_imaged_tokens = info.baselineImagedTokens;

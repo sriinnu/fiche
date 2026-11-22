@@ -15,14 +15,17 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
+import { buildWarpAppArgs, type ResolvedMacApp } from './app-launch.js';
 import { createWarpHandlers } from './connect.js';
 import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
+import { readBrandEnv } from '../core/env.js';
 import { buildUpstreamRegistry, parseUpstreamHosts } from '../core/upstream-hosts.js';
 
 export interface WarpRuntimeOptions {
@@ -34,6 +37,8 @@ export interface WarpRuntimeOptions {
    * than api.anthropic.com (codex, opencode) need one rule each.
    */
   routes?: readonly string[];
+  /** Optional resolved macOS desktop `.app` bundle launched via `fiche warp --app`. */
+  app?: ResolvedMacApp;
 }
 
 export interface WarpRuntime {
@@ -46,15 +51,21 @@ export interface WarpRuntime {
  * telemetry, the control plane — is re-originated untouched, which is what
  * keeps the agent's client-side gates satisfied.
  */
-function defaultRoutes(port: number): Route[] {
+export function defaultRoutes(port: number): Route[] {
   return [
     parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`),
+    parseRoute(`api.openai.com/v1/responses*=http://127.0.0.1:${port}`),
+    parseRoute(`api.openai.com/v1/chat/completions*=http://127.0.0.1:${port}`),
+    parseRoute(`chatgpt.com/backend-api/codex/responses*=http://127.0.0.1:${port}`),
+    parseRoute(`cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
     parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
+    parseRoute(`generativelanguage.googleapis.com/v1beta/openai/chat/completions*=http://127.0.0.1:${port}`),
     ...compatRoutes(port),
   ];
 }
@@ -68,7 +79,7 @@ const COMPAT_INFERENCE_PATHS = ['/v1/messages', '/messages', '/v1/chat/completio
  * rest). Only inference paths under each registered API prefix are diverted.
  */
 export function compatRoutes(port: number): Route[] {
-  const registry = buildUpstreamRegistry(parseUpstreamHosts(process.env.INKLING_UPSTREAM_HOSTS));
+  const registry = buildUpstreamRegistry(parseUpstreamHosts(readBrandEnv('UPSTREAM_HOSTS')));
   const specs = new Set<string>();
   for (const entry of registry.values()) {
     if (entry.family !== 'compat') continue;
@@ -87,7 +98,11 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     ...(options.routes ?? []).map((spec) => parseRoute(spec)),
     ...defaultRoutes(port),
   ];
-  const ca = CertificateAuthority.loadOrCreate(join(homedir(), '.inkling'));
+  const caDir = join(homedir(), '.fiche');
+  const legacyCaDir = join(homedir(), '.inkling');
+  // Reuse legacy ~/.inkling CA dir if ~/.fiche doesn't exist yet so installed trust certs keep working.
+  const resolvedCaDir = existsSync(caDir) || !existsSync(legacyCaDir) ? caDir : legacyCaDir;
+  const ca = CertificateAuthority.loadOrCreate(resolvedCaDir);
 
   const handlers = createWarpHandlers({
     routes,
@@ -98,7 +113,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // silent when a human is looking at the agent. events.jsonl records the
     // request either way.
     onDivert: (host, path, target) => {
-      if (!process.stdout.isTTY) console.error(`[inkling] warp: ${host}${path} → ${target}`);
+      if (!process.stdout.isTTY) console.error(`[fiche] warp: ${host}${path} → ${target}`);
     },
   });
 
@@ -109,6 +124,9 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const proxy = createServer(handlers.handleAbsoluteForm);
   proxy.on('connection', (socket) => socket.setNoDelay(true));
   proxy.on('connect', handlers.handleConnect);
+  /** POSIX single-quote: safe for anything except a single quote itself. */
+  const shellQuote = (arg: string): string => `'${arg.replaceAll("'", `'\\''`)}'`;
+
   /**
    * Does the user's interactive shell consider this word an alias? Both zsh
    * ("cc is an alias for ...") and bash ("cc is aliased to ...") answer through
@@ -117,15 +135,12 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
    */
   const shellAliasTarget = (name: string, shell: string, env: NodeJS.ProcessEnv): string | null => {
     if (name.includes('/')) return null;
-    const probe = spawnSync(shell, ['-ic', `type -- ${name}`], { encoding: 'utf8', env });
+    const probe = spawnSync(shell, ['-ic', `type -- ${shellQuote(name)}`], { encoding: 'utf8', env });
     const match = /\bis (?:an alias for|aliased to)\s+(.+)$/m.exec(probe.stdout ?? '');
     if (!match) return null;
     // bash wraps the expansion in `backtick quote'; zsh leaves it bare.
     return match[1]!.trim().replace(/^`/, '').replace(/'$/, '');
   };
-
-  /** POSIX single-quote: safe for anything except a single quote itself. */
-  const shellQuote = (arg: string): string => `'${arg.replaceAll("'", `'\\''`)}'`;
 
   /**
    * Run the child, falling back to the user's interactive shell when the
@@ -143,6 +158,10 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const spawnResolved = (command: string[], env: NodeJS.ProcessEnv) => {
     const direct = { stdio: 'inherit', env } as const;
     const shell = env.SHELL || '/bin/sh';
+    const cmd0 = command[0]!;
+    // Only plain command words are valid interactive-shell alias names; anything
+    // with spaces, paths, or shell metacharacters must never hit unquoted `shell -ic`.
+    const safeAliasWord = /^[A-Za-z0-9._+-]+$/.test(cmd0);
     // Native Windows has no /bin/sh, and Git Bash's SHELL=/usr/bin/bash is not
     // a path Node can spawn. Without a usable shell there are no aliases to
     // consult and no fallback to take.
@@ -150,7 +169,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // An alias can shadow a real binary: `cc` is Apple clang on PATH and a
     // Claude Code alias in the user's zsh, so PATH alone would silently run
     // the wrong program. Ask the interactive shell what the word means first.
-    const alias = shellUsable ? shellAliasTarget(command[0]!, shell, env) : null;
+    const alias = shellUsable && safeAliasWord ? shellAliasTarget(cmd0, shell, env) : null;
     // But a stale alias must not shadow a working binary either. An alias
     // pointing at an uninstalled path (`claude` -> /opt/homebrew/bin/claude
     // after a move to a node-managed install) would otherwise fail the launch
@@ -159,21 +178,21 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     const aliasWord = alias?.split(/\s+/)[0] ?? '';
     const aliasUsable = alias !== null && (aliasWord.includes('=') || isRunnable(aliasWord, env));
     if (alias !== null && !aliasUsable) {
-      console.error(`[inkling] warp: ignoring stale alias ${command[0]} → ${aliasWord} (not executable)`);
+      console.error(`[fiche] warp: ignoring stale alias ${cmd0} → ${aliasWord} (not executable)`);
     }
-    if (!aliasUsable && isRunnable(command[0]!, env)) {
-      return spawn(command[0]!, command.slice(1), direct);
+    if (!aliasUsable && isRunnable(cmd0, env)) {
+      return spawn(cmd0, command.slice(1), direct);
     }
-    if (!shellUsable) {
+    if (!shellUsable || !safeAliasWord) {
       // Let spawn() report the real ENOENT for the command itself rather
-      // than a misleading one for a shell that was never there.
-      return spawn(command[0]!, command.slice(1), direct);
+      // than a misleading one for a shell that was never there or unsafe word.
+      return spawn(cmd0, command.slice(1), direct);
     }
-    console.error(`[inkling] warp: resolving ${command[0]} via interactive shell fallback`);
+    console.error(`[fiche] warp: resolving ${cmd0} via interactive shell fallback`);
     // The command word is deliberately left unquoted: a shell only expands
     // aliases on unquoted words, so quoting it would defeat the entire point of
     // this fallback. Arguments are still quoted — they are data, never aliases.
-    const script = [command[0]!, ...command.slice(1).map(shellQuote)].join(' ');
+    const script = [cmd0, ...command.slice(1).map(shellQuote)].join(' ');
     return spawn(shell, ['-ic', script], direct);
   };
 
@@ -203,8 +222,10 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     env.SSL_CERT_FILE = ca.bundlePath; // OpenSSL: curl, Rust, Go with cgo
     env.CURL_CA_BUNDLE = ca.bundlePath; // libcurl
     env.REQUESTS_CA_BUNDLE = ca.bundlePath; // Python requests / httpx
+    env.FICHE_BYPASS = '1'; // prevent recursive wrapper execution inside shell-init functions
 
-    const child = spawnResolved(command, env);
+    const execArgv = options.app ? buildWarpAppArgs(options.app, proxyUrl, command) : command;
+    const child = spawnResolved(execArgv, env);
     // The child's proxy and CA point at this process. If warp dies for any
     // reason the child is reparented to init and keeps running against a closed
     // port, so every request fails and the agent looks hung instead of exiting.
@@ -243,16 +264,16 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     const die = (err: unknown): void => {
       const code = (err as NodeJS.ErrnoException | undefined)?.code;
       if (typeof code === 'string' && NET_ERRNO.has(code)) {
-        console.error(`[inkling] warp: connection error ${code} (continuing)`);
+        console.error(`[fiche] warp: connection error ${code} (continuing)`);
         return;
       }
-      console.error(`[inkling] warp: ${err instanceof Error ? err.stack : String(err)}`);
+      console.error(`[fiche] warp: ${err instanceof Error ? err.stack : String(err)}`);
       process.exit(1);
     };
     process.on('uncaughtException', die);
     process.on('unhandledRejection', die);
     child.on('error', (err) => {
-      console.error(`[inkling] warp: cannot run ${command[0]}: ${err.message}`);
+      console.error(`[fiche] warp: cannot run ${command[0]}: ${err.message}`);
       process.exit(127);
     });
     // SIGHUP and SIGQUIT matter as much as the interactive two: closing the
@@ -278,34 +299,41 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   };
 
   const launch = (command: string[]): void => {
-    if (command.length === 0) {
-      console.error('[inkling] warp: nothing to run — usage: inkling warp -- <command> [args...]');
+    if (!options.app && command.length === 0) {
+      console.error('[fiche] warp: nothing to run — usage: fiche warp -- <command> [args...]');
       process.exit(2);
     }
     // Startup banner goes to stderr: stdout belongs to the child, so a caller
     // piping the agent's output gets the agent's bytes and nothing of ours.
     for (const route of routes) {
-      console.error(`[inkling] warp route → ${route.pattern} → ${routeDestination(route)}`);
+      console.error(`[fiche] warp route → ${route.pattern} → ${routeDestination(route)}`);
     }
-    console.error(`[inkling] warp CA → ${ca.certPath}`);
+    console.error(`[fiche] warp CA → ${ca.certPath}`);
     if (ca.systemRootsPath) {
-      console.error(`[inkling] warp CA bundle → ${ca.bundlePath} (+ system roots from ${ca.systemRootsPath})`);
+      console.error(`[fiche] warp CA bundle → ${ca.bundlePath} (+ system roots from ${ca.systemRootsPath})`);
     } else {
       console.error(
-        `[inkling] warp CA bundle → ${ca.bundlePath} (no system root bundle found; ` +
-          `non-inkling HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
+        `[fiche] warp CA bundle → ${ca.bundlePath} (no system root bundle found; ` +
+          `non-fiche HTTPS in the child may fail verification — set SSL_CERT_FILE to your OS bundle before warp)`,
       );
     }
-    console.error(`[inkling] warp exec → ${command.join(' ')}`);
+    if (options.app) {
+      const modeLabel = options.app.isElectron
+        ? 'Electron (--proxy-server + CA env)'
+        : 'native bundle (CA/proxy env — custom base URL still recommended if TLS-pinned)';
+      console.error(`[fiche] warp app → ${options.app.appName} [${modeLabel}] → ${options.app.appPath}`);
+    } else {
+      console.error(`[fiche] warp exec → ${command.join(' ')}`);
+    }
 
     proxy.on('error', (err) => {
-      console.error(`[inkling] warp: proxy listener failed: ${err.message}`);
+      console.error(`[fiche] warp: proxy listener failed: ${err.message}`);
       process.exit(1);
     });
     proxy.listen(0, '127.0.0.1', () => {
       const address = proxy.address();
       const proxyUrl = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
-      console.error(`[inkling] warp proxy → ${proxyUrl} (child only)`);
+      console.error(`[fiche] warp proxy → ${proxyUrl} (child only)`);
       spawnChild(command, proxyUrl);
     });
   };

@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 620" role="img" aria-label="fiche hybrid optical and deterministic text architecture">
+  <defs>
+    <linearGradient id="arch-prism" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#FF4D5A"/>
+      <stop offset="28%" stop-color="#FF6B2B"/>
+      <stop offset="56%" stop-color="#C026D3"/>
+      <stop offset="82%" stop-color="#0EA5E9"/>
+      <stop offset="100%" stop-color="#34D399"/>
+    </linearGradient>
+    <marker id="arrow-muted" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#64748B"/>
+    </marker>
+    <marker id="arrow-coral" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#FF6B2B"/>
+    </marker>
+    <marker id="arrow-cyan" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#38BDF8"/>
+    </marker>
+    <marker id="arrow-emerald" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+      <polygon points="0 0, 8 3, 0 6" fill="#34D399"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="620" fill="#0D1117"/>
+  <rect width="1200" height="4" fill="url(#arch-prism)"/>
+
+  <!-- Header -->
+  <text x="36" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" font-weight="700" fill="#F8FAFC">fiche — Cache-Safe Hybrid Optical &amp; Deterministic Text Architecture</text>
+  <text x="36" y="64" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#94A3B8">35.1–51.9% tokens saved · Up to 40.8% USD · 90.9% cache · 1.2–3.3 ms warm p50 · Pure src/core/ (0 node: imports)</text>
+
+  <!-- Host Runtime Outer Enclosure -->
+  <rect x="220" y="88" width="762" height="368" rx="12" fill="#10151E" stroke="#253042" stroke-width="1"/>
+  <rect x="238" y="80" width="236" height="16" rx="4" fill="#0D1117"/>
+  <text x="356" y="92" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" font-weight="600" letter-spacing="1.2" text-anchor="middle" fill="#64748B">LOCAL / EDGE PROXY · src/core/</text>
+
+  <!-- Node 1: Coding Agents -->
+  <rect x="30" y="204" width="164" height="136" rx="10" fill="#151C28" stroke="#334155" stroke-width="1.2"/>
+  <rect x="42" y="216" width="56" height="16" rx="4" fill="#1E293B"/>
+  <text x="70" y="227.5" font-family="ui-monospace, Menlo, monospace" font-size="9.5" font-weight="700" text-anchor="middle" fill="#94A3B8">CLIENTS</text>
+  <text x="42" y="253" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#F8FAFC">Coding Agents</text>
+  <text x="42" y="274" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#CBD5E1">Claude Code</text>
+  <text x="42" y="291" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#CBD5E1">OpenAI Codex</text>
+  <text x="42" y="308" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#CBD5E1">Antigravity · Gemini</text>
+  <text x="42" y="325" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#94A3B8">OpenCode · Gateways</text>
+
+  <!-- Node 2: Local Proxy / Edge Worker -->
+  <rect x="234" y="204" width="174" height="136" rx="10" fill="#151C28" stroke="#475569" stroke-width="1.2"/>
+  <rect x="246" y="216" width="66" height="16" rx="4" fill="#1E293B"/>
+  <text x="279" y="227.5" font-family="ui-monospace, Menlo, monospace" font-size="9.5" font-weight="700" text-anchor="middle" fill="#CBD5E1">INGRESS</text>
+  <text x="246" y="253" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#F8FAFC">Proxy / Worker</text>
+  <text x="246" y="274" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#38BDF8">127.0.0.1:47821</text>
+  <text x="246" y="291" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#CBD5E1">fiche warp (TLS)</text>
+  <text x="246" y="308" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#CBD5E1">src/worker.ts edge</text>
+  <text x="246" y="325" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#94A3B8">Origin &amp; Host guard</text>
+
+  <!-- Node 3: Edit-Safety Guard & Tier Router -->
+  <rect x="444" y="204" width="198" height="136" rx="10" fill="#171E2E" stroke="#A855F7" stroke-opacity="0.7" stroke-width="1.4"/>
+  <rect x="456" y="216" width="62" height="16" rx="4" fill="#2A1C3F"/>
+  <text x="487" y="227.5" font-family="ui-monospace, Menlo, monospace" font-size="9.5" font-weight="700" text-anchor="middle" fill="#D8B4FE">ROUTER</text>
+  <text x="456" y="253" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#F8FAFC">Safety &amp; Tier Gate</text>
+  <text x="456" y="274" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#34D399">isCodeOrDiffProtected()</text>
+  <text x="456" y="291" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#94A3B8">active reads &amp; diffs verbatim</text>
+  <text x="456" y="310" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#E2E8F0">FICHE_MODELS scope</text>
+  <text x="456" y="327" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#D8B4FE">readerTier(model)</text>
+
+  <!-- Node 4A: Optical Microfiche Engine -->
+  <rect x="688" y="106" width="276" height="142" rx="10" fill="#1F1616" stroke="#FF6B2B" stroke-opacity="0.85" stroke-width="1.5"/>
+  <rect x="702" y="118" width="114" height="16" rx="4" fill="#3A1D13"/>
+  <text x="759" y="129.5" font-family="ui-monospace, Menlo, monospace" font-size="9.5" font-weight="700" text-anchor="middle" fill="#FF9E64">STRONG READERS</text>
+  <text x="702" y="155" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#FFF7ED">Optical Microfiche Engine</text>
+  <text x="702" y="176" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#FED7AA">Reflow ↵ · 5×8 / 14px Atlas</text>
+  <text x="702" y="193" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#FDBA74">Avg-Filter PNG (~34% smaller)</text>
+  <text x="702" y="210" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#FDBA74">Verbatim FactSheet Anchors</text>
+  <text x="702" y="232" font-family="ui-monospace, Menlo, monospace" font-size="9.5" fill="#FF8A50">fable · gemini (up to 51.9% tok · 34.6% USD)</text>
+
+  <!-- Node 4B: 4-Layer Deterministic Text Engine -->
+  <rect x="688" y="274" width="276" height="164" rx="10" fill="#101D2B" stroke="#38BDF8" stroke-opacity="0.85" stroke-width="1.5"/>
+  <rect x="702" y="286" width="114" height="16" rx="4" fill="#0F2B42"/>
+  <text x="759" y="297.5" font-family="ui-monospace, Menlo, monospace" font-size="9.5" font-weight="700" text-anchor="middle" fill="#7DD3FC">TEXT / CODING</text>
+  <text x="702" y="322" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="14.5" font-weight="700" fill="#F0F9FF">4-Layer Text Compiler</text>
+  <text x="702" y="343" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#BAE6FD">1. TSCG schemas &amp; comments</text>
+  <text x="702" y="360" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#7DD3FC">2. VT / Drain folding &amp; @toon</text>
+  <text x="702" y="377" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#7DD3FC">3. ACDC epochs + Kosha Cliff Gate</text>
+  <text x="702" y="394" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#7DD3FC">4. CASI cross-turn diff deltas</text>
+  <text x="702" y="420" font-family="ui-monospace, Menlo, monospace" font-size="9.5" fill="#38BDF8">astra · opus-5-5 · grok · glm (up to 40.8% USD)</text>
+
+  <!-- Node 5: Append-Only Cache & Upstream APIs -->
+  <rect x="1006" y="204" width="164" height="136" rx="10" fill="#10211D" stroke="#34D399" stroke-opacity="0.8" stroke-width="1.4"/>
+  <rect x="1018" y="216" width="84" height="16" rx="4" fill="#133329"/>
+  <text x="1060" y="227.5" font-family="ui-monospace, Menlo, monospace" font-size="9.5" font-weight="700" text-anchor="middle" fill="#6EE7B7">UPSTREAM</text>
+  <text x="1018" y="253" font-family="-apple-system, 'Segoe UI', sans-serif" font-size="14" font-weight="700" fill="#ECFDF5">KV Cache &amp; APIs</text>
+  <text x="1018" y="274" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#A7F3D0">Append-Only Seal</text>
+  <text x="1018" y="291" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#6EE7B7">@fiche pin tail</text>
+  <text x="1018" y="308" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#34D399">90.9% Cache Hit</text>
+  <text x="1018" y="325" font-family="ui-monospace, Menlo, monospace" font-size="9.5" fill="#94A3B8">Anthropic · OAI · Google</text>
+
+  <!-- Arrows -->
+  <path d="M 194 272 L 232 272" stroke="#64748B" stroke-width="1.8" fill="none" marker-end="url(#arrow-muted)"/>
+  <path d="M 408 272 L 442 272" stroke="#64748B" stroke-width="1.8" fill="none" marker-end="url(#arrow-muted)"/>
+  <path d="M 642 244 C 664 244, 664 177, 686 177" stroke="#FF6B2B" stroke-width="1.8" fill="none" marker-end="url(#arrow-coral)"/>
+  <path d="M 642 300 C 664 300, 664 356, 686 356" stroke="#38BDF8" stroke-width="1.8" fill="none" marker-end="url(#arrow-cyan)"/>
+  <path d="M 964 177 C 984 177, 984 244, 1004 244" stroke="#34D399" stroke-width="1.8" fill="none" marker-end="url(#arrow-emerald)"/>
+  <path d="M 964 356 C 984 356, 984 300, 1004 300" stroke="#34D399" stroke-width="1.8" fill="none" marker-end="url(#arrow-emerald)"/>
+
+  <!-- Telemetry Down-Arrow from Proxy -->
+  <path d="M 321 340 L 321 480" stroke="#34D399" stroke-opacity="0.7" stroke-width="1.6" stroke-dasharray="5 4" fill="none" marker-end="url(#arrow-emerald)"/>
+  <text x="332" y="420" font-family="ui-monospace, Menlo, monospace" font-size="10.5" fill="#6EE7B7">async TrackEvent (&lt;0.5 ms)</text>
+
+  <!-- Zero-Token Telemetry Strip -->
+  <rect x="36" y="482" width="1128" height="104" rx="10" fill="#101822" stroke="#334155" stroke-width="1.2" stroke-dasharray="6 4"/>
+  <rect x="52" y="497" width="166" height="18" rx="4" fill="#133329"/>
+  <text x="135" y="509.5" font-family="ui-monospace, Menlo, monospace" font-size="10" font-weight="700" text-anchor="middle" fill="#34D399">ZERO-TOKEN TELEMETRY</text>
+  <text x="230" y="510" font-family="ui-monospace, Menlo, monospace" font-size="12" fill="#E2E8F0">~/.fiche/events.jsonl ($FICHE_LOG) · 0 extra LLM tokens billed</text>
+
+  <!-- 4 Telemetry Consumer Pills -->
+  <rect x="52" y="528" width="256" height="42" rx="7" fill="#151E2B" stroke="#263347"/>
+  <text x="66" y="546" font-family="ui-monospace, Menlo, monospace" font-size="12" font-weight="700" fill="#38BDF8">x-fiche-* HTTP Headers</text>
+  <text x="66" y="562" font-family="-apple-system, sans-serif" font-size="11" fill="#94A3B8">saved-tokens · stages · cliff-saved-usd</text>
+
+  <rect x="326" y="528" width="256" height="42" rx="7" fill="#151E2B" stroke="#263347"/>
+  <text x="340" y="546" font-family="ui-monospace, Menlo, monospace" font-size="12" font-weight="700" fill="#FF9E64">Live Dashboard :47821</text>
+  <text x="340" y="562" font-family="-apple-system, sans-serif" font-size="11" fill="#94A3B8">PNG crop inspector · session kill switch</text>
+
+  <rect x="600" y="528" width="256" height="42" rx="7" fill="#151E2B" stroke="#263347"/>
+  <text x="614" y="546" font-family="ui-monospace, Menlo, monospace" font-size="12" font-weight="700" fill="#34D399">fiche turn-report (&lt;5 ms)</text>
+  <text x="614" y="562" font-family="-apple-system, sans-serif" font-size="11" fill="#94A3B8">CLI · reverse tail scan · 1.9 MiB &lt;1 ms p50</text>
+
+  <rect x="874" y="528" width="274" height="42" rx="7" fill="#151E2B" stroke="#263347"/>
+  <text x="888" y="546" font-family="ui-monospace, Menlo, monospace" font-size="12" font-weight="700" fill="#D8B4FE">fiche-mcp &amp; IDE Plugins</text>
+  <text x="888" y="562" font-family="-apple-system, sans-serif" font-size="11" fill="#94A3B8">Antigravity hook · Claude Code statusLine</text>
+</svg>

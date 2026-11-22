@@ -1,7 +1,7 @@
 # Model render profiles
 
 The endpoint is a wire protocol, not a rendering profile. Claude, GPT, and Grok
-can all arrive on `/v1/responses`; inkling resolves geometry and vision billing
+can all arrive on `/v1/responses`; `fiche` resolves geometry and vision billing
 from the model id.
 
 A gateway may prefix that wire path with one routing segment and may qualify the
@@ -16,10 +16,12 @@ still forwards to the passthrough upstream.
 
 | model rule | default | cell | columns | max height | evidence |
 |---|:---:|---|---:|---:|---|
-| `claude-*` / `anthropic-*` | yes | JetBrains Mono 14px, 9×16 | 172 | 728 px | established Claude suites; Fable keeps dense (Spleen 5×8, 312 cols) |
-| `gpt-5.6-sol*` / `gpt-6.1-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | `gpt-6.1-sol`: 100/100 arith, 96/98 gist, 18/18 state, 0/16 guards, 15/15 hex (5×8 control: 20/98 gist, 9/18 state, 3/15 hex); `gpt-5.6-sol` pilot: 7/8 exact, 0 inventions |
-| `grok-*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | `grok-4.7`: 100/100 arith, 98/98 gist, 18/18 state, 0/16 guards, 14/15 hex (5×8 control: 85/100 arith, 14/98 gist, 5/18 state, 0/15 hex); `grok-4.5`/`4.6`: 100/100 arith, 97/98 gist, 17/18 state |
-| other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | conservative fallback |
+| `claude-fable-5` (original) | yes | Spleen 5×8 (+ Unifont 8px), 5×8 | 312 | 728 px | established Claude suites: 100/100 arith, 98/98 gist, 13/15 hex |
+| other `claude-*` (`fable-5-1`/`5-2`, etc.) | `fable-5-*` yes; others opt-in | Spleen 5×8 +2px rows (`cellHBonus: 2`), 5×10 | 312 | 728 px | spaced rows recover `fable-5-1`/`5-2` to 14/15 & 13/15 hex; 14px dropped on Claude as net-negative after cache |
+| `gemini-3.6-flash` / `3.7` / `3.8` / `gemini-4*` | yes (vision tiers) | Spleen 5×8 (+ Unifont 8px), 5×8 | 312 | 728 px | `gemini-4-argon`: 15/15 hex, 100/100 arith, 98/98 gist (`gemini-4-neon/carbon/hydrogen` stay text-only) |
+| `gpt-5.6-sol*` / `gpt-6.1-sol*` / `gpt-6.2-sol*` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 1954 px | `gpt-6.1-sol`: 100/100 arith, 96/98 gist, 18/18 state, 0/16 guards, 15/15 hex (5×8 control: 20/98 gist, 9/18 state, 3/15 hex); `gpt-5.6-sol` pilot: 7/8 exact, 0 inventions |
+| `grok-*` / `qwen3.8-27b` | opt-in | JetBrains Mono 14px, 9×16 | 84 | 512 px | `grok-4.7`: 100/100 arith, 98/98 gist, 18/18 state, 0/16 guards, 14/15 hex; `qwen3.8-27b`: 11/15 hex, `providerImageCap: 32` |
+| `gpt-6*` (non-Sol) & other GPT/o-series | opt-in | Spleen 5×8 | 152 | 1932 px | `GPT6_PROFILE` / conservative fallback (`gpt-6*-astra` stays text-only by default) |
 
 Every production path adds IDS rows to the image and an adjacent text factsheet
 for precision-critical strings. Recent and open protocol state remains native.
@@ -39,23 +41,23 @@ profitability gate skip transforms whose amortized create cost it predicts will
 lose.
 
 Sol and Grok remain opt-in because their broader image-reading results do not
-match Claude. Enable them explicitly with `INKLING_MODELS`, for example:
+match Fable/Gemini. Enable them explicitly with `FICHE_MODELS`, for example:
 
 ```bash
-INKLING_MODELS=claude-fable-5,gpt-5.6-sol
+FICHE_MODELS=claude-fable-5,gpt-5.6-sol
 ```
 `gpt-5.6-terra`, `gpt-6.1-terra`, and other non-Sol siblings do not inherit the Sol profile or allowlist.
 
 Evidence: [GPT-6.1 Sol 14px results](../eval/model-quality/results/gpt-6.1-sol/QUALITY_RESULTS.md) ([5×8 control](../eval/model-quality/results/gpt-6.1-sol-5x8/QUALITY_RESULTS.md)), [Sol pilot results](../eval/sol-profile/RESULTS.md), [Grok 4.7 14px results](../eval/model-quality/results/grok-4.7/QUALITY_RESULTS.md) ([5×8 control](../eval/model-quality/results/grok-4.7-5x8/QUALITY_RESULTS.md)), [Grok 4.5/4.6 results](../eval/grok-density/QUALITY_RESULTS.md).
 ## Overrides
 
-`INKLING_GPT_PROFILES` is a JSON map from model-id prefix to a partial profile.
-The longest prefix wins. Supported render fields are `font`, `cellWBonus`,
+`FICHE_GPT_PROFILES` (legacy `INKLING_GPT_PROFILES`) is a JSON map from model-id prefix to a partial profile.
+The longest prefix wins. Supported render fields are `font` (`spleen-5x8`, `jetbrains-mono-10`, `jetbrains-mono-12`, `jetbrains-mono-14`), `cellWBonus`,
 `cellHBonus`, `aa`, `grid`, `gridCols`, `colorCycle`, `markerScale`, and
 `markerRed`; geometry fields are `stripCols` and `maxHeightPx`.
 
 ```bash
-INKLING_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
+FICHE_GPT_PROFILES='{"gpt-5.6-sol":{"stripCols":120}}'
 ```
 
 The profitability gate uses the same resolved profile as the renderer, so a
@@ -65,11 +67,11 @@ style or geometry override cannot leave cost prediction on stale dimensions.
 
 `historyStripCols` and `historyStyle` override `stripCols` and `style` for
 **collapsed history only**. The static slab and tool-result pages keep the dense
-geometry. Both are undefined in every shipped profile, so leaving them out
-changes nothing.
+geometry. Both are undefined in shipped non-Claude profiles, so leaving them out
+changes nothing (`CLAUDE_SPACED_PROFILE` sets `style` and `historyStyle` to `spleen-5x8` with `cellHBonus: 2`).
 
 ```bash
-INKLING_GPT_PROFILES='{"claude-opus-5":{"historyStripCols":172,"historyStyle":{"font":"jetbrains-mono-14"}}}'
+FICHE_GPT_PROFILES='{"claude-opus-5":{"historyStripCols":172,"historyStyle":{"font":"jetbrains-mono-14"}}}'
 ```
 
 They exist because reading accuracy and rendering cost are not the same axis.
@@ -95,7 +97,7 @@ legibility it was meant to buy.
 
 ## Unmeasured families
 
-An id that names a family inkling HAS measured, but does not match any of that
+An id that names a family `fiche` HAS measured, but does not match any of that
 family's profiles — an unmeasured Gemini or Grok sibling — is refused by
 `isMisresolvedModelId`, and the request passes through as text. Such an id would
 otherwise fall through to `DEFAULT_GPT_PROFILE` and be gated with OpenAI's tile
@@ -105,8 +107,9 @@ An id that names no known family at all (anything reached through a gateway's
 OpenAI-compatible route — Kimi K3 on Cloudflare is the example this repo has
 run) is NOT refused. It resolves to
 `DEFAULT_GPT_PROFILE` and is gated with OpenAI's tile math as an approximation.
-`INKLING_MODELS` is the only gate: listing such a model is the operator asserting
-it is worth imaging. Two consequences worth stating plainly:
+`FICHE_MODELS` is the only gate: listing such a model is the operator asserting
+it is worth imaging (while text-only families like `deepseek`, `kimi`, `glm`,
+`minimax`, and `grok` stay in text-hygiene mode unless `FICHE_FORCE_IMAGES=1`). Two consequences worth stating plainly:
 
 - The savings figure is an approximation, not a measurement. If tile math
   overstates the model's real image cost, the gate declines transforms that
@@ -119,8 +122,8 @@ To replace the approximation with real numbers, declare the geometry and vision
 cost yourself:
 
 ```bash
-INKLING_MODELS=claude-fable-5,kimi-k3
-INKLING_GPT_PROFILES='{"kimi-k3":{"vision":{"regime":"mpix","tokensPerMegapixel":1000},"stripCols":152,"maxHeightPx":1932}}'
+FICHE_MODELS=claude-fable-5,kimi-k3
+FICHE_GPT_PROFILES='{"kimi-k3":{"vision":{"regime":"mpix","tokensPerMegapixel":1000},"stripCols":152,"maxHeightPx":1932}}'
 ```
 
 The `tokensPerMegapixel` above is a **placeholder, not a measurement** — read

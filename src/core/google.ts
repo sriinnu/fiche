@@ -5,7 +5,6 @@
  * passes transformed payloads to Google AI Studio.
  */
 
-import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
 import {
   READABLE_CHARS_PER_IMAGE,
   neutralizeSentinel,
@@ -14,9 +13,10 @@ import {
   shrinkColsToContent,
   type RenderedImage,
 } from './render.js';
-import { geminiVisionTokens, hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
+import { geminiVisionTokens, hasGeminiMeasuredProfile, isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
-import { classifyContent, compactSlabWhitespace, type TransformInfo } from './transform.js';
+import { classifyContent, compactSlabWhitespace, sha8, type TransformInfo } from './transform.js';
+import { sessionAnchorText } from './session-state.js';
 import {
   prepareImagedRenderText,
   droppedCodepointsTop,
@@ -29,10 +29,17 @@ import {
   COMPACT_HISTORY_TRANSCRIPT_OUTRO,
   pinnedRequestBlock,
 } from './openai.js';
-import { factSheetText } from './factsheet.js';
+import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import { relocateGooglePins } from './pin.js';
 import { compactPreview, verbatimTaskText } from './history.js';
+import { gateRatesFor, priceMode, resolvePriceRates } from './pricing.js';
+import {
+  applyGoogleTextHygiene,
+  isTextHygieneActive,
+  resolveTextHygieneMode,
+  type TextHygieneMode,
+} from './text-hygiene.js';
 export interface GooglePart {
   text?: string;
   inlineData?: {
@@ -70,7 +77,7 @@ export interface GoogleGenerateContentRequest {
   [key: string]: unknown;
 }
 
-const GOOGLE_ROUTE = /^\/google-ai-studio\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
+const GOOGLE_ROUTE = /^(?:\/google-ai-studio)?\/(?:v1|v1beta)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/;
 const CLOUDCODE_PA_INFERENCE_ROUTE = /^\/v1internal:(?:generateContent|streamGenerateContent)$/;
 
 export function parseGoogleModelFromPath(pathname: string): string | null {
@@ -113,9 +120,17 @@ interface GoogleHistoryUnit {
   opaque: boolean;
 }
 
+interface GoogleHistorySegment {
+  images: RenderedImage[];
+  imageSources: string[];
+  text: string;
+  factSheet: string;
+}
+
 interface GoogleHistoryPlan {
   start: number;
   endExclusive: number;
+  segments: GoogleHistorySegment[];
   images: RenderedImage[];
   imageSources: string[];
   text: string;
@@ -126,6 +141,26 @@ interface GoogleHistoryPlan {
   collapsedTurns: number;
   droppedChars: number;
   droppedCodepoints: Map<number, number>;
+}
+
+function countGoogleInlineImageBytes(req: GoogleGenerateContentRequest): number {
+  let bytes = 0;
+  const addParts = (parts?: GooglePart[]) => {
+    if (!Array.isArray(parts)) return;
+    for (const part of parts) {
+      if (part?.inlineData && typeof part.inlineData.data === 'string') {
+        bytes += part.inlineData.data.length;
+      }
+      if (part?.functionResponse && Array.isArray(part.functionResponse.parts)) {
+        addParts(part.functionResponse.parts);
+      }
+    }
+  };
+  addParts(req.systemInstruction?.parts);
+  if (Array.isArray(req.contents)) {
+    for (const c of req.contents) addParts(c?.parts);
+  }
+  return bytes;
 }
 
 interface GoogleToolResultPlan {
@@ -518,7 +553,7 @@ async function compressGoogleToolResults(
       const packed = options.reflow !== false ? reflow(safe) ?? safe : safe;
       const rendered = prepareImagedRenderText(
         `================= RENDERED TOOL RESULT: ${name} =================\n` +
-        'inkling rendered this completed tool result into image pages to reduce input tokens. Read it as the exact result returned by the tool.\n' +
+        'fiche rendered this completed tool result into image pages to reduce input tokens. Read it as the exact result returned by the tool.\n' +
         packed,
         false,
       );
@@ -622,30 +657,98 @@ async function planGoogleHistory(
   const cutoff = Math.max(0, units.length - profile.history.keepTail);
   // If there's only 1 user turn in the entire session (autonomous single-prompt agent),
   // keep turn 0 native so the prompt stays visible outside the image. In multi-turn
-  // chat, the active user turn is already in the kept tail, so collapse from turn 0.
+  // chat, collapse from turn 0, while anchoring tool chunk boundaries at turn 1 so
+  // sealed tool chunks NEVER shift when user turn #2 arrives.
   const userTurns: number[] = [];
   for (let i = 0; i < units.length; i++) {
     if (units[i]?.userText !== undefined) {
       userTurns.push(i);
     }
   }
-  const start = userTurns.length === 1 && userTurns[0] === 0 ? 1 : 0;
-  const boundary = googleClosedBoundary(units, start, cutoff);
+  let start = userTurns.length === 1 && userTurns[0] === 0 ? 1 : 0;
+  const anchorStart = userTurns[0] === 0 ? 1 : 0;
+  let boundary = googleClosedBoundary(units, start, cutoff);
   if (boundary < start || boundary + 1 - start < 4) return null;
-  const selected = units.slice(start, boundary + 1);
-  const eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+  let selected = units.slice(start, boundary + 1);
+  let eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
   if (eligibleTokens < profile.history.minCollapseTokens) return null;
 
-  // Admit only complete turns whose rendered pages fit. Rendering the entire history and
-  // slicing its PNGs would remove an unrendered suffix from the native request.
   const admitted: GoogleHistoryUnit[] = [];
+  const segments: GoogleHistorySegment[] = [];
   const images: RenderedImage[] = [];
   const imageSources: string[] = [];
+  const coveredTokens = new Set<string>();
   const minChunkTurns = 8;
   let cursor = 0;
+
+  // When turn 0 becomes part of collapsed history (`start === 0` & `anchorStart === 1`),
+  // skip rendering only when it is a short (<500 chars) pure user prompt (emitted verbatim/preview
+  // in `pinnedUserText`). If Turn 0 carries non-userText parts or >= 500 chars, render it into
+  // segment 0 so sealed chunks [1..k] still align at `anchorStart`; if budget is exhausted, fall
+  // back to keeping Turn 0 native (`start = 1`).
+  if (start === 0 && anchorStart === 1 && selected.length > 0) {
+    const headUnit = selected[0]!;
+    if (headUnit.userText !== undefined && headUnit.text.length < 500) {
+      admitted.push(headUnit);
+      cursor = 1;
+    } else if (!headUnit.text) {
+      admitted.push(headUnit);
+      cursor = 1;
+    } else {
+      const safe = neutralizeSentinel(headUnit.text);
+      const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
+      const headImages = await renderTextToPngs(
+        renderedText,
+        profile.stripCols,
+        profile.style,
+        profile.maxHeightPx,
+      );
+      if (headImages.length > 0 && headImages.length <= profile.history.maxImages) {
+        const segSheet = prepareFactSheet(headUnit.text, profile.factSheetFormat)(coveredTokens);
+        if (segSheet) {
+          for (const tok of extractFactSheetTokens(segSheet)) coveredTokens.add(tok);
+        }
+        const headSources = headImages.map(() => headUnit.text);
+        segments.push({
+          images: headImages,
+          imageSources: headSources,
+          text: headUnit.text,
+          factSheet: segSheet,
+        });
+        admitted.push(headUnit);
+        images.push(...headImages);
+        imageSources.push(...headSources);
+        cursor = 1;
+      } else {
+        start = 1;
+        boundary = googleClosedBoundary(units, start, cutoff);
+        if (boundary < start || boundary + 1 - start < 4) return null;
+        selected = units.slice(start, boundary + 1);
+        eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+        if (eligibleTokens < profile.history.minCollapseTokens) return null;
+        cursor = 0;
+      }
+    }
+  }
+
+  const maxPaybackReads = profile.history.maxCachePaybackReads ?? 10;
+  const rates = resolvePriceRates(modelName);
+  const compactFraming = profile.history.framing === 'compact';
+  const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
+  const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+  const framingOverheadTokens = googleTextTokens(`${intro}\n\n${outro}`);
+  const segmentPaysBack = (segBaselineTokens: number, segCollapsedTokens: number): boolean => {
+    if (segCollapsedTokens >= segBaselineTokens) return false;
+    const savedPerRead = (segBaselineTokens - segCollapsedTokens) * rates.read;
+    if (!(savedPerRead > 0)) return false;
+    const transitionCost = segCollapsedTokens * rates.write - segBaselineTokens * rates.read;
+    const paybackReads = Math.ceil(Math.max(0, transitionCost) / savedPerRead);
+    return paybackReads <= maxPaybackReads;
+  };
+
   while (cursor < selected.length && images.length < profile.history.maxImages) {
     const remaining = profile.history.maxImages - images.length;
-    let targetEnd = Math.min(selected.length, cursor + minChunkTurns);
+    let targetEnd = -1;
     let accruedChars = 0;
     for (let i = cursor; i < selected.length; i++) {
       accruedChars += selected[i]!.text.length + 2;
@@ -656,15 +759,19 @@ async function planGoogleHistory(
           break;
         }
       }
-      if (i === selected.length - 1) {
-        targetEnd = selected.length;
-      }
     }
+    if (targetEnd <= cursor) break;
     let candidateEnd = googleClosedBoundary(selected, cursor, targetEnd) + 1;
     let accepted = false;
     while (candidateEnd > cursor) {
       const chunk = selected.slice(cursor, candidateEnd);
       const chunkText = chunk.map((unit) => unit.text).filter(Boolean).join('\n\n');
+      if (!chunkText) {
+        admitted.push(...chunk);
+        cursor = candidateEnd;
+        accepted = true;
+        break;
+      }
       const safe = neutralizeSentinel(chunkText);
       const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
       const chunkImages = await renderTextToPngs(
@@ -674,9 +781,29 @@ async function planGoogleHistory(
         profile.maxHeightPx,
       );
       if (chunkImages.length > 0 && chunkImages.length <= remaining) {
+        const segSheet = prepareFactSheet(chunkText, profile.factSheetFormat)(coveredTokens);
+        const segImageTokens = chunkImages.reduce(
+          (sum, image) => sum + geminiVisionTokens(modelName, image.width, image.height),
+          0,
+        );
+        const segBaselineTokens = chunk.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+        const segCollapsedTokens = segImageTokens + framingOverheadTokens + googleTextTokens(segSheet);
+        if (!segmentPaysBack(segBaselineTokens, segCollapsedTokens)) {
+          break;
+        }
+        if (segSheet) {
+          for (const tok of extractFactSheetTokens(segSheet)) coveredTokens.add(tok);
+        }
+        const chunkSources = chunkImages.map(() => chunkText);
+        segments.push({
+          images: chunkImages,
+          imageSources: chunkSources,
+          text: chunkText,
+          factSheet: segSheet,
+        });
         admitted.push(...chunk);
         images.push(...chunkImages);
-        imageSources.push(...chunkImages.map(() => chunkText));
+        imageSources.push(...chunkSources);
         cursor = candidateEnd;
         accepted = true;
         break;
@@ -694,10 +821,8 @@ async function planGoogleHistory(
     (sum, image) => sum + geminiVisionTokens(modelName, image.width, image.height),
     0,
   );
-  const factSheet = factSheetText(text, profile.factSheetFormat);
-  const compactFraming = profile.history.framing === 'compact';
-  const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
-  const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
+  const segSheets = segments.map((s) => s.factSheet).filter(Boolean);
+  const factSheet = segSheets.join('\n');
   const endExclusive = start + admitted.length;
 
   // Identify the active user request: the latest human user turn, plus any
@@ -737,7 +862,11 @@ async function planGoogleHistory(
   if (collapsedUserIndices.length > 0) {
     const blocks: string[] = [];
     if (collapsedPriorIndices.length > 0) {
-      const recentPrior = collapsedPriorIndices.slice(-6);
+      // Never drop Turn 0 from prior-turn breadcrumbs when there are >6 user turns.
+      const recentPrior =
+        collapsedPriorIndices.length > 6 && collapsedPriorIndices[0] === 0
+          ? [0, ...collapsedPriorIndices.slice(-5)]
+          : collapsedPriorIndices.slice(-6);
       const priorLines = recentPrior.map(
         (i) => `<user t="${i}">${compactPreview(units[i]!.userText!)}</user>`,
       );
@@ -762,10 +891,13 @@ async function planGoogleHistory(
     pinnedUserText = blocks.join('\n\n');
   }
 
+  const segNativeText = segments
+    .map((s) => [intro, s.factSheet, outro].filter(Boolean).join('\n\n'))
+    .join('\n\n');
   const nativeTokens = googleTextTokens(
-    [intro, factSheet, outro, pinnedUserText].filter(Boolean).join('\n\n'),
+    [segNativeText, pinnedUserText].filter(Boolean).join('\n\n'),
   );
-  if (imageTokens + nativeTokens >= baselineTokens) return null;
+  if (!segmentPaysBack(baselineTokens, imageTokens + nativeTokens)) return null;
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;
   for (const image of images) {
@@ -777,6 +909,7 @@ async function planGoogleHistory(
   return {
     start,
     endExclusive,
+    segments,
     images,
     imageSources,
     text,
@@ -832,11 +965,35 @@ export function normalizeGoogleTurnRoles(contents: GoogleContent[]): GoogleConte
   return merged;
 }
 
+function firstGoogleUserText(contents: readonly GoogleContent[] | undefined): string {
+  if (!Array.isArray(contents)) return '';
+  const texts: string[] = [];
+  for (const turn of contents) {
+    if (!turn || typeof turn !== 'object') continue;
+    if (turn.role === 'model') {
+      if (texts.length > 0) break;
+      continue;
+    }
+    if (Array.isArray(turn.parts)) {
+      for (const part of turn.parts) {
+        if (part && typeof part === 'object' && typeof part.text === 'string' && part.text.trim()) {
+          texts.push(part.text);
+        }
+      }
+    }
+    if (texts.length > 0) break;
+  }
+  return sessionAnchorText(texts);
+}
+
 export async function transformGoogleGenerateContent(
   bodyBytes: Uint8Array,
   modelName: string,
   options: {
     compress?: boolean;
+    imageCompress?: boolean;
+    textHygiene?: boolean | TextHygieneMode;
+    expectedOutputTokens?: number;
     compressTools?: boolean;
     compressToolResults?: boolean;
     collapseHistory?: boolean;
@@ -846,22 +1003,21 @@ export async function transformGoogleGenerateContent(
     reflow?: boolean;
   } = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
-  if (!hasGeminiMeasuredProfile(modelName)) {
-    const info = createDefaultInfo(modelName);
-    info.reason = 'unsupported_model';
-    return { body: bodyBytes, info };
-  }
-
+  const isGemini = isGeminiModel(modelName);
   const text = new TextDecoder().decode(bodyBytes);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return { body: bodyBytes, info: createDefaultInfo(modelName) };
+    const info = createDefaultInfo(modelName);
+    if (!isGemini) info.reason = 'unsupported_model';
+    return { body: bodyBytes, info };
   }
   const reqRecord = record(parsed);
   if (!reqRecord) {
-    return { body: bodyBytes, info: createDefaultInfo(modelName) };
+    const info = createDefaultInfo(modelName);
+    if (!isGemini) info.reason = 'unsupported_model';
+    return { body: bodyBytes, info };
   }
   const isEnvelope = Boolean(
     reqRecord.request
@@ -871,27 +1027,87 @@ export async function transformGoogleGenerateContent(
   const req = (isEnvelope ? reqRecord.request : reqRecord) as GoogleGenerateContentRequest;
 
   const info = createDefaultInfo(modelName);
-  const pinChars = relocateGooglePins(req);
-  if (pinChars > 0) info.pinChars = pinChars;
-  const pinBody = pinChars > 0
-    ? new TextEncoder().encode(JSON.stringify(isEnvelope ? { ...reqRecord, request: req } : req))
-    : bodyBytes;
+  const measuredProfile = isGemini && hasGeminiMeasuredProfile(modelName);
+  const firstUser = firstGoogleUserText(req.contents);
+  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+
+  const infoMeasured = measuredProfile;
   if (options.compress === false) {
     info.reason = 'compression_disabled';
-    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
+    return infoMeasured
+      ? withStampedThoughtSignatures(req, bodyBytes, info, isEnvelope ? reqRecord : undefined)
+      : { body: bodyBytes, info };
   }
+
+  const pinChars = relocateGooglePins(req);
+  if (pinChars > 0) info.pinChars = pinChars;
+
+  const nativeImageBytes = countGoogleInlineImageBytes(req);
+
+  const hygieneStats = isTextHygieneActive(options.textHygiene)
+    ? applyGoogleTextHygiene(req, {
+        foldLogs: !measuredProfile || options.imageCompress === false,
+        deepTextCompact: !measuredProfile || options.imageCompress === false,
+        aggressiveToon: resolveTextHygieneMode(options.textHygiene) === 'on',
+        model: modelName,
+        expectedOutputTokens: options.expectedOutputTokens,
+        rawBodyBytes: bodyBytes.byteLength,
+        nativeImageBytes,
+      })
+    : undefined;
+  if (hygieneStats?.changed) {
+    info.textHygieneSavedChars = hygieneStats.savedChars;
+    info.textHygieneSavedTokens = hygieneStats.savedTokens;
+    info.textHygieneBlocks = hygieneStats.blocks;
+    info.textHygieneStages = [...hygieneStats.stages];
+    if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
+  }
+
+  let cachedPinBody: Uint8Array | undefined;
+  const getPinBody = (): Uint8Array => {
+    if (cachedPinBody) return cachedPinBody;
+    cachedPinBody = pinChars > 0 || hygieneStats?.changed
+      ? new TextEncoder().encode(JSON.stringify(isEnvelope ? { ...reqRecord, request: req } : req))
+      : bodyBytes;
+    return cachedPinBody;
+  };
+
+  if (!measuredProfile || options.imageCompress === false) {
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      return measuredProfile
+        ? withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined)
+        : { body: getPinBody(), info };
+    }
+    info.reason = !measuredProfile ? 'unsupported_model' : 'image_disabled';
+    if (pinChars > 0) {
+      return measuredProfile
+        ? withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined)
+        : { body: getPinBody(), info };
+    }
+    return { body: bodyBytes, info };
+  }
+
+  const finishEarlyInvalid = () => {
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+    }
+    return { body: getPinBody(), info };
+  };
 
   // Extract system instructions
   const systemTexts: string[] = [];
   const systemInstruction = record(req.systemInstruction);
   const systemParts = systemInstruction?.parts;
   if (systemParts !== undefined && !Array.isArray(systemParts)) {
-    return { body: pinBody, info };
+    return finishEarlyInvalid();
   }
   if (Array.isArray(systemParts)) {
     for (const rawPart of systemParts) {
       const part = record(rawPart);
-      if (!part) return { body: pinBody, info };
+      if (!part) return finishEarlyInvalid();
       if (typeof part.text === 'string' && part.text.trim()) {
         systemTexts.push(part.text);
         info.staticChars += part.text.length;
@@ -910,6 +1126,17 @@ export async function transformGoogleGenerateContent(
   info.origChars = combinedRaw.length;
 
   const profile = resolveGeminiProfile(modelName);
+  const contentPromptTokens = Array.isArray(req.contents)
+    ? req.contents.reduce((sum, c) => sum + (record(c) ? googleHistoryUnit(c, 0).baselineTokens : 0), 0)
+    : 0;
+  const estPromptTokens = googleTextTokens(authorityText) + toolRewrite.originalTokens + contentPromptTokens;
+
+  if (priceMode() === 'kosha' && gateRatesFor(modelName, { promptTokens: estPromptTokens }) === null) {
+    info.reason = hygieneStats?.changed ? 'text_hygiene' : 'unpriced_model';
+    if (hygieneStats?.changed) info.compressed = true;
+    return withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined);
+  }
+
   let staticImages: RenderedImage[] = [];
   let staticProfitable = false;
   let textTokens = 0;
@@ -946,15 +1173,16 @@ export async function transformGoogleGenerateContent(
     const nativeText = SYSTEM_POINTER + (fsText ?? '');
     nativeInjectedTokens = Math.ceil(nativeText.length / 3.5);
 
+    const slabProfitable = imageTokens + nativeInjectedTokens < textTokens;
     info.gateEval = {
       site: 'slab',
       imageTokens,
       textTokens,
       burnImageSide: nativeInjectedTokens,
       burnTextSide: 0,
-      profitable: imageTokens + nativeInjectedTokens < textTokens,
+      profitable: slabProfitable,
     };
-    staticProfitable = info.gateEval.profitable;
+    staticProfitable = slabProfitable;
   }
 
   // Build static image parts if static slab is profitable
@@ -966,29 +1194,34 @@ export async function transformGoogleGenerateContent(
   // Prepare transformed request. Plan history against the ORIGINAL contents;
   // inserting the slab image first would make content[0] an opaque image barrier.
   if (req.contents !== undefined && !Array.isArray(req.contents)) {
-    return { body: pinBody, info: createDefaultInfo(modelName) };
+    return finishEarlyInvalid();
   }
   const originalContents = Array.isArray(req.contents) ? [...req.contents] : [];
   for (const content of originalContents) {
     if (!record(content) || (content.parts !== undefined && !Array.isArray(content.parts))) {
-      return { body: pinBody, info: createDefaultInfo(modelName) };
+      return finishEarlyInvalid();
     }
   }
 
   const historyPlan = options.collapseHistory === false
     ? null
-    : await planGoogleHistory(originalContents, modelName, options.reflow !== false);
+    : await planGoogleHistory(
+        originalContents,
+        modelName,
+        options.reflow !== false,
+      );
   let contents = originalContents;
   if (historyPlan) {
     const compactFraming = resolveGeminiProfile(modelName).history.framing === 'compact';
     const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
     const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
-    const historyParts: GooglePart[] = [
-      { text: intro },
-      ...historyPlan.images.map(imagePart),
-    ];
-    if (historyPlan.factSheet) historyParts.push({ text: historyPlan.factSheet });
-    historyParts.push({ text: outro });
+    const historyParts: GooglePart[] = [];
+    for (const seg of historyPlan.segments) {
+      historyParts.push({ text: intro });
+      historyParts.push(...seg.images.map(imagePart));
+      if (seg.factSheet) historyParts.push({ text: seg.factSheet });
+      historyParts.push({ text: outro });
+    }
     if (historyPlan.pinnedUserText) {
       historyParts.push({ text: historyPlan.pinnedUserText });
     }
@@ -1018,12 +1251,15 @@ export async function transformGoogleGenerateContent(
   const hasToolCompression = toolResultPlan.images.length > 0;
 
   if (!hasStaticCompression && !hasHistoryCompression && !hasToolCompression) {
-    if (!combinedRaw) {
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+    } else if (!combinedRaw) {
       info.reason = 'no_static_context';
     } else if (!staticProfitable) {
       info.reason = 'not_profitable';
     }
-    return withStampedThoughtSignatures(req, pinBody, info, isEnvelope ? reqRecord : undefined);
+    return withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined);
   }
 
   if (hasStaticCompression) {
@@ -1061,6 +1297,14 @@ export async function transformGoogleGenerateContent(
   };
 
   const effectiveStaticImages = hasStaticCompression ? staticImages : [];
+  const mergedDroppedCodepoints = new Map<number, number>();
+  let totalDroppedChars = 0;
+  for (const img of effectiveStaticImages) {
+    totalDroppedChars += img.droppedChars;
+    for (const [codepoint, count] of img.droppedCodepoints) {
+      mergedDroppedCodepoints.set(codepoint, (mergedDroppedCodepoints.get(codepoint) ?? 0) + count);
+    }
+  }
   info.compressed = true;
   info.imageCount = effectiveStaticImages.length;
   info.imageBytes = effectiveStaticImages.reduce((acc, img) => acc + img.png.byteLength, 0);
@@ -1098,9 +1342,10 @@ export async function transformGoogleGenerateContent(
       info.collapsedChars = historyPlan.text.length;
       info.collapsedImages = historyPlan.images.length;
       info.historyReason = 'collapsed';
-      info.droppedChars = (info.droppedChars ?? 0) + historyPlan.droppedChars;
-      info.droppedCodepointsTop = droppedCodepointsTop(historyPlan.droppedCodepoints)
-        ?? info.droppedCodepointsTop;
+      totalDroppedChars += historyPlan.droppedChars;
+      for (const [codepoint, count] of historyPlan.droppedCodepoints) {
+        mergedDroppedCodepoints.set(codepoint, (mergedDroppedCodepoints.get(codepoint) ?? 0) + count);
+      }
   } else if (options.collapseHistory !== false) {
     info.historyReason = originalContents.length > profile.history.keepTail
       ? 'not_profitable'
@@ -1123,8 +1368,13 @@ export async function transformGoogleGenerateContent(
     info.compressedChars += toolResultPlan.compressedChars;
     info.toolResultImgs = toolResultPlan.images.length;
     info.bucketChars = { ...info.bucketChars, ...toolResultPlan.bucketChars };
-    info.droppedChars = (info.droppedChars ?? 0) + toolResultPlan.droppedChars;
+    totalDroppedChars += toolResultPlan.droppedChars;
+    for (const [codepoint, count] of toolResultPlan.droppedCodepoints) {
+      mergedDroppedCodepoints.set(codepoint, (mergedDroppedCodepoints.get(codepoint) ?? 0) + count);
+    }
   }
+  info.droppedChars = (info.droppedChars ?? 0) + totalDroppedChars;
+  info.droppedCodepointsTop = droppedCodepointsTop(mergedDroppedCodepoints) ?? {};
 
   const outPayload = isEnvelope ? { ...reqRecord, request: transformedReq } : transformedReq;
   const transformedBytes = new TextEncoder().encode(JSON.stringify(outPayload));

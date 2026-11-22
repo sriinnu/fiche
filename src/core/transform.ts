@@ -48,13 +48,26 @@ import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import {
   collapseHistory,
+  HISTORY_DEFAULTS,
   HISTORY_SYNTHETIC_INTRO,
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
 import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
-import { ANTHROPIC_GATE_RATES, gateRatesFor, priceMode, type PriceRates } from './pricing.js';
+import {
+  ANTHROPIC_GATE_RATES,
+  evaluateCliffAvoidance,
+  gateRatesFor,
+  priceMode,
+  type PriceRates,
+} from './pricing.js';
+import {
+  applyAnthropicTextHygiene,
+  isTextHygieneActive,
+  resolveTextHygieneMode,
+  type TextHygieneMode,
+} from './text-hygiene.js';
 
 /** Gate rates for one request, priced once: the cache TTL its markers ask for
  *  and its size as it arrived. Keyed by the parsed request, so every gate in
@@ -120,8 +133,15 @@ export interface RecoverableBlock {
 export interface TransformOptions {
   /** Resolved model id. Its profile supplies font, columns, height, and history defaults. */
   model?: string;
-  /** Master switch — false makes this a no-op pass-through. */
+  /** Master switch — false makes this a no-op pass-through (neither imaging nor text hygiene). */
   compress?: boolean;
+  /** Enable image rendering passes (slab, history, tool_result PNGs). Set false for
+   *  weak/text-only readers while leaving prefix-safe deterministic text hygiene active. */
+  imageCompress?: boolean;
+  /** Prefix-safe deterministic tool-output hygiene (`auto` | `on` | `off` | boolean). */
+  textHygiene?: boolean | TextHygieneMode;
+  /** Optional expected output tokens for long-context output-cliff calculations. */
+  expectedOutputTokens?: number;
   /** Move tool descriptions into the same image (and stub the originals). */
   compressTools?: boolean;
   /** Compress large tool_result text content across all user messages. */
@@ -186,6 +206,9 @@ export interface TransformOptions {
 
 const DEFAULTS: Required<TransformOptions> = {
   compress: true,
+  imageCompress: true,
+  textHygiene: 'auto',
+  expectedOutputTokens: 1000,
   compressTools: true,
   compressToolResults: true,
   minCompressChars: 2000,
@@ -644,7 +667,7 @@ export interface TransformInfo {
   /** Exact UTF-8 byte length of the final serialized provider request. */
   serializedRequestBytes?: number;
   /** Result of the profile-level serialized request guard. */
-  sizeLimitOutcome?: 'within_limit' | 'rejected';
+  sizeLimitOutcome?: 'within_limit' | 'rejected' | 'fallback';
   origChars: number;
   /** Total source chars image-encoded this request (static slab + reminders + tool_results).
    *  Unlike `origChars` (static slab + tool docs only), reflects what `imageCount` replaced. */
@@ -656,6 +679,17 @@ export interface TransformInfo {
   imagePixels?: number;
   /** Provider-estimated vision tokens the rendered images cost as input. */
   imageTokens?: number;
+  /** Chars/tokens removed losslessly or structurally by prefix-safe text hygiene. */
+  textHygieneSavedChars?: number;
+  textHygieneSavedTokens?: number;
+  textHygieneBlocks?: number;
+  textHygieneStages?: string[];
+  /** Non-null when compression avoided a kosha long-context pricing cliff (e.g. >272K, >200K, >100K). */
+  cliffAvoided?: {
+    at: number;
+    multiplier: number;
+    savedUsd: number;
+  };
   /** Provider-specific text-token estimate of the content inkling imaged/stripped —
    *  the would-have-paid "as plain text" baseline. Compared against imageTokens
    *  for the per-request saving. See src/core/openai-savings.ts. */
@@ -1338,20 +1372,31 @@ async function cachePrefixDigest(
   const sys = req.system;
   if (typeof sys === 'string') sysParts.push(sys);
   else if (Array.isArray(sys)) for (const b of sys) sysParts.push(JSON.stringify(b));
+
+  // Memoize serialized blocks per message so shared span 0..boundary isn't stringified twice.
+  const serializedMsgs = new Map<number, string | string[]>();
+  const getMsgSerialized = (idx: number): string | string[] => {
+    const existing = serializedMsgs.get(idx);
+    if (existing !== undefined) return existing;
+    const content = msgs[idx]?.content;
+    let res: string | string[] = [];
+    if (typeof content === 'string') {
+      res = content;
+    } else if (Array.isArray(content)) {
+      res = content.map((b) => (typeof b === 'string' ? b : JSON.stringify(b)));
+    }
+    serializedMsgs.set(idx, res);
+    return res;
+  };
+
   const headParts: string[] = [];
   for (let i = 0; i <= boundary; i++) {
-    const content = msgs[i]?.content;
-    if (typeof content === 'string') headParts.push(content);
-    else if (Array.isArray(content))
-      for (const b of content) headParts.push(typeof b === 'string' ? b : JSON.stringify(b));
+    const s = getMsgSerialized(i);
+    if (typeof s === 'string') headParts.push(s);
+    else for (let j = 0; j < s.length; j++) headParts.push(s[j]!);
   }
   // The span Anthropic actually caches ends at the LAST cache_control marker —
-  // not at the message boundary above. Those differ by construction after a
-  // collapse: the synthetic message's newest freeze chunk re-renders every turn
-  // BY DESIGN and sits AFTER the pinned marker, so the boundary-scoped digest
-  // reports a bust on every single turn even when the cached span is perfectly
-  // stable. Digest the marker-scoped span too, and record where the marker sits:
-  // a moving marker is itself a bust cause, and telemetry could not see it.
+  // not at the message boundary above.
   let markPos = '';
   const markedParts: string[] = [...toolParts, ...sysParts];
   const markedUpTo: string[] = [];
@@ -1363,14 +1408,15 @@ async function cachePrefixDigest(
       if (b && typeof b === 'object' && b.cache_control !== undefined) {
         markPos = `m${i}.b${k}`;
         for (let mi = 0; mi <= i; mi++) {
-          const c = msgs[mi]?.content;
-          if (typeof c === 'string') markedUpTo.push(c);
-          else if (Array.isArray(c))
-            for (let bk = 0; bk < c.length; bk++) {
-              if (mi === i && bk > k) break;
-              const blk = c[bk];
-              markedUpTo.push(typeof blk === 'string' ? blk : JSON.stringify(blk));
+          const s = getMsgSerialized(mi);
+          if (typeof s === 'string') {
+            markedUpTo.push(s);
+          } else {
+            const lim = mi === i ? Math.min(k + 1, s.length) : s.length;
+            for (let bk = 0; bk < lim; bk++) {
+              markedUpTo.push(s[bk]!);
             }
+          }
         }
         break outer;
       }
@@ -1380,13 +1426,20 @@ async function cachePrefixDigest(
   const marked = markedParts.join('\x00');
   const parts = [...toolParts, ...sysParts, ...headParts];
   const prefix = parts.join('\x00');
+  const [digestSha8, toolsSha8, systemSha8, headSha8, markedSha8] = await Promise.all([
+    sha8(prefix),
+    sha8(toolParts.join('\x00')),
+    sha8(sysParts.join('\x00')),
+    sha8(headParts.join('\x00')),
+    sha8(marked),
+  ]);
   return {
-    sha8: await sha8(prefix),
+    sha8: digestSha8,
     bytes: prefix.length,
-    toolsSha8: await sha8(toolParts.join('\x00')),
-    systemSha8: await sha8(sysParts.join('\x00')),
-    headSha8: await sha8(headParts.join('\x00')),
-    markedSha8: await sha8(marked),
+    toolsSha8,
+    systemSha8,
+    headSha8,
+    markedSha8,
     markedBytes: marked.length,
     markerPos: markPos,
   };
@@ -1661,7 +1714,7 @@ function buildPagingMarker(args: {
       ? ` Showing first ${args.shownHeadLines} lines and last ${args.shownTailLines} lines.`
       : ` Showing first ${args.shownHeadLines} lines (tail elided).`;
   return (
-    `\n\n[ inkling paging: omitted ${args.omittedLines.toLocaleString('en-US')} lines ` +
+    `\n\n[ fiche paging: omitted ${args.omittedLines.toLocaleString('en-US')} lines ` +
     `(${args.omittedChars.toLocaleString('en-US')} chars) of content here. ` +
     `Original length: ${args.originalChars.toLocaleString('en-US')} chars ` +
     `(${args.originalLines.toLocaleString('en-US')} lines, ~${args.originalEstImages} images).` +
@@ -1704,20 +1757,25 @@ export function truncateForBudget(
   // matching the renderer, while still binding the row budget for narrow columns
   // where the char budget alone would under-truncate.
   const reflowed = nlChar === NL_SENTINEL;
+  const sentinelPad = reflowed ? 2 * NL_SENTINEL_PAD_CELLS : 0;
   const packedRows = (n: number): number => Math.ceil(n / Math.max(1, cols));
-  const rowCost = (seg: string, priorChars: number, addChars: number): number =>
-    reflowed ? packedRows(priorChars + addChars) - packedRows(priorChars) : lineRows(seg, cols);
+  const rowCost = (seg: string, priorCells: number, addCells: number): number =>
+    reflowed ? packedRows(priorCells + addCells) - packedRows(priorCells) : lineRows(seg, cols);
 
   if (shape === 'structured') {
     let rows = 0;
     let chars = 0;
+    let cells = 0;
     let cut = 0;
     for (let i = 0; i < lines.length; i++) {
-      const c = lines[i]!.length + (i > 0 ? 1 : 0);
-      const r = rowCost(lines[i]!, chars, c);
+      const sep = i > 0 ? 1 : 0;
+      const c = lines[i]!.length + sep;
+      const cellDelta = lines[i]!.length + (sep > 0 ? 1 + sentinelPad : 0);
+      const r = rowCost(lines[i]!, cells, cellDelta);
       if (rows + r > totalRowBudget || chars + c > totalCharBudget) break;
       rows += r;
       chars += c;
+      cells += cellDelta;
       cut = i + 1;
     }
     if (cut === 0) cut = 1;
@@ -1747,25 +1805,33 @@ export function truncateForBudget(
   const tailCharBudget = totalCharBudget - headCharBudget;
   let headRows = 0;
   let headChars = 0;
+  let headCells = 0;
   let headCut = 0;
   for (let i = 0; i < lines.length; i++) {
-    const c = lines[i]!.length + (i > 0 ? 1 : 0);
-    const r = rowCost(lines[i]!, headChars, c);
+    const sep = i > 0 ? 1 : 0;
+    const c = lines[i]!.length + sep;
+    const cellDelta = lines[i]!.length + (sep > 0 ? 1 + sentinelPad : 0);
+    const r = rowCost(lines[i]!, headCells, cellDelta);
     if (headRows + r > headRowBudget || headChars + c > headCharBudget) break;
     headRows += r;
     headChars += c;
+    headCells += cellDelta;
     headCut = i + 1;
   }
   if (headCut === 0) headCut = 1;
   let tailRows = 0;
   let tailChars = 0;
+  let tailCells = 0;
   let tailStart = lines.length;
   for (let i = lines.length - 1; i >= headCut; i--) {
-    const c = lines[i]!.length + (i < lines.length - 1 ? 1 : 0);
-    const r = rowCost(lines[i]!, tailChars, c);
+    const sep = i < lines.length - 1 ? 1 : 0;
+    const c = lines[i]!.length + sep;
+    const cellDelta = lines[i]!.length + (sep > 0 ? 1 + sentinelPad : 0);
+    const r = rowCost(lines[i]!, tailCells, cellDelta);
     if (tailRows + r > tailRowBudget || tailChars + c > tailCharBudget) break;
     tailRows += r;
     tailChars += c;
+    tailCells += cellDelta;
     tailStart = i;
   }
   if (tailStart <= headCut || tailStart >= lines.length) {
@@ -2073,10 +2139,6 @@ async function compressToolResultsInPlace(
                 denseGeo.maxChars,
                 linesPerImage,
               );
-              if (paged.truncated) {
-                info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
-                info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
-              }
               const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                 await textToImageBlocks(
                   paged.text,
@@ -2106,10 +2168,16 @@ async function compressToolResultsInPlace(
                 rewritten.push(blk);
                 continue;
               }
+              if (paged.truncated) {
+                info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
+                info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
+              }
               (info.imagePngs ??= []).push(...rawPngs);
               (info.imageDims ??= []).push(...rawDims);
               for (const img of imgs) info.imageBytes += approxBlockBytes(img);
               info.imagePixels = (info.imagePixels ?? 0) + pixels;
+              info.imageTokens = (info.imageTokens ?? 0) + rawDims.reduce((s, d) => s + visionTokens(denseGeo.pricing, d.width, d.height), 0);
+              info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + Math.ceil(innerRaw.length / Math.max(1e-6, o.charsPerToken));
               info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
               info.imageCount += imgs.length;
               await recordRecoverable(info, o.emitRecoverable, {
@@ -2184,10 +2252,6 @@ async function compressToolResultsInPlace(
                 denseGeo.maxChars,
                 linesPerImage,
               );
-              if (paged.truncated) {
-                info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
-                info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
-              }
               const { blocks: imgs, pngs: rawPngs, dims: rawDims, droppedChars, droppedCodepoints: dcp, pixels } =
                 await textToImageBlocks(
                   paged.text,
@@ -2213,6 +2277,10 @@ async function compressToolResultsInPlace(
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
               }
+              if (paged.truncated) {
+                info.truncatedToolResults = (info.truncatedToolResults ?? 0) + 1;
+                info.omittedChars = (info.omittedChars ?? 0) + paged.omittedChars;
+              }
               (info.imagePngs ??= []).push(...rawPngs);
               (info.imageDims ??= []).push(...rawDims);
               const srcCacheControl = demoteRelocatedCacheControl((ib as { cache_control?: unknown }).cache_control);
@@ -2228,6 +2296,8 @@ async function compressToolResultsInPlace(
               const partFactSheet = factSheetText(innerTextRaw);
               if (partFactSheet) newInner.push({ type: 'text', text: partFactSheet });
               info.imagePixels = (info.imagePixels ?? 0) + pixels;
+              info.imageTokens = (info.imageTokens ?? 0) + rawDims.reduce((s, d) => s + visionTokens(denseGeo.pricing, d.width, d.height), 0);
+              info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + Math.ceil(innerTextRaw.length / Math.max(1e-6, o.charsPerToken));
               info.toolResultImgs = (info.toolResultImgs ?? 0) + imgs.length;
               info.imageCount += imgs.length;
               await recordRecoverable(info, o.emitRecoverable, {
@@ -2263,6 +2333,23 @@ async function compressToolResultsInPlace(
   return anyChanged;
 }
 
+const ANTHROPIC_CLIFF_STICKY_MAX = 512;
+const anthropicCliffSticky = new Map<string, number>();
+
+function recordAnthropicCliffSticky(key: string, cliffAt: number): void {
+  if (anthropicCliffSticky.size >= ANTHROPIC_CLIFF_STICKY_MAX) anthropicCliffSticky.clear();
+  anthropicCliffSticky.set(key, cliffAt);
+}
+
+function estimateTailMsgTokens(messages: readonly Message[] | undefined, charsPerToken: number): number {
+  if (!Array.isArray(messages) || messages.length <= 1) return 0;
+  try {
+    return Math.ceil(JSON.stringify(messages[messages.length - 1]).length / Math.max(1, charsPerToken));
+  } catch {
+    return 0;
+  }
+}
+
 async function runHistoryCollapseAndFinalize(
   req: MessagesRequest,
   info: TransformInfo,
@@ -2270,6 +2357,8 @@ async function runHistoryCollapseAndFinalize(
   opts: TransformOptions,
   droppedCodepoints: Map<number, number>,
   pins: Pin[],
+  reqPromptTokensEst?: number,
+  reqTtlSec?: number,
 ): Promise<{ body: Uint8Array; info: TransformInfo; changed: boolean }> {
   let collapsedFlag = false;
   // Same wire cap as every other imaging path: the collapse buys tokens with
@@ -2292,13 +2381,41 @@ async function runHistoryCollapseAndFinalize(
     // 2026-05-23 showed three-turn sessions paying cache_create every
     // turn because the history gate ignored priorWarmImageTokens.
     const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
-    const historyProfitable = (text: string, cols: number): boolean => {
+    const rates = gateRates(req, o.model);
+    const historyProfitable = (text: string, _cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
-      return isCompressionProfitableAmortized(
+      if (isCompressionProfitableAmortized(
         text, historyGeometry.cols, undefined, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
-        gateRates(req, o.model),
-      );
+        rates,
+      )) return true;
+      if (rates !== null && reqPromptTokensEst !== undefined) {
+        const textTok = text.length / Math.max(1e-6, historyCpt);
+        const imgTok = imageTokensCost(text, historyGeometry.cols, undefined, true, historyGeometry.maxChars, historyGeometry);
+        if (imgTok < textTok) {
+          const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.firstUserSha8 ?? ''}\0history`;
+          const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(histCliffKey) : undefined;
+          if (stickyCliffAt !== undefined && reqPromptTokensEst > stickyCliffAt) return true;
+          const upstreamSysTok = Math.ceil((info.origChars ?? 0) / Math.max(1, o.charsPerToken));
+          const tailTok = estimateTailMsgTokens(req.messages, o.charsPerToken);
+          const downstreamCachedTokens = Math.max(0, reqPromptTokensEst - upstreamSysTok - textTok - tailTok);
+          const cliff = evaluateCliffAvoidance(o.model, {
+            promptTokensBefore: reqPromptTokensEst,
+            promptTokensAfter: Math.max(0, reqPromptTokensEst - (textTok - imgTok)),
+            collapsedBaselineTokens: textTok,
+            collapsedActualTokens: imgTok,
+            downstreamCachedTokens,
+            expectedOutputTokens: o.expectedOutputTokens,
+            ttlSec: reqTtlSec,
+          });
+          if (cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) {
+            recordAnthropicCliffSticky(histCliffKey, cliff.cliffAt);
+            info.cliffAvoided = { at: cliff.cliffAt, multiplier: cliff.multiplier, savedUsd: cliff.netSingleTurnUsd };
+            return true;
+          }
+        }
+      }
+      return false;
     };
     // The slab needs no shield here: this path runs only when the slab did NOT
     // image (it stays as text in req.system). But project instructions do.
@@ -2350,6 +2467,11 @@ async function runHistoryCollapseAndFinalize(
       info.imageCount += histInfo.collapsedImages;
       info.imageBytes += histInfo.collapsedImageBytes;
       info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
+      info.imageTokens = (info.imageTokens ?? 0) + histInfo.collapsedImageDims.reduce(
+        (s, d) => s + visionTokens(historyGeometry.pricing, d.width, d.height),
+        0,
+      );
+      info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + Math.ceil(histInfo.collapsedChars / Math.max(1e-6, historyCpt));
       // Register the rendered (colored) history PNGs into the dashboard image ring
       // so they are visible, not merely counted. Every other image path feeds this.
       // imagePngs + imageDims must be pushed in lockstep (ring reads them parallel).
@@ -2463,7 +2585,8 @@ export async function transformRequest(
     info.reason = 'invalid_messages';
     return { body, info };
   }
-  seedGateRates(req, o.model, body.byteLength, o.charsPerToken);
+  const reqTtlSec = requestCacheTtlSec(req);
+  const reqPromptTokensEst = Math.ceil(body.byteLength / Math.max(1, o.charsPerToken));
 
   // Price the caller's OWN images before we rewrite anything: they occupy the
   // same wire cap we are about to spend from. Counted once, here, because every
@@ -2505,6 +2628,45 @@ export async function transformRequest(
       info.pinError = String((e as Error)?.message ?? e);
     }
   }
+
+  const hygieneStats = isTextHygieneActive(o.textHygiene)
+    ? applyAnthropicTextHygiene(req, {
+        foldLogs: !o.imageCompress,
+        deepTextCompact: !o.imageCompress,
+        enableCasi: typeof opts.keepSharp !== 'function',
+        aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
+        model: o.model,
+        expectedOutputTokens: o.expectedOutputTokens,
+        rawBodyBytes: body.byteLength,
+        nativeImageBytes: Math.ceil((info.nativeImageBytes ?? 0) * 4 / 3),
+        ttlSec: reqTtlSec,
+      })
+    : undefined;
+  if (hygieneStats?.changed) {
+    info.textHygieneSavedChars = hygieneStats.savedChars;
+    info.textHygieneSavedTokens = hygieneStats.savedTokens;
+    info.textHygieneBlocks = hygieneStats.blocks;
+    info.textHygieneStages = [...hygieneStats.stages];
+    if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
+  }
+  if (!o.imageCompress) {
+    if (pinsRewrote) applyPins(req, info, pins);
+    if (hygieneStats?.changed) {
+      const firstUser = firstUserText(req);
+      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countOutgoingTextChars(req);
+      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+    }
+    info.reason = 'image_disabled';
+    if (pinsRewrote) {
+      info.outgoingTextChars = countOutgoingTextChars(req);
+      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+    }
+    return { body, info };
+  }
+  seedGateRates(req, o.model, body.byteLength, o.charsPerToken);
 
   // 1. Pull system text out. Split into:
   //    - billingLine: Claude Code's per-turn random header (must NOT be cached).
@@ -2651,7 +2813,7 @@ export async function transformRequest(
   // config, not a replayed/extracted prompt.
   const toolReferenceText = toolDocsText
     ? '=== TOOL REFERENCE ===\n' +
-      "inkling (this user's local proxy) moved the full tool documentation for this" +
+      "fiche (this user's local proxy) moved the full tool documentation for this" +
       ' session here to reduce token cost. Each tool in the tools list carries a short' +
       ' stub description pointing here; the entry under the matching' +
       ' "## Tool: <name>" heading below is the complete description for that tool.\n\n' +
@@ -2676,15 +2838,44 @@ export async function transformRequest(
     // If history collapses, we flip `info.compressed = true` and let the
     // library wrapper return reason='applied'; otherwise this still
     // populates `outgoingTextChars` for the regression denominator.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
-    if (finalized.changed) {
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
+      if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
       return { body: finalized.body, info };
     }
     // `body` is the original bytes. If the pin pass edited `req`, those bytes
     // describe a request we are no longer sending, so forwarding them would put
     // the raw `@inkling pin` line back and drop the tail block.
     return { body: pinsRewrote ? finalized.body : body, info };
+  }
+
+  // Anthropic's system field rejects image blocks, so without a user turn there
+  // is nowhere valid to attach the slab images. Strip any billing line from
+  // req.system (so it still leaves via HTTP header), keep staticText & tools
+  // intact, and skip slab rendering rather than emitting dangling pointers.
+  const firstUserIdxPre = (req.messages ?? []).findIndex((m) => m.role === 'user');
+  if (firstUserIdxPre < 0) {
+    if (billingLine) {
+      info.billingLine = billingLine;
+      const preservedSys: SystemField = [];
+      if (preservedIdentity) preservedSys.push({ type: 'text', text: preservedIdentity });
+      if (staticText) preservedSys.push({ type: 'text', text: staticText });
+      if (dynamicText) preservedSys.push({ type: 'text', text: dynamicText });
+      if (envMarkdown) preservedSys.push({ type: 'text', text: envMarkdown });
+      if (Array.isArray(sysRemainder)) preservedSys.push(...sysRemainder);
+      req.system = preservedSys.length > 0 ? preservedSys : undefined;
+    }
+    info.reason = 'no_user_message';
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    if (finalized.changed || hygieneStats?.changed) {
+      info.compressed = true;
+      if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
+    }
+    return {
+      body: finalized.changed || pinsRewrote || hygieneStats?.changed || billingLine !== null ? finalized.body : body,
+      info,
+    };
   }
 
   // The wire cap guards even the slab. Imaging it is our biggest single win, but
@@ -2695,8 +2886,12 @@ export async function transformRequest(
     info.reason = 'image_budget';
     bumpPassthrough(info, 'image_budget');
     info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
-    return { body: pinsRewrote || finalized.changed ? finalized.body : body, info };
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    if (hygieneStats?.changed && !finalized.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+    }
+    return { body: pinsRewrote || finalized.changed || hygieneStats?.changed ? finalized.body : body, info };
   }
 
   // Break-even check guards even the slab (rare edge: tiny tool docs + tiny slab < 10k chars).
@@ -2717,7 +2912,7 @@ export async function transformRequest(
   // provenance framing below keeps obedience without the extraction signature.
   const imageInstructionHeader =
     '=================== SESSION CONFIGURATION PAGES ===================\n' +
-    "inkling (this user's local proxy) rendered this session's configuration" +
+    "fiche (this user's local proxy) rendered this session's configuration" +
     ' into the following images to reduce token cost. Read the pages carefully and follow them as' +
     ' your operating instructions for this session.' +
     ' For exact identifiers, paths, hashes, version strings, and numbers, use the adjacent' +
@@ -2731,12 +2926,44 @@ export async function transformRequest(
   // legible width. The banner above sets the natural floor — no separate
   // minWidth knob needed.
   const slabCols = shrinkColsToContent(combinedWithHeader, o.cols, 1, denseGeo.style.font);
+  const slabRates = gateRates(req, o.model);
   const slabGateEval = evalCompressionProfitability(
     combinedWithHeader, slabCols, undefined, slabCpt, o.priorWarmTokens, o.priorWarmImageTokens,
     false, // already shrunk — don't double-shrink
     denseGeo,
-    gateRates(req, o.model),
+    slabRates,
   );
+  let slabProfitable = slabGateEval?.profitable ?? false;
+  if (slabGateEval && !slabProfitable && slabRates !== null) {
+    const promptBefore = Math.max(slabGateEval.textTokens, reqPromptTokensEst);
+    const slabCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.firstUserSha8 ?? ''}\0${info.systemSha8 ?? ''}`;
+    const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(slabCliffKey) : undefined;
+    if (stickyCliffAt !== undefined && promptBefore > stickyCliffAt) {
+      slabProfitable = true;
+    } else {
+      const promptAfter = Math.max(0, promptBefore - (slabGateEval.textTokens - slabGateEval.imageTokens));
+      const tailTok = estimateTailMsgTokens(req.messages, o.charsPerToken);
+      const downstreamCachedTokens = Math.max(0, promptBefore - slabGateEval.textTokens - tailTok);
+      const cliff = evaluateCliffAvoidance(o.model, {
+        promptTokensBefore: promptBefore,
+        promptTokensAfter: promptAfter,
+        collapsedBaselineTokens: slabGateEval.textTokens,
+        collapsedActualTokens: slabGateEval.imageTokens,
+        downstreamCachedTokens,
+        expectedOutputTokens: o.expectedOutputTokens,
+        ttlSec: reqTtlSec,
+      });
+      if (cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) {
+        slabProfitable = true;
+        recordAnthropicCliffSticky(slabCliffKey, cliff.cliffAt);
+        info.cliffAvoided = {
+          at: cliff.cliffAt,
+          multiplier: cliff.multiplier,
+          savedUsd: cliff.netSingleTurnUsd,
+        };
+      }
+    }
+  }
   if (slabGateEval) {
     info.gateEval = {
       site: 'slab',
@@ -2744,27 +2971,17 @@ export async function transformRequest(
       textTokens: slabGateEval.textTokens,
       burnImageSide: slabGateEval.burnImageSide,
       burnTextSide: slabGateEval.burnTextSide,
-      profitable: slabGateEval.profitable,
+      profitable: slabProfitable,
     };
   }
-  if (!isCompressionProfitable(
-    combinedWithHeader,
-    slabCols,
-    undefined,
-    slabCpt,
-    o.priorWarmTokens,
-    o.priorWarmImageTokens,
-    false,
-    READABLE_CHARS_PER_IMAGE,
-    denseGeo,
-    gateRates(req, o.model),
-  )) {
+  if (!slabProfitable) {
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
-    if (finalized.changed) {
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
+      if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
       return { body: finalized.body, info };
     }
     // `body` is the original bytes. If the pin pass edited `req`, those bytes
@@ -2801,9 +3018,10 @@ export async function transformRequest(
     bumpPassthrough(info, 'image_budget');
     if (slabOverBytes && !slabOverCount) info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
     else info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins);
-    if (finalized.changed) {
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
+      if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
       return { body: finalized.body, info };
     }
     return { body: pinsRewrote ? finalized.body : body, info };
@@ -2827,6 +3045,11 @@ export async function transformRequest(
     );
   }
   info.imageCount = imageBlocks.length;
+  info.imageTokens = (info.imageTokens ?? 0) + images.reduce(
+    (s, img) => s + visionTokens(denseGeo.pricing, img.width, img.height),
+    0,
+  );
+  info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + Math.ceil(combinedRaw.length / Math.max(1e-6, slabCpt));
   // Credit raw (pre-compaction) length — what Anthropic would have billed.
   info.compressedChars += combinedRaw.length;
   bumpBucket(info, 'static_slab', combinedRaw.length);
@@ -2903,19 +3126,50 @@ export async function transformRequest(
   // History is single-col dense; use slab cpt unless host pinned charsPerToken.
   // protectedPrefix excludes the slab-bearing first user message — collapsing it
   // would reduce slab images to [image] placeholders and destroy the cache anchor.
-  if (Array.isArray(req.messages) && req.messages.length > 0) {
+  if (imageHeadroom(info) <= 0) {
+    bumpPassthrough(info, 'image_budget');
+    info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
+    info.historyReason ??= 'too_many_images';
+  } else if (Array.isArray(req.messages) && req.messages.length > 0) {
     const historyCpt = opts.charsPerToken !== undefined
       ? o.charsPerToken
       : HISTORY_CHARS_PER_TOKEN;
     const horizon = Math.max(1, Math.floor(o.historyAmortizationHorizon));
     const historyGeometry = historyGateGeometry(o, opts.cols !== undefined);
-    const historyProfitable = (text: string, cols: number): boolean => {
+    const historyRates = gateRates(req, o.model);
+    const historyProfitable = (text: string, _cols: number): boolean => {
       // Gate with the same model profile used by the history renderer.
-      return isCompressionProfitableAmortized(
+      if (isCompressionProfitableAmortized(
         text, historyGeometry.cols, undefined, historyCpt, horizon,
         o.priorWarmTokens, o.priorWarmImageTokens, true, historyGeometry.maxChars, historyGeometry,
-        gateRates(req, o.model),
-      );
+        historyRates,
+      )) return true;
+      if (historyRates !== null) {
+        const textTok = text.length / Math.max(1e-6, historyCpt);
+        const imgTok = imageTokensCost(text, historyGeometry.cols, undefined, true, historyGeometry.maxChars, historyGeometry);
+        if (imgTok < textTok) {
+          const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.firstUserSha8 ?? ''}\0history`;
+          const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(histCliffKey) : undefined;
+          if (stickyCliffAt !== undefined && reqPromptTokensEst > stickyCliffAt) return true;
+          const tailTok = estimateTailMsgTokens(req.messages, o.charsPerToken);
+          const downstreamCachedTokens = Math.max(0, reqPromptTokensEst - (info.imageTokens ?? 0) - textTok - tailTok);
+          const cliff = evaluateCliffAvoidance(o.model, {
+            promptTokensBefore: reqPromptTokensEst,
+            promptTokensAfter: Math.max(0, reqPromptTokensEst - (textTok - imgTok)),
+            collapsedBaselineTokens: textTok,
+            collapsedActualTokens: imgTok,
+            downstreamCachedTokens,
+            expectedOutputTokens: o.expectedOutputTokens,
+            ttlSec: reqTtlSec,
+          });
+          if (cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) {
+            recordAnthropicCliffSticky(histCliffKey, cliff.cliffAt);
+            info.cliffAvoided = { at: cliff.cliffAt, multiplier: cliff.multiplier, savedUsd: cliff.netSingleTurnUsd };
+            return true;
+          }
+        }
+      }
+      return false;
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
     const tuning = historyGridTuning(info);
@@ -2959,6 +3213,11 @@ export async function transformRequest(
       info.imageCount += histInfo.collapsedImages;
       info.imageBytes += histInfo.collapsedImageBytes;
       info.imagePixels = (info.imagePixels ?? 0) + histInfo.collapsedImagePixels;
+      info.imageTokens = (info.imageTokens ?? 0) + histInfo.collapsedImageDims.reduce(
+        (s, d) => s + visionTokens(historyGeometry.pricing, d.width, d.height),
+        0,
+      );
+      info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + Math.ceil(histInfo.collapsedChars / Math.max(1e-6, historyCpt));
       // Register the rendered (colored) history PNGs into the dashboard image ring
       // so they are visible, not merely counted. Every other image path feeds this.
       // imagePngs + imageDims must be pushed in lockstep (ring reads them parallel).

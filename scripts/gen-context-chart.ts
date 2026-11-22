@@ -1,7 +1,7 @@
 /**
  * gen-context-chart.ts — README chart: how many *characters* a frontier context
  * window has held over time, GPT-1 (2018) → Fable 5 / Grok 4.5 (2026), as a
- * line chart on a real year axis. One inkling overlay is measured live for
+ * line chart on a real year axis. One fiche overlay is measured live for
  * Fable (the default reader); Grok appears as a plain text-window series only
  * (opt-in, not Fable-level pure-image quality).
  *
@@ -13,7 +13,7 @@
  *  - Text points: window tokens × 4 chars/token (the standard English-prose
  *    rule of thumb; token-dense content like code/JSON tokenizes *worse*,
  *    ~2-2.5, so 4 is the generous assumption for the text series).
- *  - inkling points: window tokens × measured chars-per-vision-token using the
+ *  - fiche points: window tokens × measured chars-per-vision-token using the
  *    shipped 312-column geometry and each provider's image-token accounting.
  *
  * Window sizes (announcement-era frontier defaults), with release dates used
@@ -30,19 +30,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCanvas } from '@napi-rs/canvas';
 import { renderTextToImages } from '../src/core/library.js';
-import type {
-  RenderTextToImagesOptions,
-  RenderTextToImagesResult,
-} from '../src/core/library.js';
 import { resolveGptProfile } from '../src/core/gpt-model-profiles.js';
-import { patchTokens } from '../src/core/anthropic-vision.js';
+import { visionTokens } from '../src/core/vision-cost.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = join(ROOT, 'docs/assets/context-window-chars.png');
 const README_EXAMPLE = join(ROOT, 'docs/assets/example-render.png');
 
 const TEXT_CPT = 4; // chars per text token, prose rule of thumb
-const GEMINI_TOKENS_PER_FULL_PAGE = 1078; // measured at 1568x728
 
 interface Density {
   /** chars per vision-token for this family's render+billing profile */
@@ -56,7 +51,7 @@ interface Density {
 // 1. Measure chars-per-vision-token through the real pipeline.
 // ---------------------------------------------------------------------------
 function loadFixture(): string {
-  // Representative token-dense context — the kinds of content inkling actually
+  // Representative token-dense context — the kinds of content fiche actually
   // images (markdown docs, TS source, JSON), taken from this repo itself.
   // Literal ↵ sentinels are stripped: these files *document* the sentinel, and
   // reflow() deliberately bails on source that already contains it.
@@ -70,33 +65,32 @@ function loadFixture(): string {
     .replaceAll('↵', '');
 }
 
-/** Render the fixture under one model's geometry and report its density.
- *  `countTokens` differs by provider: Anthropic bills 28-px patches, Gemini a flat
- *  rate per full page. Default geometry is the library's Claude dense path
- *  (312-col Spleen, Anthropic height). */
+/** Render the fixture under one model's resolved profile (`renderTextToImages`
+ *  routes through the same `measureContentCols` + `renderTextToPngsWithCharLimit`
+ *  pipeline as `renderDensePages`) and bill through `visionTokens()`. */
 async function measureDensity(
   label: string,
+  model: string,
   fixture: string,
-  countTokens: (pages: RenderTextToImagesResult['pages']) => number,
-  geometry: RenderTextToImagesOptions = {},
 ): Promise<Density> {
-  const r = await renderTextToImages(fixture, { reflow: true, ...geometry });
+  const profile = resolveGptProfile(model);
+  const r = await renderTextToImages(fixture, { model, reflow: true });
   if (r.droppedChars > 0) {
     throw new Error(
       `${label} fixture dropped ${r.droppedChars} chars — atlas gap, fix before charting`,
     );
   }
-  const visionTokens = countTokens(r.pages);
-  const cpt = fixture.length / visionTokens;
+  const totalVisionTokens = r.pages.reduce(
+    (sum, page) => sum + visionTokens(profile, page.width, page.height),
+    0,
+  );
+  const cpt = fixture.length / totalVisionTokens;
   console.log(
     `${label} density: ${fixture.length} chars → ${r.pages.length} pages, ` +
-      `${r.pixels} px = ${visionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
+      `${r.pixels} px = ${totalVisionTokens} vision tokens → ${cpt.toFixed(2)} chars/vision-token`,
   );
-  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens };
+  return { cpt, pages: r.pages.length, pixels: r.pixels, visionTokens: totalVisionTokens };
 }
-
-const patchTokenCount = (pages: RenderTextToImagesResult['pages']): number =>
-  pages.reduce((total, page) => total + patchTokens(page.width, page.height), 0);
 
 
 // ---------------------------------------------------------------------------
@@ -111,8 +105,8 @@ interface Point {
   /** Model context window, in tokens. */
   tokens: number;
   chars: number;
-  /** Vendor series — each gets its own line. 'inkling' is a measured overlay. */
-  kind: 'openai' | 'gemini' | 'claude' | 'grok' | 'inkling';
+  /** Vendor series — each gets its own line. 'fiche' is a measured overlay. */
+  kind: 'openai' | 'gemini' | 'claude' | 'grok' | 'fiche';
   /** Where to hang the label so the cluttered 2023 cluster stays readable. */
   label: LabelSide;
   /** Extra vertical label offset (px) — staggers the linear-scale floor pileup. */
@@ -152,42 +146,37 @@ function points(fableCpt: number, geminiCpt: number, opusCpt: number): Point[] {
     t('openai', 'GPT-5.6', 2026.52, 1_050_000, 'right'),
     // the model powering this session: claude-fable-5[1m], 1M-token window
     t('claude', 'Fable 5 [1m]', 2026.05, 1_000_000, 'below'),
-    // Gemini 3.6 Flash 1M window
-    t('gemini', 'Gemini 3.6 Flash', 2026.50, 1_000_000, 'below'),
-    // Grok 4.5: text-window only (opt-in; no inkling overlay on this chart).
-    // Window = xAI docs maxPromptLength for grok-4.5 (500000).
-    t('grok', 'Grok 4.5', 2026.42, 500_000, 'below', 10),
+    // Gemini 3.8 Flash 1M window (current Flash optical profile)
+    t('gemini', 'Gemini 3.8 Flash', 2026.50, 1_000_000, 'below'),
+    // Grok 4.5 / 4.7 text-window series (xAI maxPromptLength 500000).
+    t('grok', 'Grok 4.7', 2026.58, 500_000, 'below', 10),
     // Claude Opus 5: released July 25, 2026. Window = 1M tokens per Anthropic
-    // models overview (tooltip: ~555k words / ~2.5M unicode characters).
-    // The ID is dateless (`claude-opus-5`) — the 4.6-generation convention drops
-    // the YYYYMMDD snapshot — so the date comes from the release, not the ID.
+    // models overview. Spaced 5x8+2px optical geometry (~14.3 c/vt).
     t('claude', 'Opus 5', 2026.56, 1_000_000, 'above', -18),
     {
-      name: 'Fable 5 [1m] + inkling',
+      name: 'Fable 5 [1m] + fiche',
       x: 2026.05,
       tokens: 1_000_000,
       chars: Math.round(1_000_000 * fableCpt),
-      kind: 'inkling',
+      kind: 'fiche',
       label: 'above',
     },
     {
-      name: 'Gemini 3.6 Flash + inkling',
+      name: 'Gemini 3.8 Flash + fiche',
       x: 2026.50,
       tokens: 1_000_000,
       chars: Math.round(1_000_000 * geminiCpt),
-      kind: 'inkling',
+      kind: 'fiche',
       label: 'above',
     },
     {
-      // Measures identical to Fable 5 (same resolved profile geometry), so this
-      // lands on the same horizontal line — that equality is the finding, not a
-      // copy: opusCpt comes from its own render pass.
-      name: 'Opus 5 + inkling',
+      // Measured via Opus 5's spaced 5x8+2px profile (distinct from Fable 5's dense 5x8).
+      name: 'Opus 5 + fiche',
       x: 2026.56,
       tokens: 1_000_000,
       chars: Math.round(1_000_000 * opusCpt),
-      kind: 'inkling',
-      label: 'above',
+      kind: 'fiche',
+      label: 'right',
     },
   ];
 }
@@ -220,7 +209,7 @@ function pngWidth(path: string): number {
   return png.readUInt32BE(16);
 }
 
-function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
+function draw(data: Point[], fableCpt: number, geminiCpt: number, opusCpt: number): Buffer {
   const logicalWidth = 1180;
   const logicalHeight = 1000;
   const outputWidth = pngWidth(README_EXAMPLE);
@@ -239,21 +228,31 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     gemini: '#a371f7',
     claude: '#58a6ff',
     grok: '#e3b341',
-    inkling: '#f0883e',
+    fiche: '#FF6B2B',
   };
 
   ctx.fillStyle = bg;
   ctx.fillRect(0, 0, 1180, 1000);
 
+  // Top fiche prism accent bar (matches gen-fiche-charts.ts)
+  const prism = ctx.createLinearGradient(0, 0, 1180, 0);
+  prism.addColorStop(0, '#FF4D5A');
+  prism.addColorStop(0.25, '#FF6B2B');
+  prism.addColorStop(0.55, '#C026D3');
+  prism.addColorStop(0.8, '#0EA5E9');
+  prism.addColorStop(1, '#34D399');
+  ctx.fillStyle = prism;
+  ctx.fillRect(0, 0, 1180, 4);
+
   // Title block
   ctx.fillStyle = ink;
-  ctx.font = '600 24px sans-serif';
-  ctx.fillText('Characters a frontier context window holds', 36, 44);
+  ctx.font = '700 24px sans-serif';
+  ctx.fillText('fiche — Characters a frontier context window holds', 36, 44);
   ctx.fillStyle = dim;
   ctx.font = '400 14px sans-serif';
   ctx.fillText(
-    `each point: model · context window (tokens) → characters it holds · text at ~${TEXT_CPT} chars/token · ` +
-      `inkling uses shipped 312-column pages · Fable ${fableCpt.toFixed(1)} · Gemini ${geminiCpt.toFixed(1)} chars/vision-token`,
+    `each point: model · context window (tokens) → characters it holds · text ~${TEXT_CPT} c/tok · ` +
+      `fiche 312-col: Gemini ${geminiCpt.toFixed(1)} · Fable ${fableCpt.toFixed(1)} · Opus ${opusCpt.toFixed(1)} c/vt`,
     36,
     68,
   );
@@ -267,7 +266,7 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
   // point of the chart: 18M must physically tower ~4.5× over the 4M pack.
   const Y_MAX = 24_000_000;
   const X_MIN = 2018;
-  const X_MAX = 2027.25;
+  const X_MAX = 2027.75;
   const y = (v: number) => bottom - (v / Y_MAX) * (bottom - top);
   const x = (v: number) => left + ((v - X_MIN) / (X_MAX - X_MIN)) * (right - left);
 
@@ -307,7 +306,7 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
   ctx.fillText('characters (linear scale)', 0, 0);
   ctx.restore();
   ctx.fillStyle = axis;
-  ctx.fillText('release year', (left + right) / 2, 1000 - 40);
+  ctx.fillText('release year', (left + right) / 2, 1000 - 30);
 
   // One line per vendor series (chronological within each series)
   for (const vendor of ['openai', 'gemini', 'claude', 'grok'] as const) {
@@ -322,11 +321,12 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     ctx.stroke();
   }
 
-  // Dashed vertical connector: Fable / Gemini text window → same window imaged (inkling).
-  // Grok is plotted as a text series only (no inkling overlay).
-  const overlays: Array<{ textName: string; pxName: string }> = [
-    { textName: 'Fable 5 [1m]', pxName: 'Fable 5 [1m] + inkling' },
-    { textName: 'Gemini 3.6 Flash', pxName: 'Gemini 3.6 Flash + inkling' },
+  // Dashed vertical connector: Fable / Gemini text window → same window imaged (fiche).
+  // Grok is plotted as a text series only (no fiche overlay).
+  const overlays: Array<{ textName: string; pxName: string; side: 'left' | 'right' }> = [
+    { textName: 'Fable 5 [1m]', pxName: 'Fable 5 [1m] + fiche', side: 'left' },
+    { textName: 'Gemini 3.8 Flash', pxName: 'Gemini 3.8 Flash + fiche', side: 'left' },
+    { textName: 'Opus 5', pxName: 'Opus 5 + fiche', side: 'right' },
   ];
   for (const o of overlays) {
     const base = data.find((p) => p.name === o.textName)!;
@@ -334,7 +334,7 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     const cx = x(base.x); // same as x(px.x) — both points share the year
     const y0 = y(base.chars) - 7;
     const y1 = y(px.chars) + 8;
-    ctx.strokeStyle = colors.inkling;
+    ctx.strokeStyle = colors.fiche;
     ctx.lineWidth = 1.5;
     ctx.setLineDash([5, 4]);
     ctx.beginPath();
@@ -342,17 +342,17 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     ctx.lineTo(cx, y1);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.textAlign = 'left';
+    ctx.textAlign = o.side === 'left' ? 'right' : 'left';
     const annLine1 = `${(px.chars / base.chars).toFixed(1)}×`;
     const annLine2 = 'same window, imaged';
-    const annX = cx + 12;
+    const annX = o.side === 'left' ? cx - 12 : cx + 12;
     const annY = (y0 + y1) / 2 + 4;
     ctx.lineJoin = 'round';
     ctx.strokeStyle = bg;
     ctx.lineWidth = 5;
     ctx.font = '700 15px sans-serif';
     ctx.strokeText(annLine1, annX, annY - 9);
-    ctx.fillStyle = colors.inkling;
+    ctx.fillStyle = colors.fiche;
     ctx.fillText(annLine1, annX, annY - 9);
     ctx.font = '600 12px sans-serif';
     ctx.strokeText(annLine2, annX, annY + 9);
@@ -360,7 +360,7 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
   }
 
   const emphasize = (p: Point): boolean =>
-    p.kind === 'inkling' || p.name === 'Fable 5 [1m]' || p.name === 'Grok 4.5';
+    p.kind === 'fiche' || p.name === 'Fable 5 [1m]' || p.name === 'Grok 4.7';
 
   // Markers first, so no marker is drawn over a neighbouring label.
   for (const p of data) {
@@ -370,11 +370,11 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     ctx.arc(cx, cy, emphasize(p) ? 6.5 : 4.5, 0, Math.PI * 2);
     ctx.fillStyle = colors[p.kind];
     ctx.fill();
-    // Outer ring on inkling overlays so they read as measured, not vendor text.
-    if (p.kind === 'inkling') {
+    // Outer ring on fiche overlays so they read as measured, not vendor text.
+    if (p.kind === 'fiche') {
       ctx.beginPath();
       ctx.arc(cx, cy, 9, 0, Math.PI * 2);
-      ctx.strokeStyle = colors.inkling;
+      ctx.strokeStyle = colors.fiche;
       ctx.lineWidth = 2;
       ctx.stroke();
     }
@@ -465,8 +465,8 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
     [colors.openai, `OpenAI · GPT — plain text @ ~${TEXT_CPT} chars/token`],
     [colors.gemini, 'Google · Gemini'],
     [colors.claude, 'Anthropic · Claude → Fable'],
-    [colors.grok, 'xAI · Grok 4.5'],
-    [colors.inkling, 'inkling images (measured overlays)'],
+    [colors.grok, 'xAI · Grok 4.7'],
+    [colors.fiche, 'fiche images (measured overlays)'],
   ];
   ctx.font = '400 13px sans-serif';
   let ly = top + 20;
@@ -481,10 +481,10 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
   }
 
   // Footnote
-  ctx.fillStyle = '#484f58';
+  ctx.fillStyle = '#7d8590';
   ctx.font = '400 12px sans-serif';
   ctx.fillText(
-    `same ratio at any size: a standard 200K Fable 5 window × inkling ≈ ${fmt(Math.round(200_000 * fableCpt))} chars (vs 800K as text). Regenerate: npx tsx scripts/gen-context-chart.ts`,
+    `same ratio at any size: a standard 200K Fable 5 window × fiche ≈ ${fmt(Math.round(200_000 * fableCpt))} chars (vs 800K as text). Regenerate: npx tsx scripts/gen-context-chart.ts`,
     36,
     1000 - 14,
   );
@@ -494,21 +494,9 @@ function draw(data: Point[], fableCpt: number, geminiCpt: number): Buffer {
 
 // ---------------------------------------------------------------------------
 const fixture = loadFixture();
-const fable = await measureDensity('Fable', fixture, patchTokenCount);
-// Opus 5 is measured, not derived from Fable. Both resolve to CLAUDE_PROFILE
-// today, so this returns the same cpt — but hardcoding `fable.cpt` would go stale
-// if resolveClaudeProfile ever splits them. Render under the resolved geometry.
-const opusProfile = resolveGptProfile('claude-opus-5');
-const opus = await measureDensity('Opus', fixture, patchTokenCount, {
-  cols: opusProfile.stripCols,
-  maxHeightPx: opusProfile.maxHeightPx,
-  style: opusProfile.style,
-});
-const gemini = await measureDensity(
-  'Gemini',
-  fixture,
-  (pages) => pages.length * GEMINI_TOKENS_PER_FULL_PAGE,
-);
+const fable = await measureDensity('Fable', 'claude-fable-5', fixture);
+const opus = await measureDensity('Opus', 'claude-opus-5', fixture);
+const gemini = await measureDensity('Gemini', 'gemini-3.8-flash', fixture);
 const data = points(fable.cpt, gemini.cpt, opus.cpt);
 
 console.log('\n  model                released   window (tokens)   chars in window');
@@ -518,17 +506,23 @@ for (const p of data) {
   );
 }
 const fableText = data.find((p) => p.name === 'Fable 5 [1m]')!;
-const fablePx = data.find((p) => p.name === 'Fable 5 [1m] + inkling')!;
-const geminiText = data.find((p) => p.name === 'Gemini 3.6 Flash')!;
-const geminiPx = data.find((p) => p.name === 'Gemini 3.6 Flash + inkling')!;
+const fablePx = data.find((p) => p.name === 'Fable 5 [1m] + fiche')!;
+const geminiText = data.find((p) => p.name === 'Gemini 3.8 Flash')!;
+const geminiPx = data.find((p) => p.name === 'Gemini 3.8 Flash + fiche')!;
+const opusText = data.find((p) => p.name === 'Opus 5')!;
+const opusPx = data.find((p) => p.name === 'Opus 5 + fiche')!;
 
 console.log(
-  `\n  Fable inkling multiplier on the same window: ${(fablePx.chars / fableText.chars).toFixed(2)}×`,
+  `\n  Fable fiche multiplier on the same window: ${(fablePx.chars / fableText.chars).toFixed(2)}×`,
 );
 console.log(
-  `  Gemini 3.6 Flash inkling multiplier on the same window: ${(geminiPx.chars / geminiText.chars).toFixed(2)}×`,
+  `  Gemini 3.8 Flash fiche multiplier on the same window: ${(geminiPx.chars / geminiText.chars).toFixed(2)}×`,
+);
+console.log(
+  `  Opus 5 fiche multiplier on the same window: ${(opusPx.chars / opusText.chars).toFixed(2)}×`,
 );
 
+const pngBuf = draw(data, fable.cpt, gemini.cpt, opus.cpt);
 mkdirSync(dirname(OUT), { recursive: true });
-writeFileSync(OUT, draw(data, fable.cpt, gemini.cpt));
-console.log(`\nwrote ${OUT}`);
+writeFileSync(OUT, pngBuf);
+console.log(`wrote ${OUT}`);

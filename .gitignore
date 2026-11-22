@@ -1,6 +1,7 @@
 # Node / TS
 node_modules/
 dist/
+site/dist/
 build/
 *.log
 # pnpm is the package manager — npm's lockfile is not the source of truth
@@ -71,3 +72,7 @@ eval/**/agent/sessions/
 *.pfx
 id_rsa*
 id_ed25519*
+
+# SwiftPM / macOS FicheBar build outputs
+apps/macos-bar/.build/
+apps/macos-bar/build.noindex/

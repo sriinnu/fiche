@@ -130,6 +130,7 @@ export interface FullStatsSummary {
   inputTokensTotal: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
+  inclusiveCacheReadTotal?: number;
   outputTokensTotal: number;
   cacheHitEvents: number;
   // Denominator for the event-based cache-hit rate: events that carried usage

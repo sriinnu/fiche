@@ -1789,6 +1789,36 @@ describe('proxy usage extraction', () => {
     expect(captured!.errorBody).toBeUndefined();
   });
 
+  /** Await onRequest callback without racing CompressionStream/tee timing under parallel load. */
+  function createOnRequestWaiter(): {
+    onRequest: (e: ProxyEvent) => void;
+    wait: (timeoutMs?: number) => Promise<ProxyEvent | undefined>;
+  } {
+    let val: ProxyEvent | undefined;
+    let resolveFn: ((e: ProxyEvent) => void) | undefined;
+    const p = new Promise<ProxyEvent>((resolve) => {
+      resolveFn = resolve;
+    });
+    return {
+      onRequest: (e: ProxyEvent) => {
+        val = e;
+        resolveFn?.(e);
+      },
+      wait: async (timeoutMs = 3000) => {
+        if (val !== undefined) return val;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const raced = await Promise.race([
+          p,
+          new Promise<undefined>((resolve) => {
+            timer = setTimeout(() => resolve(undefined), timeoutMs);
+          }),
+        ]);
+        if (timer !== undefined) clearTimeout(timer);
+        return raced ?? val;
+      },
+    };
+  }
+
   it('captures upstream error body for 4xx responses (up to 2 KiB)', async () => {
     const upstreamErr = {
       type: 'error',
@@ -1805,13 +1835,11 @@ describe('proxy usage extraction', () => {
         }),
     );
 
-    let captured: ProxyEvent | undefined;
+    const waiter = createOnRequestWaiter();
     const proxy = createProxy({
       transform: {},
       captureErrorReqBody: true,
-      onRequest: (e) => {
-        captured = e;
-      },
+      onRequest: waiter.onRequest,
     });
 
     const res = await proxy(
@@ -1823,7 +1851,7 @@ describe('proxy usage extraction', () => {
     );
     // Drain the client side so the tee can complete.
     const clientBody = await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    const captured = await waiter.wait();
     restore();
 
     expect(captured).toBeDefined();
@@ -1844,13 +1872,11 @@ describe('proxy usage extraction', () => {
         }),
     );
 
-    let captured: ProxyEvent | undefined;
+    const waiter = createOnRequestWaiter();
     const proxy = createProxy({
       transform: {},
       captureErrorReqBody: true,
-      onRequest: (e) => {
-        captured = e;
-      },
+      onRequest: waiter.onRequest,
     });
 
     const res = await proxy(
@@ -1861,7 +1887,7 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    const captured = await waiter.wait();
     restore();
 
     expect(captured).toBeDefined();
@@ -1892,13 +1918,11 @@ describe('proxy usage extraction', () => {
         }),
     );
 
-    let captured: ProxyEvent | undefined;
+    const waiter = createOnRequestWaiter();
     const proxy = createProxy({
       transform: {},
       captureErrorReqBody: true,
-      onRequest: (e) => {
-        captured = e;
-      },
+      onRequest: waiter.onRequest,
     });
 
     const res = await proxy(
@@ -1909,7 +1933,7 @@ describe('proxy usage extraction', () => {
       }),
     );
     await res.text();
-    await new Promise((r) => setTimeout(r, 20));
+    const captured = await waiter.wait();
     restore();
 
     expect(captured).toBeDefined();

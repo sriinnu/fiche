@@ -1,8 +1,9 @@
 # Benchmarks and model measurements
 
 **Where these numbers come from.** Every score on this page was measured
-before inkling's starting point (see the README's [Credits](../README.md#credits)).
-inkling has not re-run them. It uses them to decide which models get images
+in the upstream optical-rendering evaluation suite before the `fiche` rebrand
+(see the README's [Credits](../README.md#credits)).
+`fiche` uses these measurements to decide which models get images
 (`src/core/reader-tier.ts`) and which render profile each model gets. The
 harnesses and receipts are in [`eval/`](../eval/) and
 [FINDINGS.md](../FINDINGS.md); re-run them before trusting a number for your
@@ -22,7 +23,7 @@ Not every vision encoder can read dense 5×8 bitmap glyphs. **Gemini 4 (`gemini-
 
 - **Independent 6-document benchmark (`TokenSave` / `johnisking` corpus — English/Korean/Japanese prose, JS code, 60-record JSON, 230-line log):** That benchmark tested only `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`, and `claude-fable-5-1` with `--tools ""`, where `images only` scored **3/60 to 14/60** on planted hex IDs, **6/60 to 29/60** on planted numbers, **0/80** on unplanted log/JSON IDs, and **3/10** on Korean prose numbers (`94392` misread as `9392`). Running the exact same 6-document, 80-item benchmark on **`gemini-4-argon` pure images (no factsheet)** scores **28/30 (93.3%)** on planted hex IDs (**10/10** on English + Code, **10/10** on Korean `prose_ko` including `94392` exact, **5/5** on Japanese hex), **27/30 (90.0%)** on planted numbers, and **13/20** on unplanted JSON/log items (including **4/5** on unplanted 230-line log `req=` IDs where all four Claude models scored 0/20).
 - **We tested removing the factsheet on Gemini 4 (`68/80` pure-image) — and put it back:** Because `gemini-4-argon` scored **15/15** on our 12-char `verbatim-hex` benchmark and **100/100** on pure-image arithmetic, we tested removing the text factsheet completely (`factSheetFormat: 'none'`) on the 6-document TokenSave corpus. Even at 85% overall (`28/30` planted hex, `27/30` planted numbers), 5 of the 12 pure-image misses were single-pixel `0`↔`8` / `6`↔`8` substitutions inside 22-char `req_<18-hex>` strings (`req_709b2b8ff97e92994a` → `req_709b2b0ff97e92994a`) or `30141` → `38141`. In Spleen 5×8, `0` and `8` differ by one interior pixel. When a strong reader (`gemini-4-argon` or `claude-fable-5`) reads the image, it already sees which ticket/row goes with which value and uses the bounded 96-token factsheet to disambiguate `0` vs `8` (recovering the planted misses to **30/30** hex and **29/30** numbers), so we kept the factsheet in production. On weak readers (`opus-5-5`, `sonnet-5-5`, `fable-5-1`), the model cannot read the image rows at all, so it guesses pairings from the factsheet and fails 0/80 on any ID past the 96-token cap ([FINDINGS.md](../FINDINGS.md), 2026-10-25 entry).
-- **Escape hatch:** subagents on non-allowlisted models pass through as text — route byte-exact work there (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in agent frontmatter), or restrict `INKLING_MODELS=gemini,claude-fable-5` if you do not want `claude-opus-5-5` imaged.
+- **Escape hatch:** subagents on non-allowlisted models pass through as text — route byte-exact work there (`CLAUDE_CODE_SUBAGENT_MODEL=claude-sonnet-4-6`, or `model: sonnet` in agent frontmatter), or restrict `FICHE_MODELS=gemini,claude-fable-5` if you do not want `claude-opus-5-5` imaged.
 - **Real work (measured on `claude-fable-5`):** SWE-bench Lite pilot **10/10 both arms** at −65% request size; SWE-bench Pro **14/19 ON vs 15/19 OFF** at −60%, verdicts agree 18/19, and the single split re-resolved 3/3 on replication — run-to-run variance, not compression. Small n; receipts in `eval/`. Later Claude releases (`fable-5-1`, `opus-5-5`, `sonnet-5-5`) have weaker pixel recall than `claude-fable-5`.
 - **Workload-dependent.** Wins on token-dense content (~1 char/token), loses money on sparse prose (~3.5 chars/token); a profitability gate (calibrated on N=391 production rows) images only where the math wins.
 - **Client-dependent.** Savings track uncached bulk the client still re-sends as text. Claude Code re-sends system + tools + history on `/anthropic/messages` and typically lands ~60–70%. Details and measured splits: [docs/CACHING_AND_SAVINGS.md](CACHING_AND_SAVINGS.md).
@@ -48,7 +49,7 @@ numbers predate it).
 | `claude-fable-5-2` (default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | **98/98** | **18/18** | **0/16** | 13/15 | spaced profile; 13/15 and 11/15 over two hex runs, was 7/15 and 5/15 on the unspaced Fable 5 cell. Arithmetic measured unspaced, not rerun: [arithmetic](../eval/model-quality/), [dense hex](../eval/verbatim-15/), [gist/state/guards](../eval/gist-recall/) |
 | `claude-opus-5-5` (opt-in, text by default) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 94/98 | 17/18 | **0/16** | 3/15 | spaced profile (Opus 5.5+); hex measured at dense geometry: [arithmetic](../eval/sol-profile/), [gist/state/guards](../eval/gist-recall/), [dense hex](../eval/verbatim-15/) |
 | `claude-opus-5` (opt-in) | Spleen 5×8, 312 cols (shipped) | **100/100** | 94/98 | 17/18 | **0/16** | 2/15 | current profile: [arithmetic](../eval/gsm8k/), [gist/state/guards](../eval/gist-recall/), [dense hex](../eval/verbatim-15/) |
-| `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `INKLING_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](../eval/sol-profile/), [gist/state/guards](../eval/gist-recall/), [dense hex](../eval/verbatim-15/) |
+| `claude-sonnet-5-5` (opt-in, not recommended) | Spleen 5×8, 312 cols, +2px rows | **100/100** | 85/98 | 12/18 | **0/16** | 2/15 | spaced profile, opt-in via `FICHE_MODELS`; 6 state misses are wrong final values/counts, 7 gist misses answered UNKNOWN: [arithmetic](../eval/sol-profile/), [gist/state/guards](../eval/gist-recall/), [dense hex](../eval/verbatim-15/) |
 | `grok-4.5` (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84 quality suite (live profile); [quality](../eval/grok-density/QUALITY_RESULTS.md), [native-sweep](../eval/grok-density/native-sweep/RESULTS.md) |
 | `grok-4.6` high (opt-in) | JetBrains Mono 14px, 84 cols (shipped) | **100/100** | **97/98** | 17/18 | **0/16** | 0/15 | native 14px/84, reasoning high; [quality](../eval/grok-profile/QUALITY_RESULTS.md) |
 | `gpt-5.6-sol` (opt-in) | Spleen 5×8, 152 cols; **ships 14px/84** | 98/100 | 83/98 | 17/18 | 4/16 | 0/15 | broad suite predates the shipped 14px profile; 14px pilot: 7/8 exact, 0 inventions, gist/guard pass: [pilot](../eval/sol-profile/README.md) |
@@ -89,10 +90,10 @@ These are not cross-model comparisons. Every unlisted model is **not run**.
 
 | test | model | result | evaluation and receipts |
 | --- | --- | --- | --- |
-| SWE-bench Lite | `claude-fable-5` | inkling 10/10; text 10/10; −65% request size | [paired pilot](../eval/swe-bench/) |
-| SWE-bench Pro | `claude-fable-5` | inkling 14/19; text 15/19; −60% request size | [paired pilot](../eval/swe-bench-pro/) |
-| production-history row localization | `google/gemini-3.6-flash` | text 17/30; inkling 18/30 | [positional retrieval](../eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
-| production-history exact row | `google/gemini-3.6-flash` | text 3/30; inkling 3/30 | [positional retrieval](../eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
+| SWE-bench Lite | `claude-fable-5` | fiche 10/10; text 10/10; −65% request size | [paired pilot](../eval/swe-bench/) |
+| SWE-bench Pro | `claude-fable-5` | fiche 14/19; text 15/19; −60% request size | [paired pilot](../eval/swe-bench-pro/) |
+| production-history row localization | `google/gemini-3.6-flash` | text 17/30; fiche 18/30 | [positional retrieval](../eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
+| production-history exact row | `google/gemini-3.6-flash` | text 3/30; fiche 3/30 | [positional retrieval](../eval/gemini-profile/QUALITY_RESULTS.md#production-history-positional-retrieval) |
 
 The SWE-bench runner is Claude Code/Fable-specific; no other model has an ON/OFF
 run. Gemini's positional-retrieval sweep is directional evidence, not a general
@@ -104,29 +105,32 @@ Measured by rendering this repo’s dense fixture through the real pipeline and
 pricing pixels at each family’s vision rate. Multiplier = measured
 chars/vision-token ÷ 4 (prose text baseline). Not a model-quality score.
 
-| family | window | as text (@4 c/tok) | as inkling images | density | multiplier |
+| family | window | as text (@4 c/tok) | as fiche images | density | multiplier |
 |---|---:|---:|---:|---:|---:|
-| **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (exact 28px patches) | **~4.7×** |
-| **`google/gemini-3.6-flash`** | 1M | ~4.0M | **~20.1M** | ~20.1 c/vt (1,078 tok/page) | **~5.0×** |
-| **`claude-opus-5`** | 1M | ~4.0M | **~18.9M** | ~18.9 c/vt (resolves to Fable 5’s geometry) | **~4.7×** |
+| **`google/gemini-3.8-flash`** (default) | 1M | ~4.0M | **~21M** (~20.6M) | ~20.6 c/vt (1,078 tok/page) | **~5.1×** |
+| **`claude-fable-5[1m]`** (default) | 1M | ~4.0M | **~18M** (~17.9M) | ~17.9 c/vt (exact 28px patches) | **~4.5×** |
+| **`claude-opus-5`** (opt-in) | 1M | ~4.0M | **~14M** (~14.4M) | ~14.4 c/vt (spaced 5×8+2px profile) | **~3.6×** |
 
 Regenerate: `npx tsx scripts/gen-context-chart.ts` · chart PNG
-[`docs/assets/context-window-chars.png`](assets/context-window-chars.png).
+[`docs/assets/context-window-chars.png`](assets/context-window-chars.png) · multi-turn trade-offs [`docs/assets/efficiency-vs-latency.png`](assets/efficiency-vs-latency.png).
 
 The older GSM8K result is omitted because its training-data contamination can
 hide image misreads; the linked arithmetic evaluations use novel numbers.
 
 ## Context capacity chart
 
-![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.5; orange measured overlays are Fable 5 [1m] + inkling ~19.0M (4.8×) and Gemini 3.6 Flash + inkling ~21.3M (5.3×)](assets/context-window-chars.png)
+![chart: characters a frontier context window holds, 2018–2026 — vendor text series including Grok 4.7; orange measured overlays are Gemini 3.8 Flash + fiche ~21M (5.1×), Fable 5 [1m] + fiche ~18M (4.5×), and Opus 5 + fiche ~14M (3.6×)](assets/context-window-chars.png)
 
-*Eight years of context growth, in characters. Every text line tops out near
-~4M chars (a 1M-token window at ~4 chars/token); **Grok 4.5** is shown as a
-text-window point only (500K). The orange overlays are the **same 1M
-windows** read through inkling images — ~19.0M chars for Fable 5 (**4.8×**) and ~21.3M chars for Gemini 3.6 Flash (**5.3×** text capacity). Density is measured from a live render at
-generation time, not hand-typed: regenerate with
-`npx tsx scripts/gen-context-chart.ts`
-([source](../scripts/gen-context-chart.ts)).*
+*Eight years of context growth, in characters. Every 1M text line tops out near
+~4M chars (at ~4 chars/token); **Grok 4.7** is shown as a text-window point only
+(500K → ~2M chars). The orange overlays are the **same 1M windows** read through
+fiche images — ~21M chars (`~20.6 c/vt`) for **Gemini 3.8 Flash** (**5.1×**),
+~18M chars (`~17.9 c/vt`) for **Fable 5** (**4.5×**, or ~3.6M on a 200K window),
+and ~14M chars (`~14.4 c/vt`) for **Opus 5** at its spaced 5×8+2px geometry
+(**3.6×**). Density is measured from a live render at generation time, not
+hand-typed: regenerate with `npx tsx scripts/gen-context-chart.ts`
+([source](../scripts/gen-context-chart.ts)). See also the 16-model Pareto
+frontier in [`docs/assets/efficiency-vs-latency.png`](assets/efficiency-vs-latency.png).*
 
 ## Research status
 

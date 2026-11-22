@@ -34,7 +34,7 @@ describe('MCP server', () => {
     }));
     const initBody = init as { result: { protocolVersion: string; serverInfo: { name: string } } };
     expect(initBody.result.protocolVersion).toBe('2025-03-26');
-    expect(initBody.result.serverInfo.name).toBe('inkling-mcp');
+    expect(initBody.result.serverInfo.name).toBe('fiche-mcp');
     expect(await handleMcpMessage({ jsonrpc: '2.0', method: 'notifications/initialized' })).toBeNull();
     const withId = await handleMcpMessage({ jsonrpc: '2.0', id: 9, method: 'notifications/initialized' });
     expect(withId).toEqual({ jsonrpc: '2.0', id: 9, result: {} });
@@ -86,12 +86,51 @@ describe('MCP server', () => {
         request,
       },
     }));
-    const body = (transformed as { result: { structuredContent: { report: { readerTier: string; imaged: boolean; promptCacheBreakpoint: boolean; savedVsOriginal: number }; request: unknown } } }).result.structuredContent;
+    const body = (transformed as {
+      result: {
+        structuredContent: {
+          report: {
+            readerTier: string;
+            imaged: boolean;
+            textCompressed?: boolean;
+            textStages?: string[];
+            promptCacheBreakpoint: boolean;
+            savedVsOriginal: number;
+          };
+          request: { messages: Array<{ content: Array<{ content: string }> }> };
+        };
+      };
+    }).result.structuredContent;
     expect(body.report.readerTier).toBe('text');
     expect(body.report.imaged).toBe(false);
     expect(body.report.promptCacheBreakpoint).toBe(false);
-    expect(body.report.savedVsOriginal).toBe(0);
-    expect(body.request).toEqual(request);
+    expect(body.report.textCompressed).toBe(true);
+    expect(body.report.textStages).toContain('toon');
+    expect(body.report.savedVsOriginal).toBeGreaterThan(0);
+    expect(body.request.messages[0]?.content[0]?.content).toContain('@toon');
+
+    const cleanRequest = {
+      model: 'grok-4.7',
+      max_tokens: 64,
+      system: 'You are a coding agent.',
+      messages: [{ role: 'user', content: 'Explain the checksum mismatch.' }],
+    };
+    const cleanTransformed = await handleMcpMessage(rpc('tools/call', {
+      name: 'transform_request',
+      arguments: {
+        model: 'grok-4.7',
+        wire: 'anthropic',
+        upstream: 'https://chatgpt.com',
+        pathname: '/backend-api/codex/responses',
+        request: cleanRequest,
+      },
+    }));
+    const cleanBody = (cleanTransformed as { result: { structuredContent: { report: { readerTier: string; imaged: boolean; promptCacheBreakpoint: boolean; savedVsOriginal: number }; request: unknown } } }).result.structuredContent;
+    expect(cleanBody.report.readerTier).toBe('text');
+    expect(cleanBody.report.imaged).toBe(false);
+    expect(cleanBody.report.promptCacheBreakpoint).toBe(false);
+    expect(cleanBody.report.savedVsOriginal).toBe(0);
+    expect(cleanBody.request).toEqual(cleanRequest);
   });
 
   it('speaks newline frames and streamable HTTP', async () => {
@@ -114,7 +153,7 @@ describe('MCP server', () => {
       });
       expect(res.status).toBe(200);
       const json = await res.json() as { result: { structuredContent: { name: string; codex: string } } };
-      expect(json.result.structuredContent.name).toBe('inkling-mcp');
+      expect(json.result.structuredContent.name).toBe('fiche-mcp');
       expect(json.result.structuredContent.codex).toContain('chatgpt.com');
       const denied = await fetch(`http://127.0.0.1:${http.port}/mcp`, {
         method: 'POST',

@@ -79,7 +79,10 @@ export function isTrustedHostname(
 
 export function parseAllowedHosts(spec: string | undefined): string[] {
   if (!spec) return [];
-  return spec.split(',').map((s) => hostnameOf(s)).filter((s) => s !== '');
+  return spec
+    .split(',')
+    .map((s) => hostnameOf(s.trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split(/[/?#]/, 1)[0] ?? ''))
+    .filter((s) => s !== '');
 }
 
 /**
@@ -87,11 +90,18 @@ export function parseAllowedHosts(spec: string | undefined): string[] {
  * keeps its stricter loopback-and-same-origin rule.
  */
 export function guardProxyRequest(
-  headers: { host?: string | null; origin?: string | null },
+  headers: { host?: string | null; origin?: string | null; secFetchSite?: string | null },
   options: RequestGuardOptions = {},
 ): RequestGuardDenial | null {
   const allowed = options.allowedHosts ?? [];
   if (allowed.includes('*')) return null;
+  if (typeof headers.secFetchSite === 'string' && headers.secFetchSite.trim().toLowerCase() === 'cross-site') {
+    return {
+      status: 403,
+      reason: 'cross_origin',
+      message: 'fiche: cross-site browser request refused; set FICHE_ALLOWED_HOSTS=* to allow it',
+    };
+  }
   const origin = headers.origin;
   if (origin !== undefined && origin !== null) {
     let originHost: string | undefined;
@@ -107,7 +117,7 @@ export function guardProxyRequest(
       return {
         status: 403,
         reason: 'cross_origin',
-        message: `inkling: browser request from ${origin} refused; set INKLING_ALLOWED_HOSTS to allow it`,
+        message: `fiche: browser request from ${origin} refused; set FICHE_ALLOWED_HOSTS to allow it`,
       };
     }
   }
@@ -116,7 +126,7 @@ export function guardProxyRequest(
     return {
       status: 421,
       reason: 'untrusted_host',
-      message: `inkling: Host ${host} refused (possible DNS rebinding); set INKLING_ALLOWED_HOSTS to allow it`,
+      message: `fiche: Host ${host} refused (possible DNS rebinding); set FICHE_ALLOWED_HOSTS to allow it`,
     };
   }
   return null;

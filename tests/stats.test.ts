@@ -128,7 +128,7 @@ describe('stats aggregator', () => {
       );
     }
     const out = renderTextReport(s);
-    expect(out).toContain('inkling stats');
+    expect(out).toContain('fiche stats');
     expect(out).toContain('compressed');
     expect(out).toContain('cache hit rate');
     expect(out).toContain('/Users/x/code/pp');

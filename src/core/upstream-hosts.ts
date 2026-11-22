@@ -63,6 +63,17 @@ const COMPAT: readonly UpstreamHost[] = [
   { host: 'dashscope.aliyuncs.com', family: 'compat', prefixes: ['/apps/anthropic', '/compatible-mode'] },
   { host: 'openrouter.ai', family: 'compat', prefixes: ['/api'] },
   { host: 'api.x.ai', family: 'compat', prefixes: [''] },
+  { host: 'api.groq.com', family: 'compat', prefixes: ['/openai', ''] },
+  { host: 'api.together.xyz', family: 'compat', prefixes: [''] },
+  { host: 'api.fireworks.ai', family: 'compat', prefixes: ['/inference', ''] },
+  { host: 'api.cerebras.ai', family: 'compat', prefixes: [''] },
+  { host: 'api.mistral.ai', family: 'compat', prefixes: [''] },
+  { host: 'api.perplexity.ai', family: 'compat', prefixes: [''] },
+  { host: 'api.cohere.com', family: 'compat', prefixes: ['/compatibility', ''] },
+  { host: 'api.sambanova.ai', family: 'compat', prefixes: [''] },
+  { host: 'models.github.ai', family: 'compat', prefixes: ['/inference', ''] },
+  { host: 'models.inference.ai.azure.com', family: 'compat', prefixes: [''] },
+  { host: 'ai-gateway.vercel.sh', family: 'compat', prefixes: [''] },
 ];
 
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -190,11 +201,11 @@ export function resolveFollowTarget(
     const hostPart = slash < 0 ? rest : rest.slice(0, slash);
     const host = hostPart.toLowerCase().replace(/\.$/, '');
     const refuse = (message: string): FollowRefusal => ({ status: 400, reason: 'follow_refused', message });
-    if (!isFollowableHostname(host)) return refuse(`inkling: /to/ needs a provider hostname, got ${JSON.stringify(hostPart.slice(0, 100))}`);
+    if (!isFollowableHostname(host)) return refuse(`fiche: /to/ needs a provider hostname, got ${JSON.stringify(hostPart.slice(0, 100))}`);
     const entry = registry.get(host);
-    if (!entry) return refuse(`inkling: ${host} is not a known provider host; add it with INKLING_UPSTREAM_HOSTS`);
+    if (!entry) return refuse(`fiche: ${host} is not a known provider host; add it with FICHE_UPSTREAM_HOSTS`);
     if (entry.family !== 'compat') {
-      return refuse(`inkling: ${host} is first-party; point the agent at inkling's plain base URL instead of /to/`);
+      return refuse(`fiche: ${host} is first-party; point the agent at fiche's plain base URL instead of /to/`);
     }
     const tail = slash < 0 ? '/' : rest.slice(slash);
     return {
@@ -221,7 +232,7 @@ export function resolveFollowTarget(
     return {
       status: 421,
       reason: 'follow_refused',
-      message: `inkling: ${parsed.host}:${parsed.port} refused; provider hosts are followed on https:443 only`,
+      message: `fiche: ${parsed.host}:${parsed.port} refused; provider hosts are followed on https:443 only`,
     };
   }
   return {
@@ -250,7 +261,7 @@ export function refuseUnfollowedProviderHost(
   return {
     status: 421,
     reason: 'follow_refused',
-    message: `inkling: ${parsed.host} is a third-party provider and following is off (INKLING_FOLLOW_HOSTS=0)`,
+    message: `fiche: ${parsed.host} is a third-party provider and following is off (FICHE_FOLLOW_HOSTS=0)`,
   };
 }
 

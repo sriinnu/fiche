@@ -1,21 +1,28 @@
-name = "inkling"
+name = "fiche"
 main = "src/worker.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat_v2"]
 
-# Anthropic upstream is fetched via global fetch — no special bindings needed.
-# Set secrets via: wrangler secret put ANTHROPIC_API_KEY (optional passthrough)
+# Anthropic / OpenAI / Cloudflare upstreams are fetched via global fetch — no special bindings needed.
+# Set optional secrets via:
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#   npx wrangler secret put FICHE_WORKER_SECRET  # required whenever an API-key override is configured (x-fiche-secret header)
 
 [vars]
 ANTHROPIC_UPSTREAM = "https://api.anthropic.com"
 COMPRESS = "1"
 MIN_COMPRESS_CHARS = "2000"
-INKLING_MODELS = "claude-fable-5,gemini-3.6-flash"
+FICHE_MODELS = "claude-fable-5,gemini"
+# Optional Worker vars supported by src/worker.ts (and legacy INKLING_* fallbacks):
+# FICHE_UPSTREAM = "https://api.anthropic.com"
+# FICHE_TRACK = "1"
+# FICHE_RENDER_CACHE_BYTES = "8388608"  # 8 MiB edge default (0 disables)
+# FICHE_MAX_REQUEST_BYTES = "16777216"  # 16 MiB default
 
 # Uncomment to ship to a workers.dev subdomain
 # workers_dev = true
 
 # Or attach a custom route:
 # routes = [
-#   { pattern = "inkling.example.com/*", zone_name = "example.com" }
+#   { pattern = "fiche.example.com/*", zone_name = "example.com" }
 # ]

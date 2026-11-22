@@ -18,8 +18,11 @@ import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/
 import { setAllowedModelBases } from './core/applicability.js';
 import { setRenderCacheMaxBytes } from './core/render.js';
 
+import { readBrandEnv } from './core/env.js';
+
 export interface Env {
   /** Optional single upstream base for every API family. Family-specific env vars override it. */
+  FICHE_UPSTREAM?: string;
   INKLING_UPSTREAM?: string;
   ANTHROPIC_UPSTREAM?: string;
   /** Optional override — if set, replaces whatever x-api-key the client sent. */
@@ -38,15 +41,18 @@ export interface Env {
   MIN_TOOL_RESULT_CHARS?: string;
   COLS?: string;
   /** Comma-separated model bases eligible for compression. */
+  FICHE_MODELS?: string;
   INKLING_MODELS?: string;
   /** Ceiling on a buffered inbound request body, in bytes. A Worker is publicly
    *  reachable by default, so this is the setting that keeps one caller from
    *  choosing the isolate's memory ceiling. Unset uses the core 16 MiB default;
    *  a non-numeric or non-positive value is ignored rather than obeyed. */
+  FICHE_MAX_REQUEST_BYTES?: string;
   INKLING_MAX_REQUEST_BYTES?: string;
   /** When "0" / "false", disable per-request event JSON logs. Default-on.
    *  Cloudflare ingests console.log as Workers Logs; pipe via Logpush to
    *  R2/S3 for the same JSONL shape Node writes to disk. */
+  FICHE_TRACK?: string;
   INKLING_TRACK?: string;
   /** Max bytes of rendered pages held in memory, or "0" to disable the cache.
    *  Unset uses the core edge default (8 MiB), which is deliberately far below
@@ -55,12 +61,12 @@ export interface Env {
    *  not visible to core at module-init time, so this is applied per request via
    *  `setRenderCacheMaxBytes`. A negative or non-numeric value is ignored rather
    *  than obeyed; `0` is a real setting and must not be read as "unset". */
+  FICHE_RENDER_CACHE_BYTES?: string;
   INKLING_RENDER_CACHE_BYTES?: string;
-  /** Shared secret callers must present via the `x-inkling-secret` header
-   *  whenever an API-key override is configured. Without this gate a
-   *  discovered workers.dev URL is an open key-spender: the Worker would
-   *  attach your key to any stranger's request. Set with:
-   *    npx wrangler secret put INKLING_WORKER_SECRET */
+  /** Shared secret callers must present via the `x-fiche-secret` (or legacy
+   *  `x-inkling-secret`) header whenever an API-key override is configured.
+   *  Set with: npx wrangler secret put FICHE_WORKER_SECRET */
+  FICHE_WORKER_SECRET?: string;
   INKLING_WORKER_SECRET?: string;
 }
 
@@ -101,8 +107,8 @@ const nonNegativeInt = (v: string | undefined): number | undefined => {
 };
 
 export default {
-  async fetch(req: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
-    const configuredModels = env.INKLING_MODELS?.trim();
+  async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const configuredModels = (env.FICHE_MODELS ?? env.INKLING_MODELS)?.trim();
     setAllowedModelBases(
       configuredModels === undefined || configuredModels === ''
         ? null
@@ -113,57 +119,74 @@ export default {
     // Bindings only exist inside `fetch`, so the render cache budget is applied here
     // rather than at module init the way the Node host does it. Cheap and idempotent:
     // assigning the same value evicts nothing. Left unset, core keeps its edge default.
-    const renderCacheBytes = nonNegativeInt(env.INKLING_RENDER_CACHE_BYTES);
+    const renderCacheBytes = nonNegativeInt(env.FICHE_RENDER_CACHE_BYTES ?? env.INKLING_RENDER_CACHE_BYTES);
     if (renderCacheBytes !== undefined) setRenderCacheMaxBytes(renderCacheBytes);
     // ── Caller auth ────────────────────────────────────────────────────
-    // If this deployment injects API keys, never serve anonymous callers:
-    // workers.dev URLs are discoverable, and without this gate anyone who
-    // finds the URL spends this deployment's API credits.
-    if (env.ANTHROPIC_API_KEY || env.OPENAI_API_KEY || env.CLOUDFLARE_API_TOKEN) {
-      if (!env.INKLING_WORKER_SECRET) {
+    // If FICHE_WORKER_SECRET is configured, require it unconditionally. Also require
+    // it whenever any deployment API-key override is configured so workers.dev URLs
+    // never let anonymous callers spend operator credits.
+    const workerSecret = env.FICHE_WORKER_SECRET?.trim() || env.INKLING_WORKER_SECRET?.trim();
+    const hasConfiguredKey = Boolean(
+      env.ANTHROPIC_API_KEY?.trim() || env.OPENAI_API_KEY?.trim() || env.CLOUDFLARE_API_TOKEN?.trim(),
+    );
+    if (hasConfiguredKey && !workerSecret) {
+      return new Response(
+        JSON.stringify({
+          error:
+            'refusing to proxy: an API key override is configured but FICHE_WORKER_SECRET is not, ' +
+            'which would let anyone who finds this URL spend the configured key. ' +
+            'Run `npx wrangler secret put FICHE_WORKER_SECRET` and send the value as the x-fiche-secret header.',
+        }),
+        { status: 503, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (workerSecret) {
+      const presented = req.headers.get('x-fiche-secret') ?? req.headers.get('x-inkling-secret') ?? '';
+      if (!(await secretsMatch(presented, workerSecret))) {
         return new Response(
-          JSON.stringify({
-            error:
-              'refusing to proxy: an API key override is configured but INKLING_WORKER_SECRET is not, ' +
-              'which would let anyone who finds this URL spend the configured key. ' +
-              'Run `npx wrangler secret put INKLING_WORKER_SECRET` and send the value as the x-inkling-secret header.',
-          }),
-          { status: 503, headers: { 'content-type': 'application/json' } },
-        );
-      }
-      const presented = req.headers.get('x-inkling-secret') ?? '';
-      if (!(await secretsMatch(presented, env.INKLING_WORKER_SECRET))) {
-        return new Response(
-          JSON.stringify({ error: 'missing or invalid x-inkling-secret header' }),
+          JSON.stringify({ error: 'missing or invalid x-fiche-secret header' }),
           { status: 401, headers: { 'content-type': 'application/json' } },
         );
       }
-      // Don't forward the shared secret upstream.
+    }
+    // Never forward worker auth headers upstream, even when unauthenticated.
+    if (req.headers.has('x-fiche-secret') || req.headers.has('x-inkling-secret')) {
       req = new Request(req);
+      req.headers.delete('x-fiche-secret');
       req.headers.delete('x-inkling-secret');
     }
+
+    const parsedMinCompress = env.MIN_COMPRESS_CHARS !== undefined && env.MIN_COMPRESS_CHARS.trim() !== ''
+      ? Number(env.MIN_COMPRESS_CHARS)
+      : NaN;
+    const parsedMinToolResult = env.MIN_TOOL_RESULT_CHARS !== undefined && env.MIN_TOOL_RESULT_CHARS.trim() !== ''
+      ? Number(env.MIN_TOOL_RESULT_CHARS)
+      : NaN;
+    const parsedCols = env.COLS !== undefined && env.COLS.trim() !== ''
+      ? Number(env.COLS)
+      : NaN;
 
     const transform: TransformOptions = {
       compress: truthy(env.COMPRESS, true),
       compressTools: truthy(env.COMPRESS_TOOLS, true),
       compressToolResults: truthy(env.COMPRESS_TOOL_RESULTS, true),
-      minCompressChars: env.MIN_COMPRESS_CHARS ? Number(env.MIN_COMPRESS_CHARS) : 2000,
+      minCompressChars: Number.isFinite(parsedMinCompress) && parsedMinCompress >= 0 ? parsedMinCompress : 2000,
       // No floors — the content-aware `isCompressionProfitable()` gate
       // decides per-block based on actual pixel cost vs text cost. Host
       // can still set a floor via env if they want observability buckets
       // (e.g. MIN_TOOL_RESULT_CHARS=200 to skip absurdly small dumps).
-      minToolResultChars: env.MIN_TOOL_RESULT_CHARS ? Number(env.MIN_TOOL_RESULT_CHARS) : 0,
+      minToolResultChars: Number.isFinite(parsedMinToolResult) && parsedMinToolResult >= 0 ? parsedMinToolResult : 0,
       // Omit by default so OpenAI-shaped requests use their exact model profile;
       // COLS remains an explicit operator override for every family.
-      ...(env.COLS ? { cols: Number(env.COLS) } : {}),
+      ...(Number.isFinite(parsedCols) && parsedCols > 0 ? { cols: Math.floor(parsedCols) } : {}),
     };
-    const trackingOn = truthy(env.INKLING_TRACK, true);
+    const trackingOn = truthy(env.FICHE_TRACK ?? env.INKLING_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line
     // per event so downstream (Logpush → R2/S3) reads the same JSONL shape
     // the Node host writes to disk.
     const tracker: Tracker = trackingOn ? new JsonLogTracker((s) => console.log(s)) : noopTracker;
 
-    const sharedUpstream = env.INKLING_UPSTREAM;
+    const sharedUpstream = env.FICHE_UPSTREAM ?? env.INKLING_UPSTREAM ?? readBrandEnv('UPSTREAM');
     const parseModels = (value: string | undefined): string[] | undefined =>
       value === undefined ? undefined : value.split(',').map((model) => model.trim()).filter(Boolean);
     const cfAccount = env.CLOUDFLARE_ACCOUNT_ID?.trim();
@@ -171,20 +194,20 @@ export default {
     const cloudflareUpstream = cfAccount && cfToken
       ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
       : undefined;
+    const maxRequestBytes = positiveInt(env.FICHE_MAX_REQUEST_BYTES ?? env.INKLING_MAX_REQUEST_BYTES);
     const config: ProxyConfig = {
       upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
-      apiKey: env.ANTHROPIC_API_KEY,
+      apiKey: env.ANTHROPIC_API_KEY?.trim() || undefined,
       openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
-      openAIApiKey: env.OPENAI_API_KEY,
+      openAIApiKey: env.OPENAI_API_KEY?.trim() || undefined,
       cloudflareUpstream,
       cloudflareApiKey: cfToken,
       openAIModels: parseModels(env.OPENAI_MODELS),
       cloudflareModels: parseModels(env.CLOUDFLARE_MODELS),
+      ...(typeof ctx?.waitUntil === 'function' ? { waitUntil: (promise) => ctx.waitUntil(promise) } : {}),
       // A Worker cannot exit on bad config the way the Node host does, so an
       // unparseable value is dropped here and the core default applies.
-      ...(positiveInt(env.INKLING_MAX_REQUEST_BYTES) !== undefined
-        ? { maxRequestBytes: positiveInt(env.INKLING_MAX_REQUEST_BYTES) }
-        : {}),
+      ...(maxRequestBytes !== undefined ? { maxRequestBytes } : {}),
       transform,
       onRequest: (e) => {
         // Terse human-readable line (separate from the JSON event below;
@@ -201,7 +224,7 @@ export default {
 
         if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
           console.warn(
-            `[inkling warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}`,
+            `[fiche warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}`,
           );
         }
 

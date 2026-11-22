@@ -149,18 +149,18 @@ export function visionTokens(pricing: VisionPricing, width: number, height: numb
         ? c.exact.tokens
         : c.tokens;
     case 'tile': {
-      let w = width, h = height;
+      let w = Math.max(1, width), h = Math.max(1, height);
       const long = Math.max(w, h);
       if (long > OPENAI_TILE_MAX_LONG_EDGE) {
         const r = OPENAI_TILE_MAX_LONG_EDGE / long;
-        w = Math.floor(w * r);
-        h = Math.floor(h * r);
+        w = Math.max(1, Math.floor(w * r));
+        h = Math.max(1, Math.floor(h * r));
       }
       const short = Math.min(w, h);
       if (short > OPENAI_TILE_MAX_SHORT_EDGE) {
         const r = OPENAI_TILE_MAX_SHORT_EDGE / short;
-        w = Math.floor(w * r);
-        h = Math.floor(h * r);
+        w = Math.max(1, Math.floor(w * r));
+        h = Math.max(1, Math.floor(h * r));
       }
       return c.base + c.perTile * (Math.ceil(w / OPENAI_TILE_PX) * Math.ceil(h / OPENAI_TILE_PX));
     }

@@ -1,12 +1,18 @@
 /**
- * inkling proxy as a single Web-standard fetch handler.
+ * fiche proxy as a single Web-standard fetch handler.
  * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
+import { readBrandEnv } from './env.js';
 import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
-import { isAnthropicMessagesPath, isInklingSupportedGptModel, isInklingSupportedModel } from './applicability.js';
+import {
+  isAnthropicMessagesPath,
+  isInConfiguredModelBases,
+  isInklingSupportedGptModel,
+  isInklingSupportedModel,
+} from './applicability.js';
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
@@ -34,6 +40,7 @@ import {
   type UpstreamRegistry,
 } from './upstream-hosts.js';
 import { shouldImageModel } from './reader-tier.js';
+import { resolveTextHygieneMode } from './text-hygiene.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -115,6 +122,8 @@ export interface ProxyConfig {
   followHosts?: boolean;
   /** Registry for `followHosts`; defaults to the built-in provider list. */
   upstreamRegistry?: UpstreamRegistry;
+  /** Optional Edge Runtime hook (`ctx.waitUntil`) to keep async telemetry alive past response return. */
+  waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 export interface ProxyEvent {
@@ -213,7 +222,7 @@ function withIdleTimeout(
       timer = undefined;
       onIdle();
       try {
-        ctl?.error(new Error(`inkling: upstream stalled for ${budget}ms`));
+        ctl?.error(new Error(`fiche: upstream stalled for ${budget}ms`));
       } catch {
         /* already errored or closed */
       }
@@ -567,9 +576,11 @@ function processSseEvent(
   // discriminator when present and use the SSE name as a compatibility fallback.
   const eventType = typeof obj.type === 'string' ? obj.type : event;
 
-  // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
-  const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
-  if (openAIUsage) state.usage = openAIUsage;
+  if (eventType !== 'message_delta' && eventType !== 'message_start') {
+    // OpenAI chunks have no `event:` line; usage only present when stream_options.include_usage is set.
+    const openAIUsage = normalizeUsage((obj as { usage?: unknown }).usage);
+    if (openAIUsage) state.usage = openAIUsage;
+  }
   // OpenAI Responses API streams usage nested under `response` on the terminal
   // terminal Responses event — not at the top level.
   if (
@@ -665,7 +676,10 @@ function processSseEvent(
       if (!state.usage) state.usage = {} as Usage;
       const cur = state.usage;
       if (typeof u.output_tokens === 'number') cur.output_tokens = u.output_tokens;
-      if (typeof u.input_tokens === 'number' && cur.input_tokens === undefined) {
+      if (
+        typeof u.input_tokens === 'number' &&
+        (cur.input_tokens === undefined || cur.input_tokens === 0 || u.input_tokens > 0)
+      ) {
         cur.input_tokens = u.input_tokens;
       }
       if (typeof u.cache_creation_input_tokens === 'number') {
@@ -673,6 +687,18 @@ function processSseEvent(
       }
       if (typeof u.cache_read_input_tokens === 'number') {
         cur.cache_read_input_tokens = u.cache_read_input_tokens;
+      }
+      if (typeof u.cache_creation === 'object' && u.cache_creation !== null) {
+        cur.cache_creation = {
+          ...cur.cache_creation,
+          ...u.cache_creation,
+        };
+      }
+      if (typeof u.server_tool_use === 'object' && u.server_tool_use !== null) {
+        cur.server_tool_use = {
+          ...cur.server_tool_use,
+          ...u.server_tool_use,
+        };
       }
     }
   }
@@ -745,6 +771,25 @@ function normalizeUsage(raw: unknown): Usage | undefined {
   if (details && typeof details.cached_tokens === 'number') {
     out.cached_tokens = details.cached_tokens;
   }
+  // Root-level cached_tokens fallback (some OpenAI-compatible gateways).
+  if (out.cached_tokens === undefined && typeof u.cached_tokens === 'number') {
+    out.cached_tokens = u.cached_tokens;
+  }
+  // DeepSeek top-level prompt_cache_hit_tokens / prompt_cache_miss_tokens.
+  if (
+    typeof u.prompt_cache_hit_tokens === 'number' &&
+    (out.cached_tokens === undefined || (out.cached_tokens === 0 && u.prompt_cache_hit_tokens > 0))
+  ) {
+    out.cached_tokens = u.prompt_cache_hit_tokens;
+  }
+  if (
+    out.input_tokens === undefined &&
+    (typeof u.prompt_cache_hit_tokens === 'number' || typeof u.prompt_cache_miss_tokens === 'number')
+  ) {
+    out.input_tokens =
+      (typeof u.prompt_cache_hit_tokens === 'number' ? u.prompt_cache_hit_tokens : 0) +
+      (typeof u.prompt_cache_miss_tokens === 'number' ? u.prompt_cache_miss_tokens : 0);
+  }
   // Some OpenAI-compatible providers additionally expose prompt-cache writes.
   // Like cached_tokens, this is a diagnostic subset of input_tokens: consumers
   // must not add it to the input total a second time.
@@ -808,6 +853,11 @@ function revertedGoogleInfo(
     historyReason: undefined,
     bucketChars: undefined,
     gateEval: undefined,
+    textHygieneSavedChars: undefined,
+    textHygieneSavedTokens: undefined,
+    textHygieneBlocks: undefined,
+    textHygieneStages: undefined,
+    cliffAvoided: undefined,
     baselineProbeStatus,
   };
 }
@@ -821,6 +871,7 @@ function measureOpenAIChoices(obj: Record<string, unknown>, m: OutputMeasurement
     const payload = (c.delta ?? c.message) as Record<string, unknown> | undefined;
     if (!payload || typeof payload !== 'object') continue;
     if (typeof payload.content === 'string') m.textChars += payload.content.length;
+    if (typeof payload.reasoning_content === 'string') m.thinkingChars += payload.reasoning_content.length;
     const toolCalls = payload.tool_calls;
     if (Array.isArray(toolCalls)) {
       for (const tc of toolCalls) {
@@ -866,10 +917,43 @@ function measureGoogleCandidates(
   return true;
 }
 
-/** Measure non-streaming messages.content[] — same OutputMeasurement shape as the SSE accumulator. */
+/** Measure non-streaming messages.content[] / choices[] / Responses output[] — same OutputMeasurement shape as the SSE accumulator. */
 function measureFromMessageJson(j: unknown): OutputMeasurement {
   const m: OutputMeasurement = { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 };
-  if (j && typeof j === 'object') measureOpenAIChoices(j as Record<string, unknown>, m);
+  if (j && typeof j === 'object') {
+    const obj = j as Record<string, unknown>;
+    measureOpenAIChoices(obj, m);
+    if (Array.isArray(obj.output)) {
+      for (const rawItem of obj.output) {
+        if (!rawItem || typeof rawItem !== 'object') continue;
+        const item = rawItem as Record<string, unknown>;
+        const itemType = typeof item.type === 'string' ? item.type : '';
+        if (itemType === 'message' && Array.isArray(item.content)) {
+          for (const p of item.content) {
+            if (!p || typeof p !== 'object') continue;
+            const part = p as { type?: unknown; text?: unknown; refusal?: unknown };
+            if ((part.type === 'output_text' || part.type === 'text') && typeof part.text === 'string') {
+              m.textChars += part.text.length;
+            } else if (part.type === 'refusal' && typeof part.refusal === 'string') {
+              m.textChars += part.refusal.length;
+            }
+          }
+        } else if (itemType === 'reasoning') {
+          for (const arr of [item.summary, item.content]) {
+            if (!Array.isArray(arr)) continue;
+            for (const p of arr) {
+              if (p && typeof p === 'object' && typeof (p as { text?: unknown }).text === 'string') {
+                m.thinkingChars += ((p as { text: string }).text).length;
+              }
+            }
+          }
+        } else if (itemType === 'function_call' || itemType === 'custom_tool_call') {
+          if (typeof item.arguments === 'string') m.toolUseChars += item.arguments.length;
+          else if (typeof item.input === 'string') m.toolUseChars += item.input.length;
+        }
+      }
+    }
+  }
   const content = (j as { content?: unknown })?.content;
   if (!Array.isArray(content)) return m;
   for (const block of content) {
@@ -892,7 +976,7 @@ function measureFromMessageJson(j: unknown): OutputMeasurement {
 }
 
 /** Stop reason from a non-streaming response JSON: Anthropic `stop_reason`,
- *  OpenAI chat `choices[].finish_reason`, Responses `incomplete_details.reason`. */
+ *  OpenAI chat `choices[].finish_reason`, Responses `status` / `incomplete_details.reason`. */
 function readStopReasonFromJson(j: unknown): string | undefined {
   if (!j || typeof j !== 'object') return undefined;
   const obj = j as {
@@ -900,6 +984,7 @@ function readStopReasonFromJson(j: unknown): string | undefined {
     choices?: unknown;
     status?: unknown;
     incomplete_details?: { reason?: unknown };
+    error?: { code?: unknown };
   };
   if (typeof obj.stop_reason === 'string') return obj.stop_reason;
   if (Array.isArray(obj.choices)) {
@@ -911,6 +996,13 @@ function readStopReasonFromJson(j: unknown): string | undefined {
   if (obj.status === 'incomplete') {
     const reason = obj.incomplete_details?.reason;
     return typeof reason === 'string' ? reason : 'incomplete';
+  }
+  if (obj.status === 'failed') {
+    const code = obj.error?.code;
+    return typeof code === 'string' ? code : 'failed';
+  }
+  if (typeof obj.status === 'string') {
+    return obj.status === 'completed' ? 'stop' : obj.status;
   }
   return undefined;
 }
@@ -1019,17 +1111,23 @@ function teeForUsage(
           redactedBlockCount: 0,
         };
         streamedMeasurement = m;
+        const sseBoundaryRe = /\r\n\r\n|\n\n|\r\r/g;
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          const prevLen = buf.length;
           buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line; support LF, CRLF, and CR.
+          // SSE events are terminated by a blank line; start scanning at prevLen - 3 so
+          // a split delimiter is caught without rescanning the entire buffer O(N^2).
+          sseBoundaryRe.lastIndex = Math.max(0, prevLen - 3);
+          let consumedUntil = 0;
           let boundary: RegExpExecArray | null;
-          while ((boundary = /\r\n\r\n|\n\n|\r\r/.exec(buf)) !== null) {
-            const block = buf.slice(0, boundary.index);
-            buf = buf.slice(boundary.index + boundary[0].length);
+          while ((boundary = sseBoundaryRe.exec(buf)) !== null) {
+            const block = buf.slice(consumedUntil, boundary.index);
+            consumedUntil = boundary.index + boundary[0].length;
             processSseEvent(block, m, state);
           }
+          if (consumedUntil > 0) buf = buf.slice(consumedUntil);
           // A malformed/headerless non-SSE response must not make the audit
           // branch buffer without bound. Ordinary Responses events are far
           // smaller; fail closed and drain if no delimiter arrives within 4 MiB.
@@ -1047,13 +1145,25 @@ function teeForUsage(
       }
 
       if (ct.includes('application/json') || (ct === '' && assumeResponsesJson)) {
-        // Buffer fully, capped at 4 MiB.
+        // Buffer up to 4 MiB for telemetry while still draining oversized
+        // streams to EOF so the client tee never stalls on backpressure.
         const MAX = 4 * 1024 * 1024;
-        while (buf.length < MAX) {
+        let overflow = false;
+        while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          buf += decoder.decode(value, { stream: true });
+          if (!overflow) {
+            buf += decoder.decode(value, { stream: true });
+            if (buf.length > MAX) {
+              overflow = true;
+              buf = '';
+            }
+          }
         }
+        if (overflow) {
+          return { usage: undefined, measurement: undefined, stopReason: undefined };
+        }
+        buf += decoder.decode();
         try {
           const objects = parseJsonObjects(buf);
           if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
@@ -1130,7 +1240,8 @@ const STRIP_REQ_HEADERS = new Set([
   'content-length', // we recompute
   'expect',
   'accept-encoding', // let upstream choose
-  'x-inkling-bypass', // inkling-only opt-out signal; never forwarded upstream
+  'x-fiche-bypass', // fiche-only opt-out signal; never forwarded upstream
+  'x-inkling-bypass', // legacy opt-out alias; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -1336,9 +1447,13 @@ async function countTokensUpstream(
       method: 'POST',
       headers,
       body: body as unknown as BodyInit,
+      redirect: 'manual',
       signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => {});
+      return null;
+    }
     const json = (await res.json()) as { input_tokens?: unknown };
     return typeof json.input_tokens === 'number' ? json.input_tokens : null;
   } catch {
@@ -1383,6 +1498,7 @@ async function countGoogleTokensUpstream(
           method: 'POST',
           headers,
           body: countBody,
+          redirect: 'manual',
           signal: AbortSignal.timeout(Math.min(remainingMs, perShapeTimeout)),
         });
         if (res.ok) {
@@ -1391,6 +1507,8 @@ async function countGoogleTokensUpstream(
             if (host) preferredGoogleCountShapeByHost.set(host, countBody === shapeWrapped ? 1 : 0);
             return json.totalTokens;
           }
+        } else {
+          await res.body?.cancel().catch(() => {});
         }
       } catch {
         // try next payload shape
@@ -1475,6 +1593,18 @@ function stripTrailingSlashes(str: string): string {
   return str.slice(0, end);
 }
 
+function urlTargetsBase(targetUrl: string, base: string): boolean {
+  const trimmed = stripTrailingSlashes(base.trim());
+  if (!trimmed) return false;
+  if (targetUrl === trimmed) return true;
+  return targetUrl.startsWith(`${trimmed}/`) || targetUrl.startsWith(`${trimmed}?`);
+}
+
+function stripAnthropicCredentials(headers: Headers): void {
+  if (/^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '')) headers.delete('authorization');
+  if (/^sk-ant-/i.test(headers.get('x-api-key') ?? '')) headers.delete('x-api-key');
+}
+
 function resolveGoogleUpstream(
   req: Request,
   pathname: string,
@@ -1534,12 +1664,15 @@ export function createProxy(config: ProxyConfig = {}) {
   // Same trim policy as resolveUpstreams: keep provider-prefixed passthroughs
   // (e.g. /openai/*, /google-ai-studio/*) safe from env whitespace — see the
   // JSDoc on resolveUpstreams for the full rationale.
+  const gatewayBase = stripTrailingSlashes((config.gatewayBaseUrl ?? '').trim());
   const passthroughUpstream = config.provider === 'cloudflare-ai-gateway'
-    ? (config.gatewayBaseUrl ?? '').trim().replace(/\/+$/, '')
+    ? gatewayBase
     : upstream;
   const gatewayHeaders = config.gatewayHeaders ?? {};
-  const applyGatewayHeaders = (h: Headers): Headers => {
-    for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
+  const applyGatewayHeadersIfTargeted = (h: Headers, targetUrl: string): Headers => {
+    if (gatewayBase !== '' && urlTargetsBase(targetUrl, gatewayBase)) {
+      for (const [k, v] of Object.entries(gatewayHeaders)) h.set(k, v);
+    }
     return h;
   };
 
@@ -1553,7 +1686,7 @@ export function createProxy(config: ProxyConfig = {}) {
     // retries the socket several times before falling back. 426 is the answer
     // it takes as "use HTTP" on the first try (measured, codex-cli 0.167.1).
     if ((req.headers.get('upgrade') ?? '').toLowerCase().includes('websocket')) {
-      return new Response(JSON.stringify({ error: { type: 'websocket_unsupported', message: 'inkling proxies HTTP only; retry over HTTP' } }), {
+      return new Response(JSON.stringify({ error: { type: 'websocket_unsupported', message: 'fiche proxies HTTP only; retry over HTTP' } }), {
         status: 426,
         headers: { 'content-type': 'application/json', connection: 'close' },
       });
@@ -1597,9 +1730,9 @@ let responseContentType: string | undefined;
       errorBody?: string,
       measurement?: OutputMeasurement,
       stopReason?: string,
-    ): void => {
+    ): Promise<void> => {
       const is4xx = status >= 400 && status < 500;
-      // Gzip body lazily (only on 4xx). Async IIFE keeps fire() synchronous.
+      // Gzip body lazily (only on 4xx).
       const finalize = async (): Promise<void> => {
         let reqBodyGz: Uint8Array | undefined;
         if (config.captureErrorReqBody && is4xx && reqBodyBytes && reqBodyBytes.byteLength > 0) {
@@ -1644,14 +1777,17 @@ let responseContentType: string | undefined;
         }
         // The Messages compatibility response exposes Anthropic's disjoint
         // usage buckets to the client. Dashboard accounting still needs the
-        // original Responses semantics: input includes the cached subset.
-        const eventUsage = bridgedGptMessages && usage
-          ? {
-              ...usage,
-              input_tokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
-              cached_tokens: usage.cache_read_input_tokens ?? 0,
-            }
-          : usage;
+        // original Responses/Chat semantics: input includes the cached subset.
+        let eventUsage = usage;
+        if ((bridgedGptMessages || bridgedChatMessages) && usage) {
+          const converted: Usage = {
+            ...usage,
+            input_tokens: (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0),
+            cached_tokens: usage.cache_read_input_tokens ?? 0,
+          };
+          if (bridgedChatMessages) delete converted.cache_read_input_tokens;
+          eventUsage = converted;
+        }
         await config.onRequest?.({
           method: req.method,
           path: url.pathname,
@@ -1681,16 +1817,19 @@ let responseContentType: string | undefined;
           responseContentEncoding,
         });
       };
-      void finalize();
+      return finalize();
+    };
+    const fireWait = (...args: Parameters<typeof fire>): void => {
+      const p = fire(...args);
+      config.waitUntil?.(p);
     };
 
     // Transform only known shapes; everything else passes through.
     // Explicit per-request opt-out (#111): a subprocess that merely inherited
     // ANTHROPIC_BASE_URL (e.g. a plugin's internal `claude` probe) can send
-    // `x-inkling-bypass: 1` — via Claude Code's ANTHROPIC_CUSTOM_HEADERS — to
-    // have its traffic forwarded byte-for-byte untouched. Routing and auth
-    // still apply; the header itself is stripped before forwarding.
-    const bypassHeader = req.headers.get('x-inkling-bypass');
+    // `x-fiche-bypass: 1` (or legacy `x-inkling-bypass: 1`) via ANTHROPIC_CUSTOM_HEADERS
+    // to have its traffic forwarded byte-for-byte untouched.
+    const bypassHeader = req.headers.get('x-fiche-bypass') ?? req.headers.get('x-inkling-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
     const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
     const followed = config.followHosts
@@ -1753,7 +1892,7 @@ let responseContentType: string | undefined;
 
     // Refused here, not at resolution: fire() reads the per-request state above.
     if (followRefusal) {
-      fire(followRefusal.status, undefined, followRefusal.message);
+      fireWait(followRefusal.status, undefined, followRefusal.message);
       return new Response(JSON.stringify({ error: followRefusal.reason, message: followRefusal.message }), {
         status: followRefusal.status,
         headers: { 'content-type': 'application/json' },
@@ -1767,11 +1906,11 @@ let responseContentType: string | undefined;
     // operator chose where they go.
     if (upstreamBase === DEFAULT_UPSTREAM
       && !isAnthropicFamilyPath(url.pathname)
-      && !isMessagesWire && !isOpenAIChatWire && !isOpenAIResponsesWire) {
-      fire(404, undefined, `unknown_route: ${url.pathname.slice(0, 200)}`);
+      && !isMessagesWire) {
+      fireWait(404, undefined, `unknown_route: ${url.pathname.slice(0, 200)}`);
       return new Response(JSON.stringify({
         error: 'unknown_route',
-        message: `inkling does not forward ${url.pathname}; see docs/SECURITY_MODEL.md`,
+        message: `fiche does not forward ${url.pathname}; see docs/SECURITY_MODEL.md`,
       }), { status: 404, headers: { 'content-type': 'application/json' } });
     }
 
@@ -1789,7 +1928,7 @@ let responseContentType: string | undefined;
       const bounded = await readBodyBounded(req, maxRequestBytes);
       if (!bounded.ok) {
         const message =
-          `request body exceeds the ${maxRequestBytes}-byte inkling limit ` +
+          `request body exceeds the ${maxRequestBytes}-byte fiche limit ` +
           `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
           `read ${bounded.observedBytes})`;
         const error = isMessages
@@ -1797,7 +1936,7 @@ let responseContentType: string | undefined;
           : { error: { type: 'request_too_large', message } };
         // Emit like the serialized-size 413 below: a rejected request is still a
         // dashboard row, otherwise over-limit clients are invisible.
-        fire(413, undefined, message);
+        fireWait(413, undefined, message);
         return new Response(JSON.stringify(error), {
           status: 413,
           headers: { 'content-type': 'application/json' },
@@ -1828,10 +1967,9 @@ let responseContentType: string | undefined;
         if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
         requestModel = model ?? undefined;
         // A turn whose only content is `@inkling pin` / `@inkling unpin` is
-        // configuration, not a question. Answer it here: forwarding it would bill
-        // a full prefix to have the model paraphrase a list the proxy already
-        // holds, and the reply would be a guess about state it cannot see.
-        if (isMessages || isOpenAIChat || isOpenAIResponses) {
+        // configuration, not a question. Answer it here unless compression is
+        // paused/disabled: passthrough mode must forward `@fiche pin` untouched.
+        if (transformOpts?.compress !== false && (isMessages || isOpenAIChat || isOpenAIResponses)) {
           const pinReply = isMessages
             ? pinCommandResponse(bodyIn)
             : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
@@ -1860,7 +1998,7 @@ let responseContentType: string | undefined;
         modelRouteForRequest = modelRoute;
         const forceChat = isMessages && modelRoute === 'cloudflare';
         const messagesAnthropic = isMessages
-          && modelRoute === undefined && !forceChat && isClaudeModel(model);
+          && modelRoute === undefined && !forceChat && (Boolean(follow) || isClaudeModel(model));
         // Provider routing is explicit. Unlisted Messages models use the
         // default Anthropic route, regardless of how their id is shaped.
         bridgedGptMessages =
@@ -1876,7 +2014,7 @@ let responseContentType: string | undefined;
           ? (isGeminiModel(model) && isInklingSupportedModel(model))
           : isMessages
             ? (messagesAnthropic && isInklingSupportedModel(model))
-              || bridgedGptMessages
+              || (bridgedGptMessages && isInklingSupportedGptModel(effectiveModel))
               || (bridgedChatMessages && isInklingSupportedGptModel(effectiveModel))
             : isInklingSupportedGptModel(model);
         // Compression eligibility and telemetry follow the model that actually
@@ -1902,13 +2040,19 @@ let responseContentType: string | undefined;
           upstream: openAIUpstream,
         });
         // Allowlisted models image, except weak or unmeasured readers (Claude
-        // 5.5, Grok, Gemini 4 hydrogen/carbon), which pass through as text until
-        // INKLING_FORCE_IMAGES. That flag does not itself add a model to the
-        // allowlist. Opus 5 still images once named.
+        // 5.5, Grok, Gemini 4 hydrogen/carbon, DeepSeek, Kimi, GLM, MiniMax),
+        // which stay text unless INKLING_FORCE_IMAGES=1. When compression is not
+        // switched off, weak/text-only/third-party models still receive
+        // prefix-safe deterministic text hygiene (`imageCompress: false`).
         const imageThisRequest = shouldImageModel(routeModel, modelOk);
-        const effectiveOpts = imageThisRequest
-          ? { ...transformOpts, explicitPromptCacheBreakpoints: allowBreakpoints }
-          : { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
+        const hygieneForcedOn = resolveTextHygieneMode(transformOpts?.textHygiene) === 'on';
+        const familyInScope = modelOk || isInConfiguredModelBases(routeModel);
+        const killSwitchOff = transformOpts?.compress === false || (!familyInScope && !hygieneForcedOn);
+        const effectiveOpts = killSwitchOff
+          ? { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints }
+          : imageThisRequest
+            ? { ...transformOpts, imageCompress: true, explicitPromptCacheBreakpoints: allowBreakpoints }
+            : { ...transformOpts, imageCompress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
         // Local render+encode cost only. The Google branch below issues upstream
         // count_tokens probes, so the timer closes here rather than after them —
         // otherwise network latency would be charged to our own CPU.
@@ -1936,9 +2080,14 @@ let responseContentType: string | undefined;
           r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
         }
         transformMs = Date.now() - tTransform;
-        if (isGoogle && r.info.compressed) {
-          const countHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
-          countHeaders.set('content-type', 'application/json');
+        // CloudCode PA (`/v1internal:*`) has no `:countTokens` endpoint, and
+        // text-hygiene-only turns already have exact local token deltas.
+        if (
+          isGoogle &&
+          r.info.compressed &&
+          (r.info.imageCount ?? 0) > 0 &&
+          !url.pathname.startsWith('/v1internal:')
+        ) {
           const countUrl = new URL(
             (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
               /:(?:generateContent|streamGenerateContent)$/,
@@ -1947,31 +2096,45 @@ let responseContentType: string | undefined;
           );
           for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
           countUrl.searchParams.delete('alt');
-          const [baseline, transformed] = await Promise.all([
-            countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
-            countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
-          ]);
-          if (baseline !== null && transformed !== null) {
-            if (transformed >= baseline) {
-              r = {
-                body: bodyIn,
-                info: revertedGoogleInfo(
-                  r.info,
-                  `not_profitable (${transformed} >= ${baseline} tokens)`,
-                  'ok',
-                ),
-              };
+          const countHeaders = applyGatewayHeadersIfTargeted(
+            filterHeaders(req.headers, STRIP_REQ_HEADERS),
+            countUrl.toString(),
+          );
+          stripAnthropicCredentials(countHeaders);
+          countHeaders.delete('content-encoding');
+          countHeaders.set('content-type', 'application/json');
+          const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
+          const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
+          if (googleSyncProbe) {
+            const [baseline, transformed] = await Promise.all([
+              countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
+              countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
+            ]);
+            if (baseline !== null && transformed !== null) {
+              if (transformed >= baseline) {
+                r = {
+                  body: bodyIn,
+                  info: revertedGoogleInfo(
+                    r.info,
+                    `not_profitable (${transformed} >= ${baseline} tokens)`,
+                    'ok',
+                  ),
+                };
+              } else {
+                r.info.baselineTokens = baseline;
+                r.info.baselineProbeStatus = 'ok';
+              }
             } else {
-              r.info.baselineTokens = baseline;
-              r.info.baselineProbeStatus = 'ok';
+              // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
+              // Retain local profitability decision computed by transformGoogleGenerateContent.
+              r.info.baselineProbeStatus = 'failed';
             }
           } else {
-            // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
-            // Retain local profitability decision computed by transformGoogleGenerateContent.
-            r.info.baselineProbeStatus = 'failed';
+            baselineStatusApplies = true;
+            baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!);
           }
         }
-        if (!modelOk) r.info.reason = 'unsupported_model';
+        if (!modelOk && !r.info.compressed) r.info.reason = 'unsupported_model';
         bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
         info = r.info;
         reqBodyBytes = r.body;
@@ -1986,8 +2149,8 @@ let responseContentType: string | undefined;
         if (r.info.compressed && requestByteLimit !== undefined) {
           if (r.body.byteLength > requestByteLimit) {
             r.info.sizeLimitOutcome = 'rejected';
-            const message = `inkling serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
-            fire(413, r.info, message);
+            const message = `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+            fireWait(413, r.info, message);
             const error = isMessages
               ? { type: 'error', error: { type: 'request_too_large', message } }
               : { error: { type: 'request_too_large', message } };
@@ -2008,13 +2171,6 @@ let responseContentType: string | undefined;
           // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
           const ctBody = buildBaselineCountTokensBody(bodyIn);
           if (ctBody) {
-            const ctHeaders = applyGatewayHeaders(filterHeaders(req.headers, STRIP_REQ_HEADERS));
-            ctHeaders.set('content-type', 'application/json');
-            if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-            // The probe carries the client's frozen bearer otherwise, so it 401s
-            // exactly when the main forward starts succeeding on the fresh one.
-            const ctAuth = resolveAuthToken(config);
-            if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
             // Mirror the actual outbound request base+path: count_tokens lives at
             // `<messages-path>/count_tokens`, so provider-prefixed routes like
             // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
@@ -2022,6 +2178,19 @@ let responseContentType: string | undefined;
             const ctUrl = providerPrefixed
               ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
               : upstream + url.pathname + '/count_tokens';
+            const ctHeaders = applyGatewayHeadersIfTargeted(
+              filterHeaders(req.headers, STRIP_REQ_HEADERS),
+              ctUrl,
+            );
+            ctHeaders.delete('content-encoding');
+            ctHeaders.set('content-type', 'application/json');
+            const ctAuth = resolveAuthToken(config);
+            if (config.apiKey) ctHeaders.delete('authorization');
+            if (ctAuth) ctHeaders.delete('x-api-key');
+            if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+            // The probe carries the client's frozen bearer otherwise, so it 401s
+            // exactly when the main forward starts succeeding on the fresh one.
+            if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
             baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
             // Null = no markers → cacheable=0 by definition, no probe needed.
             const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
@@ -2036,14 +2205,14 @@ let responseContentType: string | undefined;
         }
       } catch (e) {
         if ((bridgedGptMessages || bridgedChatMessages) && (e as Error).name === 'MessagesBridgeInvalidRequest') {
-          fire(400, undefined, `invalid_request: ${(e as Error).message}`);
+          fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
           return new Response(JSON.stringify({
             type: 'error',
             error: { type: 'invalid_request_error', message: (e as Error).message },
           }), { status: 400, headers: { 'content-type': 'application/json' } });
         }
-        fire(502, undefined, `transform_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'inkling transform failed' }), {
+        fireWait(502, undefined, `transform_error: ${(e as Error).message}`);
+        return new Response(JSON.stringify({ error: 'fiche transform failed' }), {
           status: 502,
           headers: { 'content-type': 'application/json' },
         });
@@ -2083,70 +2252,8 @@ let responseContentType: string | undefined;
       bodyOut = req.body; // pass through unchanged
     }
 
-    const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
-    // The body now travels as plain bytes; a stale coding header would make
-    // the upstream try to decompress JSON.
-    if (requestBodyDecoded) outHeaders.delete('content-encoding');
-    if (follow) {
-      // The agent addressed this host with this credential; it is the only one
-      // that may travel. No configured key, no gateway header, and never an
-      // Anthropic-issued credential, which no third party should ever see.
-      if (/^Bearer\s+sk-ant-/i.test(outHeaders.get('authorization') ?? '')) outHeaders.delete('authorization');
-      if (/^sk-ant-/i.test(outHeaders.get('x-api-key') ?? '')) outHeaders.delete('x-api-key');
-    } else if (isOpenAIPath || bridgedGptMessages || bridgedChatMessages) {
-      // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
-      outHeaders.delete('x-api-key');
-      const anthropicHeaders: string[] = [];
-      outHeaders.forEach((_value, name) => {
-        if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
-      });
-      for (const name of anthropicHeaders) outHeaders.delete(name);
-      // The chat bridge uses the Cloudflare token; Responses uses the OpenAI key.
-      const bridgeKey = bridgedChatMessages
-        ? config.cloudflareApiKey
-        : config.openAIApiKey;
-      if (bridgedGptMessages || bridgedChatMessages) {
-        // A bridged request came in as Anthropic Messages, so whatever credential
-        // it carries is an Anthropic one by construction. Drop it unconditionally
-        // and use only what the host configured for the bridge target.
-        outHeaders.delete('authorization');
-        if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
-      } else {
-        // A direct OpenAI-family route. The client's own credential may be the
-        // right one to forward, so decide by shape instead of by whether a host
-        // key happens to be set. See resolveOpenAIRouteAuth for the three rules.
-        const decision = resolveOpenAIRouteAuth(
-          classifyInboundCredential(req.headers),
-          bridgeKey !== undefined && bridgeKey !== '',
-        );
-        if (decision.action === 'drop') outHeaders.delete('authorization');
-        else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
-        // 'keep-inbound' leaves the header filterHeaders already copied.
-      }
-    } else if (isGoogleFamily) {
-      // Inbound Google credential (Bearer or API key) is preserved; do not inject Anthropic keys.
-    } else if (!providerPrefixed || url.pathname.startsWith('/anthropic/')) {
-      if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
-      const bearer = resolveAuthToken(config);
-      if (bearer) outHeaders.set('authorization', `Bearer ${bearer}`);
-    }
-
-    if (!follow) applyGatewayHeaders(outHeaders);
-
-    // Claude Code smuggles its volatile per-turn billing line inside system
-    // text. transform.ts strips it from the body (no body position is both
-    // cache-safe and invisible — see the billingLine comments there) and hands
-    // it up; it travels upstream as the HTTP header it names.
-    if (info?.billingLine) {
-      const sep = info.billingLine.indexOf(':');
-      if (sep > 0) {
-        outHeaders.set(
-          info.billingLine.slice(0, sep).trim().toLowerCase(),
-          info.billingLine.slice(sep + 1).trim(),
-        );
-      }
-    }
-
+    // Compute the outbound upstreamUrl BEFORE applying credentials or gateway
+    // headers so every credential/header rule gates on the true destination.
     // Gateway OpenAI routes drop the `/v1` prefix; provider-prefixed passthrough
     // routes keep their full path so prefix-routing gateways see `/openai/*`,
     // `/google-ai-studio/*`, etc. exactly as the client sent them.
@@ -2167,6 +2274,89 @@ let responseContentType: string | undefined;
       upstreamUrl = providerPrefixed && !bridgedGptMessages
         ? joinProviderPath(requestUpstreamBase, outPath)
         : requestUpstreamBase + outPath;
+    }
+
+    const outHeaders = filterHeaders(req.headers, STRIP_REQ_HEADERS);
+    // The body now travels as plain bytes; a stale coding header would make
+    // the upstream try to decompress JSON.
+    if (requestBodyDecoded) outHeaders.delete('content-encoding');
+    const isAnthropicCredentialRoute =
+      !isGoogleFamily
+      && !isOpenAIChatWire
+      && !isOpenAIResponsesWire
+      && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))
+      && (isAnthropicFamilyPath(url.pathname) || url.pathname.startsWith('/anthropic/') || isMessagesWire);
+    if (follow) {
+      // The agent addressed this host with this credential; it is the only one
+      // that may travel. No configured key, no gateway header, and never an
+      // Anthropic-issued credential, which no third party should ever see.
+      stripAnthropicCredentials(outHeaders);
+    } else if (isOpenAIPath || url.pathname.startsWith('/openai/') || bridgedGptMessages || bridgedChatMessages) {
+      // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
+      outHeaders.delete('x-api-key');
+      const anthropicHeaders: string[] = [];
+      outHeaders.forEach((_value, name) => {
+        if (name.toLowerCase().startsWith('anthropic-')) anthropicHeaders.push(name);
+      });
+      for (const name of anthropicHeaders) outHeaders.delete(name);
+      // Only inject openAIApiKey when targeting openAIUpstream or gatewayBaseUrl
+      // (never send OPENAI_API_KEY to a custom ANTHROPIC_UPSTREAM on `/openai/*`).
+      const targetsOpenAIOrGateway =
+        urlTargetsBase(upstreamUrl, openAIUpstream)
+        || (gatewayBase !== '' && urlTargetsBase(upstreamUrl, gatewayBase));
+      // The chat bridge uses the Cloudflare token; Responses uses the OpenAI key.
+      const bridgeKey = bridgedChatMessages
+        ? config.cloudflareApiKey
+        : targetsOpenAIOrGateway
+          ? config.openAIApiKey
+          : undefined;
+      if (bridgedGptMessages || bridgedChatMessages) {
+        // A bridged request came in as Anthropic Messages, so whatever credential
+        // it carries is an Anthropic one by construction. Drop it unconditionally
+        // and use only what the host configured for the bridge target.
+        outHeaders.delete('authorization');
+        if (bridgeKey) outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+      } else {
+        // A direct OpenAI-family route. The client's own credential may be the
+        // right one to forward, so decide by shape instead of by whether a host
+        // key happens to be set. See resolveOpenAIRouteAuth for the three rules.
+        const decision = resolveOpenAIRouteAuth(
+          classifyInboundCredential(req.headers),
+          bridgeKey !== undefined && bridgeKey !== '',
+        );
+        if (decision.action === 'drop') outHeaders.delete('authorization');
+        else if (decision.action === 'replace') outHeaders.set('authorization', `Bearer ${bridgeKey}`);
+        // 'keep-inbound' leaves the header filterHeaders already copied.
+      }
+    } else if (!isAnthropicCredentialRoute) {
+      // Non-Anthropic provider routes (Google, /compat/, /grok/, /xai/, /deepseek/,
+      // /kimi/, /glm/, etc.) never receive Anthropic credentials.
+      stripAnthropicCredentials(outHeaders);
+    } else {
+      const bearer = resolveAuthToken(config);
+      if (config.apiKey) outHeaders.delete('authorization');
+      if (bearer) outHeaders.delete('x-api-key');
+      if (config.apiKey) outHeaders.set('x-api-key', config.apiKey);
+      if (bearer) outHeaders.set('authorization', `Bearer ${bearer}`);
+    }
+
+    if (!follow) applyGatewayHeadersIfTargeted(outHeaders, upstreamUrl);
+
+    // Claude Code smuggles its volatile per-turn billing line inside system
+    // text. transform.ts strips it from the body (no body position is both
+    // cache-safe and invisible — see the billingLine comments there) and hands
+    // it up; it travels upstream as the HTTP header it names.
+    if (info?.billingLine) {
+      const sep = info.billingLine.indexOf(':');
+      if (sep > 0) {
+        try {
+          const headerName = info.billingLine.slice(0, sep).trim().toLowerCase();
+          const headerValue = info.billingLine.slice(sep + 1).replace(/[\r\n]+/g, ' ').trim();
+          outHeaders.set(headerName, headerValue);
+        } catch {
+          // Malformed header name/value in billingLine must never crash the proxy.
+        }
+      }
     }
     let releaseInFlight = (): void => {};
     if (reqBodySha256 && duplicateHoldMs > 0) {
@@ -2197,7 +2387,7 @@ let responseContentType: string | undefined;
       // late is the client recovering from a stall, not an accidental double-send.
       if (existing && now - existing.startedAt < duplicateHoldMs) {
         const message = 'An identical request is already in progress';
-        fire(409, undefined, 'duplicate_request_in_flight');
+        fireWait(409, undefined, 'duplicate_request_in_flight');
         const error = isMessages
           ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
           : { error: { type: 'duplicate_request_in_flight', message } };
@@ -2225,7 +2415,7 @@ let responseContentType: string | undefined;
       headersTimer = setTimeout(() => {
         headersTimer = undefined;
         timeoutKind = 'headers';
-        upstreamAbort.abort(new Error('inkling: upstream headers timeout'));
+        upstreamAbort.abort(new Error('fiche: upstream headers timeout'));
         resolve(HEADERS_TIMEOUT);
       }, headersTimeoutMs);
     });
@@ -2241,9 +2431,9 @@ let responseContentType: string | undefined;
       const upstreamFetch = fetch(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
-        // A followed host's redirect goes back to the agent; following it here
-        // would carry the credential to wherever the 3xx points.
-        ...(follow ? { redirect: 'manual' as const } : {}),
+        // Never auto-follow 3xx redirects upstream: cross-origin redirects could
+        // forward x-api-key, x-goog-api-key, Authorization, or gateway headers.
+        redirect: 'manual' as const,
         body: bodyOut,
         signal: upstreamAbort.signal,
         // duplex is required by spec when sending a stream as body
@@ -2255,13 +2445,13 @@ let responseContentType: string | undefined;
       if (raced === HEADERS_TIMEOUT) {
         // Abandoned: keep its eventual rejection from surfacing as unhandled.
         void upstreamFetch.catch(() => undefined);
-        throw new Error('inkling: upstream headers timeout');
+        throw new Error('fiche: upstream headers timeout');
       }
       upstreamRes = raced;
       // Watch the raw upstream stream, before any bridge re-encodes it.
       upstreamRes = withIdleTimeout(upstreamRes, headersTimeoutMs, idleTimeoutMs, () => {
         timeoutKind = 'idle';
-        upstreamAbort.abort(new Error('inkling: upstream stalled'));
+        upstreamAbort.abort(new Error('fiche: upstream stalled'));
       });
       if (bridgedGptMessages) {
         upstreamRes = await openAIResponsesToAnthropicResponse(upstreamRes, requestModel ?? '');
@@ -2275,14 +2465,14 @@ let responseContentType: string | undefined;
         const detail = timeoutKind === 'headers'
           ? `no response headers within ${headersTimeoutMs}ms`
           : `no upstream bytes for ${idleTimeoutMs}ms`;
-        fire(504, info, `upstream_timeout: ${detail}`);
-        return new Response(JSON.stringify({ error: `inkling upstream timeout (${detail})` }), {
+        fireWait(504, info, `upstream_timeout: ${detail}`);
+        return new Response(JSON.stringify({ error: `fiche upstream timeout (${detail})` }), {
           status: 504,
           headers: { 'content-type': 'application/json' },
         });
       }
-      fire(502, info, `upstream_error: ${(e as Error).message}`);
-      return new Response(JSON.stringify({ error: 'inkling upstream unreachable' }), {
+      fireWait(502, info, `upstream_error: ${(e as Error).message}`);
+      return new Response(JSON.stringify({ error: 'fiche upstream unreachable' }), {
         status: 502,
         headers: { 'content-type': 'application/json' },
       });
@@ -2312,7 +2502,7 @@ let teed: Response;
     }
 
     // Fire event in background once all four resolve (all share the same stream read).
-    void Promise.all([
+    const bgTask = Promise.all([
       usagePromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
@@ -2333,7 +2523,7 @@ let teed: Response;
         usage?.cache_read_input_tokens,
         usage?.cache_creation_input_tokens,
       );
-      fire(
+      return fire(
         upstreamRes.status,
         info,
         timeoutKind === 'idle' ? `upstream_timeout: no upstream bytes for ${idleTimeoutMs}ms` : undefined,
@@ -2347,6 +2537,7 @@ let teed: Response;
       clearHeadersTimer();
       releaseInFlight();
     });
+    config.waitUntil?.(bgTask);
 
     // Client disconnect: drop the lease immediately and abort upstream, rather than
     // waiting on scanner promises that a wedged connection would never settle.
@@ -2355,15 +2546,36 @@ let teed: Response;
           clearHeadersTimer();
           releaseInFlight();
           if (!upstreamAbort.signal.aborted) {
-            upstreamAbort.abort(new Error('inkling: client disconnected'));
+            upstreamAbort.abort(new Error('fiche: client disconnected'));
           }
         })
       : null;
 
+    const resHeaders = filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS);
+    if (info && (info.compressed || (info.textHygieneSavedTokens ?? 0) > 0)) {
+      const imagedSaved = info.compressed
+        ? Math.max(
+            0,
+            (info.baselineImagedTokens ?? Math.round((info.compressedChars ?? 0) / 4)) -
+              (info.imageTokens ?? 0),
+          )
+        : 0;
+      const savedTokens = (info.textHygieneSavedTokens ?? 0) + imagedSaved;
+      const stages = [
+        ...(info.compressed && (info.imageCount ?? 0) > 0 ? ['image'] : []),
+        ...(info.textHygieneStages ?? []),
+      ];
+      if (savedTokens > 0) resHeaders.set('x-fiche-saved-tokens', String(savedTokens));
+      if (stages.length > 0) resHeaders.set('x-fiche-stages', [...new Set(stages)].join(','));
+      if (info.cliffAvoided && info.cliffAvoided.savedUsd > 0) {
+        resHeaders.set('x-fiche-cliff-saved-usd', info.cliffAvoided.savedUsd.toFixed(4));
+      }
+    }
+
     return new Response(clientBody, {
       status: upstreamRes.status,
       statusText: upstreamRes.statusText,
-      headers: filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS),
+      headers: resHeaders,
     });
   };
 }
