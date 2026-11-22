@@ -322,7 +322,7 @@ describe('Wave 1 P0 audit regressions', () => {
       expect(res.changed).toBe(true);
       const schemaA = tools[0]!.input_schema as Record<string, unknown>;
       expect(schemaA.$id).toBe('https://example.com/schemas/tool_a.json');
-      expect(schemaA.$schema).toBeUndefined();
+      expect(schemaA.$schema).toBe('https://json-schema.org/draft/2020-12/schema');
       const propsA = schemaA.properties as Record<string, Record<string, unknown>>;
       expect(propsA['---']!.title).toBe('DashLabel');
       expect(propsA.targetPath!.title).toBeUndefined();

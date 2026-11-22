@@ -160,7 +160,7 @@ describe('per-turn savings telemetry, proxy headers, MCP live stats & plugin hoo
   it('persists text_hygiene_stages in TrackEvent and emits x-fiche-* downstream proxy headers', async () => {
     setAllowedModelBases(['gpt-6-astra']);
     const sharedDesc =
-      'Strict workspace validation rule: verify files on disk before proposing edits and preserve all tests cleanly.';
+      'Strict workspace validation rule: verify files on disk before proposing edits, inspect full surrounding context carefully, preserve formatting conventions cleanly, and confirm all tests pass after edits.';
     const tools = Array.from({ length: 6 }, (_, i) => ({
       type: 'function',
       name: `tool_${i}`,

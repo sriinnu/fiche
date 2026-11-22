@@ -197,7 +197,7 @@ export function parseExportArgv(
       diff = val;
     } else if (a.startsWith('--diff=')) {
       const v = a.slice('--diff='.length);
-      if (!v) return { kind: 'error', message: '--diff= requires a non-empty value' };
+      if (!v || v.startsWith('-')) return { kind: 'error', message: '--diff= requires a non-empty ref not starting with -' };
       diff = v;
     } else if (a === '--stdin') {
       stdin = true;

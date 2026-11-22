@@ -153,7 +153,7 @@ export function isClaudeModel(model: string | null | undefined): boolean {
  * downscale the server will not perform.
  */
 export function isPre47Claude(m: string): boolean {
-  const v = /claude-(?:[a-z]+-)?(\d+)(?:-(\d+))?/.exec(m);
+  const v = /claude-(?:[a-z]+-)?(\d+)(?:[-.](\d{1,2})(?!\d))?/.exec(m);
   if (!v) return false;
   const [major, minor] = [Number(v[1]), Number(v[2] ?? '0')];
   return major < 4 || (major === 4 && minor < 7);

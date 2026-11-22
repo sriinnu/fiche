@@ -67,7 +67,7 @@ function walkLinesWithFences(
     if (ch === '`' || ch === '~') {
       while (trimmedStart[run] === ch) run++;
     }
-    if (!openChar && run >= 3) {
+    if (!openChar && run >= 3 && !(ch === '`' && trimmedStart.indexOf('`', run) >= 0)) {
       openChar = ch!;
       openLen = run;
       if (onLine(line, true) === false) return;

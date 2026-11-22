@@ -5,6 +5,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -43,10 +44,28 @@ export function resolveFicheBins(scriptsDir = SCRIPTS_DIR) {
   return [...new Set(candidates)];
 }
 
+function packageRootsForBin(binPath) {
+  const roots = [];
+  if (!path.isAbsolute(binPath)) return roots;
+  const binDir = path.dirname(binPath);
+  // Global npm / pnpm layout (e.g. %APPDATA%\npm\node_modules\@sriinnu\fiche or ~/.local/share/pnpm/global/5/node_modules/@sriinnu/fiche)
+  roots.push(path.resolve(binDir, 'node_modules/@sriinnu/fiche'));
+  roots.push(path.resolve(binDir, '../node_modules/@sriinnu/fiche'));
+  roots.push(path.resolve(binDir, '../lib/node_modules/@sriinnu/fiche'));
+  try {
+    const real = fs.realpathSync(binPath);
+    const realDir = path.dirname(real);
+    roots.push(path.resolve(realDir, '..'));
+    roots.push(path.resolve(realDir, '../lib/node_modules/@sriinnu/fiche'));
+  } catch {
+    // ignore broken/missing symlink
+  }
+  return [...new Set(roots)];
+}
+
 /**
  * Resolve `dist/turn-report.js` in <1ms without spawning a subprocess.
- * Works both inside the repo (`../../../dist/turn-report.js`) and when the
- * plugin is copied externally (follows symlinks on ~/.local/bin/fiche -> bin/cli.js).
+ * Works inside a repo checkout, symlinked `~/.local/bin/fiche`, or global npm/pnpm installs.
  */
 export async function loadTurnReportModule(scriptsDir = SCRIPTS_DIR) {
   const envModule =
@@ -59,12 +78,8 @@ export async function loadTurnReportModule(scriptsDir = SCRIPTS_DIR) {
   ].filter(Boolean);
 
   for (const binPath of resolveFicheBins(scriptsDir)) {
-    if (!path.isAbsolute(binPath)) continue;
-    try {
-      const real = fs.realpathSync(binPath);
-      candidates.push(path.resolve(path.dirname(real), '../dist/turn-report.js'));
-    } catch {
-      // ignore missing bin symlink
+    for (const pkgRoot of packageRootsForBin(binPath)) {
+      candidates.push(path.join(pkgRoot, 'dist/turn-report.js'));
     }
   }
 
@@ -74,6 +89,43 @@ export async function loadTurnReportModule(scriptsDir = SCRIPTS_DIR) {
       return await import(pathToFileURL(modPath).href);
     } catch {
       // try next candidate
+    }
+  }
+  return null;
+}
+
+/**
+ * Fallback CLI invocation that avoids Node >= 20.12.2 Windows `.cmd` `EINVAL`
+ * by preferring the underlying `.js` entrypoint via `process.execPath` when available.
+ */
+export function spawnFicheTurnReport(args, scriptsDir = SCRIPTS_DIR) {
+  const jsEntries = [path.resolve(scriptsDir, '../../../bin/cli.js')];
+  for (const binPath of resolveFicheBins(scriptsDir)) {
+    if (/\.(?:m?js|cjs)$/i.test(binPath)) jsEntries.push(binPath);
+    for (const pkgRoot of packageRootsForBin(binPath)) {
+      jsEntries.push(path.join(pkgRoot, 'bin/cli.js'));
+    }
+  }
+  for (const entry of [...new Set(jsEntries)]) {
+    if (!fs.existsSync(entry)) continue;
+    const res = spawnSync(process.execPath, [entry, ...args], {
+      encoding: 'utf8',
+      timeout: 3000,
+    });
+    if (res.status === 0 && typeof res.stdout === 'string' && res.stdout.trim()) {
+      return res;
+    }
+  }
+
+  for (const bin of resolveFicheBins(scriptsDir)) {
+    const needsShell = process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(bin);
+    const res = spawnSync(bin, args, {
+      encoding: 'utf8',
+      timeout: 3000,
+      ...(needsShell ? { shell: true } : {}),
+    });
+    if (res.status === 0 && typeof res.stdout === 'string' && res.stdout.trim()) {
+      return res;
     }
   }
   return null;
