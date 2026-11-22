@@ -495,10 +495,11 @@ struct PluginDescriptor: Decodable, Identifiable, Sendable, Equatable {
         self.id = id
         self.name = c.firstString("name", "title", "label") ?? id
         self.description = c.firstString("description", "summary", "detail")
-        self.kind = PluginKind(rawKind: c.firstString("kind", "type", "category"))
+        let parsedKind = PluginKind(rawKind: c.firstString("kind", "type", "category"))
+        self.kind = parsedKind
         self.source = c.firstString("source", "origin")
         self.enabled = c.firstBool("enabled", "active", "on") ?? true
-        self.mutable = c.firstBool("mutable", "toggleable", "canToggle", "configurable") ?? true
+        self.mutable = c.firstBool("mutable", "toggleable", "canToggle", "configurable") ?? (parsedKind != .stage)
         self.path = c.firstString("path", "file")
     }
 

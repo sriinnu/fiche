@@ -9,9 +9,8 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { loadTurnReportModule, resolveEventsFile, resolveFicheBins } from './resolve-turn-report.mjs';
+import { loadTurnReportModule, resolveEventsFile, spawnFicheTurnReport } from './resolve-turn-report.mjs';
 
 const SCRIPTS_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -106,16 +105,13 @@ async function main() {
     return;
   }
 
-  for (const bin of resolveFicheBins(SCRIPTS_DIR)) {
-    const res = spawnSync(
-      bin,
-      ['turn-report', '--format=agy', '--file', eventsFile, '--cursor', cursorPath],
-      { encoding: 'utf8', timeout: 3000 },
-    );
-    if (res.status === 0 && typeof res.stdout === 'string' && res.stdout.trim().startsWith('{')) {
-      process.stdout.write(res.stdout.trim());
-      return;
-    }
+  const res = spawnFicheTurnReport(
+    ['turn-report', '--format=agy', '--file', eventsFile, '--cursor', cursorPath],
+    SCRIPTS_DIR,
+  );
+  if (res && typeof res.stdout === 'string' && res.stdout.trim().startsWith('{')) {
+    process.stdout.write(res.stdout.trim());
+    return;
   }
   failOpen();
 }

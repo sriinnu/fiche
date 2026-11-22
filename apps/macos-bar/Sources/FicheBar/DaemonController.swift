@@ -2,6 +2,9 @@ import AppKit
 import Darwin
 import Foundation
 
+@_silgen_name("proc_pidpath")
+private func cProcPidPath(_ pid: Int32, _ buffer: UnsafeMutableRawPointer, _ bufferSize: UInt32) -> Int32
+
 // MARK: - Helper Types
 
 private enum DefaultsKey {
@@ -540,10 +543,10 @@ final class DaemonController: ObservableObject {
 
         if isLoginAgentInstalled {
             _ = await Self.bootoutLaunchAgent()
-        } else if case .httpError(let status, _) = shutdownRes, status == 404, let pid = knownPid {
-            kill(pid_t(pid), SIGTERM)
-        } else if case .unreachable = shutdownRes, let pid = knownPid {
-            kill(pid_t(pid), SIGTERM)
+        } else if case .httpError(let status, _) = shutdownRes, status == 404, let pid = knownPid, Self.isFicheProcess(pid: pid) {
+            Darwin.kill(pid_t(pid), SIGTERM)
+        } else if case .unreachable = shutdownRes, let pid = knownPid, Self.isFicheProcess(pid: pid) {
+            Darwin.kill(pid_t(pid), SIGTERM)
         }
 
         for _ in 0..<12 {
@@ -553,8 +556,8 @@ final class DaemonController: ObservableObject {
             }
         }
 
-        if await isDaemonReachable(), let pid = knownPid, !isLoginAgentInstalled {
-            kill(pid_t(pid), SIGTERM)
+        if await isDaemonReachable(), let pid = knownPid, !isLoginAgentInstalled, Self.isFicheProcess(pid: pid) {
+            Darwin.kill(pid_t(pid), SIGTERM)
             try? await Task.sleep(for: .milliseconds(250))
         }
 
@@ -954,7 +957,8 @@ final class DaemonController: ObservableObject {
             path = Self.ficheHomeURL.appendingPathComponent("plugins").path
         }
         let url = URL(fileURLWithPath: path, isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        Darwin.chmod(url.path, 0o700)
         NSWorkspace.shared.open(url)
     }
 
@@ -962,7 +966,8 @@ final class DaemonController: ObservableObject {
         let url = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config", isDirectory: true)
             .appendingPathComponent("fiche", isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        Darwin.chmod(url.path, 0o700)
         NSWorkspace.shared.open(url)
     }
 
@@ -977,7 +982,8 @@ final class DaemonController: ObservableObject {
 
     func openFicheHomeFolder() {
         let url = Self.ficheHomeURL
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        Darwin.chmod(url.path, 0o700)
         NSWorkspace.shared.open(url)
     }
 
@@ -1247,13 +1253,16 @@ final class DaemonController: ObservableObject {
 
         let fm = FileManager.default
         do {
-            try fm.createDirectory(at: ficheHomeURL, withIntermediateDirectories: true)
+            try fm.createDirectory(at: ficheHomeURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            Darwin.chmod(ficheHomeURL.path, 0o700)
         } catch {
             return .failure(SpawnFailure(message: "Failed to create ~/.fiche: \(error.localizedDescription)"))
         }
 
-        let outFd = Darwin.open(outLogURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
-        let errFd = Darwin.open(errLogURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        let outFd = Darwin.open(outLogURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+        let errFd = Darwin.open(errLogURL.path, O_WRONLY | O_CREAT | O_APPEND, 0o600)
+        if outFd >= 0 { Darwin.fchmod(outFd, 0o600) }
+        if errFd >= 0 { Darwin.fchmod(errFd, 0o600) }
         guard outFd >= 0, errFd >= 0 else {
             if outFd >= 0 { Darwin.close(outFd) }
             if errFd >= 0 { Darwin.close(errFd) }
@@ -1320,6 +1329,16 @@ final class DaemonController: ObservableObject {
         }
     }
 
+    nonisolated private static func isFicheProcess(pid: Int) -> Bool {
+        guard pid > 1 else { return false }
+        var buf = [CChar](repeating: 0, count: 4096)
+        let len = cProcPidPath(Int32(pid), &buf, UInt32(buf.count))
+        guard len > 0 else { return false }
+        let path = String(decoding: buf.prefix(Int(len)).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        return name == "node" || name == "fiche"
+    }
+
     nonisolated private static func runProcessSync(
         executable: String,
         arguments: [String],
@@ -1345,8 +1364,35 @@ final class DaemonController: ObservableObject {
             return CommandOutput(exitCode: 1, stdout: "", stderr: error.localizedDescription)
         }
 
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let group = DispatchGroup()
+        nonisolated(unsafe) var outData = Data()
+        nonisolated(unsafe) var errData = Data()
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+
+        let timedOut = group.wait(timeout: .now() + 15) == .timedOut
+        if timedOut {
+            if process.isRunning {
+                process.terminate()
+            }
+            _ = group.wait(timeout: .now() + 1)
+            return CommandOutput(
+                exitCode: 124,
+                stdout: String(data: outData, encoding: .utf8) ?? "",
+                stderr: "Subprocess timed out after 15s."
+            )
+        }
+
         process.waitUntilExit()
 
         return CommandOutput(

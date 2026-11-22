@@ -134,7 +134,7 @@ describe('novel 4-layer text compression (TOON, CASI, TSCG, ACDC) & gemini-4-neo
     const resAnth = compileToolSchemas(anthropicTools, 'anthropic');
     expect(resAnth.changed).toBe(true);
     expect(resAnth.savedTokens).toBeGreaterThan(100);
-    expect(anthropicTools[0]!.input_schema).not.toHaveProperty('$schema');
+    expect(anthropicTools[0]!.input_schema).toHaveProperty('$schema', 'http://json-schema.org/draft-07/schema#');
     expect(anthropicTools[0]!.input_schema.properties.file_path).not.toHaveProperty('title');
     expect(anthropicTools[0]!.input_schema.properties.mode).not.toHaveProperty('description');
     expect(anthropicTools[0]!.input_schema.required).toEqual(['file_path']);

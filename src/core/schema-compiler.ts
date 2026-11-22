@@ -252,7 +252,7 @@ function cleanSchemaNode(node: unknown, propKey?: string): void {
     return;
   }
   const obj = node as Record<string, unknown>;
-  delete obj.$schema;
+  // Preserve `$schema` so Draft-07 MCP tool schemas aren't re-evaluated as Draft 2020-12.
   delete obj.$comment;
 
   if (typeof obj.description === 'string') {

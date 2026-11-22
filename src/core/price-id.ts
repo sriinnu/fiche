@@ -13,6 +13,12 @@ export function normalizeModelId(model: string | null | undefined): string {
   if (slash >= 0) m = m.slice(slash + 1);
   const colon = m.indexOf(':');
   if (colon >= 0) m = m.slice(0, colon);
-  m = m.replace(/@\d{8}$/, '').replace(/-\d{4}-\d{2}-\d{2}$/, '').replace(/-\d{8}$/, '');
+  m = m
+    .replace(/^(?:[a-z]{2}\.)?anthropic\./, '')
+    .replace(/-v\d+$/, '')
+    .replace(/@\d{8}$/, '')
+    .replace(/-\d{4}-\d{2}-\d{2}$/, '')
+    .replace(/-\d{8}$/, '');
+  m = m.replace(/^(claude-(?:[a-z-]+-)?)(\d+)\.(\d+)(.*)$/, '$1$2-$3$4');
   return m;
 }

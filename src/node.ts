@@ -1149,7 +1149,7 @@ async function collectSource(opts: ExportParsed): Promise<[string, string[]]> {
   // --diff <ref>
   if (opts.diff !== undefined) {
     const cwd = opts.targets.length > 0 ? opts.targets[0]! : process.cwd();
-    const diff = gitRun(['diff', opts.diff], cwd);
+    const diff = gitRun(['diff', '--end-of-options', opts.diff], cwd);
     if (diff === null) {
       console.error(`[fiche export] git diff ${opts.diff} failed`);
       process.exit(1);

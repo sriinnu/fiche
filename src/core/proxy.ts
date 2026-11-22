@@ -1350,7 +1350,7 @@ export type InboundCredential =
   /** A bearer of unrecognised shape. Gateways and self-hosted upstreams use these. */
   | 'opaque-bearer';
 
-const ANTHROPIC_BEARER_RE = /^Bearer\s+sk-ant-/i;
+const ANTHROPIC_BEARER_RE = /(?:^|,\s*)Bearer\s+sk-ant-/i;
 const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
 /** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
 const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
@@ -1601,8 +1601,9 @@ function urlTargetsBase(targetUrl: string, base: string): boolean {
 }
 
 function stripAnthropicCredentials(headers: Headers): void {
-  if (/^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '')) headers.delete('authorization');
-  if (/^sk-ant-/i.test(headers.get('x-api-key') ?? '')) headers.delete('x-api-key');
+  if (/\bsk-ant-/i.test(headers.get('authorization') ?? '')) headers.delete('authorization');
+  if (/\bsk-ant-/i.test(headers.get('x-api-key') ?? '')) headers.delete('x-api-key');
+  headers.delete('x-anthropic-billing-header');
 }
 
 function resolveGoogleUpstream(
@@ -1889,6 +1890,7 @@ let responseContentType: string | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
     let responsesStreaming = false;
+    let isAnthropicMessagesRoute = false;
 
     // Refused here, not at resolution: fire() reads the per-request state above.
     if (followRefusal) {
@@ -1999,6 +2001,7 @@ let responseContentType: string | undefined;
         const forceChat = isMessages && modelRoute === 'cloudflare';
         const messagesAnthropic = isMessages
           && modelRoute === undefined && !forceChat && (Boolean(follow) || isClaudeModel(model));
+        isAnthropicMessagesRoute = messagesAnthropic;
         // Provider routing is explicit. Unlisted Messages models use the
         // default Anthropic route, regardless of how their id is shaped.
         bridgedGptMessages =
@@ -2346,13 +2349,15 @@ let responseContentType: string | undefined;
     // text. transform.ts strips it from the body (no body position is both
     // cache-safe and invisible — see the billingLine comments there) and hands
     // it up; it travels upstream as the HTTP header it names.
-    if (info?.billingLine) {
+    if (info?.billingLine && !follow && isAnthropicMessagesRoute) {
       const sep = info.billingLine.indexOf(':');
       if (sep > 0) {
         try {
           const headerName = info.billingLine.slice(0, sep).trim().toLowerCase();
-          const headerValue = info.billingLine.slice(sep + 1).replace(/[\r\n]+/g, ' ').trim();
-          outHeaders.set(headerName, headerValue);
+          if (headerName === 'x-anthropic-billing-header') {
+            const headerValue = info.billingLine.slice(sep + 1).replace(/[\r\n]+/g, ' ').trim();
+            outHeaders.set(headerName, headerValue);
+          }
         } catch {
           // Malformed header name/value in billingLine must never crash the proxy.
         }
@@ -2518,11 +2523,13 @@ let teed: Response;
       // read proves the prefix was live; a create proves one was just written.
       // Either way the next turn must not re-cut the grid — which the wall clock
       // alone could not tell, and got wrong on most gaps that mattered.
-      noteCacheOutcome(
-        info?.firstUserSha8,
-        usage?.cache_read_input_tokens,
-        usage?.cache_creation_input_tokens,
-      );
+      if (upstreamRes.ok && usage !== undefined && isAnthropicMessagesRoute) {
+        noteCacheOutcome(
+          info?.firstUserSha8,
+          usage.cache_read_input_tokens,
+          usage.cache_creation_input_tokens,
+        );
+      }
       return fire(
         upstreamRes.status,
         info,

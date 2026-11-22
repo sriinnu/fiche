@@ -76,7 +76,7 @@ const GEMINI_MEASURED_PROFILES: Readonly<Record<string, GptModelProfile>> = {
   'gemini-4-argon-low': GEMINI_PROFILE,
 };
 function normalizeGeminiId(model: string | null | undefined): string {
-  const id = (model ?? '').toLowerCase();
+  const id = (model ?? '').trim().toLowerCase().replace(/\[[^\]]*\]/g, '');
   const slash = id.lastIndexOf('/');
   return slash >= 0 ? id.slice(slash + 1) : id;
 }

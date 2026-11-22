@@ -106,7 +106,7 @@ const RECENT_CAP = 50;
 /** How many rendered PNGs to keep in the in-memory image ring. Matches
  *  RECENT_CAP so every visible recent-requests row can still resolve its
  *  image. Images are never written to disk — this ring is the only store. */
-const IMAGE_RING_CAP = 800;
+const IMAGE_RING_CAP = 50;
 
 /** One rendered image held in the in-memory ring. `id` is a monotonic
  *  counter (never reused) so a RecentRow can reference its image even after
@@ -1692,9 +1692,19 @@ export class DashboardState {
       compression_enabled: this.compressionEnabled,
       allowed_models: getAllowedModelBases(),
       by_model: (() => {
-        const byModel: Record<string, { requests: number; compressed: number; saved_tokens: number; saved_usd: number }> = {};
+        const byModel: Record<string, {
+          requests: number;
+          compressed: number;
+          baseline_input_weighted: number;
+          actual_input_weighted: number;
+          saved_tokens: number;
+          saved_pct: number;
+          saved_usd: number;
+        }> = {};
         for (const [model, t] of this.totalsByModel) {
           const key = model || 'unknown';
+          const baseline = Math.round(t.baselineInputWeighted);
+          const actual = Math.round(t.actualInputWeighted);
           const savedTokens = Math.round(t.baselineInputWeighted - t.actualInputWeighted);
           const savedUsd = round4(
             priceMode() === 'kosha'
@@ -1702,19 +1712,29 @@ export class DashboardState {
               : ((t.pricedBaselineInputWeighted - t.pricedActualInputWeighted) * ASSUMED_INPUT_USD_PER_MTOK) / 1e6,
           );
           const prev = byModel[key];
-          byModel[key] = prev
-            ? {
-                requests: prev.requests + t.requests,
-                compressed: prev.compressed + t.compressedRequests,
-                saved_tokens: prev.saved_tokens + savedTokens,
-                saved_usd: round4(prev.saved_usd + savedUsd),
-              }
-            : {
-                requests: t.requests,
-                compressed: t.compressedRequests,
-                saved_tokens: savedTokens,
-                saved_usd: savedUsd,
-              };
+          if (prev) {
+            const nextBaseline = prev.baseline_input_weighted + baseline;
+            const nextSaved = prev.saved_tokens + savedTokens;
+            byModel[key] = {
+              requests: prev.requests + t.requests,
+              compressed: prev.compressed + t.compressedRequests,
+              baseline_input_weighted: nextBaseline,
+              actual_input_weighted: prev.actual_input_weighted + actual,
+              saved_tokens: nextSaved,
+              saved_pct: nextBaseline > 0 ? Math.round((nextSaved / nextBaseline) * 1000) / 10 : 0,
+              saved_usd: round4(prev.saved_usd + savedUsd),
+            };
+          } else {
+            byModel[key] = {
+              requests: t.requests,
+              compressed: t.compressedRequests,
+              baseline_input_weighted: baseline,
+              actual_input_weighted: actual,
+              saved_tokens: savedTokens,
+              saved_pct: baseline > 0 ? Math.round((savedTokens / baseline) * 1000) / 10 : 0,
+              saved_usd: savedUsd,
+            };
+          }
         }
         return byModel;
       })(),
@@ -2368,6 +2388,12 @@ export function dashboardHostLabel(): string {
 
 function htmlResponse(body: string): Response {
   return new Response(body, {
-    headers: { 'content-type': 'text/html; charset=utf-8' },
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'x-frame-options': 'DENY',
+      'x-content-type-options': 'nosniff',
+      'cross-origin-resource-policy': 'same-origin',
+      'content-security-policy': "frame-ancestors 'none'; object-src 'none'; base-uri 'self'",
+    },
   });
 }

