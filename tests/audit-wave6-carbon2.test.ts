@@ -400,7 +400,7 @@ describe('Wave 2 Step 5 — Warp CA, route normalization, no-SNI TLS & app args'
     const longHost = `${'sub.'.repeat(18)}example.com`;
     expect(longHost.length).toBeGreaterThan(64);
     const longLeaf = new X509Certificate(ca.mintLeafCertPem(longHost));
-    expect(longLeaf.subject).toBe('');
+    expect(longLeaf.subject ?? '').toBe('');
     expect(longLeaf.subjectAltName).toContain(`DNS:${longHost}`);
 
     const mappedLeaf = new X509Certificate(ca.mintLeafCertPem('::ffff:127.0.0.1'));

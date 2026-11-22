@@ -65,7 +65,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "prepare": "node scripts/prepare.mjs",
-    "prepublishOnly": "pnpm run typecheck && pnpm test && pnpm run build",
+    "prepublishOnly": "pnpm run typecheck && pnpm run build && pnpm test",
     "vendor:ui": "node scripts/vendor-ui.mjs",
     "prices:gen": "tsx scripts/gen-prices.ts",
     "prices:check": "tsx scripts/gen-prices.ts --check"
