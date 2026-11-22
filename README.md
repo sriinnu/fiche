@@ -9,7 +9,7 @@
 <p>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-FF6B2B.svg"></a>
   <img alt="Platform: macOS | Linux | Windows | Docker | Workers" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20Docker%20%7C%20Workers-1E293B.svg">
-  <img alt="Node >= 20.19" src="https://img.shields.io/badge/node-%3E%3D20.19-339933.svg?logo=node.js&logoColor=white">
+  <img alt="Node 20.19+" src="https://img.shields.io/badge/node-%3E%3D20.19-339933.svg?logo=node.js&logoColor=white">
   <img alt="Core: 0 deps" src="https://img.shields.io/badge/core-0%20node%3A%20deps-0EA5E9.svg">
   <img alt="Warm p50: 1.2-3.3 ms" src="https://img.shields.io/badge/warm%20p50-1.2%E2%80%933.3%20ms-34D399.svg">
   <img alt="MCP: fiche-mcp" src="https://img.shields.io/badge/MCP-fiche--mcp-A855F7.svg">
@@ -22,7 +22,7 @@
 
 Cuts **35.1–51.9%** of multi-turn tokens and **27.9–40.8%** real USD across text & Fable/Gemini optical tiers with **80.9–90.9%** KV prefix-cache hits, **1.2–3.3 ms** warm p50 latency, and **100% `editSafe`** verbatim source preservation.
 
-[30s Quickstart](#30-second-quickstart) · [Website](https://fiche.srinivas.dev) · [Efficiency vs Latency](#token-efficiency-vs-latency) · [FicheBar](#macos-menubar-app-fichebar--personal-stack) · [Architecture](./wiki/Architecture.md) · [Getting Started](./docs/GETTING_STARTED.md) · [Wiki](./wiki/Home.md) · [Sponsor](https://github.com/sponsors/sriinnu)
+[30s Quickstart](#30-second-quickstart) · [Website](https://fiche.srinivas.dev) · [Efficiency vs Latency](#token-efficiency-vs-latency) · [FicheBar](#macos-menubar-app-fichebar--ecosystem) · [Architecture](./wiki/Architecture.md) · [Getting Started](./docs/GETTING_STARTED.md) · [Wiki](./wiki/Home.md) · [Support](#support)
 
 </div>
 
@@ -45,8 +45,8 @@ Cuts **35.1–51.9%** of multi-turn tokens and **27.9–40.8%** real USD across 
 ## 30-Second Quickstart
 
 ```bash
-# 1. Install once (Node >= 20.19) — or run directly with `npx @sriinnu/fiche`
-npm install -g @sriinnu/fiche
+# 1. Install once (Node >= 20.19) directly from GitHub (builds automatically via prepare)
+npm install -g github:sriinnu/fiche
 
 # 2. Start daemon (or `fiche service install` on macOS). Zero-config applies default `FICHE_MODELS=claude-fable-5,gemini`;
 #    recommended: enable kosha pricing + all coding models (or save in ~/.config/fiche/config.json):
@@ -68,11 +68,11 @@ Open `http://127.0.0.1:47821/` in your browser for the live dashboard & PNG crop
 
 ---
 
-## macOS Menubar App (`FicheBar`) & Personal Stack
+## macOS Menubar App (`FicheBar`) & Ecosystem
 
 - **[`FicheBar.app`](./apps/macos-bar/README.md)** (`./apps/macos-bar/bundle.sh --install`): native SwiftUI macOS 14+ menubar companion with **5 Apple HIG themes** (`Editorial`, `Native`, `Slate`, `Terminal`, `Midnight`), weighted-vs-raw savings clarity, 1-click **Pause / Resume**, 1-click **Disable all 3rd-party models/plugins**, **Desktop App Proxy (`fiche warp --app`)** launcher, and About / GitHub Sponsor panel.
 - **23-Host Universal Upstream Coverage (`src/core/upstream-hosts.ts`)**: "Follow-the-agent" TLS/base-URL routing across Anthropic, OpenAI / ChatGPT Codex, Google Gemini & `/v1internal:*` (`Antigravity`), DeepSeek, Moonshot/Kimi, Z.AI/BigModel, MiniMax, DashScope, OpenRouter, xAI, Groq, Together, Fireworks, Cerebras, Mistral, Perplexity, Cohere, SambaNova, GitHub Models, Azure AI, and Vercel AI Gateway.
-- **[Ecosystem Integration](./docs/ECOSYSTEM_INTEGRATION.md)**: clean integration across `kosha-discovery` (pricing & cliffs), `tokmeter` (gross ledger + after-fiche net savings, sharing Claude's `statusLine`), `Runic` (`runic-mcp-plugin.json`), `LLM Bar`, `baton` (cross-session briefs), `omit` (output minimalism), and `ribhu` / `chitragupta`.
+- **[Ecosystem Integration](./docs/ECOSYSTEM_INTEGRATION.md)**: works cleanly alongside [kosha-discovery](https://github.com/sriinnu/kosha-discovery) (pricing & cliffs), [tokmeter](https://github.com/sriinnu/tokmeter) (gross ledger + net savings, sharing Claude's `statusLine`), [Runic](https://github.com/sriinnu/Runic) (`runic-mcp-plugin.json`), [llm-bar](https://github.com/sriinnu/llm-bar), [baton](https://github.com/sriinnu/baton) (cross-session briefs), and [omit](https://github.com/sriinnu/omit) (output minimalism).
 - **[Stage Plugins & Skills](./docs/PLUGINS_AND_SKILLS.md)**: extend or toggle pipeline stages via `~/.fiche/plugins/<id>/plugin.json`, `~/.agents/skills/`, and `/api/plugins`.
 
 ---
@@ -194,6 +194,13 @@ Evolved from `pxpipe` by [Steven / teamchong](https://github.com/teamchong/pxpip
 - **GNU Unifont** — SIL Open Font License 1.1 / GPLv2+ with GNU font embedding exception (`assets/UNIFONT_LICENSE.txt`)
 - **Spleen** — BSD 2-Clause License (`assets/SPLEEN_LICENSE.txt`)
 
-## License & Sponsor
+## Support
 
-MIT © [Srinivas Pendela (Sriinnu)](https://github.com/sriinnu) · [github.com/sriinnu/fiche](https://github.com/sriinnu/fiche) · [fiche.srinivas.dev](https://fiche.srinivas.dev) · [Sponsor on GitHub](https://github.com/sponsors/sriinnu)
+`fiche` is free and open source. If it cuts your token bills, consider supporting maintenance:
+
+- [GitHub Sponsors](https://github.com/sponsors/sriinnu)
+- [Buy Me a Coffee](https://buymeacoffee.com/sriinnu)
+
+## License
+
+[MIT](LICENSE). See [NOTICE](NOTICE) for third-party attributions and [CONTRIBUTING.md](CONTRIBUTING.md) to contribute.
