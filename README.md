@@ -1,346 +1,199 @@
-<p align="center">
-  <img src="assets/inkling-logo.svg" alt="inkling" width="420">
-</p>
+<div align="center">
 
-<h1 align="center">inkling</h1>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/fiche-logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./assets/fiche-logo-light.svg">
+  <img alt="fiche — Microfiche for coding agents" src="./assets/fiche-logo-light.svg" width="360">
+</picture>
 
-<p align="center"><strong>Images for the context a model can read. Everything else untouched.</strong></p>
-
-<p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-6D5BFF.svg"></a>
+<p>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-FF6B2B.svg"></a>
+  <img alt="Platform: macOS | Linux | Windows | Docker | Workers" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20Docker%20%7C%20Workers-1E293B.svg">
   <img alt="Node >= 20.19" src="https://img.shields.io/badge/node-%3E%3D20.19-339933.svg?logo=node.js&logoColor=white">
-  <img alt="pnpm 10" src="https://img.shields.io/badge/pnpm-10.21.0-F69220.svg?logo=pnpm&logoColor=white">
-  <img alt="MCP server" src="https://img.shields.io/badge/MCP-server-1E1B4B.svg">
+  <img alt="Core: 0 deps" src="https://img.shields.io/badge/core-0%20node%3A%20deps-0EA5E9.svg">
+  <img alt="Warm p50: 1.2-3.3 ms" src="https://img.shields.io/badge/warm%20p50-1.2%E2%80%933.3%20ms-34D399.svg">
+  <img alt="MCP: fiche-mcp" src="https://img.shields.io/badge/MCP-fiche--mcp-A855F7.svg">
+  <a href="./apps/macos-bar/README.md"><img alt="macOS: FicheBar" src="https://img.shields.io/badge/macOS-FicheBar-111827.svg?logo=apple"></a>
+  <a href="https://github.com/sponsors/sriinnu"><img alt="Sponsor on GitHub" src="https://img.shields.io/badge/sponsor-sriinnu-EA4AAA.svg?logo=githubsponsors&logoColor=white"></a>
+  <a href="https://fiche.srinivas.dev"><img alt="Website: fiche.srinivas.dev" src="https://img.shields.io/badge/web-fiche.srinivas.dev-0F172A.svg"></a>
 </p>
 
-inkling is a local proxy for coding agents: Claude Code, Codex, OpenCode, pi, Cursor, and anything else that speaks the Anthropic, OpenAI or Gemini wire format. Providers bill an image by its pixel area, not by the characters drawn on it. For models that can read dense text in an image, inkling renders the stale, bulky parts of a request as PNG pages:
+**Microfiche for coding agents — cache-safe hybrid optical & deterministic text context compiler + local proxy.**
 
-- the system prompt and tool docs
-- old, closed tool rounds
-- large tool results
+Cuts **35.1–51.9%** of multi-turn tokens and **27.9–40.8%** real USD across text & Fable/Gemini optical tiers with **80.9–90.9%** KV prefix-cache hits, **1.2–3.3 ms** warm p50 latency, and **100% `editSafe`** verbatim source preservation.
 
-It forwards everything else byte for byte.
+[30s Quickstart](#30-second-quickstart) · [Website](https://fiche.srinivas.dev) · [Efficiency vs Latency](#token-efficiency-vs-latency) · [FicheBar](#macos-menubar-app-fichebar--personal-stack) · [Architecture](./wiki/Architecture.md) · [Getting Started](./docs/GETTING_STARTED.md) · [Wiki](./wiki/Home.md) · [Sponsor](https://github.com/sponsors/sriinnu)
 
-- One 1568×728 page bills about 1,456 tokens on Anthropic and holds about 28k characters.
-- The live tail, any open tool call and your current message stay text. Next to each image goes a short text factsheet that repeats its paths, hashes and numbers verbatim.
-- Old pages stay byte-identical from turn to turn, so the provider reads them from the prompt cache instead of billing them again.
-- A profitability gate images a block only when the image costs fewer tokens than the text it replaces. Sparse prose stays text.
-- If a transform throws, inkling fails open and forwards the request as it arrived.
+</div>
 
-![a real transformRequest output: system prompt and tool docs reflowed into one dense page, an instruction banner on top, ↵ marking the original newlines](docs/assets/example-render.png)
+---
 
-*About 48k characters of system prompt and tool docs: about 25k tokens as text, about 2.7k image tokens as this page.*
+## Proxy Daemon vs. MCP Server vs. Offline Export
 
-How it fits together: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+| Component | How You Run It | What It Does | Shrinks Live Turns? |
+| :--- | :--- | :--- | :--- |
+| **`fiche` Proxy Daemon** | `fiche` / `fiche service install` / `fiche warp` | Loopback HTTP proxy (`127.0.0.1:47821`); compiles live agent context, emits `x-fiche-*` headers, logs `~/.fiche/events.jsonl` | **Yes** |
+| **`fiche-mcp` MCP Server** | `fiche mcp` (stdio on demand) or `--http 47823` | Inspection & telemetry (`check_model`, `transform_request`, `health`, `stats`) | **No** (dry-run & stats only) |
+| **`fiche export`** | `fiche export src/` / `--git` / `--stdin` | Proxy-free generator for `page-*.png` + `factsheet.txt` + `prompt.txt` bundles | Offline bundle |
 
-## Install
+> **Cross-Platform (Not OS-Dependent):**
+> - **Runs everywhere**: `src/core/` (zero `node:` deps), the `fiche` loopback proxy daemon, `fiche warp -- <cli>`, `fiche-mcp`, `fiche export`, `fiche turn-report`, `fiche stats`, and the Web Dashboard (`http://127.0.0.1:47821`) run identically on **macOS, Linux, Windows (native & WSL), Docker (`docker compose up -d`), and Cloudflare Workers**.
+> - **Optional macOS extras only**: [`FicheBar.app`](./apps/macos-bar/README.md) (SwiftUI menubar companion — Linux/Windows use the web dashboard at `:47821`), `fiche service` (`launchd` wrapper — use `systemd --user` / Docker on Linux or Task Scheduler / WSL on Windows), and `fiche warp --app <Name>` (macOS `.app` bundle resolver — on Linux/Windows run `fiche warp -- <binary>` directly).
 
-inkling isn't on npm yet; the v0.17.0 publish is pending. Until then, install from git:
+---
 
-```bash
-npx --yes --package github:sriinnu/inkling inkling        # proxy on 127.0.0.1:47821
-```
-
-Or run it from a checkout:
+## 30-Second Quickstart
 
 ```bash
-pnpm install && pnpm build
-node dist/node.js
+# 1. Install once (Node >= 20.19) — or run directly with `npx @sriinnu/fiche`
+npm install -g @sriinnu/fiche
+
+# 2. Start daemon (or `fiche service install` on macOS). Zero-config applies default `FICHE_MODELS=claude-fable-5,gemini`;
+#    recommended: enable kosha pricing + all coding models (or save in ~/.config/fiche/config.json):
+FICHE_PRICES=kosha FICHE_TEXT_HYGIENE=on \
+FICHE_MODELS="claude-fable-5,gemini,gpt-6-astra,gpt-6.2-astra,claude-opus-5-5,deepseek,kimi,glm,grok" \
+fiche
+
+# 3. Connect your coding agent CLI or desktop app via warp (preserves native auth & connectors)
+fiche warp -- claude         # Claude Code (/remote-control & connectors stay intact)
+fiche warp -- codex          # OpenAI Codex (or `codex -p fiche` via ~/.codex/config.toml)
+fiche warp --app Cursor      # Route macOS desktop GUI apps through local HTTPS CONNECT MITM
+eval "$(fiche shell-init)"   # Add fclaude / fcodex / fgemini / fiche-app helpers (or `--wrap`)
+
+# 4. Verify savings (<1 ms CLI rollup from ~/.fiche/events.jsonl, 0 LLM tokens)
+fiche turn-report --color
 ```
 
-Once published, run it with `npx @sriinnu/inkling`. Use the scoped name: the unscoped `inkling` on npm is an unrelated package.
+Open `http://127.0.0.1:47821/` in your browser for the live dashboard & PNG crop inspector. Full multi-agent setup lives in the **[Getting Started Guide](./docs/GETTING_STARTED.md)**.
 
-## Point your agent at it
+---
 
-**Claude Code:**
+## macOS Menubar App (`FicheBar`) & Personal Stack
 
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
-```
+- **[`FicheBar.app`](./apps/macos-bar/README.md)** (`./apps/macos-bar/bundle.sh --install`): native SwiftUI macOS 14+ menubar companion with **5 Apple HIG themes** (`Editorial`, `Native`, `Slate`, `Terminal`, `Midnight`), weighted-vs-raw savings clarity, 1-click **Pause / Resume**, 1-click **Disable all 3rd-party models/plugins**, **Desktop App Proxy (`fiche warp --app`)** launcher, and About / GitHub Sponsor panel.
+- **23-Host Universal Upstream Coverage (`src/core/upstream-hosts.ts`)**: "Follow-the-agent" TLS/base-URL routing across Anthropic, OpenAI / ChatGPT Codex, Google Gemini & `/v1internal:*` (`Antigravity`), DeepSeek, Moonshot/Kimi, Z.AI/BigModel, MiniMax, DashScope, OpenRouter, xAI, Groq, Together, Fireworks, Cerebras, Mistral, Perplexity, Cohere, SambaNova, GitHub Models, Azure AI, and Vercel AI Gateway.
+- **[Ecosystem Integration](./docs/ECOSYSTEM_INTEGRATION.md)**: clean integration across `kosha-discovery` (pricing & cliffs), `tokmeter` (gross ledger + after-fiche net savings, sharing Claude's `statusLine`), `Runic` (`runic-mcp-plugin.json`), `LLM Bar`, `baton` (cross-session briefs), `omit` (output minimalism), and `ribhu` / `chitragupta`.
+- **[Stage Plugins & Skills](./docs/PLUGINS_AND_SKILLS.md)**: extend or toggle pipeline stages via `~/.fiche/plugins/<id>/plugin.json`, `~/.agents/skills/`, and `/api/plugins`.
 
-**ChatGPT Codex.** Add this provider to `~/.codex/config.toml`:
+---
 
-```toml
-model = "gpt-5.6-sol"
-model_provider = "inkling"
+## How It Works
 
-[model_providers.inkling]
-name = "inkling"
-base_url = "http://127.0.0.1:47821/backend-api/codex"
-wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
-```
+1. **Edit-safety guard (`isCodeOrDiffProtected`)**: freezes numbered code reads and unified diffs verbatim so `Edit` and `apply_patch` never fail.
+2. **Tiered reader router (`readerTier`)**: verified dense page readers (`claude-fable-5`, measured `gemini`, opt-in `sol`) receive crisp bitmap **optical microfiche PNGs + verbatim `FactSheet` anchors**; text-tier coding models receive **0 images**.
+3. **4-layer deterministic text compiler**: `TSCG` (schemas & static boilerplate) → `Terminal / Drain` log folding + bijective `@toon` tables → `ACDC` frozen-epoch compaction (gated by `kosha` payback math) → `CASI-Delta` cross-turn deduplication.
+4. **Append-only prefix-cache sealing & zero-token telemetry**: old chunks stay byte-identical across turns; `@fiche pin <rule>` relocates live rules to the tail; `~/.fiche/events.jsonl`, `fiche turn-report`, `x-fiche-*` headers, and `fiche-mcp` cost **0 LLM tokens**.
 
-Then start the proxy with Sol in scope and the ChatGPT upstream:
+<details>
+<summary><strong>Preview: 312-column optical microfiche PNG + architecture diagram</strong> (click to expand)</summary>
 
-```bash
-OPENAI_UPSTREAM=https://chatgpt.com INKLING_MODELS=gpt-5.6-sol node dist/node.js
-```
+![Real fiche optical microfiche output packed into a 312-column monochrome PNG page with instruction banner and newline sentinels](docs/assets/example-render.png)
 
-- **`[profiles.*]` tables:** Codex 0.167+ rejects them in `config.toml`. For an opt-in profile, put the provider in `~/.codex/inkling.config.toml` and run `codex -p inkling`.
-- **WebSocket:** Codex tries one first. inkling answers 426, so Codex falls back to HTTP; inkling decodes its zstd body before compressing.
+![fiche hybrid optical and deterministic text architecture](docs/architecture/fiche-architecture.svg)
 
-**OpenAI-compatible clients:**
+</details>
 
-```bash
-OPENAI_BASE_URL=http://127.0.0.1:47821/v1
-```
+---
 
-**No base URL at all (`inkling warp`).** `warp` runs the agent and diverts its provider's inference paths into inkling. The agent keeps talking to its real host, so OAuth, Claude Code `/remote-control`, claude.ai connectors and other first-party gates keep working.
+## Token Efficiency vs. Latency
 
-```bash
-inkling warp -- claude
-inkling warp -- agy             # Antigravity CLI (Gemini)
-inkling warp -- opencode        # or codex, cursor-agent, omp, any shell alias
-inkling warp --route '127.0.0.1:9090/v1/*=http://127.0.0.1:47821' -- codex
-```
+Measured across 16 models on the 16-turn coding-agent benchmark (`bench/multiturn-all-models.mts` + `bench/latency-p99.mts` → [`bench/results.generated.json`](./bench/results.generated.json); **`editSafe = true` on all 16 models**):
 
-By default it routes:
+| Engine Mode | Tokens Saved | Real USD Saved (`kosha`) | Prefix Cache Hit | Warm p50 Latency | Best For |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| **4-Layer Text Compiler** (`TSCG→Drain→TOON→ACDC→CASI`) | **44.5–44.9%** | **33.3–40.8%** (`grok-4.7` top) | **90.8–90.9%** | **1.22–1.32 ms** | Daily coding on Astra, Opus 5.5, Grok, DeepSeek, Kimi, GLM, Gemini text |
+| **Optical Microfiche** (PNG + `FactSheet`) | **35.1–51.9%** (`gemini-3.8-flash` top) | **27.9–34.6%** (Fable/Gemini) · `-1.4–5.0%` (opt-in Sol 16T) | **80.9–90.0%** | **1.66–3.25 ms** | Massive docs/logs & `3.6×–5.1×` context packing on Fable 5 / Gemini |
 
-- Anthropic `/v1/messages`
-- Google CloudCode `streamGenerateContent`/`generateContent`
-- Google AI Studio `streamGenerateContent`/`generateContent`
+![Token and cost efficiency vs latency frontier across 16 models](docs/assets/efficiency-vs-latency.png)
 
-`--route` adds a rule for any other base URL. A rule that names a port matches only that port.
+![fiche 16-model token and USD savings benchmark](docs/assets/benchmark-16-models.png)
 
-**Dashboard:** <http://127.0.0.1:47821/>. It shows:
+![fiche cold vs warm latency and adversarial guards](docs/assets/latency-profile.png)
 
-- tokens and dollars saved, with a kill switch
-- model chips that turn models on and off live
-- every text-to-image conversion, side by side
+<details>
+<summary><strong>Full 16-model benchmark table, latency breakdown &amp; context capacity chart</strong> (click to expand)</summary>
 
-inkling compresses the request only. Responses stream back untouched.
+| Provider | Model | Mode | Tokens Saved | Real USD Saved | Prefix Hit | Avg / Turn |
+| :--- | :--- | :--- | ---: | ---: | ---: | ---: |
+| **xAI** | `grok-4.7` | `TSCG+TOON+ACDC+CASI` | **44.5%** | **40.8%** | 90.9% | 1.3 ms |
+| **z.ai** | `glm-5.3` | `TSCG+TOON+ACDC+CASI` | **44.6%** | **40.1%** | 90.9% | 1.4 ms |
+| **DeepSeek** | `deepseek-v4-pro` | `TSCG+TOON+ACDC+CASI` | **44.6%** | **37.9%** | 90.9% | 1.5 ms |
+| **OpenAI / Codex** | `gpt-6-astra` | `TSCG+TOON+ACDC+CASI` | **44.5%** | **36.7%** | 90.9% | 3.3 ms |
+| **OpenAI / Codex** | `gpt-6.2-astra` | `TSCG+TOON+ACDC+CASI` | **44.5%** | **35.5%** | 90.9% | 1.5 ms |
+| **Anthropic** | `claude-opus-5-5` | `TSCG+TOON+ACDC+CASI` | **44.5%** | **35.5%** | 90.8% | 1.6 ms |
+| **Moonshot** | `kimi-k3` | `TSCG+TOON+ACDC+CASI` | **44.6%** | **35.0%** | 90.9% | 1.6 ms |
+| **Anthropic** | `claude-fable-5-20260609` | `Fable-image+hygiene+CASI` | **43.6%** | **34.6%** | 90.0% | 6.9 ms |
+| **Google / AGY** | `gemini-4-carbon` | `TSCG+TOON+ACDC+CASI` | **44.9%** | **33.4%** | 90.9% | 1.5 ms |
+| **Google / AGY** | `gemini-4-hydrogen` | `TSCG+TOON+ACDC+CASI` | **44.9%** | **33.4%** | 90.9% | 1.4 ms |
+| **Google / AGY** | `gemini-3.1-pro-preview` | `TSCG+TOON+ACDC+CASI` | **44.9%** | **33.3%** | 90.9% | 1.2 ms |
+| **Google / AGY** | `gemini-3.8-flash` | `image+hygiene+CASI` | **51.9%** | **28.8%** | 84.0% | 9.4 ms |
+| **Google / AGY** | `gemini-4-argon` | `image+hygiene+CASI` | **39.7%** | **27.9%** | 90.0% | 10.5 ms |
+| **OpenAI / Codex** | `gpt-5.6-sol` | `14px-Sol-image+hygiene+CASI` | **35.1%** | **5.0%** | 80.9% | 10.0 ms |
+| **OpenAI / Codex** | `gpt-6.2-sol` | `14px-Sol-image+hygiene+CASI` | **35.1%** | **-1.4%** | 80.9% | 15.3 ms |
+| **Google / AGY** | `gemini-4-neon` | `TSCG+TOON+ACDC+CASI` | **44.9%** | unpriced | 90.9% | 2.0 ms |
 
-## Which models get images
+| Latency / Guard Workload | Cold | Warm p50 | Warm p95 | Warm p99 |
+| :--- | ---: | ---: | ---: | ---: |
+| 20T Text: `gpt-6-astra` (Responses) | 5.84 ms | **1.32 ms** | 1.61 ms | 1.80 ms |
+| 20T Text: `gemini-4-neon` (Google) | 5.55 ms | **1.22 ms** | 1.54 ms | 1.68 ms |
+| 20T Imaged: `gemini-4-argon` (Google) | 40.49 ms | **1.66 ms** | 1.91 ms | 1.93 ms |
+| 20T Imaged: `claude-fable-5` (Anthropic) | 48.25 ms | **2.75 ms** | 3.44 ms | 3.48 ms |
+| 20T Imaged: `gpt-6.2-sol` (Responses) | 74.58 ms | **3.25 ms** | 3.77 ms | 4.10 ms |
+| 600 KB ACDC epochs (`15×40 KB`) | 34.95 ms | **2.35 ms** | 2.54 ms | 2.69 ms |
+| 50 KB dotted line (`cleanToolOutput`) | 1.65 ms | **1.19 ms** | 1.39 ms | 2.04 ms |
+| 35 KB unclosed `<!--` (`compileStaticText`) | 0.18 ms | **0.20 ms** | 0.25 ms | 0.28 ms |
+| 30 KB unbroken blob (clean + digest + static + toon) | 0.38 ms | **0.35 ms** | 0.50 ms | 1.10 ms |
+| 1.90 MiB `events.jsonl` tail (`readTurnReport`) | 0.74 ms | **0.25 ms** | 0.57 ms | 6.31 ms |
 
-Imaging needs two things: the model is in scope (default `INKLING_MODELS=claude-fable-5,gemini`), and it reads dense pages well enough for an image to beat text.
+![Characters a frontier context window holds with fiche: Gemini 3.8 Flash 21M (5.1x), Fable 5 18M (4.5x), Opus 5 spaced 14M (3.6x)](docs/assets/context-window-chars.png)
 
-| Model | What inkling does |
-| --- | --- |
-| Gemini (3.6–3.8 Flash, Gemini 4 Argon, Pro) | Images by default |
-| Claude Fable 5, 5.1, 5.2 (5.1 and later with 2px of extra row spacing) | Images by default |
-| `gpt-5.6-sol`, `gpt-6.1-sol` (native 14px profile), Claude Opus 5 | Images once named in `INKLING_MODELS` |
-| Claude Opus, Sonnet and Haiku 5.5, every Haiku, Grok, Gemini 4 hydrogen and carbon | Text, even when named. They understand rendered pages but misread single characters. `INKLING_FORCE_IMAGES=1` overrides this for a model that is also named |
-| Anything not in scope | Forwarded byte for byte |
+Reproduce via [`scripts/gen-fiche-charts.ts`](./scripts/gen-fiche-charts.ts) and [`scripts/gen-context-chart.ts`](./scripts/gen-context-chart.ts) (`pnpm run charts:gen`).
 
-`INKLING_MODELS=off` or `compress: false` turns imaging off. The measurements behind this table predate inkling (see [Credits](#credits)); they are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), with per-model render geometry in [docs/MODEL_RENDER_PROFILES.md](docs/MODEL_RENDER_PROFILES.md).
+</details>
 
-## Savings, measured per request
-
-inkling doesn't quote a headline saving. Whether images save money depends on your model, your traffic and how much of it the client re-sends, so measure your own.
-
-- **Measured savings.** For every Anthropic `/v1/messages` request, inkling sends the original, uncompressed body to the free `count_tokens` endpoint, in parallel with the real request. It reads the billed usage off the response. Both land in one row of `~/.inkling/events.jsonl`, so the comparison has no turn-count or run-to-run confound. A row without a probe counts as unmeasured, never as zero saving.
-- **Cache-weighted dollars.** Cache reads, writes and output are weighted by their price ratios on both sides, so the caching discount cancels and isn't counted as a saving. The warm-cache window follows the TTL the session writes: 1 hour after a 1-hour write, otherwise 5 minutes.
-- **Prices (`INKLING_PRICES`).**
-  - `legacy`, the default, uses inkling's historical ratios: 1.25x for a cache write and 0.1x for a read.
-  - `INKLING_PRICES=kosha` prices each model from a build-time table of first-party rows in a kosha registry export (`pnpm prices:gen`, checked by `pnpm prices:check`). Every row cites its source.
-  - In kosha mode an unpriced model is never imaged, and the dashboard counts its rows apart.
-  - The gate and the savings math price from one resolver, so the decision to image and the reported saving can't disagree.
-
-Formula and field names: [docs/CACHING_AND_SAVINGS.md](docs/CACHING_AND_SAVINGS.md) and `src/core/baseline.ts`.
-
-Read the log after the fact, with no server running:
-
-```bash
-inkling stats                  # human report from ~/.inkling/events.jsonl
-inkling stats --json
-inkling stats --file /path/to/events.jsonl
-```
-
-`inkling stats` exits 0 when it prints a report, 1 when the file is missing, and 2 when the file has no valid events.
-
-## Safety
-
-inkling holds your provider credentials, so the proxy is locked down by default. [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) has the details.
-
-- **Loopback only.** It binds `127.0.0.1`. Dashboard routes stay loopback-only even when `HOST` binds wider.
-- **No cross-site spending.** A browser request from a non-loopback page gets 403. A public DNS name in `Host` that isn't a known provider host gets 421, which blocks DNS rebinding. `INKLING_ALLOWED_HOSTS` adds names.
-- **Default-deny routing.**
-  - Every `/backend-api/` path goes to the ChatGPT upstream.
-  - Google countTokens and listing paths go to Google.
-  - On the stock Anthropic upstream, paths outside `/v1/*` and `/api/*` get 404.
-- **No `prompt_cache_breakpoint` on ChatGPT Codex.** chatgpt.com rejects it with HTTP 400, so inkling never sends it on a `/backend-api/codex/` path or to `chatgpt.com`. When a profile injects the field, it's removed as a text edit, so nothing else in the body is re-serialized. `api.openai.com` still gets the field when the profile asks for it.
-- **Bounded decoding.** gzip, deflate, br and zstd bodies are decoded up to a size limit. A body inkling can't decode is forwarded as is, never rewritten.
-
-## Follow the agent to third-party providers
-
-One inkling serves every provider an agent talks to. A request for a registered third-party host goes back to that host over https, carrying only the agent's own credential. inkling's configured keys, gateway headers and `count_tokens` probes never apply to it.
-
-- Under `inkling warp`, the agent keeps addressing its provider, and inkling follows the `Host` header.
-- With a base URL, put the host in the path: `ANTHROPIC_BASE_URL=http://127.0.0.1:47821/to/api.deepseek.com/anthropic`.
-
-Built-in hosts are DeepSeek, Moonshot/Kimi, z.ai/BigModel, MiniMax, Qwen DashScope, OpenRouter and xAI. `INKLING_UPSTREAM_HOSTS=host[/api-prefix],...` adds more, and `INKLING_FOLLOW_HOSTS=0` turns following off.
-
-The proxy refuses some requests before any upstream call:
-
-- unknown hosts
-- IP literals and local names
-- ports other than 443
-- `user@host` tricks
-- first-party hosts named through `/to/`
-
-It also returns redirects to the agent instead of following them, and strips an Anthropic credential (`sk-ant-…`) before it can reach a third party. With following off, a third-party `Host` is refused, never re-routed to Anthropic.
-
-## MCP server
-
-`inkling mcp` (also `inkling-mcp`) runs over stdio, or over stateless Streamable HTTP with `--http PORT` (`POST /mcp` on loopback; `GET` answers 405).
-
-```bash
-node dist/node.js mcp                 # stdio
-node dist/node.js mcp --http 47823    # http://127.0.0.1:47823/mcp
-```
-
-The MCP tools don't lower your bill; the HTTP proxy does. A tool call adds its argument and result to the turn, and the tool list itself is extra cached prefix. Use the tools to inspect what inkling would do.
-
-| Tool | What it does |
-| --- | --- |
-| `check_model` | Whether a model is in scope, and whether it gets images or text. |
-| `transform_request` | Runs inkling on a request object and reports estimated tokens before and after. Pass `upstream: "https://chatgpt.com"` or a `/backend-api/codex/` path to strip `prompt_cache_breakpoint`. |
-| `health` | Version and the Codex breakpoint policy. No payloads. |
-| `stats` | Process counters only. |
-
-All four are read-only and closed-world. `stats` isn't idempotent.
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"check_model","arguments":{"model":"claude-opus-5-5"}}}
-```
-
-In the client configs below, replace `<checkout>` with the absolute path of this repo.
-
-**Claude Code** loads this repo as a plugin (`.claude-plugin/plugin.json` with `.mcp.json`; marketplace: `claude plugin marketplace add sriinnu/inkling`). Or use `.mcp.json` or `claude_desktop_config.json` directly. **Cursor** reads the same block from `.cursor/mcp.json`, and **pi** from `~/.pi/agent/mcp.json`:
-
-```json
-{ "mcpServers": { "inkling": { "command": "node", "args": ["<checkout>/dist/node.js", "mcp"] } } }
-```
-
-**Codex CLI** (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.inkling]
-command = "node"
-args = ["<checkout>/dist/node.js", "mcp"]
-# or, after `mcp --http 47823`:
-# url = "http://127.0.0.1:47823/mcp"
-```
-
-**pi** from a shell:
-
-```bash
-pi mcp add inkling -- node <checkout>/dist/node.js mcp
-```
-
-**OpenCode:**
-
-```json
-{ "mcp": { "inkling": { "type": "local", "command": ["node", "<checkout>/dist/node.js", "mcp"], "enabled": true } } }
-```
-
-For the remote form, use `"type": "remote"` with the `url` above.
-
-**[Ribhu](https://github.com/sriinnu/ribhu)** takes an extension file, `~/.ribhu/agent/extensions/inkling.json`. Tools show up as `mcp__inkling__<tool>`.
-
-```json
-{
-  "slash": "/inkling",
-  "description": "inkling context tools",
-  "prompt": "Use the inkling MCP tools to check which models inkling images and to inspect a request. {args}",
-  "mcp": { "command": "node", "args": ["<checkout>/dist/node.js", "mcp"] }
-}
-```
-
-Any other stdio client takes the same `command` and `args` pair. Over HTTP, point it at `http://127.0.0.1:47823/mcp`.
+---
 
 ## Offline export (no proxy)
 
-`inkling export` renders text, files or a diff to PNG pages without running the proxy. Use it for image-upload clients such as Cursor.
+Need to feed a directory, git branch, or huge log directly into **Cursor**, web chat, or another client **without running the proxy**? Run `fiche export`:
 
 ```bash
-inkling export src/
-cat prompt.txt | inkling export --stdin
-inkling export --git
+fiche export src/                      # directory / file targets
+fiche export --git                     # uncommitted git diff + untracked files
+fiche export --diff HEAD~3             # commit range diff
+cat server.log | fiche export --stdin  # pipe logs or transcripts via --stdin
 ```
 
-Each run writes a new `inkling-export-XXXXXX/` folder containing `page-*.png`, `factsheet.txt`, `manifest.json` and `prompt.txt`. The command prints the folder's path when it finishes.
+Each invocation writes an isolated folder containing `page-*.png` (reflowed microfiche PNGs), `factsheet.txt` (verbatim paths, SHAs, ports, IDs), `prompt.txt` (paste-ready prompt referencing the pages and factsheet), and `manifest.json`.
 
-## Library use
+---
 
-```ts
-import { renderTextToImages, transformAnthropicMessages } from "@sriinnu/inkling";
+## Zero-Token Telemetry, Live Pins & Config
 
-const { pages } = await renderTextToImages(toolResultText);     // pages[i].png: Uint8Array
-const { body, applied, info } = await transformAnthropicMessages({
-  body: requestBytes,
-  model: "claude-fable-5",
-});
-```
+- **Telemetry (`0` LLM tokens)**: `fiche turn-report --color`, `fiche stats`, `GET /api/last-turn.json`, `x-fiche-saved-tokens` / `x-fiche-stages` / `x-fiche-cliff-saved-usd` headers, `plugins/fiche-telemetry/` (Antigravity `PostInvocation` + Claude `statusLine`), and `fiche-mcp`.
+- **Live Pins (`@fiche pin <rule>`)**: pinned rules stay authoritative at the live turn tail without invalidating prefix caches (`@fiche unpin <n|all>`).
+- **Interactive Browser Playground & Subsite**: zero-backend optical plate viewer & benchmark explorer at **[fiche.srinivas.dev](https://fiche.srinivas.dev)**.
 
-- `options.keepSharp(block)` pins blocks as text.
-- `options.emitRecoverable` returns the originals of imaged blocks.
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `FICHE_MODELS` | `claude-fable-5,gemini` | Comma-separated active model bases or `off` |
+| `FICHE_PRICES` | `legacy` | Set `kosha` for calibrated cache & long-context cliff math |
+| `FICHE_TEXT_HYGIENE` | `auto` | `on` / `auto` / `off` for the 4-layer deterministic text engine |
+| `FICHE_CONFIG` | `~/.config/fiche/config.json` | Optional JSON override (`{"models": [...]}`) |
+| `FICHE_LOG` | `~/.fiche/events.jsonl` | JSONL telemetry path (falls back to `~/.inkling/events.jsonl`) |
+| `FICHE_ALLOWED_HOSTS` | loopback + registered hosts | Extra trusted `Host`/`Origin` names (`*` disables checks) |
 
-The runtime is pure JS, for Node and edge runtimes such as Workers; `@napi-rs/canvas` is needed only at build time. Full API: `src/core/index.ts`.
+**Deep dives:** [Getting Started](./docs/GETTING_STARTED.md) · [Architecture (Wiki)](./wiki/Architecture.md) · [Architecture (Detailed)](./docs/ARCHITECTURE.md) · [Benchmarks](./docs/BENCHMARKS.md) · [Ecosystem Integration](./docs/ECOSYSTEM_INTEGRATION.md) · [Plugins & Skills](./docs/PLUGINS_AND_SKILLS.md) · [Privacy Policy](./PRIVACY.md) · [Security Model](./docs/SECURITY_MODEL.md) · [Changelog](./CHANGELOG.md) · [Wiki](./wiki/Home.md)
 
-## Configuration
-
-`node dist/node.js --help` lists every variable. The ones you'll reach for:
-
-| Variable | What it does |
-| --- | --- |
-| `INKLING_MODELS` | Model bases allowed to compress (default `claude-fable-5,gemini`; `off` disables). |
-| `INKLING_FORCE_IMAGES` | `1` images weak readers that are also named in scope. Doesn't re-enable `prompt_cache_breakpoint` on Codex. |
-| `INKLING_PRICES` | `kosha` prices from the kosha table; anything else is `legacy`. |
-| `INKLING_GPT_PROFILES` | JSON per-model overrides for GPT-family profiles (for example `{"gpt-5.6-sol":{"cacheBreakpoints":false}}`). |
-| `INKLING_GPT_HISTORY_MAX_IMAGES` | History image cap on the GPT path (defensive cap 100). |
-| `ANTHROPIC_UPSTREAM`, `OPENAI_UPSTREAM`, `INKLING_UPSTREAM` | Upstream bases. |
-| `INKLING_UPSTREAM_HOSTS`, `INKLING_FOLLOW_HOSTS` | Third-party hosts to follow, and the off switch. |
-| `INKLING_ALLOWED_HOSTS` | Extra `Host`/`Origin` names the proxy API accepts. |
-| `INKLING_DISABLE` | Pass-through mode: no compression, still logs usage and baselines. |
-| `INKLING_LOG`, `INKLING_CONFIG`, `INKLING_SESSION_STATE` | Events log, JSON config and session-state paths (under `~/.inkling` and `~/.config/inkling`). |
-| `PORT`, `HOST` | Listen port (default 47821) and interface (default loopback). |
-
-Docker: `compose.yml` runs the proxy read-only, with every capability dropped, bound to `127.0.0.1`. Cloudflare Workers: `wrangler.toml` and `src/worker.ts`.
-
-## Limits
-
-- **Exact strings in an image aren't byte-safe.** A model's vision encoder reads patch embeddings, not characters, so it has no per-glyph confidence to fail loudly on. When the pixels underdetermine a glyph, the model fills it in with something plausible, so a miss reads as confident and wrong.
-  - Coding agents tolerate this, because they re-read a file before editing it.
-  - Pure chat recall has no such check.
-  - The factsheet carries the identifiers most likely to matter, as text.
-  - Background: [docs/NOT-OCR.md](docs/NOT-OCR.md) and [docs/LEGIBILITY-AUDIT-2026-07-01.md](docs/LEGIBILITY-AUDIT-2026-07-01.md).
-- **Workload-dependent.** Token-dense content (code, JSON, logs, about 1 character per token) wins. Sparse prose (about 3.5 characters per token) loses, and the gate leaves it as text.
-- **Latency.** PNG encoding adds time before a large request leaves. Speeding up the transform on very large bodies is being worked on.
-- **Script coverage.** ASCII and Latin-1 are well tested; CJK works, but conservatively.
-- **Platforms.** Developed on macOS and Linux.
-
-## Development
-
-```bash
-pnpm install
-pnpm test
-pnpm typecheck
-pnpm build          # regenerates dist/
-pnpm prices:check   # the kosha price table matches the snapshot
-```
-
-[CONTRIBUTING.md](CONTRIBUTING.md) covers the workflow, [SECURITY.md](SECURITY.md) how to report a vulnerability, and [CHANGELOG.md](CHANGELOG.md) what changed.
+---
 
 ## Credits
 
-inkling's image pipeline, renderer, evals and most of the research in [FINDINGS.md](FINDINGS.md) and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) come from **[pxpipe](https://github.com/teamchong/pxpipe)** by Steven ([teamchong](https://github.com/teamchong)), MIT. inkling started from pxpipe v0.16.0 (`9e0e0e99b4483f40e8a58036bb1f6a1a81c331e3`). Steven's work includes:
+Evolved from `pxpipe` by [Steven / teamchong](https://github.com/teamchong/pxpipe) (MIT; see [NOTICE](./NOTICE)). Bundled font licenses live in `assets/*_LICENSE.txt` and Docker `/app/licenses/`:
+- **JetBrains Mono** — SIL Open Font License 1.1 (`assets/JETBRAINS_MONO_LICENSE.txt`)
+- **GNU Unifont** — SIL Open Font License 1.1 / GPLv2+ with GNU font embedding exception (`assets/UNIFONT_LICENSE.txt`)
+- **Spleen** — BSD 2-Clause License (`assets/SPLEEN_LICENSE.txt`)
 
-- the "context as images" idea
-- the fonts and atlases
-- the `count_tokens` counterfactual
-- the model-tier measurements
+## License & Sponsor
 
-Thank you, Steven.
-
-Other projects built on pxpipe, not maintained by inkling:
-
-- [pxpipe-windows](https://github.com/DivyeshPatro/pxpipe-windows) — Windows support for `pxpipe mitm` (node-forge CA in place of openssl, Task Scheduler autostart).
-- [OmniGlyph](https://github.com/diegosouzapw/OmniGlyph) — a community-maintained project derived from pxpipe and used by [OmniRoute](https://github.com/diegosouzapw/OmniRoute).
-- [pxpipe-go](https://github.com/evan-choi/pxpipe-go) — a Go port of pxpipe's core with a CLI wrapper, standalone proxy and embeddable library for Anthropic Messages and OpenAI Chat/Responses.
-
-## License
-
-MIT. See [LICENSE](LICENSE), which keeps pxpipe's original copyright notice as the license requires.
+MIT © [Srinivas Pendela (Sriinnu)](https://github.com/sriinnu) · [github.com/sriinnu/fiche](https://github.com/sriinnu/fiche) · [fiche.srinivas.dev](https://fiche.srinivas.dev) · [Sponsor on GitHub](https://github.com/sponsors/sriinnu)

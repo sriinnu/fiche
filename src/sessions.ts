@@ -25,6 +25,7 @@
  */
 
 import * as fs from 'node:fs';
+import { readBrandEnv } from './core/env.js';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
@@ -38,7 +39,14 @@ import {
   type BaselineWarmthPrev,
 } from './core/baseline.js';
 import { sessionAnchorText } from './core/session-state.js';
-import { anthropicReadRate } from './core/pricing.js';
+import { anthropicReadRate, priceMode, resolvePriceRates } from './core/pricing.js';
+import {
+  computeOpenAIActualInputEff,
+  computeOpenAISessionBaselineInputEff,
+  deriveOpenAIBaselineWarmth,
+  OPENAI_CACHE_TTL_SEC,
+  type OpenAIWarmthPrev,
+} from './core/openai-savings.js';
 
 // ---- Types -----------------------------------------------------------------
 
@@ -88,8 +96,10 @@ export interface SessionsPaths {
 
 export function defaultPaths(): SessionsPaths {
   const home = os.homedir();
+  const preferred = path.join(home, '.fiche', 'events.jsonl');
+  const legacy = path.join(home, '.inkling', 'events.jsonl');
   const eventsFile =
-    process.env.INKLING_LOG ?? path.join(home, '.inkling', 'events.jsonl');
+    readBrandEnv('LOG') ?? (fs.existsSync(preferred) || !fs.existsSync(legacy) ? preferred : legacy);
   // The sidecar directory is `4xx-bodies` next to the events file, matching
   // what src/node.ts writes.
   const sidecarDir = path.join(path.dirname(eventsFile), '4xx-bodies');
@@ -146,6 +156,7 @@ export async function aggregateSessions(
   // split. Kept out of SessionSummary so it never leaks into the
   // /api/sessions.json shape.
   const warmth = new Map<string, BaselineWarmthPrev>();
+  const openaiWarmth = new Map<string, OpenAIWarmthPrev>();
   const CACHE_TTL_SEC = 300; // default; a 1h-tier prior carries 3600 s (observedCacheTtlSec)
 
   // Stat sidecar sizes once up front. Looking up size per event would be
@@ -187,9 +198,88 @@ export async function aggregateSessions(
     const cc5m = ev.cache_create_5m_tokens;
     const cc1h = ev.cache_create_1h_tokens ?? 0;
     const cr = ev.cache_read_tokens ?? 0;
-    const haveUsage = inp > 0 || cc > 0 || cr > 0;
+    const cached = ev.cached_tokens ?? 0;
+    const cacheWrite = ev.cache_write_tokens ?? 0;
+    const out = ev.output_tokens ?? 0;
+    const isGoogle = ev.accounting_provider === 'google'
+      || ev.path.includes('google-ai-studio')
+      || ev.path.toLowerCase().includes('generatecontent');
+    const isOpenAI = ev.accounting_provider === 'openai'
+      || (!isGoogle && (ev.path.includes('responses') || ev.path.includes('chat/completions')));
+    const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0 || cached > 0 || cacheWrite > 0;
+    const completionSec = Date.parse(ev.ts) / 1000;
+    const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
     const baseline = ev.baseline_tokens;
-    if (
+
+    if (isGoogle) {
+      const measured = ev.baseline_probe_status === 'ok' && typeof baseline === 'number' && baseline > 0
+        ? baseline
+        : 0;
+      const hygieneTok = ev.text_hygiene_saved_tokens ?? 0;
+      const estimated = ev.compressed === true
+        && (((ev.image_tokens ?? 0) > 0 && (ev.baseline_imaged_tokens ?? 0) > 0) || hygieneTok > 0)
+        ? Math.max(
+            0,
+            inp
+              - (ev.image_tokens ?? 0)
+              - (ev.native_injected_tokens ?? 0)
+              + (ev.baseline_imaged_tokens ?? 0)
+              + hygieneTok,
+          )
+        : 0;
+      const gBaseline = measured || estimated;
+      if (ev.compressed === true && haveUsage && gBaseline > 0) {
+        const delta = gBaseline - inp;
+        const tokensSaved = priceMode() === 'kosha'
+          ? delta * (cached > 0 ? resolvePriceRates(ev.model, { promptTokens: inp }).read : 1)
+          : delta;
+        s.tokensSavedEst += Math.round(tokensSaved);
+        s.charsSaved += Math.round(tokensSaved * 4);
+      }
+    } else if (isOpenAI) {
+      const oPrev = openaiWarmth.get(id);
+      const pxShaO = ev.cache_prefix_sha8 ?? ev.history_image_sha8;
+      const oWarmth = deriveOpenAIBaselineWarmth(
+        oPrev,
+        requestStartSec,
+        cached,
+        ev.system_sha8,
+        ev.model,
+        OPENAI_CACHE_TTL_SEC,
+        pxShaO,
+      );
+      const hygieneTok = ev.text_hygiene_saved_tokens ?? 0;
+      if (
+        ev.compressed === true &&
+        haveUsage &&
+        ((ev.baseline_imaged_tokens ?? 0) > 0 || hygieneTok > 0)
+      ) {
+        const actualEff = computeOpenAIActualInputEff(inp, cached, ev.model, cacheWrite);
+        const baselineEff = computeOpenAISessionBaselineInputEff({
+          inputTokens: inp,
+          cachedTokens: cached,
+          imageTokens: ev.image_tokens ?? 0,
+          baselineImagedTokens: ev.baseline_imaged_tokens ?? 0,
+          nativeInjectedTokens: ev.native_injected_tokens ?? 0,
+          textHygieneSavedTokens: hygieneTok,
+          cacheWriteTokens: cacheWrite,
+          model: ev.model,
+          warmth: oWarmth,
+        });
+        const tokensSaved = baselineEff - actualEff;
+        s.tokensSavedEst += Math.round(tokensSaved);
+        s.charsSaved += Math.round(tokensSaved * 4);
+      }
+      if (haveUsage) {
+        openaiWarmth.set(id, {
+          ts: completionSec,
+          cachedOrPrefixTokens: cached > 0 ? cached : Math.max(oPrev?.cachedOrPrefixTokens ?? 0, inp),
+          prefixSha: ev.system_sha8 ?? oPrev?.prefixSha,
+          pxPrefixSha: pxShaO ?? oPrev?.pxPrefixSha,
+          model: ev.model ?? oPrev?.model,
+        });
+      }
+    } else if (
       typeof baseline === 'number' &&
       baseline > 0 &&
       haveUsage &&
@@ -198,8 +288,6 @@ export async function aggregateSessions(
     ) {
       const cacheable = ev.baseline_cacheable_tokens ?? 0;
       const prefixSha = ev.system_sha8;
-      const completionSec = Date.parse(ev.ts) / 1000;
-      const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
       const prev = warmth.get(id);
       const { warm, prevCacheable } = deriveBaselineWarmth(
         prev,
@@ -227,11 +315,23 @@ export async function aggregateSessions(
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);
+    } else if (
+      haveUsage &&
+      ev.compressed === true &&
+      (ev.text_hygiene_saved_tokens ?? 0) > 0 &&
+      (ev.image_count ?? 0) === 0
+    ) {
+      const hygieneTok = ev.text_hygiene_saved_tokens ?? 0;
+      const deltaWeight = cr > 0
+        ? anthropicReadRate(ev.model)
+        : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+      const tokensSaved = hygieneTok * deltaWeight;
+      s.tokensSavedEst += Math.round(tokensSaved);
+      s.charsSaved += Math.round(tokensSaved * 4);
     }
     // Record this completed row's prefix for later warmth/split decisions.
     // Carry prior cacheable when this row had no probe.
-    if (haveUsage) {
-      const completionSec = Date.parse(ev.ts) / 1000;
+    if (haveUsage && !isGoogle && !isOpenAI) {
       const cacheable = ev.baseline_cacheable_tokens ?? 0;
       const prefixSha = ev.system_sha8;
       const prev = warmth.get(id);
@@ -245,8 +345,9 @@ export async function aggregateSessions(
         ttlSec: observedCacheTtlSec(ev.cache_create_1h_tokens, prev?.ttlSec),
       });
     }
-    if (typeof ev.cache_read_tokens === 'number') {
-      s.cacheReadTokens += ev.cache_read_tokens;
+    const cacheReadEv = ev.cache_read_tokens ?? ev.cached_tokens;
+    if (typeof cacheReadEv === 'number') {
+      s.cacheReadTokens += cacheReadEv;
     }
     if (ev.req_body_sample_path) {
       let set = sidecarsBySession.get(id);
@@ -469,9 +570,9 @@ async function rewriteEventsFile(
   toRemove: Set<string>,
 ): Promise<void> {
   if (!fs.existsSync(eventsFile)) return;
-  const tmp = eventsFile + '.tmp';
-  // Open with 'w' (truncate). We never reuse a stale .tmp.
-  const outFd = fs.openSync(tmp, 'w');
+  const tmp = `${eventsFile}.tmp.${process.pid}`;
+  // Open with 'w' (truncate) and 0o600 permissions so pruned logs never expose prompts.
+  const outFd = fs.openSync(tmp, 'w', 0o600);
   try {
     const stream = fs.createReadStream(eventsFile, { encoding: 'utf8' });
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -489,10 +590,18 @@ async function rewriteEventsFile(
       fs.writeSync(outFd, line + '\n');
     }
     fs.fsyncSync(outFd);
-  } finally {
+  } catch (err) {
     fs.closeSync(outFd);
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore cleanup error */
+    }
+    throw err;
   }
+  fs.closeSync(outFd);
   fs.renameSync(tmp, eventsFile);
+  fs.chmodSync(eventsFile, 0o600);
 }
 
 // ---- disk usage ------------------------------------------------------------

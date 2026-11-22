@@ -1,10 +1,14 @@
 export {
   getAllowedModelBases,
   getConfiguredModelBases,
+  isFicheSupportedGptModel,
+  isFicheSupportedModel,
   isInklingSupportedGptModel,
   isInklingSupportedModel,
   setAllowedModelBases,
   shouldTransformAnthropicMessages,
+  type FicheApplicabilityInput,
+  type FicheApplicabilityReason,
   type InklingApplicabilityInput,
   type InklingApplicabilityReason,
 } from './applicability.js';
@@ -18,6 +22,10 @@ export {
 export {
   transformAnthropicMessages,
   renderTextToImages,
+  type FicheOptions,
+  type FicheReason,
+  type FicheTransformInput,
+  type FicheTransformResult,
   type InklingOptions,
   type InklingReason,
   type InklingTransformInput,
@@ -28,6 +36,7 @@ export {
 } from './library.js';
 export {
   transformRequest,
+  type TransformInfo as FicheTransformInfo,
   type TransformInfo as InklingTransformInfo,
   type TransformOptions,
   type KeepSharpBlock,

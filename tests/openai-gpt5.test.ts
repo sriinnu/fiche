@@ -1134,7 +1134,7 @@ describe('resolveGptProfile (GPT-5.6 Sol)', () => {
         collapseChunk: 1,
         freezeChunk: 1,
         framing: 'compact',
-        factSheetScope: 'combined',
+        factSheetScope: 'per-segment',
       });
       expect(sol.factSheetFormat, model).toBe('full');
     }

@@ -1,6 +1,8 @@
 # How imaged history stays cache-safe as a conversation grows
 
-This doc captures the **mental model** behind inkling's history-image compression:
+This doc captures the **mental model** behind `fiche`'s history-image compression
+(for text-tier models, the parallel append-only `ACDC` frozen-epoch compactor lives
+in `src/core/text-history.ts`):
 why turning past conversation turns into images doesn't break Anthropic's prompt
 cache, even though the conversation keeps growing and "new" content is constantly
 becoming "old."
@@ -140,7 +142,7 @@ Everything above collapses into one rule:
 > **Byte-stable content goes *before* the cache mark; per-turn-volatile content
 > goes *after* it. "One-time" is defined relative to that mark.**
 
-inkling never *adds* a breakpoint — Task #21: it **relocates** the caller's
+`fiche` never *adds* a breakpoint — Task #21: it **relocates** the caller's
 existing `cache_control` marker onto the **last static image** produced from the
 content that marker covered (transform.ts; doc: "the marker rides the last
 image"). So the breakpoint lands exactly at the stable↔volatile seam:
@@ -182,11 +184,11 @@ history image *after* it.
 
 Claude Code natively ships a big **stable prefix** (system prompt, tool docs,
 `<system-reminder>`s, older history) terminated by a `cache_control` breakpoint,
-followed by a thin per-turn tail. inkling preserves that exact shape. It only:
+followed by a thin per-turn tail. `fiche` preserves that exact shape. It only:
 
 1. Swaps the stable prefix's **representation** — verbose text → byte-stable image.
 2. **Moves the mark with it** (relocate, not add) so the seam stays in the same
-   logical place and inkling spends none of the 4-breakpoint budget.
+   logical place and `fiche` spends none of the 4-breakpoint budget.
 3. Quantizes the history boundary so the imaged region's bytes change only at
    chunk crossings, keeping the native byte-stability Claude Code relied on.
 

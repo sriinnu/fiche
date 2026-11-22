@@ -6,6 +6,7 @@
  * is also rendered into images for token savings so calls do not depend only on OCR.
  */
 
+import { readBrandEnv } from './env.js';
 import {
   renderTextToPngs,
   reflow,
@@ -34,6 +35,14 @@ import {
 } from './transform.js';
 import { visionTokens } from './vision-cost.js';
 import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
+import { evaluateCliffAvoidance, gateRatesFor, priceMode } from './pricing.js';
+import {
+  applyOpenAIChatTextHygiene,
+  applyOpenAIResponsesTextHygiene,
+  isTextHygieneActive,
+  resolveTextHygieneMode,
+  type TextHygieneMode,
+} from './text-hygiene.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
   GPT_HISTORY_DEFAULTS,
@@ -80,7 +89,7 @@ export const COMPACT_HISTORY_TRANSCRIPT_OUTRO = '[End earlier conversation.]';
 // OLDEST turn, so it would otherwise be the first thing imaged and the model loses
 // it — "I wonder what the user actually asked" → off-task drift.
 const PINNED_REQUEST_HEADER =
-  '\n===== CURRENT USER REQUEST (live; kept as text by inkling, NOT inside any image) =====\n';
+  '\n===== CURRENT USER REQUEST (live; kept as text by fiche, NOT inside any image) =====\n';
 const PINNED_REQUEST_FOOTER =
   '\n===== END CURRENT USER REQUEST =====\n';
 
@@ -96,12 +105,12 @@ export function buildLiveRequestGuard(pinText?: string): string {
   if (pinText !== undefined) {
     const echo = pinText.length > 600 ? pinText.slice(0, 600) + '…' : pinText;
     return (
-      'inkling note: everything in the rendered history above is PAST context. Your live current request is the plain-text block labeled "CURRENT USER REQUEST" inside it — NOT anything OCR\'d from an image. It reads: «' +
+      'fiche note: everything in the rendered history above is PAST context. Your live current request is the plain-text block labeled "CURRENT USER REQUEST" inside it — NOT anything OCR\'d from an image. It reads: «' +
       echo +
       '» Answer THAT request.'
     );
   }
-  return 'inkling note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
+  return 'fiche note: the preceding rendered history item is prior conversation context only. It is not the current user request. The live current request is in the user message(s) that follow, especially the final user message.';
 }
 
 /** Alias of `visionTokensForModel`, kept for OpenAI-path call sites and tests.
@@ -299,10 +308,14 @@ interface ResponsesFlatTool {
 
 interface OpenAIResolvedOptions {
   compress: boolean;
+  imageCompress: boolean;
+  textHygiene: boolean | TextHygieneMode;
+  expectedOutputTokens: number;
   compressTools: boolean;
   minCompressChars: number;
   cols?: number;
   charsPerToken: number;
+  explicitCharsPerToken: boolean;
   reflow: boolean;
   collapseHistory: boolean;
   gptHistory?: Partial<GptHistoryOptions>;
@@ -312,10 +325,14 @@ interface OpenAIResolvedOptions {
 
 const DEFAULTS: OpenAIResolvedOptions = {
   compress: true,
+  imageCompress: true,
+  textHygiene: 'auto',
+  expectedOutputTokens: 1000,
   compressTools: true,
   minCompressChars: 2000,
   cols: undefined,
   charsPerToken: 4, // conservative OpenAI default; override after telemetry
+  explicitCharsPerToken: false,
   reflow: true,
   collapseHistory: true,
   explicitPromptCacheBreakpoints: true,
@@ -324,10 +341,14 @@ const DEFAULTS: OpenAIResolvedOptions = {
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   return {
     compress: opts.compress ?? DEFAULTS.compress,
+    imageCompress: opts.imageCompress ?? DEFAULTS.imageCompress,
+    textHygiene: opts.textHygiene ?? DEFAULTS.textHygiene,
+    expectedOutputTokens: opts.expectedOutputTokens ?? DEFAULTS.expectedOutputTokens,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
     cols: opts.cols,
     charsPerToken: opts.charsPerToken ?? DEFAULTS.charsPerToken,
+    explicitCharsPerToken: opts.charsPerToken !== undefined,
     reflow: opts.reflow ?? DEFAULTS.reflow,
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
     gptHistory: opts.gptHistory,
@@ -341,7 +362,7 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
  *  history is expensive on its pixel bill + weak cache discount. */
 function configuredHistoryMaxImages(model: string): number {
   const fallback = resolveGptProfile(model).history.maxImages;
-  const raw = typeof process !== 'undefined' ? process.env?.INKLING_GPT_HISTORY_MAX_IMAGES : undefined;
+  const raw = readBrandEnv('GPT_HISTORY_MAX_IMAGES');
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   // Responses providers impose their own total image caps. Keep a defensive ceiling
@@ -651,6 +672,34 @@ function countOutgoingTextChars(req: OpenAIChatRequest): number {
  *  already drops non-text parts). */
 type ResponsesComposition = NonNullable<TransformInfo['responsesComposition']>;
 
+/** Bounded LRU cache for opaque reasoning/compaction blobs so immutable
+ *  Codex `encrypted_content` items are not re-serialized & o200k-tokenized on every turn. */
+const OPAQUE_ITEM_TOKEN_CACHE = new Map<string, number>();
+const OPAQUE_ITEM_CACHE_MAX = 256;
+
+function cachedOpaqueItemTokens(o: Record<string, unknown>): number {
+  const enc = typeof o.encrypted_content === 'string' ? o.encrypted_content : undefined;
+  const keyCount = Object.keys(o).length;
+  if (enc && enc.length >= 256 && keyCount <= 6) {
+    const id = typeof o.id === 'string' ? o.id : '';
+    const cacheKey = `${id}\0${enc}`;
+    const hit = OPAQUE_ITEM_TOKEN_CACHE.get(cacheKey);
+    if (hit !== undefined) {
+      OPAQUE_ITEM_TOKEN_CACHE.delete(cacheKey);
+      OPAQUE_ITEM_TOKEN_CACHE.set(cacheKey, hit);
+      return hit;
+    }
+    const tokens = gptTextTokens(JSON.stringify(o));
+    if (OPAQUE_ITEM_TOKEN_CACHE.size >= OPAQUE_ITEM_CACHE_MAX) {
+      const oldest = OPAQUE_ITEM_TOKEN_CACHE.keys().next().value;
+      if (oldest !== undefined) OPAQUE_ITEM_TOKEN_CACHE.delete(oldest);
+    }
+    OPAQUE_ITEM_TOKEN_CACHE.set(cacheKey, tokens);
+    return tokens;
+  }
+  return gptTextTokens(JSON.stringify(o));
+}
+
 /** Local o200k decomposition of the original Responses request. This is
  * diagnostic only and never calls Anthropic/provider count_tokens. */
 function measureResponsesComposition(
@@ -698,12 +747,12 @@ function measureResponsesComposition(
       c.imageParts += countImages(o.output);
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
-      c.reasoningEncrypted += gptTextTokens(JSON.stringify(o));
+      c.reasoningEncrypted += cachedOpaqueItemTokens(o);
     } else if (
       type === 'compaction' || type === 'compaction_trigger' ||
       type === 'context_compaction' || type === 'item_reference'
     ) {
-      c.compactionOpaque += gptTextTokens(JSON.stringify(o));
+      c.compactionOpaque += cachedOpaqueItemTokens(o);
     } else if (!role && type) {
       c.other += gptTextTokens(JSON.stringify(o));
     }
@@ -818,9 +867,11 @@ function evalOpenAIGate(
       ? lastPageTokens
       : (estImages - 1) * fullPageTokens + lastPageTokens;
   const textTokens = baselineTextTokens ?? (
-    profile.minCompressTokens !== undefined || charsPerToken === DEFAULTS.charsPerToken
-      ? Math.max(1, gptTextTokens(renderedText) || Math.ceil(renderedText.length / charsPerToken))
-      : renderedText.length / Math.max(1e-6, charsPerToken)
+    charsPerToken !== DEFAULTS.charsPerToken
+      ? renderedText.length / Math.max(1e-6, charsPerToken)
+      : (profile.minCompressTokens !== undefined || charsPerToken === DEFAULTS.charsPerToken
+          ? Math.max(1, gptTextTokens(renderedText) || Math.ceil(renderedText.length / charsPerToken))
+          : renderedText.length / Math.max(1e-6, charsPerToken))
   );
   return { imageTokens, textTokens, profitable: imageTokens < textTokens };
 }
@@ -961,10 +1012,19 @@ async function applyChatHistoryCollapse(
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const histFactSheet = factSheetText(plan.text, profile.factSheetFormat);
   const content: OpenAIContentPart[] = [{ type: 'text', text: intro }];
-  for (const img of plan.images) content.push(openAIImagePart(img, req.model));
+  const chatB64Parts: string[] = [];
+  for (const img of plan.images) {
+    const part = openAIImagePart(img, req.model);
+    chatB64Parts.push(part.image_url.url.slice('data:image/png;base64,'.length));
+    content.push(part);
+  }
   if (plan.pinText !== undefined) {
     content.push({ type: 'text', text: pinnedRequestBlock(plan.pinText) });
-    for (const img of plan.imagesAfter) content.push(openAIImagePart(img, req.model));
+    for (const img of plan.imagesAfter) {
+      const part = openAIImagePart(img, req.model);
+      chatB64Parts.push(part.image_url.url.slice('data:image/png;base64,'.length));
+      content.push(part);
+    }
   }
   if (histFactSheet) content.push({ type: 'text', text: histFactSheet });
   content.push({ type: 'text', text: outro });
@@ -977,8 +1037,40 @@ async function applyChatHistoryCollapse(
   ];
   info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0)
     + gptTextTokens(intro + histFactSheet + outro + guard);
-  info.historyImageSha = await sha8(allImages.map((i) => bytesToBase64(i.png)).join(''));
+  info.historyImageSha = await sha8(chatB64Parts.join(''));
   return true;
+}
+
+const OPENAI_CLIFF_STICKY_MAX = 512;
+const openaiCliffSticky = new Map<string, number>();
+
+function recordOpenAICliffSticky(key: string, cliffAt: number): void {
+  if (openaiCliffSticky.size >= OPENAI_CLIFF_STICKY_MAX) openaiCliffSticky.clear();
+  openaiCliffSticky.set(key, cliffAt);
+}
+
+function clearImageTelemetryForLimit(info: TransformInfo): void {
+  info.imageCount = 0;
+  info.imageTokens = 0;
+  info.baselineImagedTokens = 0;
+  info.nativeInjectedTokens = 0;
+  info.imageBytes = 0;
+  info.imagePixels = 0;
+  info.imagePngs = undefined;
+  info.imageDims = undefined;
+  info.imageSourceText = undefined;
+  info.imageSourceTexts = undefined;
+  info.firstImagePng = undefined;
+  info.firstImageWidth = undefined;
+  info.firstImageHeight = undefined;
+  info.collapsedTurns = undefined;
+  info.collapsedChars = undefined;
+  info.collapsedImages = undefined;
+  info.historyReason = undefined;
+  info.historyTextChars = undefined;
+  info.historyImageSha = undefined;
+  info.bucketChars = undefined;
+  info.compressedChars = 0;
 }
 
 async function applyResponsesHistoryCollapse(
@@ -994,8 +1086,20 @@ async function applyResponsesHistoryCollapse(
   // spellings; rejected sections must not make a later replacement look cheaper.
   const plannedSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
     && profile.history.factSheetScope === 'per-segment' ? new Set<string>() : undefined;
+  const initialComp = info.responsesComposition;
+  let remainingPromptTokens = initialComp?.totalLocal ?? 0;
+  const upstreamPrefixTokens = (initialComp?.instructions ?? 0) + (initialComp?.toolsJson ?? 0);
+  const tailItemTokens = inputItems.length > 0
+    ? gptTextTokens(JSON.stringify(inputItems[inputItems.length - 1]))
+    : 0;
   const profitable = (text: string, cols: number, baselineTextTokens?: number, sourceText = text) => {
-    const gate = evalOpenAIGate(req.model, text, cols, o.charsPerToken, baselineTextTokens);
+    const gate = evalOpenAIGate(
+      req.model,
+      text,
+      cols,
+      o.charsPerToken,
+      o.explicitCharsPerToken ? undefined : baselineTextTokens,
+    );
     if (!gate.profitable) return false;
     const maxReads = profile.history.maxCachePaybackReads;
     if (!profile.history.factSheetOverflow && maxReads === undefined) return true;
@@ -1005,14 +1109,46 @@ async function applyResponsesHistoryCollapse(
     const sheet = renderHistorySheet(sourceText, plannedSheetTokens);
     const collapsedTokens = gate.imageTokens + gptTextTokens(sheet + framing);
     if (collapsedTokens >= gate.textTokens) return false;
-    const accepted = maxReads === undefined
+    let accepted = maxReads === undefined
       || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
-    if (accepted && plannedSheetTokens) {
-      for (const token of extractFactSheetTokens(sheet)) plannedSheetTokens.add(token);
+    const cliffStickyKey = `${req.model}\0${info.firstUserSha8 ?? ''}\0${sourceText.length}:${sourceText.slice(0, 128)}`;
+    if (!accepted && remainingPromptTokens > gate.textTokens) {
+      const stickyCliffAt = priceMode() === 'kosha' ? openaiCliffSticky.get(cliffStickyKey) : undefined;
+      if (stickyCliffAt !== undefined && remainingPromptTokens > stickyCliffAt) {
+        accepted = true;
+      } else {
+        const downstreamCachedTokens = Math.max(
+          0,
+          remainingPromptTokens - upstreamPrefixTokens - gate.textTokens - tailItemTokens,
+        );
+        const cliff = evaluateCliffAvoidance(req.model, {
+          promptTokensBefore: remainingPromptTokens,
+          promptTokensAfter: Math.max(0, remainingPromptTokens - (gate.textTokens - collapsedTokens)),
+          collapsedBaselineTokens: gate.textTokens,
+          collapsedActualTokens: collapsedTokens,
+          downstreamCachedTokens,
+          expectedOutputTokens: o.expectedOutputTokens,
+        });
+        if (cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) {
+          accepted = true;
+          recordOpenAICliffSticky(cliffStickyKey, cliff.cliffAt);
+          info.cliffAvoided = {
+            at: cliff.cliffAt,
+            multiplier: cliff.multiplier,
+            savedUsd: cliff.netSingleTurnUsd,
+          };
+        }
+      }
+    }
+    if (accepted) {
+      remainingPromptTokens = Math.max(0, remainingPromptTokens - (gate.textTokens - collapsedTokens));
+      if (plannedSheetTokens) {
+        for (const token of extractFactSheetTokens(sheet)) plannedSheetTokens.add(token);
+      }
     }
     return accepted;
   };
-  const existingImages = info.imageCount ?? 0;
+  const existingImages = (info.imageCount ?? 0) + (info.responsesComposition?.imageParts ?? 0);
   const plan = await planResponsesPairCollapse(
     inputItems,
     profitable,
@@ -1056,14 +1192,22 @@ async function applyResponsesHistoryCollapse(
   // coverage used by planning; appended groups keep old prefixes.
   const coveredSheetTokens = profile.history.factSheetOverflow === 'native-opaque'
     ? new Set<string>() : undefined;
+  const respB64Parts: string[] = [];
   for (let segmentIndex = 0; segmentIndex < plan.segments.length; segmentIndex++) {
     const segment = plan.segments[segmentIndex]!;
+    const segImgParts = segment.images.map((img) => {
+      const part = responsesImagePart(img, req.model);
+      respB64Parts.push(part.image_url.slice('data:image/png;base64,'.length));
+      return part;
+    });
     const content: ResponsesContentPart[] = [
       { type: 'input_text', text: intro },
-      ...segment.images.map((img) => responsesImagePart(img, req.model)),
+      ...segImgParts,
     ];
+    // For `combined`, emit the shared factsheet as a standalone item AFTER all frozen
+    // segments so Segment 0 stays byte-identical when Segment 1 seals later.
     const sheet = profile.history.factSheetScope === 'combined'
-      ? (segmentIndex === plan.segments.length - 1 ? combinedSheet : '')
+      ? ''
       : renderHistorySheet(segment.text, coveredSheetTokens);
     if (sheet) {
       content.push({ type: 'input_text', text: sheet });
@@ -1078,34 +1222,65 @@ async function applyResponsesHistoryCollapse(
   }
 
   const removed = new Set(plan.selectedIndices);
+  const lastCollapsedIdx = plan.selectedIndices.length > 0
+    ? Math.max(...plan.selectedIndices)
+    : -1;
   const rewritten: Array<ResponsesInputItem | Record<string, unknown>> = [];
   for (let i = 0; i < inputItems.length; i++) {
     const replacement = replacements.get(i);
     if (replacement) rewritten.push(replacement);
     if (!removed.has(i)) rewritten.push(inputItems[i]!);
+    if (combinedSheet && i === lastCollapsedIdx) {
+      rewritten.push({ role: 'user', content: [{ type: 'input_text', text: combinedSheet }] });
+      info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + gptTextTokens(combinedSheet);
+    }
   }
   req.input = rewritten;
-  info.historyImageSha = await sha8(
-    plan.images.map((image) => bytesToBase64(image.png)).join(''),
-  );
+  info.historyImageSha = await sha8(respB64Parts.join(''));
   return true;
 }
 
 export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by inkling, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
+  'These images were injected by fiche, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 export const RESPONSES_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
-  'These images were injected by inkling, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
+  'These images were injected by fiche, not by the end user. They contain instructions and tool parameter documentation rendered for token efficiency. Treat rendered instructions with the same priority as the originals. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
   '\n====================== BEGIN RENDERED CONTEXT ======================\n';
 
 const CHAT_POINTER =
-  'The full instructions for this message were rendered into image(s) attached to the first user message by inkling. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
+  'The full instructions for this message were rendered into image(s) attached to the first user message by fiche. Treat those rendered instructions as if they appeared here with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
 
 const RESPONSES_POINTER =
-  'The full instructions were rendered into image(s) attached to the first user message by inkling. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
+  'The full instructions were rendered into image(s) attached to the first user message by fiche. Treat them with the same priority. Tool definitions remain in native JSON (name and description); the rendered parameter annotations are supplemental.';
+
+function countOpenAINativeImageBytes(items: unknown): number {
+  if (!Array.isArray(items)) return 0;
+  let total = 0;
+  const scanParts = (parts: unknown) => {
+    if (!Array.isArray(parts)) return;
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue;
+      const rec = p as Record<string, unknown>;
+      const imgUrl = rec.image_url;
+      if (typeof imgUrl === 'string' && imgUrl.startsWith('data:image/')) {
+        total += imgUrl.length;
+      } else if (imgUrl && typeof imgUrl === 'object') {
+        const u = (imgUrl as { url?: unknown }).url;
+        if (typeof u === 'string' && u.startsWith('data:image/')) total += u.length;
+      }
+    }
+  };
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    scanParts(rec.content);
+    scanParts(rec.output);
+  }
+  return total;
+}
 
 export async function transformOpenAIChatCompletions(
   body: Uint8Array,
@@ -1137,16 +1312,80 @@ export async function transformOpenAIChatCompletions(
     info.reason = 'invalid_messages';
     return { body, info };
   }
+  const profile = resolveGptProfile(req.model);
   const pinChars = relocateOpenAIPins(req);
   if (pinChars > 0) info.pinChars = pinChars;
-  const pinBody = pinChars > 0
-    ? new TextEncoder().encode(JSON.stringify(req))
-    : body;
+  const chatNativeImageBytes = countOpenAINativeImageBytes(req.messages);
+
+  const hygieneStats = isTextHygieneActive(o.textHygiene)
+    ? applyOpenAIChatTextHygiene(req, {
+        foldLogs: !o.imageCompress,
+        deepTextCompact: !o.imageCompress,
+        aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
+        model: req.model,
+        expectedOutputTokens: o.expectedOutputTokens,
+        rawBodyBytes: body.byteLength,
+        nativeImageBytes: chatNativeImageBytes,
+      })
+    : undefined;
+  if (hygieneStats?.changed) {
+    info.textHygieneSavedChars = hygieneStats.savedChars;
+    info.textHygieneSavedTokens = hygieneStats.savedTokens;
+    info.textHygieneBlocks = hygieneStats.blocks;
+    info.textHygieneStages = [...hygieneStats.stages];
+    if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
+  }
+  let cachedPinBodyChat: Uint8Array | undefined;
+  let cachedPinOutgoingChat: number | undefined;
+  const getPinBody = (): Uint8Array => {
+    if (cachedPinBodyChat) return cachedPinBodyChat;
+    if (pinChars > 0 || hygieneStats?.changed) {
+      cachedPinOutgoingChat = countOutgoingTextChars(req);
+      cachedPinBodyChat = new TextEncoder().encode(JSON.stringify(req));
+    } else {
+      cachedPinBodyChat = body;
+    }
+    return cachedPinBodyChat;
+  };
+  if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed)) {
+    getPinBody();
+  }
+  if (!o.imageCompress) {
+    if (hygieneStats?.changed) {
+      const firstUser = firstUserText(req);
+      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countOutgoingTextChars(req);
+      return { body: getPinBody(), info };
+    }
+    info.reason = 'image_disabled';
+    if (pinChars > 0) info.outgoingTextChars = countOutgoingTextChars(req);
+    return { body: getPinBody(), info };
+  }
 
   const firstUserIdx = req.messages.findIndex((m) => m.role === 'user');
   if (firstUserIdx < 0) {
-    info.reason = 'no_user_message';
-    return { body: pinBody, info };
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countOutgoingTextChars(req);
+    } else {
+      info.reason = 'no_user_message';
+    }
+    return { body: getPinBody(), info };
+  }
+
+  const estPromptTokensChat = Math.ceil(body.byteLength / Math.max(1, o.charsPerToken));
+  if (priceMode() === 'kosha' && gateRatesFor(req.model, { promptTokens: estPromptTokensChat }) === null) {
+    info.reason = hygieneStats?.changed ? 'text_hygiene' : 'unpriced_model';
+    if (hygieneStats?.changed) {
+      const firstUser = firstUserText(req);
+      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      info.compressed = true;
+      info.outgoingTextChars = countOutgoingTextChars(req);
+    }
+    return { body: getPinBody(), info };
   }
 
   const authorityDocs: string[] = [];
@@ -1167,18 +1406,46 @@ export async function transformOpenAIChatCompletions(
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
-  const profile = resolveGptProfile(req.model);
+  const finishSerializedChat = () => {
+    const encoded = new TextEncoder().encode(JSON.stringify(req));
+    const serializedByteLimit = profile.maxSerializedRequestBytes;
+    if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
+      clearImageTelemetryForLimit(info);
+      info.reason = 'serialized_request_limit';
+      if (body.byteLength > serializedByteLimit) {
+        info.compressed = true;
+        info.serializedRequestBytes = encoded.byteLength;
+        info.sizeLimitOutcome = 'rejected';
+        return { body, info };
+      }
+      const pinBody = getPinBody();
+      const usePinBody = pinBody.byteLength <= serializedByteLimit;
+      const outBody = usePinBody ? pinBody : body;
+      info.compressed = usePinBody && Boolean(hygieneStats?.changed);
+      info.sizeLimitOutcome = 'fallback';
+      if (usePinBody && cachedPinOutgoingChat !== undefined) {
+        info.outgoingTextChars = cachedPinOutgoingChat;
+      }
+      return { body: outBody, info };
+    }
+    info.outgoingTextChars = countOutgoingTextChars(req);
+    info.compressed = true;
+    return { body: encoded, info };
+  };
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
     if (o.collapseHistory && await applyChatHistoryCollapse(
       req, info, o, profile, firstUserIdx + 1,
     )) {
       info.reason = undefined;
-      info.outgoingTextChars = countOutgoingTextChars(req);
-      info.compressed = true;
-      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+      return finishSerializedChat();
     }
-    return { body: pinBody, info };
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countOutgoingTextChars(req);
+    }
+    return { body: getPinBody(), info };
   };
   if (!combinedRaw) {
     return finishHistoryOnly('no_static_context');
@@ -1208,6 +1475,10 @@ export async function transformOpenAIChatCompletions(
     profile.stripCols,
   );
 
+  const slabFactSheetPreview = factSheetText(combinedRaw, profile.factSheetFormat);
+  const slabNativeOverhead = systemTexts.length * gptTextTokens(CHAT_POINTER)
+    + gptTextTokens('[End of rendered GPT system/tool context.]')
+    + gptTextTokens(slabFactSheetPreview);
   const staticBaselineTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
   const gate = evalOpenAIGate(
     req.model,
@@ -1218,15 +1489,16 @@ export async function transformOpenAIChatCompletions(
       ? staticBaselineTokens
       : undefined,
   );
+  const slabProfitable = gate.imageTokens + (profile.exactStaticBaseline ? slabNativeOverhead : 0) < gate.textTokens;
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
     textTokens: gate.textTokens,
     burnImageSide: 0,
     burnTextSide: 0,
-    profitable: gate.profitable,
+    profitable: slabProfitable,
   };
-  if (!gate.profitable) {
+  if (!slabProfitable) {
     info.passthroughReasons = { not_profitable: 1 };
     return finishHistoryOnly(`not_profitable (slab=${combined.length} chars)`);
   }
@@ -1234,7 +1506,7 @@ export async function transformOpenAIChatCompletions(
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
-    return { body: pinBody, info };
+    return { body: getPinBody(), info };
   }
 
   // A hard provider cap makes static-first allocation pathological on long Qwen
@@ -1255,7 +1527,7 @@ export async function transformOpenAIChatCompletions(
   if (profile.providerImageCap !== undefined &&
       countRequestImages(req.messages) + images.length > profile.providerImageCap) {
     info.reason = 'provider_image_cap';
-    return { body: pinBody, info };
+    return { body: getPinBody(), info };
   }
 
   const { droppedCodepoints } = accumulateRenderedImages(images, info);
@@ -1285,10 +1557,8 @@ export async function transformOpenAIChatCompletions(
   // Verbatim fact-sheet: precision-critical tokens (paths, ids, versions, flags)
   // pulled from the pre-image text so exact strings survive OCR loss. Deterministic
   // → stays inside the cached prefix. See src/core/factsheet.ts.
-  const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);
-  info.nativeInjectedTokens = systemTexts.reduce((sum) => sum + gptTextTokens(CHAT_POINTER), 0)
-    + gptTextTokens('[End of rendered GPT system/tool context.]')
-    + gptTextTokens(slabFactSheet);
+  const slabFactSheet = slabFactSheetPreview;
+  info.nativeInjectedTokens = slabNativeOverhead;
   const slabUserMsg: OpenAIChatMessage = {
     role: 'user',
     content: [
@@ -1317,9 +1587,7 @@ export async function transformOpenAIChatCompletions(
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
-  info.outgoingTextChars = countOutgoingTextChars(req);
-  info.compressed = true;
-  return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+  return finishSerializedChat();
 }
 
 export async function transformOpenAIResponses(
@@ -1340,11 +1608,58 @@ export async function transformOpenAIResponses(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  const profile = resolveGptProfile(req.model);
   const pinChars = relocateOpenAIPins(req);
   if (pinChars > 0) info.pinChars = pinChars;
-  const pinBody = pinChars > 0
-    ? new TextEncoder().encode(JSON.stringify(req))
-    : body;
+  const respNativeImageBytes = countOpenAINativeImageBytes(req.input);
+
+  const hygieneStats = isTextHygieneActive(o.textHygiene)
+    ? applyOpenAIResponsesTextHygiene(req, {
+        foldLogs: !o.imageCompress,
+        deepTextCompact: !o.imageCompress,
+        aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
+        model: req.model,
+        expectedOutputTokens: o.expectedOutputTokens,
+        rawBodyBytes: body.byteLength,
+        nativeImageBytes: respNativeImageBytes,
+      })
+    : undefined;
+  if (hygieneStats?.changed) {
+    info.textHygieneSavedChars = hygieneStats.savedChars;
+    info.textHygieneSavedTokens = hygieneStats.savedTokens;
+    info.textHygieneBlocks = hygieneStats.blocks;
+    info.textHygieneStages = [...hygieneStats.stages];
+    if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
+  }
+  let cachedPinBodyResp: Uint8Array | undefined;
+  let cachedPinOutgoingResp: number | undefined;
+  const getPinBodyResp = (): Uint8Array => {
+    if (cachedPinBodyResp) return cachedPinBodyResp;
+    if (pinChars > 0 || hygieneStats?.changed) {
+      cachedPinOutgoingResp = countResponsesOutgoingTextChars(req);
+      cachedPinBodyResp = new TextEncoder().encode(JSON.stringify(req));
+    } else {
+      cachedPinBodyResp = body;
+    }
+    return cachedPinBodyResp;
+  };
+  if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed)) {
+    getPinBodyResp();
+  }
+  if (!o.imageCompress) {
+    if (hygieneStats?.changed) {
+      const inputArr = Array.isArray(req.input) ? req.input as Array<ResponsesInputItem | Record<string, unknown>> : [];
+      const firstUser = firstResponsesUserText(typeof req.input === 'string', typeof req.input === 'string' ? req.input : undefined, inputArr);
+      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+      return { body: getPinBodyResp(), info };
+    }
+    info.reason = 'image_disabled';
+    if (pinChars > 0) info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    return { body: getPinBodyResp(), info };
+  }
 
   // Normalize input to an array; preserve original string for wrap-back if needed.
   const inputWasString = typeof req.input === 'string';
@@ -1356,13 +1671,13 @@ export async function transformOpenAIResponses(
     inputItems = req.input as Array<ResponsesInputItem | Record<string, unknown>>;
   } else {
     info.reason = 'parse_error: input must be a string or array';
-    return { body: pinBody, info };
+    return { body: getPinBodyResp(), info };
   }
   // As on the chat path: every stage below reads `.role` / `.content` off each
   // item, so a non-object item threw out of the transform and became a 502.
   if (inputItems.some((item) => !item || typeof item !== 'object')) {
     info.reason = 'invalid_input';
-    return { body: pinBody, info };
+    return { body: getPinBodyResp(), info };
   }
 
   // Find first user item index (skip non-message items like function_call_output, reasoning).
@@ -1372,13 +1687,29 @@ export async function transformOpenAIResponses(
       (item as ResponsesInputItem).role === 'user',
   );
   if (!inputWasString && firstUserIdx < 0) {
-    info.reason = 'no_user_message';
-    return { body: pinBody, info };
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    } else {
+      info.reason = 'no_user_message';
+    }
+    return { body: getPinBodyResp(), info };
   }
 
   info.responsesComposition = measureResponsesComposition(
     req, inputWasString, originalInputString, inputItems,
   );
+  if (priceMode() === 'kosha' && gateRatesFor(req.model, { promptTokens: info.responsesComposition.totalLocal }) === null) {
+    info.reason = hygieneStats?.changed ? 'text_hygiene' : 'unpriced_model';
+    if (hygieneStats?.changed) {
+      const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
+      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      info.compressed = true;
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    }
+    return { body: getPinBodyResp(), info };
+  }
 
   // Collect static context: instructions + system/developer items + flat tools.
   const authorityDocs: string[] = [];
@@ -1412,7 +1743,6 @@ export async function transformOpenAIResponses(
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
-  const profile = resolveGptProfile(req.model);
   const finishSerialized = () => {
     const encoded = new TextEncoder().encode(JSON.stringify(req));
     // The SAME cap the proxy enforces with a 413 (proxy.ts), applied to every
@@ -1422,12 +1752,23 @@ export async function transformOpenAIResponses(
     // the original here turns a hard 413 into a plain uncompressed request.
     const serializedByteLimit = profile.maxSerializedRequestBytes;
     if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
+      clearImageTelemetryForLimit(info);
+      info.reason = 'serialized_request_limit';
       if (body.byteLength > serializedByteLimit) {
-        info.reason = 'serialized_request_limit';
         info.compressed = true;
+        info.serializedRequestBytes = encoded.byteLength;
+        info.sizeLimitOutcome = 'rejected';
         return { body, info };
       }
-      return { body, info: emptyInfo('serialized_request_limit') };
+      const pinBody = getPinBodyResp();
+      const usePinBody = pinBody.byteLength <= serializedByteLimit;
+      const outBody = usePinBody ? pinBody : body;
+      info.compressed = usePinBody && Boolean(hygieneStats?.changed);
+      info.sizeLimitOutcome = 'fallback';
+      if (usePinBody && cachedPinOutgoingResp !== undefined) {
+        info.outgoingTextChars = cachedPinOutgoingResp;
+      }
+      return { body: outBody, info };
     }
     info.outgoingTextChars = countResponsesOutgoingTextChars(req);
     info.compressed = true;
@@ -1441,7 +1782,12 @@ export async function transformOpenAIResponses(
       info.reason = undefined;
       return finishSerialized();
     }
-    return { body: pinBody, info };
+    if (hygieneStats?.changed) {
+      info.compressed = true;
+      info.reason = 'text_hygiene';
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    }
+    return { body: getPinBodyResp(), info };
   };
   if (!combinedRaw) {
     return finishHistoryOnly('no_static_context');
@@ -1471,6 +1817,16 @@ export async function transformOpenAIResponses(
     profile.stripCols,
   );
 
+  const slabFactSheetPreview = factSheetText(combinedRaw, profile.factSheetFormat);
+  const authorityPointerCountPre = (typeof req.instructions === 'string' && req.instructions.length > 0 ? 1 : 0)
+    + inputItems.slice(0, leadingAuthorityEnd).filter((item) => {
+      const it = item as ResponsesInputItem;
+      return (it.role === 'system' || it.role === 'developer')
+        && responsesContentText(it.content).length > 0;
+    }).length;
+  const slabNativeOverhead = authorityPointerCountPre * gptTextTokens(RESPONSES_POINTER)
+    + gptTextTokens(slabFactSheetPreview)
+    + gptTextTokens('[End of rendered GPT system/tool context.]');
   const staticBaselineTokens = gptBaselineImagedTokens(systemTexts, req.tools, rewrittenTools);
   const gate = evalOpenAIGate(
     req.model,
@@ -1481,15 +1837,16 @@ export async function transformOpenAIResponses(
       ? staticBaselineTokens
       : undefined,
   );
+  const slabProfitable = gate.imageTokens + (profile.exactStaticBaseline ? slabNativeOverhead : 0) < gate.textTokens;
   info.gateEval = {
     site: 'slab',
     imageTokens: gate.imageTokens,
     textTokens: gate.textTokens,
     burnImageSide: 0,
     burnTextSide: 0,
-    profitable: gate.profitable,
+    profitable: slabProfitable,
   };
-  if (!gate.profitable) {
+  if (!slabProfitable) {
     info.passthroughReasons = { not_profitable: 1 };
     return finishHistoryOnly(`not_profitable (slab=${combined.length} chars)`);
   }
@@ -1497,7 +1854,14 @@ export async function transformOpenAIResponses(
   const images = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
   if (images.length === 0) {
     info.reason = 'render_empty';
-    return { body: pinBody, info };
+    return { body: getPinBodyResp(), info };
+  }
+  if (
+    profile.providerImageCap !== undefined &&
+    (info.responsesComposition?.imageParts ?? 0) + images.length > profile.providerImageCap
+  ) {
+    info.reason = 'provider_image_cap';
+    return { body: getPinBodyResp(), info };
   }
 
   const { droppedCodepoints } = accumulateRenderedImages(images, info);
@@ -1525,19 +1889,11 @@ export async function transformOpenAIResponses(
   const imagePartsResp: ResponsesInputImagePart[] = images.map((img) => responsesImagePart(img, req.model));
   const endMarker: ResponsesInputTextPart = { type: 'input_text', text: '[End of rendered GPT system/tool context.]', ...responsesCacheBreakpoint(req, profile, o.explicitPromptCacheBreakpoints) };
   // Verbatim fact-sheet (see src/core/factsheet.ts): exact tokens that survive OCR loss.
-  const slabFactSheet = factSheetText(combinedRaw, profile.factSheetFormat);
+  const slabFactSheet = slabFactSheetPreview;
   const slabFactSheetPart: ResponsesInputTextPart[] = slabFactSheet
     ? [{ type: 'input_text', text: slabFactSheet }]
     : [];
-  const authorityPointerCount = (typeof req.instructions === 'string' && req.instructions.length > 0 ? 1 : 0)
-    + inputItems.slice(0, leadingAuthorityEnd).filter((item) => {
-      const it = item as ResponsesInputItem;
-      return (it.role === 'system' || it.role === 'developer')
-        && responsesContentText(it.content).length > 0;
-    }).length;
-  info.nativeInjectedTokens = authorityPointerCount * gptTextTokens(RESPONSES_POINTER)
-    + gptTextTokens(slabFactSheet)
-    + gptTextTokens(endMarker.text);
+  info.nativeInjectedTokens = slabNativeOverhead;
 
   if (inputWasString) {
     // Wrap bare string input into a user item with images prepended.

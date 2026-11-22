@@ -1,20 +1,26 @@
-/** Applicability helpers for inkling's production-safe model scope. */
+/** Applicability helpers for fiche's production-safe model scope. */
 
+import { readBrandEnv } from './env.js';
 import { isMisresolvedModelId } from './gpt-model-profiles.js';
 
-export type InklingApplicabilityReason =
+export type FicheApplicabilityReason =
   | 'eligible'
   | 'unsupported_model'
   | 'unsupported_method'
   | 'unsupported_path'
   | 'empty_body';
 
-export interface InklingApplicabilityInput {
+export interface FicheApplicabilityInput {
   readonly model?: string | null;
   readonly method?: string | null;
   readonly path?: string | null;
   readonly bodyBytes?: number | null;
 }
+
+/** @deprecated Use {@link FicheApplicabilityReason}. */
+export type InklingApplicabilityReason = FicheApplicabilityReason;
+/** @deprecated Use {@link FicheApplicabilityInput}. */
+export type InklingApplicabilityInput = FicheApplicabilityInput;
 
 /** Bracketed variant tags (e.g. `[1m]`) stripped before model matching so base and variant gate identically. */
 const VARIANT_TAG = /\[[^\]]*\]/g;
@@ -64,8 +70,8 @@ function falsey(v: string): boolean {
  *  - `off`/`0`/`false`/... → compress nothing
  *  - CSV of model bases    → exactly those families (e.g. `claude-fable-5,gpt-5.6-sol`) */
 function envOrDefaultBases(): string[] {
-  // Edge-safe: `process` is undefined off-Node; `typeof` avoids a ReferenceError.
-  const raw = typeof process !== 'undefined' ? process.env?.INKLING_MODELS : undefined;
+  // Edge-safe: `process` is undefined off-Node; `readBrandEnv` handles FICHE_* / INKLING_*.
+  const raw = readBrandEnv('MODELS');
   if (raw === undefined) return [...DEFAULT_MODEL_BASES];
   const trimmed = raw.trim();
   if (!trimmed) return [...DEFAULT_MODEL_BASES];
@@ -107,6 +113,18 @@ function unqualifiedModelId(base: string): string | null {
   return slash >= 0 ? base.slice(slash + 1) : null;
 }
 
+/** True when `model` matches an entry in FICHE_MODELS / dashboard chips, ignoring visual profile guards. */
+export function isInConfiguredModelBases(model: string | null | undefined): boolean {
+  if (typeof model !== 'string') return false;
+  const base = baseModelId(model).toLowerCase();
+  const unqualified = unqualifiedModelId(base);
+  return allowedModelBases().some((b) => {
+    const target = b.toLowerCase();
+    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
+    return hit(base) || (unqualified !== null && hit(unqualified));
+  });
+}
+
 /** Membership test against the single allowed scope. Matches exact base or `-suffix`
  *  alias; [variant] tags stripped first. */
 function isAllowed(model: string | null | undefined): boolean {
@@ -116,23 +134,24 @@ function isAllowed(model: string | null | undefined): boolean {
   // (e.g. an unmeasured Gemini sibling falling through to the OpenAI fallback).
   // Which ids those are is profile-table knowledge, not a rule maintained here.
   if (isMisresolvedModelId(base)) return false;
-  const unqualified = unqualifiedModelId(base);
-  return allowedModelBases().some((b) => {
-    const target = b.toLowerCase();
-    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
-    return hit(base) || (unqualified !== null && hit(unqualified));
-  });
+  return isInConfiguredModelBases(base);
 }
 
-/** True when inkling may transform this Anthropic model. */
-export function isInklingSupportedModel(model: string | null | undefined): boolean {
+/** True when fiche may transform this Anthropic model. */
+export function isFicheSupportedModel(model: string | null | undefined): boolean {
   return isAllowed(model);
 }
 
-/** True when inkling may transform this GPT model. Shares the single INKLING_MODELS scope. */
-export function isInklingSupportedGptModel(model: string | null | undefined): boolean {
+/** True when fiche may transform this GPT model. Shares the single FICHE_MODELS scope. */
+export function isFicheSupportedGptModel(model: string | null | undefined): boolean {
   return isAllowed(model);
 }
+
+/** @deprecated Use {@link isFicheSupportedModel}. */
+export const isInklingSupportedModel = isFicheSupportedModel;
+
+/** @deprecated Use {@link isFicheSupportedGptModel}. */
+export const isInklingSupportedGptModel = isFicheSupportedGptModel;
 
 /** Canonical set of Anthropic Messages routes inkling transforms. Shared with
  *  createProxy (src/core/proxy.ts) so the public applicability helper and the
@@ -147,8 +166,8 @@ export function isAnthropicMessagesPath(pathname: string): boolean {
 }
 
 export function shouldTransformAnthropicMessages(
-  input: InklingApplicabilityInput,
-): { eligible: boolean; reason: InklingApplicabilityReason } {
+  input: FicheApplicabilityInput,
+): { eligible: boolean; reason: FicheApplicabilityReason } {
   if (input.method !== undefined && input.method !== null && input.method.toUpperCase() !== 'POST') {
     return { eligible: false, reason: 'unsupported_method' };
   }

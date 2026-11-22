@@ -33,7 +33,8 @@ import * as os from 'node:os';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
-import { anthropicReadRate, inputUsdPerMtok, priceMode, PRICE_SNAPSHOT } from './core/pricing.js';
+import { anthropicReadRate, estimateBillUsd, inputUsdPerMtok, priceMode, PRICE_SNAPSHOT, resolvePriceRates } from './core/pricing.js';
+import { readTurnReport } from './turn-report.js';
 import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
@@ -43,9 +44,12 @@ import {
 } from './core/baseline.js';
 import {
   computeOpenAIActualInputEff,
-  computeOpenAIBaselineInputEff,
   computeOpenAIBaselineRawTokens,
+  computeOpenAISessionBaselineInputEff,
+  deriveOpenAIBaselineWarmth,
+  OPENAI_CACHE_TTL_SEC,
   openAIOutputRate,
+  type OpenAIWarmthPrev,
 } from './core/openai-savings.js';
 import { renderCacheMaxBytes, renderCacheStats } from './core/render.js';
 import {
@@ -61,9 +65,11 @@ import { aggregateEventsFile, summaryToJson } from './stats.js';
 // fragments module renders finished HTML from the same payloads the JSON
 // endpoints serve.
 import {
+  FICHE_ICON_SVG,
   renderPage,
   renderToggleFragment,
   renderModelsFragment,
+  renderPluginsFragment,
   renderContextMapFragment,
   renderSessionSummaryFragment,
   renderHeaderFragment,
@@ -73,12 +79,20 @@ import {
   renderStatsTableFragment,
   type ContextMapData,
 } from './dashboard/fragments.js';
+export { FICHE_ICON_SVG };
+import { readBrandEnv } from './core/env.js';
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
-  isInklingSupportedModel,
+  isFicheSupportedModel,
   setAllowedModelBases,
 } from './core/applicability.js';
+import {
+  isThirdPartyPlugin,
+  mergeStagePlugins,
+  type PluginOverrides,
+  type StagePluginDescriptor,
+} from './core/stage-plugins.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -313,6 +327,14 @@ interface Totals {
   /** How many events contributed measurement counters. Lets the UI annotate
    *  the panel ("N of M events measured") when the scanner fell back. */
   eventsWithMeasurement: number;
+  /** Kosha mode: exact per-row USD across compressed vs passthrough paths. */
+  compressedActualUsdKosha: number;
+  passthroughActualUsdKosha: number;
+  /** Prefix-safe text-hygiene token/char savings and cliff avoidance telemetry. */
+  textHygieneSavedTokens: number;
+  textHygieneSavedChars: number;
+  cliffAvoidedEvents: number;
+  cliffSavedUsd: number;
   startedAt: number;
 }
 
@@ -344,6 +366,12 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
     toolUseCharsMeasured: 0,
     redactedBlockCountMeasured: 0,
     eventsWithMeasurement: 0,
+    compressedActualUsdKosha: 0,
+    passthroughActualUsdKosha: 0,
+    textHygieneSavedTokens: 0,
+    textHygieneSavedChars: 0,
+    cliffAvoidedEvents: 0,
+    cliffSavedUsd: 0,
     startedAt,
   };
 }
@@ -407,40 +435,69 @@ function isOpenAIEvent(
 }
 
 function googleEff(args: {
+  model?: string;
   inputTokens: number;
   outputTokens: number;
+  cachedTokens?: number;
   compressed: boolean;
   baselineTokens: number;
   baselineProbeStatus: string | undefined;
   imageTokens: number;
   baselineImagedTokens: number;
   nativeInjectedTokens: number;
+  textHygieneSavedTokens?: number;
 }): {
   haveUsage: boolean;
   haveBaseline: boolean;
   creditSaving: boolean;
   actualInputEff: number;
   baselineInputEff: number;
+  outputEquiv: number;
+  rawBaseline: number;
+  warmForRow: boolean;
 } {
   const { inputTokens: inp, outputTokens: out, compressed } = args;
   const haveUsage = inp > 0 || out > 0;
   const measuredBaseline = args.baselineProbeStatus === 'ok' && args.baselineTokens > 0
     ? args.baselineTokens
     : 0;
+  const hygieneTok = Math.max(0, args.textHygieneSavedTokens ?? 0);
   const estimatedBaseline = compressed
-    && args.imageTokens > 0
-    && args.baselineImagedTokens > 0
-    ? Math.max(0, inp - args.imageTokens - args.nativeInjectedTokens + args.baselineImagedTokens)
+    && ((args.imageTokens > 0 && args.baselineImagedTokens > 0) || hygieneTok > 0)
+    ? Math.max(0, inp - args.imageTokens - args.nativeInjectedTokens + args.baselineImagedTokens + hygieneTok)
     : 0;
   const baseline = measuredBaseline || estimatedBaseline;
   const haveBaseline = baseline > 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
+  if (priceMode() === 'kosha') {
+    const rates = resolvePriceRates(args.model, { promptTokens: inp });
+    const cached = Math.min(inp, Math.max(0, args.cachedTokens ?? 0));
+    const actualInputEff = haveUsage ? (inp - cached) + cached * rates.read : 0;
+    const delta = baseline - inp;
+    const baselineInputEff = creditSaving
+      ? actualInputEff + delta * (cached > 0 ? rates.read : 1)
+      : actualInputEff;
+    const outputEquiv = haveUsage ? out * rates.output : 0;
+    return {
+      haveUsage,
+      haveBaseline,
+      creditSaving,
+      actualInputEff,
+      baselineInputEff,
+      outputEquiv,
+      rawBaseline: creditSaving ? baseline : inp,
+      warmForRow: cached > 0,
+    };
+  }
   return {
     haveUsage,
     haveBaseline,
     creditSaving,
     actualInputEff: inp,
     baselineInputEff: creditSaving ? baseline : inp,
+    outputEquiv: out,
+    rawBaseline: creditSaving ? baseline : inp,
+    warmForRow: false,
   };
 }
 
@@ -453,6 +510,8 @@ function gptEff(args: {
   imageTokens: number;
   baselineImagedTokens: number;
   nativeInjectedTokens: number;
+  textHygieneSavedTokens?: number;
+  warmth?: { warm: boolean; selfBusted: boolean; prevPrefixTokens: number };
   compressed: boolean;
 }): {
   haveUsage: boolean;
@@ -466,23 +525,33 @@ function gptEff(args: {
 } {
   const { model, inputTokens: inp, outputTokens: out, cachedTokens: cached } = args;
   const { imageTokens, baselineImagedTokens, nativeInjectedTokens, compressed } = args;
+  const hygieneTok = Math.max(0, args.textHygieneSavedTokens ?? 0);
   const haveUsage = inp > 0 || out > 0;
   // The transform measured what the imaged content would have cost as o200k
-  // text; without it there is no counterfactual to credit.
-  const haveBaseline = baselineImagedTokens > 0;
+  // text (or deterministic text hygiene saved tokens); without it there is no
+  // counterfactual to credit.
+  const haveBaseline = baselineImagedTokens > 0 || hygieneTok > 0;
   const actualInputEff = haveUsage ? computeOpenAIActualInputEff(inp, cached, model, args.cacheWriteTokens) : 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
   const baselineInputEff = creditSaving
-    ? computeOpenAIBaselineInputEff(
-        inp, cached, imageTokens, baselineImagedTokens, model, nativeInjectedTokens, args.cacheWriteTokens,
-      )
+    ? computeOpenAISessionBaselineInputEff({
+        inputTokens: inp,
+        cachedTokens: cached,
+        imageTokens,
+        baselineImagedTokens,
+        nativeInjectedTokens,
+        textHygieneSavedTokens: hygieneTok,
+        cacheWriteTokens: args.cacheWriteTokens,
+        model,
+        warmth: args.warmth,
+      })
     : actualInputEff;
   const outputEquiv = haveUsage ? out * openAIOutputRate(model) : 0;
   // Raw, rate-free token counts for the session's compression ratio and the
   // Details panel: actual = what we sent; baseline = the text-only equivalent.
   const rawActual = inp;
   const rawBaseline = computeOpenAIBaselineRawTokens(
-    inp, imageTokens, baselineImagedTokens, nativeInjectedTokens,
+    inp, imageTokens, baselineImagedTokens, nativeInjectedTokens, hygieneTok,
   );
   return {
     haveUsage,
@@ -494,6 +563,26 @@ function gptEff(args: {
     rawActual,
     rawBaseline,
   };
+}
+
+declare const __FICHE_VERSION__: string | undefined;
+
+function defaultDashboardVersion(): string {
+  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.17.0';
+}
+
+export interface DashboardHooks {
+  readonly version?: string;
+  readonly host?: string;
+  readonly listPlugins?: () => StagePluginDescriptor[];
+  readonly setPluginEnabled?: (
+    id: string,
+    enabled: boolean,
+  ) => { plugin: StagePluginDescriptor; plugins: StagePluginDescriptor[] } | null;
+  readonly setThirdPartyPluginsEnabled?: (
+    enabled: boolean,
+  ) => { updatedCount: number; enabled: boolean; plugins: StagePluginDescriptor[] };
+  readonly onShutdown?: () => void;
 }
 
 export class DashboardState {
@@ -514,6 +603,7 @@ export class DashboardState {
    *  replay() from persisted timestamps, so live and restored numbers agree.
    *  Capped with sessions. */
   private baselineWarmth: Map<string, BaselineWarmthPrev> = new Map();
+  private openaiWarmth: Map<string, OpenAIWarmthPrev> = new Map();
   /** Default max age of a prior row that can still make the text path warm.
    *  A prior that wrote 1h-tier tokens carries its own 3600 s window instead. */
   private static readonly CACHE_TTL_SEC = 300;
@@ -573,15 +663,19 @@ export class DashboardState {
    *  writes the `models` key of the config file so chip toggles survive a
    *  restart. Best-effort: failures are the hook's problem, never the API's. */
   private readonly persistModelBases: ((bases: readonly string[]) => void) | undefined;
+  private readonly hooks: DashboardHooks;
+  private pluginOverrides: PluginOverrides = {};
 
   constructor(
     paths?: SessionsPaths,
     ccMapFn?: () => Promise<Map<string, ClaudeCodeSessionRef>>,
     persistModelBases?: (bases: readonly string[]) => void,
+    hooks: DashboardHooks = {},
   ) {
     this.paths = paths;
     this.ccMapFn = ccMapFn ?? (() => claudeCodeMap());
     this.persistModelBases = persistModelBases;
+    this.hooks = hooks;
   }
 
   private totalsForModel(model: string | undefined): Totals {
@@ -597,7 +691,7 @@ export class DashboardState {
   private enabledTotals(): Totals {
     const combined = emptyTotals(this.startedAt);
     for (const [model, totals] of this.totalsByModel) {
-      if (!isInklingSupportedModel(model)) continue;
+      if (!isFicheSupportedModel(model) && totals.textHygieneSavedTokens <= 0) continue;
       for (const key of Object.keys(combined) as Array<keyof Totals>) {
         if (key !== 'startedAt') combined[key] += totals[key];
       }
@@ -670,7 +764,7 @@ export class DashboardState {
     const cr = u?.cache_read_input_tokens ?? 0;
     const gpt = isOpenAIEvent(ev.path, ev.accountingProvider);
     const google = ev.accountingProvider === 'google'
-      || ev.path.includes('google-ai-studio') || ev.path.includes('generateContent');
+      || ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent');
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -690,40 +784,73 @@ export class DashboardState {
 
     if (google) {
       const e = googleEff({
+        model: ev.model,
         inputTokens: inp,
         outputTokens: out,
+        cachedTokens: u?.cached_tokens ?? 0,
         compressed,
         baselineTokens: info?.baselineTokens ?? 0,
         baselineProbeStatus: info?.baselineProbeStatus,
         imageTokens: info?.imageTokens ?? 0,
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
         nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
+        textHygieneSavedTokens: info?.textHygieneSavedTokens ?? 0,
       });
       haveUsage = e.haveUsage;
       haveBaseline = e.haveBaseline;
       creditSaving = e.creditSaving;
       actualInputEff = e.actualInputEff;
       baselineInputEff = e.baselineInputEff;
-      outputEquiv = out;
+      outputEquiv = e.outputEquiv;
       rawActual = inp;
-      rawBaseline = creditSaving ? baselineInputEff : inp;
-      baselineForRow = creditSaving ? baselineInputEff : 0;
+      rawBaseline = e.rawBaseline;
+      baselineForRow = creditSaving ? e.rawBaseline : 0;
       cacheReadForRow = u?.cached_tokens ?? 0;
-      // Google fallback savings are raw provider-token deltas; do not imply
-      // that an unknown cache discount was applied to the counterfactual.
-      warmForRow = false;
+      warmForRow = e.warmForRow;
     } else if (gpt) {
+      const sidGpt = info?.firstUserSha8;
+      const cachedGpt = u?.cached_tokens ?? 0;
+      const completionSecGpt = Date.now() / 1000;
+      const requestStartSecGpt = completionSecGpt - Math.max(0, ev.durationMs || 0) / 1000;
+      const gptPrev = typeof sidGpt === 'string' && sidGpt.length > 0
+        ? this.openaiWarmth.get(sidGpt)
+        : undefined;
+      const pxShaGpt = info?.cachePrefixSha8 ?? info?.historyImageSha;
+      const warmthGpt = deriveOpenAIBaselineWarmth(
+        gptPrev,
+        requestStartSecGpt,
+        cachedGpt,
+        info?.systemSha8,
+        ev.model,
+        OPENAI_CACHE_TTL_SEC,
+        pxShaGpt,
+      );
       const e = gptEff({
         model: ev.model,
         inputTokens: inp,
         outputTokens: out,
-        cachedTokens: u?.cached_tokens ?? 0,
+        cachedTokens: cachedGpt,
         cacheWriteTokens: u?.cache_write_tokens ?? 0,
         imageTokens: info?.imageTokens ?? 0,
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
         nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
+        textHygieneSavedTokens: info?.textHygieneSavedTokens ?? 0,
+        warmth: warmthGpt,
         compressed,
       });
+      if (typeof sidGpt === 'string' && sidGpt.length > 0 && e.haveUsage) {
+        this.openaiWarmth.set(sidGpt, {
+          ts: completionSecGpt,
+          cachedOrPrefixTokens: cachedGpt > 0 ? cachedGpt : Math.max(gptPrev?.cachedOrPrefixTokens ?? 0, inp),
+          prefixSha: info?.systemSha8 ?? gptPrev?.prefixSha,
+          pxPrefixSha: pxShaGpt ?? gptPrev?.pxPrefixSha,
+          model: ev.model ?? gptPrev?.model,
+        });
+        if (this.openaiWarmth.size > DashboardState.SESSION_CAP) {
+          const firstKey = this.openaiWarmth.keys().next().value;
+          if (firstKey !== undefined) this.openaiWarmth.delete(firstKey);
+        }
+      }
       haveUsage = e.haveUsage;
       haveBaseline = e.haveBaseline;
       creditSaving = e.creditSaving;
@@ -733,9 +860,8 @@ export class DashboardState {
       rawActual = e.rawActual;
       rawBaseline = e.rawBaseline;
       baselineForRow = e.rawBaseline;
-      cacheReadForRow = u?.cached_tokens ?? 0;
-      // GPT's prefix discount is automatic: cached_tokens>0 ⇒ it read warm.
-      warmForRow = (u?.cached_tokens ?? 0) > 0;
+      cacheReadForRow = cachedGpt;
+      warmForRow = warmthGpt.warm;
     } else {
       haveUsage = u !== undefined && (inp > 0 || out > 0 || cc > 0 || cr > 0);
       const baseline = info?.baselineTokens;
@@ -809,6 +935,15 @@ export class DashboardState {
             anthropicReadRate(ev.model),
           )
         : actualInputEff;
+      const hygieneTok = info?.textHygieneSavedTokens ?? 0;
+      if (!haveBaseline && compressed && haveUsage && hygieneTok > 0 && (info?.imageCount ?? 0) === 0) {
+        haveBaseline = true;
+        creditSaving = true;
+        const deltaWeight = cr > 0
+          ? anthropicReadRate(ev.model)
+          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+        baselineInputEff = actualInputEff + hygieneTok * deltaWeight;
+      }
       // Record this completed turn's prefix for later warmth/split decisions.
       // Carry the prior cacheable when this row has no probe.
       if (typeof sidNow === 'string' && sidNow.length > 0 && haveUsage) {
@@ -836,8 +971,8 @@ export class DashboardState {
       // consumption (input + output × 5).
       outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
       rawActual = inp + cc + cr;
-      rawBaseline = baseline ?? 0;
-      baselineForRow = baseline ?? 0;
+      rawBaseline = baseline ?? (creditSaving && hygieneTok > 0 ? rawActual + hygieneTok : 0);
+      baselineForRow = rawBaseline;
       cacheReadForRow = cr;
       warmForRow = warm; // server-observed cache read (cr>0)
     }
@@ -885,12 +1020,18 @@ export class DashboardState {
 
     totals.requests += 1;
     if (compressed) totals.compressedRequests += 1;
+    if (info?.textHygieneSavedTokens) totals.textHygieneSavedTokens += info.textHygieneSavedTokens;
+    if (info?.textHygieneSavedChars) totals.textHygieneSavedChars += info.textHygieneSavedChars;
+    if (info?.cliffAvoided) {
+      totals.cliffAvoidedEvents += 1;
+      totals.cliffSavedUsd += info.cliffAvoided.savedUsd;
+    }
 
     // Token headline: compressed rows with a usable measured or local
     // baseline. An
     // uncompressed row contributes zero saved (baseline === actual), so
     // including it here would only dilute the "saved on rows we moved" %.
-    const dollarEligible = !google;
+    const dollarEligible = !google || priceMode() === 'kosha';
     if (creditSaving) {
       totals.baselineInputWeighted += baselineInputEff;
       totals.actualInputWeighted += actualInputEff;
@@ -928,6 +1069,28 @@ export class DashboardState {
       totals.allActualInputWeighted += actualInputEff;
       totals.allOutputWeighted += outputEquiv;
       totals.allUsageRequests += 1;
+      let rowActualUsdKosha = 0;
+      if (priceMode() === 'kosha') {
+        const cachedTok = u?.cached_tokens ?? 0;
+        const writeTok = u?.cache_write_tokens ?? 0;
+        const bill = google || gpt
+          ? estimateBillUsd(ev.model, {
+              uncachedTokens: Math.max(0, inp - cachedTok - writeTok),
+              cachedTokens: cachedTok,
+              cacheWriteTokens: writeTok,
+              outputTokens: out,
+              promptTokens: inp,
+            })
+          : estimateBillUsd(ev.model, {
+              uncachedTokens: inp,
+              cachedTokens: cr,
+              cacheWriteTokens: cc,
+              outputTokens: out,
+              ttlSec: cc1h > 0 && cc1h >= cc ? 3600 : 300,
+              promptTokens: inp + cc + cr,
+            });
+        rowActualUsdKosha = bill ?? ((actualInputEff + outputEquiv) * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+      }
       // Direct observed compressed-vs-passthrough split. No counterfactual,
       // no probe gating — just partition the paid-rows set by which path
       // actually ran this turn. Headline answers "is the compressed path
@@ -938,10 +1101,12 @@ export class DashboardState {
         totals.compressedPaidRequests += 1;
         totals.compressedActualInputWeighted += actualInputEff;
         totals.compressedOutputWeighted += outputEquiv;
+        totals.compressedActualUsdKosha += rowActualUsdKosha;
       } else {
         totals.passthroughPaidRequests += 1;
         totals.passthroughActualInputWeighted += actualInputEff;
         totals.passthroughOutputWeighted += outputEquiv;
+        totals.passthroughActualUsdKosha += rowActualUsdKosha;
       }
     }
 
@@ -1074,7 +1239,7 @@ export class DashboardState {
       const compressed = t.compressed === true;
       const gpt = isOpenAIEvent(t.path, t.accounting_provider);
       const google = t.accounting_provider === 'google'
-        || t.path.includes('google-ai-studio') || t.path.includes('generateContent');
+        || t.path.includes('google-ai-studio') || t.path.toLowerCase().includes('generatecontent');
 
       // Same unified accounting as update(); see the branch comments there.
       let haveUsage: boolean;
@@ -1090,8 +1255,10 @@ export class DashboardState {
 
       if (google) {
         const e = googleEff({
+          model: t.model,
           inputTokens: inp,
           outputTokens: out,
+          cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
           compressed,
           baselineTokens: (t as { baseline_tokens?: number }).baseline_tokens ?? 0,
           baselineProbeStatus:
@@ -1101,6 +1268,7 @@ export class DashboardState {
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
           nativeInjectedTokens:
             (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
+          textHygieneSavedTokens: t.text_hygiene_saved_tokens ?? 0,
         });
         haveUsage = e.haveUsage;
         haveBaseline = e.haveBaseline;
@@ -1108,24 +1276,56 @@ export class DashboardState {
         actualInputEff = e.actualInputEff;
         baselineInputEff = e.baselineInputEff;
         rawActual = inp;
-        rawBaseline = creditSaving ? baselineInputEff : inp;
-        baselineForRow = creditSaving ? baselineInputEff : 0;
+        rawBaseline = e.rawBaseline;
+        baselineForRow = creditSaving ? e.rawBaseline : 0;
         cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
-        warmForRow = false;
+        warmForRow = e.warmForRow;
       } else if (gpt) {
+        const sidGptR = (t as { first_user_sha8?: string }).first_user_sha8;
+        const cachedGptR = (t as { cached_tokens?: number }).cached_tokens ?? 0;
+        const completionSecGptR = Date.parse(t.ts) / 1000;
+        const requestStartSecGptR = completionSecGptR - Math.max(0, t.duration_ms || 0) / 1000;
+        const gptPrevR = typeof sidGptR === 'string' && sidGptR.length > 0
+          ? this.openaiWarmth.get(sidGptR)
+          : undefined;
+        const pxShaGptR = t.cache_prefix_sha8 ?? (t as { history_image_sha8?: string }).history_image_sha8;
+        const warmthGptR = deriveOpenAIBaselineWarmth(
+          gptPrevR,
+          requestStartSecGptR,
+          cachedGptR,
+          (t as { system_sha8?: string }).system_sha8,
+          t.model,
+          OPENAI_CACHE_TTL_SEC,
+          pxShaGptR,
+        );
         const e = gptEff({
           model: t.model,
           inputTokens: inp,
           outputTokens: out,
-          cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
+          cachedTokens: cachedGptR,
           cacheWriteTokens: t.cache_write_tokens ?? 0,
           imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
           baselineImagedTokens:
             (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
           nativeInjectedTokens:
             (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
+          textHygieneSavedTokens: t.text_hygiene_saved_tokens ?? 0,
+          warmth: warmthGptR,
           compressed,
         });
+        if (typeof sidGptR === 'string' && sidGptR.length > 0 && e.haveUsage) {
+          this.openaiWarmth.set(sidGptR, {
+            ts: completionSecGptR,
+            cachedOrPrefixTokens: cachedGptR > 0 ? cachedGptR : Math.max(gptPrevR?.cachedOrPrefixTokens ?? 0, inp),
+            prefixSha: (t as { system_sha8?: string }).system_sha8 ?? gptPrevR?.prefixSha,
+            pxPrefixSha: pxShaGptR ?? gptPrevR?.pxPrefixSha,
+            model: t.model ?? gptPrevR?.model,
+          });
+          if (this.openaiWarmth.size > DashboardState.SESSION_CAP) {
+            const firstKey = this.openaiWarmth.keys().next().value;
+            if (firstKey !== undefined) this.openaiWarmth.delete(firstKey);
+          }
+        }
         haveUsage = e.haveUsage;
         haveBaseline = e.haveBaseline;
         creditSaving = e.creditSaving;
@@ -1134,8 +1334,8 @@ export class DashboardState {
         rawActual = e.rawActual;
         rawBaseline = e.rawBaseline;
         baselineForRow = e.rawBaseline;
-        cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
-        warmForRow = ((t as { cached_tokens?: number }).cached_tokens ?? 0) > 0;
+        cacheReadForRow = cachedGptR;
+        warmForRow = warmthGptR.warm;
       } else {
         haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
         const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
@@ -1187,6 +1387,15 @@ export class DashboardState {
               anthropicReadRate(t.model),
             )
           : actualInputEff;
+        const hygieneTokR = t.text_hygiene_saved_tokens ?? 0;
+        if (!haveBaseline && compressed && haveUsage && hygieneTokR > 0 && ((t as { image_count?: number }).image_count ?? 0) === 0) {
+          haveBaseline = true;
+          creditSaving = true;
+          const deltaWeightR = cr > 0
+            ? anthropicReadRate(t.model)
+            : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          baselineInputEff = actualInputEff + hygieneTokR * deltaWeightR;
+        }
         if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
           this.baselineWarmth.set(sidR, {
             ts: completionSecR,
@@ -1203,8 +1412,8 @@ export class DashboardState {
           }
         }
         rawActual = inp + cc + cr;
-        rawBaseline = baseline ?? 0;
-        baselineForRow = baseline ?? 0;
+        rawBaseline = baseline ?? (creditSaving && hygieneTokR > 0 ? rawActual + hygieneTokR : 0);
+        baselineForRow = rawBaseline;
         cacheReadForRow = cr;
         warmForRow = warmR;
       }
@@ -1384,10 +1593,12 @@ export class DashboardState {
     const passthroughTokenEquiv =
       totals.passthroughActualInputWeighted +
       totals.passthroughOutputWeighted;
-    const compressedActualUsd =
-      (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
-    const passthroughActualUsd =
-      (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const compressedActualUsd = priceMode() === 'kosha'
+      ? totals.compressedActualUsdKosha
+      : (compressedTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+    const passthroughActualUsd = priceMode() === 'kosha'
+      ? totals.passthroughActualUsdKosha
+      : (passthroughTokenEquiv * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
     const compressedAvgUsd =
       totals.compressedPaidRequests > 0
         ? compressedActualUsd / totals.compressedPaidRequests
@@ -1473,8 +1684,40 @@ export class DashboardState {
       measured_tool_use_chars: totals.toolUseCharsMeasured,
       measured_redacted_block_count: totals.redactedBlockCountMeasured,
       events_with_measurement: totals.eventsWithMeasurement,
+      text_hygiene_saved_tokens: totals.textHygieneSavedTokens,
+      text_hygiene_saved_chars: totals.textHygieneSavedChars,
+      cliff_avoided_events: totals.cliffAvoidedEvents,
+      cliff_saved_usd: round4(totals.cliffSavedUsd),
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
+      allowed_models: getAllowedModelBases(),
+      by_model: (() => {
+        const byModel: Record<string, { requests: number; compressed: number; saved_tokens: number; saved_usd: number }> = {};
+        for (const [model, t] of this.totalsByModel) {
+          const key = model || 'unknown';
+          const savedTokens = Math.round(t.baselineInputWeighted - t.actualInputWeighted);
+          const savedUsd = round4(
+            priceMode() === 'kosha'
+              ? t.pricedSavedUsd
+              : ((t.pricedBaselineInputWeighted - t.pricedActualInputWeighted) * ASSUMED_INPUT_USD_PER_MTOK) / 1e6,
+          );
+          const prev = byModel[key];
+          byModel[key] = prev
+            ? {
+                requests: prev.requests + t.requests,
+                compressed: prev.compressed + t.compressedRequests,
+                saved_tokens: prev.saved_tokens + savedTokens,
+                saved_usd: round4(prev.saved_usd + savedUsd),
+              }
+            : {
+                requests: t.requests,
+                compressed: t.compressedRequests,
+                saved_tokens: savedTokens,
+                saved_usd: savedUsd,
+              };
+        }
+        return byModel;
+      })(),
       // Rendered-page cache — a live process gauge, not a fold over the event
       // ring, so it is the one number here that survives no traffic at all.
       // `max_bytes` ships alongside `bytes` because utilisation is the actionable
@@ -1565,6 +1808,12 @@ export class DashboardState {
             this.compressionEnabled,
           ),
         );
+      case 'plugins': {
+        const plugins = this.hooks.listPlugins
+          ? this.hooks.listPlugins()
+          : mergeStagePlugins([], this.pluginOverrides);
+        return htmlResponse(renderPluginsFragment(plugins));
+      }
       case 'context-map': {
         const reqParam = url.searchParams.get('req');
         if (reqParam) {
@@ -1666,13 +1915,131 @@ export class DashboardState {
     });
   }
 
+  /** GET /api/last-turn.json — latest turn & active session savings summary. */
+  serveApiLastTurn(): Response {
+    if (!this.paths) return notConfigured('last-turn');
+    return jsonResponse(readTurnReport(this.paths.eventsFile));
+  }
+
+  /** GET /api/health — live daemon status & runtime metadata. */
+  serveHealth(port = 47821): Response {
+    return jsonResponse({
+      ok: true,
+      name: 'fiche',
+      version: this.hooks.version ?? defaultDashboardVersion(),
+      pid: process.pid,
+      host: this.hooks.host ?? '127.0.0.1',
+      port,
+      uptime_sec: round1(Math.max(0, Date.now() / 1000 - this.startedAt)),
+      compression_enabled: this.compressionEnabled,
+      price_mode: priceMode(),
+      allowed_models: getAllowedModelBases(),
+      events_file: this.paths?.eventsFile ?? null,
+    });
+  }
+
+  /** GET /api/compression — inspect runtime kill switch. */
+  serveCompression(): Response {
+    return jsonResponse({ compression_enabled: this.compressionEnabled });
+  }
+
   /** POST /api/compression — flip the runtime kill switch.
    *  Body: { enabled: boolean }. Returns the new state. In-memory only;
    *  restart resets to the default (on). */
   handleCompressionToggle(body: { enabled?: unknown }): Response {
-    const on = body.enabled === true;
-    this.compressionEnabled = on;
-    return jsonResponse({ compression_enabled: on });
+    if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean') {
+      return jsonResponse({ error: 'enabled must be a boolean' }, 400);
+    }
+    this.compressionEnabled = body.enabled;
+    return jsonResponse({ compression_enabled: body.enabled });
+  }
+
+  /** GET /api/models — current allowed model bases. */
+  serveModels(): Response {
+    return jsonResponse({ models: getAllowedModelBases() });
+  }
+
+  /** POST /api/models — update runtime model scope (`{ model, on }` or `{ models: string[] }`). */
+  handleModelsApiPost(body: unknown): Response {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse({ error: 'request body must be a JSON object' }, 400);
+    }
+    const obj = body as Record<string, unknown>;
+    if ('models' in obj) {
+      if (!Array.isArray(obj.models) || !obj.models.every((m) => typeof m === 'string')) {
+        return jsonResponse({ error: 'models must be an array of strings' }, 400);
+      }
+      const cleaned = (obj.models as string[]).map((s) => s.trim()).filter(Boolean);
+      this.applyModelBases(cleaned);
+      return jsonResponse({ models: getAllowedModelBases() });
+    }
+    if (typeof obj.model === 'string' && obj.model.trim().length > 0 && typeof obj.on === 'boolean') {
+      this.handleModelsToggle(obj.model.trim(), obj.on);
+      return jsonResponse({ models: getAllowedModelBases() });
+    }
+    return jsonResponse(
+      { error: 'body must specify { model: string, on: boolean } or { models: string[] }' },
+      400,
+    );
+  }
+
+  /** GET /api/plugins — list built-in pipeline stages, custom plugins, and discovered skills. */
+  servePlugins(): Response {
+    const plugins = this.hooks.listPlugins
+      ? this.hooks.listPlugins()
+      : mergeStagePlugins([], this.pluginOverrides);
+    return jsonResponse({ plugins });
+  }
+
+  /** POST /api/plugins — toggle one plugin/skill (`{ id, enabled }`) or all 3rd-party extensions (`{ scope: 'third-party', enabled }`). */
+  handlePluginsApiPost(body: unknown): Response {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse({ error: 'request body must be a JSON object' }, 400);
+    }
+    const obj = body as Record<string, unknown>;
+    if (obj.scope === 'third-party') {
+      if (typeof obj.enabled !== 'boolean') {
+        return jsonResponse({ error: 'enabled must be a boolean' }, 400);
+      }
+      if (this.hooks.setThirdPartyPluginsEnabled) {
+        return jsonResponse(this.hooks.setThirdPartyPluginsEnabled(obj.enabled));
+      }
+      const known = mergeStagePlugins([], this.pluginOverrides);
+      let updatedCount = 0;
+      for (const p of known) {
+        if (!isThirdPartyPlugin(p)) continue;
+        this.pluginOverrides[p.id] = obj.enabled;
+        updatedCount += 1;
+      }
+      const plugins = mergeStagePlugins([], this.pluginOverrides);
+      return jsonResponse({ updatedCount, enabled: obj.enabled, plugins });
+    }
+    if (typeof obj.id !== 'string' || !obj.id.trim() || typeof obj.enabled !== 'boolean') {
+      return jsonResponse({ error: 'id must be a non-empty string and enabled must be a boolean' }, 400);
+    }
+    const id = obj.id.trim();
+    const enabled = obj.enabled;
+    if (this.hooks.setPluginEnabled) {
+      const updated = this.hooks.setPluginEnabled(id, enabled);
+      if (!updated) return jsonResponse({ error: `unknown plugin: ${id}` }, 404);
+      return jsonResponse(updated);
+    }
+    const known = mergeStagePlugins([], this.pluginOverrides);
+    if (!known.some((p) => p.id === id)) {
+      return jsonResponse({ error: `unknown plugin: ${id}` }, 404);
+    }
+    this.pluginOverrides[id] = enabled;
+    const plugins = mergeStagePlugins([], this.pluginOverrides);
+    const plugin = plugins.find((p) => p.id === id)!;
+    return jsonResponse({ plugin, plugins });
+  }
+
+  /** POST /api/shutdown — initiate graceful daemon shutdown. */
+  handleShutdown(): Response {
+    if (this.hooks.onShutdown) {
+      setImmediate(() => this.hooks.onShutdown?.());
+    }
+    return jsonResponse({ shutting_down: true });
   }
 
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
@@ -1707,6 +2074,24 @@ export class DashboardState {
       // Persistence is best-effort; the live flip already took effect.
     }
   }
+
+  /** GET /favicon.svg, /favicon.ico, /apple-touch-icon*.png */
+  serveFavicon(sub: 'svg' | 'empty', headOnly = false): Response {
+    return serveFavicon(sub, headOnly);
+  }
+}
+
+export function serveFavicon(sub: 'svg' | 'empty', headOnly = false): Response {
+  if (sub === 'empty') {
+    return new Response(null, { status: 204 });
+  }
+  return new Response(headOnly ? null : FICHE_ICON_SVG, {
+    status: 200,
+    headers: {
+      'content-type': 'image/svg+xml; charset=utf-8',
+      'cache-control': 'public, max-age=3600',
+    },
+  });
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -1739,26 +2124,41 @@ function round4(n: number): number {
  *  (html/stats/recent/png) stay alongside the `/api/*` JSON endpoints. */
 export type DashboardRoute =
   | { kind: 'html' }
+  | { kind: 'favicon'; sub: 'svg' | 'empty' } // /favicon.svg, /favicon.ico, /apple-touch-icon*.png
   | { kind: 'stats' } // /proxy-stats — legacy live counter
   | { kind: 'recent' } // /proxy-recent — legacy ring buffer
   | { kind: 'png' } // /proxy-latest-png
   | { kind: 'api-sessions' } // /api/sessions.json
   | { kind: 'api-stats' } // /api/stats.json
+  | { kind: 'api-last-turn' } // /api/last-turn.json
   | { kind: 'current-session' } // /api/current-session.json
-  | { kind: 'api-compression' } // /api/compression (POST {enabled}) — runtime kill switch
+  | { kind: 'api-health' } // /api/health
+  | { kind: 'api-compression' } // /api/compression (GET/POST {enabled}) — runtime kill switch
+  | { kind: 'api-models' } // /api/models (GET/POST) — runtime model scope control
+  | { kind: 'api-plugins' } // /api/plugins (GET/POST) — pipeline stages & skills registry
+  | { kind: 'api-shutdown' } // /api/shutdown (POST) — graceful daemon shutdown
   | { kind: 'api-image-source' } // /api/image-source[?id=N] — source text behind a rendered PNG
   | { kind: 'fragment'; name: string }; // /fragments/<name> — server-rendered htmx panels
 
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
 export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/' || pathname === '/dashboard') return { kind: 'html' };
+  if (pathname === '/favicon.svg' || pathname === '/favicon.ico') return { kind: 'favicon', sub: 'svg' };
+  if (pathname === '/apple-touch-icon.png' || pathname === '/apple-touch-icon-precomposed.png') {
+    return { kind: 'favicon', sub: 'empty' };
+  }
   if (pathname === '/proxy-stats') return { kind: 'stats' };
   if (pathname === '/proxy-recent') return { kind: 'recent' };
   if (pathname === '/proxy-latest-png') return { kind: 'png' };
   if (pathname === '/api/sessions.json') return { kind: 'api-sessions' };
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
+  if (pathname === '/api/last-turn.json') return { kind: 'api-last-turn' };
   if (pathname === '/api/current-session.json') return { kind: 'current-session' };
+  if (pathname === '/api/health') return { kind: 'api-health' };
   if (pathname === '/api/compression') return { kind: 'api-compression' };
+  if (pathname === '/api/models') return { kind: 'api-models' };
+  if (pathname === '/api/plugins') return { kind: 'api-plugins' };
+  if (pathname === '/api/shutdown') return { kind: 'api-shutdown' };
   if (pathname === '/api/image-source') return { kind: 'api-image-source' };
   if (pathname.startsWith('/fragments/')) {
     return { kind: 'fragment', name: pathname.slice('/fragments/'.length) };
@@ -1766,12 +2166,196 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   return null;
 }
 
+export function isDashboardMutation(route: DashboardRoute, method: string): boolean {
+  return method === 'POST' && (
+    route.kind === 'api-compression'
+    || route.kind === 'api-models'
+    || route.kind === 'api-plugins'
+    || route.kind === 'api-shutdown'
+    || (route.kind === 'fragment' && (route.name === 'toggle' || route.name === 'models' || route.name === 'plugins'))
+  );
+}
+
+function methodNotAllowed(allow: string): Response {
+  return new Response(JSON.stringify({ error: `method not allowed; use ${allow}` }), {
+    status: 405,
+    headers: { allow, 'content-type': 'application/json' },
+  });
+}
+
+async function parseJsonRequestBody(
+  readBody: () => Promise<string>,
+): Promise<{ ok: true; value: unknown } | { ok: false; response: Response }> {
+  let raw: string;
+  try {
+    raw = await readBody();
+  } catch {
+    return { ok: false, response: jsonResponse({ error: 'bad request body' }, 400) };
+  }
+  if (!raw.trim()) return { ok: true, value: {} };
+  try {
+    return { ok: true, value: JSON.parse(raw) as unknown };
+  } catch (e) {
+    return {
+      ok: false,
+      response: jsonResponse({ error: 'bad request body', detail: (e as Error).message }, 400),
+    };
+  }
+}
+
+/** Dispatch a matched DashboardRoute to its handler. Returns `405` on `/api/*`
+ *  and `/proxy-*` method mismatches so non-GET calls never leak to upstream. */
+export async function dispatchDashboard(
+  dashboard: DashboardState,
+  route: DashboardRoute,
+  method: string,
+  url: URL,
+  port: number,
+  readBody: () => Promise<string>,
+): Promise<Response | undefined> {
+  switch (route.kind) {
+    case 'html':
+      if (method !== 'GET') return undefined;
+      return dashboard.serveHtml(port);
+    case 'favicon':
+      if (method !== 'GET' && method !== 'HEAD') return methodNotAllowed('GET, HEAD');
+      return dashboard.serveFavicon(route.sub, method === 'HEAD');
+    case 'stats':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveStats();
+    case 'recent':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveRecent();
+    case 'png': {
+      if (method !== 'GET') return methodNotAllowed('GET');
+      const idRaw = url.searchParams.get('id');
+      const idNum = idRaw != null ? Number(idRaw) : NaN;
+      return dashboard.servePng(Number.isFinite(idNum) ? idNum : undefined);
+    }
+    case 'api-image-source': {
+      if (method !== 'GET') return methodNotAllowed('GET');
+      const idRaw = url.searchParams.get('id');
+      const idNum = idRaw != null ? Number(idRaw) : NaN;
+      return dashboard.serveImageSource(Number.isFinite(idNum) ? idNum : undefined);
+    }
+    case 'api-sessions':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveSessionsJson({
+        project: url.searchParams.get('project') ?? undefined,
+        since: url.searchParams.get('since') ?? undefined,
+      });
+    case 'api-stats':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveApiStats();
+    case 'api-last-turn':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveApiLastTurn();
+    case 'current-session':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveCurrentSessionJson();
+    case 'api-health':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveHealth(port);
+    case 'api-compression': {
+      if (method === 'GET') return dashboard.serveCompression();
+      if (method !== 'POST') return methodNotAllowed('GET, POST');
+      const parsed = await parseJsonRequestBody(readBody);
+      if (!parsed.ok) return parsed.response;
+      if (!parsed.value || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+        return jsonResponse({ error: 'enabled must be a boolean' }, 400);
+      }
+      return dashboard.handleCompressionToggle(parsed.value as { enabled?: unknown });
+    }
+    case 'api-models': {
+      if (method === 'GET') return dashboard.serveModels();
+      if (method !== 'POST') return methodNotAllowed('GET, POST');
+      const parsed = await parseJsonRequestBody(readBody);
+      if (!parsed.ok) return parsed.response;
+      return dashboard.handleModelsApiPost(parsed.value);
+    }
+    case 'api-plugins': {
+      if (method === 'GET') return dashboard.servePlugins();
+      if (method !== 'POST') return methodNotAllowed('GET, POST');
+      const parsed = await parseJsonRequestBody(readBody);
+      if (!parsed.ok) return parsed.response;
+      return dashboard.handlePluginsApiPost(parsed.value);
+    }
+    case 'api-shutdown':
+      if (method !== 'POST') return methodNotAllowed('POST');
+      return dashboard.handleShutdown();
+    case 'fragment': {
+      if (route.name === 'toggle' && method === 'POST') {
+        let enabled = false;
+        try {
+          const raw = await readBody();
+          try {
+            enabled = (JSON.parse(raw) as { enabled?: unknown }).enabled === true;
+          } catch {
+            enabled = new URLSearchParams(raw).get('enabled') === 'true';
+          }
+        } catch {
+          return new Response('bad request body', { status: 400 });
+        }
+        dashboard.handleCompressionToggle({ enabled });
+        return dashboard.serveFragment('toggle', url, port);
+      }
+      if (route.name === 'models' && method === 'POST') {
+        let model = '';
+        let on = false;
+        let list: string | null = null;
+        try {
+          const raw = await readBody();
+          try {
+            const j = JSON.parse(raw) as { model?: unknown; on?: unknown; list?: unknown };
+            model = typeof j.model === 'string' ? j.model : '';
+            on = j.on === true;
+            if (typeof j.list === 'string') list = j.list;
+          } catch {
+            const p = new URLSearchParams(raw);
+            model = p.get('model') ?? '';
+            on = p.get('on') === 'true';
+            list = p.get('list');
+          }
+        } catch {
+          return new Response('bad request body', { status: 400 });
+        }
+        if (list !== null) dashboard.handleModelsSet(list);
+        else if (model) dashboard.handleModelsToggle(model, on);
+        return dashboard.serveFragment('models', url, port);
+      }
+      if (route.name === 'plugins' && method === 'POST') {
+        let payload: unknown;
+        try {
+          const raw = await readBody();
+          try {
+            payload = JSON.parse(raw);
+          } catch {
+            const p = new URLSearchParams(raw);
+            const scope = p.get('scope');
+            const id = p.get('id');
+            const enabledRaw = p.get('enabled');
+            const enabled = enabledRaw === 'true' ? true : enabledRaw === 'false' ? false : undefined;
+            payload = scope ? { scope, enabled } : { id, enabled };
+          }
+        } catch {
+          return new Response('bad request body', { status: 400 });
+        }
+        const mutationRes = dashboard.handlePluginsApiPost(payload);
+        if (!mutationRes.ok) return mutationRes;
+        return dashboard.serveFragment('plugins', url, port);
+      }
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveFragment(route.name, url, port);
+    }
+  }
+}
+
 /** Name of the machine serving this dashboard, shown in the title and topbar.
  *  INKLING_DASH_LABEL overrides it for hosts whose system hostname says nothing
  *  useful (containers, "localhost"); an explicitly empty label opts out and
  *  renders the unlabelled page. */
 export function dashboardHostLabel(): string {
-  const override = process.env.INKLING_DASH_LABEL;
+  const override = readBrandEnv('DASH_LABEL');
   if (override !== undefined) return override.trim();
   try {
     const h = os.hostname().trim();

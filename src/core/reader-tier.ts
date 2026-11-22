@@ -1,5 +1,5 @@
 /**
- * Who may receive inkling images.
+ * Who may receive fiche images.
  *
  * Strong readers (measured on dense or 14px pages, see FINDINGS.md): Gemini,
  * Fable 5 including 5.1/5.2 at the spaced profile, and Sol 5.6 / 6.1 on the
@@ -7,20 +7,24 @@
  * its request as plain text. Images of glyphs a model cannot read are not a
  * saving.
  *
- * `INKLING_FORCE_IMAGES=1` overrides the tier. It does not override the Codex
+ * `FICHE_FORCE_IMAGES=1` (or `INKLING_FORCE_IMAGES=1`) overrides the tier. It does not override the Codex
  * breakpoint ban.
  */
 
+import { readBrandEnv } from './env.js';
+import { hasGeminiMeasuredProfile } from './gemini-model-profiles.js';
+
 export type ReaderTier = 'image' | 'text';
 
+const GEMINI_READER_RE = /(?:^|\/)gemini(?:-|$|\[)/;
 const IMAGE_READER = [
-  /(?:^|\/)gemini(?:-|$|\[)/,
+  GEMINI_READER_RE,
   /claude-fable-5/,
-  /gpt-(?:5\.6|6\.1)-sol(?:-|$|\[)/,
+  /gpt-(?:5\.6|6\.[12])-sol(?:-|$|\[)/,
 ];
 
 export function forceImagesEnabled(): boolean {
-  const v = (typeof process !== 'undefined' ? process.env?.INKLING_FORCE_IMAGES : '') ?? '';
+  const v = readBrandEnv('FORCE_IMAGES') ?? '';
   return /^(1|true|yes|on)$/i.test(v.trim());
 }
 
@@ -40,9 +44,19 @@ const TEXT_ONLY = [
   /claude-haiku(?:[-@.:]|$)/,
   // grok-4.7, x-ai/grok-4.7, x-ai.grok-4.7.
   /(?:^|[/.])grok(?:-|$)/,
-  // Gemini 4 hydrogen and carbon have no reading measurements yet; the
+  // Gemini 4 hydrogen, carbon, and neon have no reading measurements yet; the
   // `gemini` image rule would otherwise give them argon's profile blind.
-  /gemini-4-(?:hydrogen|carbon)/,
+  /gemini-4-(?:hydrogen|carbon|neon)/,
+  // GPT-6 Astra scored 2/15 hex and 26/98 gist on Spleen 5x8 (docs/BENCHMARKS.md);
+  // keep it on 3-stage text hygiene by default unless INKLING_FORCE_IMAGES=1.
+  /gpt-6(?:\.\d+)?-astra(?:-|$|\[)/,
+  // Third-party text / unmeasured coding families routed directly via warp or /to/.
+  // Prefix-safe text hygiene still compresses tool outputs for these without imaging.
+  /deepseek/i,
+  /kimi/i,
+  /moonshot/i,
+  /(?:^|[/._-])glm-/i,
+  /minimax/i,
 ];
 
 export function prefersText(model: string | null | undefined, forceImages?: boolean): boolean {
@@ -56,6 +70,9 @@ export function readerTier(model: string | null | undefined, forceImages?: boole
   const ids = modelIds(model);
   if (ids.length === 0) return 'text';
   if (ids.some((id) => TEXT_ONLY.some((re) => re.test(id)))) return 'text';
+  if (ids.some((id) => GEMINI_READER_RE.test(id))) {
+    return hasGeminiMeasuredProfile(model) ? 'image' : 'text';
+  }
   return ids.some((id) => IMAGE_READER.some((re) => re.test(id))) ? 'image' : 'text';
 }
 

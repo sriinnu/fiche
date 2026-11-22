@@ -42,25 +42,50 @@ const PIN_MAX_CHARS = 300;
 /** Total pinned text emitted at the tail. A pin that dilutes itself is not a pin. */
 const PIN_TOTAL_MAX_CHARS = 2000;
 
-// `@inkling pin <text>` / `@inkling unpin`, `>inkling pin`, `> inkling pin`,
+// `@fiche pin <text>` / `@fiche unpin` (or legacy `inkling`), `>fiche pin`,
 // anchored to a whole line so removal is a whole-line delete - deterministic,
-// with no leftover blank-line ambiguity. That determinism is what lets us MOVE
-// pins (strip from source, emit at tail) instead of copying: the rewrite stays
-// a pure function of the message, so the protected prefix remains byte-stable
-// turn to turn, exactly like demoteProtectedHeadText.
-const PIN_CMD_RE = /^(?:>[ \t]*)?@?inkling[ \t]+(pin|unpin)\b(.*)$/;
+// with no leftover blank-line ambiguity.
+// Session/chat messages require an explicit `@` or markdown-quote `>` prefix so
+// ordinary prose like "fiche pin is broken" never gets hijacked locally.
+// File sources (CLAUDE.md / AGENTS.md) keep accepting bare `fiche pin ...` too.
+const FILE_PIN_CMD_RE = /^(?:>[ \t]*)?@?(?:fiche|inkling)[ \t]+(pin|unpin)\b(.*)$/;
+const SESSION_PIN_CMD_RE = /^(?:>[ \t]*@?|@)(?:fiche|inkling)[ \t]+(pin|unpin)\b(.*)$/;
 
-/**
- * Parse one line as a pin command. Returns null when it isn't one.
- *
- * The surrounding whitespace is trimmed in JS rather than in the pattern. The
- * obvious `^[ \t]*...[ \t]*(.*?)[ \t]*$` is quadratic: on a line of many tabs
- * the leading, lazy, and trailing groups can all claim the same run, so the
- * engine retries every split before failing. Prompt text reaches this on every
- * line of every message, so it stays linear.
- */
-function matchPinCmd(line: string): { verb: string; rest: string } | null {
-  const m = PIN_CMD_RE.exec(line.trim());
+/** Track CommonMark ``` / ~~~ fence state across lines; invokes callback with fence state. */
+function walkLinesWithFences(
+  text: string,
+  onLine: (line: string, inOrDelimFence: boolean) => boolean | void,
+): void {
+  const lines = text.split('\n');
+  let openChar = '';
+  let openLen = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const trimmedStart = line.replace(/^[ \t]{0,3}/, '');
+    const ch = trimmedStart[0];
+    let run = 0;
+    if (ch === '`' || ch === '~') {
+      while (trimmedStart[run] === ch) run++;
+    }
+    if (!openChar && run >= 3) {
+      openChar = ch!;
+      openLen = run;
+      if (onLine(line, true) === false) return;
+      continue;
+    }
+    if (openChar && ch === openChar && run >= openLen && trimmedStart.slice(run).trim() === '') {
+      if (onLine(line, true) === false) return;
+      openChar = '';
+      openLen = 0;
+      continue;
+    }
+    if (onLine(line, Boolean(openChar)) === false) return;
+  }
+}
+
+function matchPinCmd(line: string, source: 'file' | 'session' = 'session'): { verb: string; rest: string } | null {
+  const re = source === 'file' ? FILE_PIN_CMD_RE : SESSION_PIN_CMD_RE;
+  const m = re.exec(line.trim());
   return m ? { verb: m[1]!, rest: m[2]!.trim() } : null;
 }
 
@@ -100,7 +125,8 @@ function stripReminders(text: string): string {
  *  the way back in. Shares the `@inkling` namespace with the commands so there is
  *  one token to learn and one to match, and unlike `·` it survives any encoding
  *  or copy/paste the transcript is put through. */
-export const PIN_REPLY_MARK = '@inkling ';
+export const PIN_REPLY_MARK = '@fiche ';
+const LEGACY_PIN_REPLY_MARK = '@inkling ';
 
 /**
  * Which tier a pin lives in. `'file'`, not `'claude.md'`: the same tier holds
@@ -162,7 +188,7 @@ function applyPinLine(
   pins: Pin[],
   { line, source, path }: { line: string; source: PinSource; path?: string },
 ): void {
-  const cmd = matchPinCmd(line);
+  const cmd = matchPinCmd(line, source);
   if (!cmd) return;
   if (cmd.verb === 'unpin') {
     applyUnpin(pins, cmd.rest);
@@ -173,7 +199,7 @@ function applyPinLine(
   // severed rule reads to the model as a whole one — "do X unless Y" becomes
   // "do X" — while the user's own transcript still shows the full text.
   const text = raw.length > PIN_MAX_CHARS
-    ? `${raw.slice(0, PIN_MAX_CHARS)}… [inkling: pin truncated]`
+    ? `${raw.slice(0, PIN_MAX_CHARS)}… [fiche: pin truncated]`
     : raw;
   if (source === 'file') {
     // A file is a document, not a list of instructions. Its blank lines and
@@ -269,7 +295,11 @@ function* pinLines(
       for (const block of reminderBlocks(text)) {
         consumed += block.length;
         const path = source === 'file' ? filePathOf(block) : undefined;
-        for (const line of block.split('\n')) yield { line, source, path };
+        const unfenced: string[] = [];
+        walkLinesWithFences(block, (line, inFence) => {
+          if (!inFence) unfenced.push(line);
+        });
+        for (const line of unfenced) yield { line, source, path };
       }
       // The harness packs the envelope and the user's own typed prompt into the
       // SAME block. Stopping at the run would strip a pin typed in the first
@@ -277,28 +307,23 @@ function* pinLines(
       const rest = text.slice(consumed);
       if (rest.trim()) {
         leadingRun = false;
-        for (const line of rest.split('\n')) yield { line, source: 'session' };
+        const unfenced: string[] = [];
+        walkLinesWithFences(rest, (line, inFence) => {
+          if (!inFence) unfenced.push(line);
+        });
+        for (const line of unfenced) yield { line, source: 'session' };
       }
       continue;
     }
     leadingRun = false;
-    for (const line of text.split('\n')) yield { line, source: 'session' };
+    const unfenced: string[] = [];
+    walkLinesWithFences(text, (line, inFence) => {
+      if (!inFence) unfenced.push(line);
+    });
+    for (const line of unfenced) yield { line, source: 'session' };
   }
 }
 
-/**
- * Pin lines in the system prompt, where OpenCode puts AGENTS.md.
- *
- * No `<system-reminder>` gate here, unlike pinLines. That gate exists because a
- * user message is mostly the user talking and the envelope is what marks the part
- * that came from a file. The system prompt has no such ambiguity: the user does
- * not type into it, so every line in it was placed by the harness, and a pin
- * command found there came from a file the user edited. Requiring a wrapper that
- * only Claude Code emits is precisely what made this path dead under OpenCode.
- *
- * Everything is the `file` tier for the same reason: it comes back next request
- * whatever `unpin` does, so offering to remove it would be a lie.
- */
 function* systemPinLines(
   sys: SystemField | undefined,
 ): Generator<{ line: string; source: PinSource; path?: string }> {
@@ -313,7 +338,11 @@ function* systemPinLines(
     // Codex labels its AGENTS.md block, OpenCode does not. Ask anyway: a label
     // costs one regex and buys the user the path to edit.
     const path = filePathOf(text);
-    for (const line of text.split('\n')) yield { line, source: 'file', path };
+    const unfenced: string[] = [];
+    walkLinesWithFences(text, (line, inFence) => {
+      if (!inFence) unfenced.push(line);
+    });
+    for (const line of unfenced) yield { line, source: 'file', path };
   }
 }
 
@@ -363,26 +392,45 @@ function isCommandOnlyTurn(m: Message, live = false): boolean {
     // instructions with it, so only the live test tolerates the envelope.
     if (!live && LEADING_REMINDER_RE.test(raw)) return false;
     const text = stripReminders(raw);
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      if (!matchPinCmd(line)) return false;
+    let hasNonCmd = false;
+    walkLinesWithFences(text, (line, inFence) => {
+      if (inFence) {
+        hasNonCmd = true;
+        return false;
+      }
+      if (!line.trim()) return;
+      if (!matchPinCmd(line, 'session')) {
+        hasNonCmd = true;
+        return false;
+      }
       sawCommand = true;
-    }
+    });
+    if (hasNonCmd) return false;
   }
   return sawCommand;
+}
+
+function isTextOnlyAssistantMsg(m: Message | undefined): boolean {
+  if (!m || m.role !== 'assistant') return false;
+  if (typeof m.content === 'string') return true;
+  if (!Array.isArray(m.content)) return false;
+  return m.content.every(
+    (b) => !!b && typeof b === 'object' && (b as { type?: string }).type === 'text',
+  );
 }
 
 /** True when a message is a pin confirmation this proxy synthesized. */
 function isPinReply(m: Message | undefined): boolean {
   if (!m || m.role !== 'assistant') return false;
   const blocks = Array.isArray(m.content) ? m.content : [];
-  if (typeof m.content === 'string') return m.content.startsWith(PIN_REPLY_MARK);
+  const hasMark = (s: string): boolean => s.startsWith(PIN_REPLY_MARK) || s.startsWith(LEGACY_PIN_REPLY_MARK);
+  if (typeof m.content === 'string') return hasMark(m.content);
   if (blocks.length !== 1) return false;
   const blk = blocks[0];
   return !!blk && typeof blk === 'object'
     && (blk as { type?: string }).type === 'text'
     && typeof (blk as TextBlock).text === 'string'
-    && (blk as TextBlock).text.startsWith(PIN_REPLY_MARK);
+    && hasMark((blk as TextBlock).text);
 }
 
 /**
@@ -407,14 +455,12 @@ export function stripPinCommands(messages: Message[]): Message[] {
       out.push(m);
       continue;
     }
-    const stripped = stripFromMessage(m);
+    const stripped = stripFromMessage(m, i);
     if (stripped === null) {
-      // Commands and nothing else, with no confirmation to pair with. Keeping
-      // the original would send `@inkling pin ...` to the model as if it were a
-      // request; dropping it alone would break role alternation, so it goes
-      // with the reply that answered it. As the final turn there is no reply
-      // yet and proxy.ts answers locally, so leave it for that path.
-      if (messages[i + 1]?.role === 'assistant') { i++; continue; }
+      // Only drop an unpaired command turn together with an assistant reply when
+      // that assistant turn is purely text (never drop tool_use blocks and orphan
+      // downstream tool_result blocks -> HTTP 400).
+      if (isTextOnlyAssistantMsg(messages[i + 1])) { i++; continue; }
       out.push(m);
       continue;
     }
@@ -423,35 +469,48 @@ export function stripPinCommands(messages: Message[]): Message[] {
   return out;
 }
 
+function stripUserTextBlock(text: string, isMsg0: boolean): string {
+  if (isMsg0 && LEADING_REMINDER_RE.test(text)) {
+    let consumed = 0;
+    let rebuilt = '';
+    for (const block of reminderBlocks(text)) {
+      consumed += block.length;
+      rebuilt += stripLines(block, 'file');
+    }
+    const rest = text.slice(consumed);
+    return rest ? rebuilt + stripLines(rest, 'session') : rebuilt;
+  }
+  return stripLines(text, 'session');
+}
+
 /** Strip command lines from a user message, or undefined if nothing changed.
  *  Returns the original when stripping would leave the message with no content —
  *  an empty `content` is rejected by the API, and dropping a lone message would
  *  break role alternation. */
-function stripFromMessage(m: Message): Message | null | undefined {
+function stripFromMessage(m: Message, idx = 1): Message | null | undefined {
   if (typeof m.content === 'string') {
-    const text = stripLines(m.content);
+    const text = stripUserTextBlock(m.content, idx === 0);
     if (text === m.content) return undefined;
     return text.trim() ? { ...m, content: text } : null;
   }
   if (!Array.isArray(m.content)) return undefined;
   let changed = false;
+  let leadingRun = idx === 0;
   const blocks: ContentBlock[] = [];
   for (const blk of m.content) {
     if (blk && typeof blk === 'object' && (blk as { type?: string }).type === 'text') {
       const tb = blk as TextBlock;
       if (typeof tb.text === 'string') {
-        const text = stripLines(tb.text);
+        const text = stripUserTextBlock(tb.text, leadingRun);
+        leadingRun = false;
         if (text !== tb.text) {
           changed = true;
           if (!text.trim()) {
-            // `{text: ''}` is rejected by the API, so the block cannot stay. Its
-            // cache_control can't just go with it — dropping a breakpoint moves
-            // the cache boundary — so hand it to the block in front.
             const prev = blocks[blocks.length - 1] as TextBlock | undefined;
             if (tb.cache_control !== undefined && prev) {
               blocks[blocks.length - 1] = { ...prev, cache_control: tb.cache_control };
             } else if (tb.cache_control !== undefined) {
-              blocks.push(blk); // nothing in front to hold it: leave as sent
+              blocks.push(blk);
             }
             continue;
           }
@@ -460,6 +519,7 @@ function stripFromMessage(m: Message): Message | null | undefined {
         }
       }
     }
+    leadingRun = false;
     blocks.push(blk);
   }
   if (!changed) return undefined;
@@ -486,7 +546,7 @@ export function stripPinCommandsFromSystem(
 ): SystemField | undefined {
   if (sys == null) return undefined;
   if (typeof sys === 'string') {
-    const text = stripLines(sys);
+    const text = stripLines(sys, 'file');
     return text === sys ? undefined : text;
   }
   if (!Array.isArray(sys)) return undefined;
@@ -496,7 +556,7 @@ export function stripPinCommandsFromSystem(
     if (blk && typeof blk === 'object' && (blk as { type?: string }).type === 'text') {
       const tb = blk as TextBlock;
       if (typeof tb.text === 'string') {
-        const text = stripLines(tb.text);
+        const text = stripLines(tb.text, 'file');
         if (text !== tb.text) {
           changed = true;
           if (!text.trim()) {
@@ -518,11 +578,12 @@ export function stripPinCommandsFromSystem(
   return changed ? out : undefined;
 }
 
-function stripLines(text: string): string {
-  return text
-    .split('\n')
-    .filter((line) => !matchPinCmd(line))
-    .join('\n');
+function stripLines(text: string, source: 'file' | 'session' = 'session'): string {
+  const kept: string[] = [];
+  walkLinesWithFences(text, (line, inFence) => {
+    if (inFence || !matchPinCmd(line, source)) kept.push(line);
+  });
+  return kept.join('\n');
 }
 
 /**
@@ -531,26 +592,33 @@ function stripLines(text: string): string {
  * cost a cache miss — which is also why formatting drift in the user's source
  * lines is free here, and why we normalize purely for tidy telemetry.
  */
+/** Neutralize closing `</system-reminder>` tags inside user/file pin text so
+ *  relocated pins cannot break out of the outer `<system-reminder>` envelope. */
+function escapeReminderClose(text: string): string {
+  return text.replace(/<\/(system-reminder)\b/gi, '<\\/$1');
+}
+
 export function pinBlockText(pins: Pin[]): string {
   if (pins.length === 0) return '';
   let budget = PIN_TOTAL_MAX_CHARS;
   const lines: string[] = [];
   for (const p of pins) {
+    const safeText = escapeReminderClose(p.text);
     // Skip, don't stop: one long file excerpt early in a big CLAUDE.md would
     // otherwise swallow every session pin the user typed this turn.
-    if (budget - p.text.length < 0) continue;
-    budget -= p.text.length;
+    if (budget - safeText.length < 0) continue;
+    budget -= safeText.length;
     // Session pins are a list the user dictated one line at a time, so a bullet
     // is what they meant. A file excerpt is markdown the user already formatted;
     // bulleting it turns their `##` headings, table rows and fenced blocks into
     // list items, i.e. we would be reformatting the very text we claim is "the
     // user's own words".
-    lines.push(p.source === 'file' ? p.text : `- ${p.text}`);
+    lines.push(p.source === 'file' ? safeText : `- ${safeText}`);
   }
   if (lines.length === 0) return '';
   return [
     '<system-reminder>',
-    '[inkling pin] The user pinned these instructions and inkling relocated them here,',
+    '[fiche pin] The user pinned these instructions and fiche relocated them here,',
     'last in the request, because rules stated far above get read as background. They',
     "are the user's own words and they govern this reply; on conflict they win.",
     ...lines,
@@ -629,12 +697,12 @@ export function pinReplyText(pins: Pin[], verb: PinVerb = 'pin'): string {
         : '';
       return `${PIN_REPLY_MARK}nothing to unpin${fromFile}`;
     }
-    const lines = [`session   (@inkling unpin <n>, or unpin all)`, ''];
+    const lines = [`session   (@fiche unpin <n>, or unpin all)`, ''];
     session.forEach((p, i) => lines.push(`${i + 1}. ${p.text}`));
     return `${PIN_REPLY_MARK}${session.length} removable\n${lines.join('\n')}`;
   }
   if (pins.length === 0) {
-    return `${PIN_REPLY_MARK}nothing pinned\n  @inkling pin <instruction>`;
+    return `${PIN_REPLY_MARK}nothing pinned\n  @fiche pin <instruction>`;
   }
   // Grouped under a source header rather than tagging each line: against a real
   // CLAUDE.md the tag repeats down the whole list and buries the text it means to
@@ -650,7 +718,7 @@ export function pinReplyText(pins: Pin[], verb: PinVerb = 'pin'): string {
     for (const p of group.pins) out.push(p.text);
   }
   if (session.length > 0) {
-    out.push('', `session   (@inkling unpin <n>, or unpin all)`, '');
+    out.push('', `session   (@fiche unpin <n>, or unpin all)`, '');
     session.forEach((p, i) => out.push(`${i + 1}. ${p.text}`));
   }
   return `${PIN_REPLY_MARK}${pins.length} pinned\n${out.slice(1).join('\n')}`;
@@ -698,10 +766,11 @@ function liveVerb(m: Message | undefined): PinVerb {
   for (const blk of blocks) {
     const text = (blk as TextBlock)?.text;
     if (typeof text !== 'string') continue;
-    for (const line of text.split('\n')) {
-      const cmd = matchPinCmd(line);
+    walkLinesWithFences(text, (line, inFence) => {
+      if (inFence) return;
+      const cmd = matchPinCmd(line, 'session');
       if (cmd) verb = cmd.verb as PinVerb;
-    }
+    });
   }
   return verb;
 }
@@ -728,7 +797,7 @@ export function pinCommandResponse(
     // answers "nothing pinned" to a user staring at four pinned lines. The
     // OpenAI twin below has always passed its own system field.
     pinReplyText(foldPins(req.messages, req.system), liveVerb(liveTurn(req.messages))),
-    typeof req.model === 'string' ? req.model : 'inkling',
+    typeof req.model === 'string' ? req.model : 'fiche',
     req.stream === true,
   );
 }
@@ -741,7 +810,7 @@ export function synthesizeReply(
   model: string,
   stream: boolean,
 ): { body: string; contentType: string } {
-  const id = `msg_inkling_pin_${Date.now().toString(36)}`;
+  const id = `msg_fiche_pin_${Date.now().toString(36)}`;
   const usage = { input_tokens: 0, output_tokens: 0 };
   if (!stream) {
     return {
@@ -805,19 +874,32 @@ interface OpenAIItem {
   content?: unknown;
 }
 
-/** Text parts of one OpenAI message. `input_text`/`output_text` are the
- *  Responses spellings of Chat Completions' `text`; images and file parts carry
- *  no pin commands, so they drop out. */
-function openAITextBlocks(content: unknown): ContentBlock[] {
+/** Parts of one OpenAI message. `input_text`/`output_text` are the Responses
+ *  spellings of Chat Completions' `text`; non-text items (`image_url`,
+ *  `input_image`, `input_file`, etc.) are preserved as non-text placeholders so
+ *  multimodal turns carrying `@fiche pin` are never misclassified as
+ *  command-only and swallowed locally. */
+function openAIContentBlocks(content: unknown): ContentBlock[] {
   if (typeof content === 'string') return [{ type: 'text', text: content }];
   if (!Array.isArray(content)) return [];
   const out: ContentBlock[] = [];
   for (const raw of content) {
-    const part = raw as { type?: string; text?: unknown };
-    if (!part || typeof part.text !== 'string') continue;
-    if (part.type === undefined || part.type === 'text'
-      || part.type === 'input_text' || part.type === 'output_text') {
+    if (!raw || typeof raw !== 'object') {
+      out.push({ type: 'non_text' } as unknown as ContentBlock);
+      continue;
+    }
+    const part = raw as { type?: unknown; text?: unknown };
+    const isTextType =
+      part.type === undefined ||
+      part.type === 'text' ||
+      part.type === 'input_text' ||
+      part.type === 'output_text';
+    if (isTextType && typeof part.text === 'string') {
       out.push({ type: 'text', text: part.text });
+    } else {
+      const placeholderType =
+        typeof part.type === 'string' && part.type !== 'text' ? part.type : 'non_text';
+      out.push({ type: placeholderType } as unknown as ContentBlock);
     }
   }
   return out;
@@ -851,9 +933,11 @@ function normalizeOpenAIRequest(
       messages.push({ role: 'assistant', content: [] });
       continue;
     }
-    const blocks = openAITextBlocks(item.content);
+    const blocks = openAIContentBlocks(item.content);
     if (item.role === 'system' || item.role === 'developer') {
-      for (const blk of blocks) system.push(blk as TextBlock);
+      for (const blk of blocks) {
+        if ((blk as { type?: string }).type === 'text') system.push(blk as TextBlock);
+      }
       continue;
     }
     messages.push({ role: item.role === 'user' ? 'user' : 'assistant', content: blocks });
@@ -877,59 +961,75 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
   const pinText = pinBlockText(pins);
   if (!pinText) return 0;
 
-  const items = Array.isArray(req.input)
-    ? req.input
+  const isResponses = Array.isArray(req.input);
+  const items = isResponses
+    ? (req.input as unknown[])
     : Array.isArray(req.messages)
       ? req.messages
       : undefined;
   const stringInput = typeof req.input === 'string';
+
+  // Validate delivery target BEFORE stripping source pins so pins are never lost.
   let target: OpenAIItem | undefined;
-  if (items) {
-    for (let i = items.length - 1; i >= 0; i--) {
-      const item = items[i] as OpenAIItem | undefined;
-      if (item?.role === 'user') {
-        target = item;
-        break;
-      }
+  let appendTrailing = false;
+  if (!stringInput && items) {
+    const last = items[items.length - 1] as OpenAIItem | undefined;
+    if (
+      last?.role === 'user' &&
+      (last.type === undefined || last.type === 'message') &&
+      (typeof last.content === 'string' || Array.isArray(last.content))
+    ) {
+      target = last;
+    } else if (items.some((raw) => (raw as OpenAIItem)?.role === 'user')) {
+      // Mid-tool-loop (last item is tool / function_call_output / assistant):
+      // never mutate a buried earlier turn (which busts automatic prefix cache);
+      // append at the tail instead.
+      appendTrailing = true;
     }
   }
-  if (!stringInput && !target) return 0;
+  if (!stringInput && !target && !appendTrailing) return 0;
 
   if (typeof req.instructions === 'string') {
-    req.instructions = stripLines(req.instructions);
+    req.instructions = stripLines(req.instructions, 'file');
   }
   if (items) {
     for (const raw of items) {
       const item = raw as OpenAIItem;
       if (item.role !== 'system' && item.role !== 'developer' && item.role !== 'user') continue;
-      item.content = stripOpenAIContent(item.content);
+      const src: 'file' | 'session' = item.role === 'user' ? 'session' : 'file';
+      item.content = stripOpenAIContent(item.content, src);
     }
   }
 
   if (stringInput) {
-    req.input = `${req.input as string}\n\n${pinText}`;
+    const cleaned = stripLines(req.input as string, 'session').trimEnd();
+    req.input = cleaned ? `${cleaned}\n\n${pinText}` : pinText;
   } else if (target) {
     if (typeof target.content === 'string') {
-      target.content = `${target.content}\n\n${pinText}`;
+      target.content = target.content.trim() ? `${target.content}\n\n${pinText}` : pinText;
     } else if (Array.isArray(target.content)) {
-      const type = Array.isArray(req.input) ? 'input_text' : 'text';
+      const type = isResponses ? 'input_text' : 'text';
       target.content.push({ type, text: pinText });
+    }
+  } else if (appendTrailing && items) {
+    if (isResponses) {
+      items.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: pinText }] });
     } else {
-      return 0;
+      items.push({ role: 'user', content: pinText });
     }
   }
   return pinText.length;
 }
 
-function stripOpenAIContent(content: unknown): unknown {
-  if (typeof content === 'string') return stripLines(content);
+function stripOpenAIContent(content: unknown, source: 'file' | 'session'): unknown {
+  if (typeof content === 'string') return stripLines(content, source);
   if (!Array.isArray(content)) return content;
   return content.map((raw) => {
     const part = raw as { type?: string; text?: unknown };
     if (!part || typeof part.text !== 'string') return raw;
     if (part.type !== undefined && part.type !== 'text'
       && part.type !== 'input_text' && part.type !== 'output_text') return raw;
-    return { ...part, text: stripLines(part.text) };
+    return { ...part, text: stripLines(part.text, source) };
   });
 }
 
@@ -962,27 +1062,27 @@ export function relocateGooglePins(req: GooglePinRequest): number {
   const pinText = pinBlockText(pins);
   if (!pinText) return 0;
 
-  let target: GooglePinContent | undefined;
-  for (let i = req.contents.length - 1; i >= 0; i--) {
-    if (req.contents[i]?.role === 'user') {
-      target = req.contents[i];
-      break;
-    }
-  }
-  if (!target || !Array.isArray(target.parts)) return 0;
+  const last = req.contents[req.contents.length - 1];
+  const canAppendToLast = last?.role === 'user' && Array.isArray(last.parts);
+  const hasAnyUser = req.contents.some((c) => c?.role === 'user');
+  if (!canAppendToLast && !hasAnyUser) return 0;
 
   if (Array.isArray(req.systemInstruction?.parts)) {
     req.systemInstruction.parts = req.systemInstruction.parts.map((part) =>
-      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text) } : part,
+      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text, 'file') } : part,
     );
   }
   for (const content of req.contents) {
     if (content.role !== 'user' || !Array.isArray(content.parts)) continue;
     content.parts = content.parts.map((part) =>
-      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text) } : part,
+      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text, 'session') } : part,
     );
   }
-  target.parts.push({ text: pinText });
+  if (canAppendToLast && last && Array.isArray(last.parts)) {
+    last.parts.push({ text: pinText });
+  } else {
+    req.contents.push({ role: 'user', parts: [{ text: pinText }] });
+  }
   return pinText.length;
 }
 
@@ -1011,7 +1111,7 @@ export function pinCommandResponseOpenAI(
     foldPins(norm.messages, norm.system),
     liveVerb(norm.messages[norm.messages.length - 1]),
   );
-  const model = typeof req.model === 'string' ? req.model : 'inkling';
+  const model = typeof req.model === 'string' ? req.model : 'fiche';
   return wire === 'responses'
     ? synthesizeResponsesReply(text, model, req.stream === true)
     : synthesizeChatReply(text, model, req.stream === true);
@@ -1024,7 +1124,7 @@ export function synthesizeChatReply(
   model: string,
   stream: boolean,
 ): { body: string; contentType: string } {
-  const id = `chatcmpl_inkling_pin_${Date.now().toString(36)}`;
+  const id = `chatcmpl_fiche_pin_${Date.now().toString(36)}`;
   const created = Math.floor(Date.now() / 1000);
   if (!stream) {
     return {
@@ -1070,8 +1170,8 @@ export function synthesizeResponsesReply(
   stream: boolean,
 ): { body: string; contentType: string } {
   const stamp = Date.now().toString(36);
-  const id = `resp_inkling_pin_${stamp}`;
-  const itemId = `msg_inkling_pin_${stamp}`;
+  const id = `resp_fiche_pin_${stamp}`;
+  const itemId = `msg_fiche_pin_${stamp}`;
   const created_at = Math.floor(Date.now() / 1000);
   const usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
   const item = {

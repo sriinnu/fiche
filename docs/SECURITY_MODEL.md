@@ -1,6 +1,6 @@
 # Security Model
 
-This document describes inkling's security boundaries and the assumptions that
+This document describes `fiche`'s security boundaries and the assumptions that
 deployers and contributors should preserve. It is a living threat model, not a
 claim that the software is free of vulnerabilities.
 
@@ -37,31 +37,31 @@ software supply-chain boundary.
   and TLS in front of the proxy API. Dashboard routes remain loopback-only.
 - Upstream URLs and gateway headers are trusted operator configuration, not
   attacker-controlled request inputs.
-- Anyone who can read the inkling log directory or Workers Logs may learn
+- Anyone who can read the `fiche` log directory (`~/.fiche/`, or legacy `~/.inkling/`) or Workers Logs may learn
   sensitive metadata. Diagnostic body capture is treated as secret material.
-- Callers that know `INKLING_WORKER_SECRET` are authorized to spend credentials
+- Callers that know `FICHE_WORKER_SECRET` (or legacy `INKLING_WORKER_SECRET`) are authorized to spend credentials
   configured in that Worker deployment.
 
 ## Threats and controls
 
 | Threat | Existing control | Contributor requirement |
 | --- | --- | --- |
-| Public deployment spends a configured API key | Worker requires `INKLING_WORKER_SECRET` and fails closed | Preserve the fail-closed check and constant-work comparison tests |
+| Public deployment spends a configured API key | Worker requires `FICHE_WORKER_SECRET` (legacy `INKLING_WORKER_SECRET` fallback, presented via `x-fiche-secret` or `x-inkling-secret`) and fails closed | Preserve the fail-closed check and constant-work comparison tests |
 | Provider credential is routed to the wrong upstream | An explicit inbound-credential x route policy (`resolveOpenAIRouteAuth`): Anthropic-shaped credentials never reach an OpenAI upstream, subscription OAuth is preserved rather than substituted, and a host key replaces only ordinary keys. Classification is by header shape; no local token store is read | Extend the policy table, not the call site, for every new route or provider, and keep the full matrix under test |
 | A request reaches a provider it was not meant for | Routing is by path family: `/backend-api/*` goes to the ChatGPT upstream, Google API shapes (`/v1beta/`, `/v1alpha/`, `/v1internal:`, `models/<id>:<method>`) to Google, and `/v1/*` and `/api/*` to Anthropic. On the stock Anthropic upstream any other path answers 404 and is never forwarded with injected keys. A custom upstream keeps forwarding unknown paths | Add a new agent's paths to a family predicate in `proxy.ts`, with a `createProxy` test that checks the upstream URL and the credential that arrives |
 | Prompt or secret leaks through telemetry | Full 4xx body capture is opt-in; normal events retain hashes/metadata; local artifacts are owner-only | Do not add raw content to logs; document any new persistence |
 | Dashboard exposes captured context | Dashboard routes require loopback source and host; cross-site mutations are rejected | Treat every dashboard route as sensitive and preserve both checks |
-| A web page spends the local proxy's keys (cross-site request or DNS rebinding) | The Node proxy API refuses any `Origin` that is not loopback (403) and any `Host` that is a public DNS name other than a known provider host (421). Loopback names, IP literals, single-label container names, `*.internal` and the provider hosts `inkling warp` keeps are accepted. `INKLING_ALLOWED_HOSTS` adds names; `*` turns the check off (`src/core/request-guard.ts`) | Keep the guard ahead of the proxy handler and test Host cases over `node:http`, since `fetch()` drops a caller-set Host |
+| A web page spends the local proxy's keys (cross-site request or DNS rebinding) | The Node proxy API refuses any `Origin` that is not loopback (403) and any `Host` that is a public DNS name other than a known provider host (421). Loopback names, IP literals, single-label container names, `*.internal` and the provider hosts `fiche warp` keeps are accepted. `FICHE_ALLOWED_HOSTS` (or legacy `INKLING_ALLOWED_HOSTS`) adds names; `*` turns the check off (`src/core/request-guard.ts`) | Keep the guard ahead of the proxy handler and test Host cases over `node:http`, since `fetch()` drops a caller-set Host |
 | Oversized dashboard request exhausts memory | Dashboard request bodies are bounded | Keep bounds before parsing and add negative tests for new endpoints |
-| Oversized proxy request exhausts memory | Transformable routes refuse past `maxRequestBytes` (`INKLING_MAX_REQUEST_BYTES`, 16 MiB default) before allocating, using the streamed size rather than the declared one; label-only routes bound their model sniff and stream the remainder untouched | Never read an inbound body to completion before the limit is proven; add exact-boundary, missing-length and under-declared-length tests for new routes |
+| Oversized proxy request exhausts memory | Transformable routes refuse past `maxRequestBytes` (`FICHE_MAX_REQUEST_BYTES` / legacy `INKLING_MAX_REQUEST_BYTES`, 16 MiB default) before allocating, using the streamed size rather than the declared one; label-only routes bound their model sniff and stream the remainder untouched | Never read an inbound body to completion before the limit is proven; add exact-boundary, missing-length and under-declared-length tests for new routes |
 | Malicious dependency or compromised release | Frozen lockfile, three-day release-age gate, restricted lifecycle scripts, OIDC trusted publishing, provenance | Keep least-privilege workflow permissions and review lockfile/lifecycle changes |
 | Vulnerable dependency remains installed | Dependabot, CodeQL/GitHub security scanning, a high-severity CI audit gate, targeted overrides | Run `pnpm audit` and remove overrides when direct dependencies adopt fixed ranges |
 
 ## Out of scope and residual risks
 
-- inkling does not authenticate the Node server or dashboard. Non-loopback
+- `fiche` does not authenticate the Node server or dashboard. Non-loopback
   deployment without an authenticated reverse proxy is unsafe by design.
-- inkling cannot protect content after it reaches a configured provider,
+- `fiche` cannot protect content after it reaches a configured provider,
   gateway, log sink, or a local user with access to its files.
 - A malicious trusted operator can configure an upstream that receives request
   credentials and content. Upstream configuration must not be exposed to

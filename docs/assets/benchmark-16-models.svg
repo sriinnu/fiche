@@ -1,0 +1,222 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1568 980" width="1568" height="980" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<defs>
+<linearGradient id="prism" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#FF4D5A"/><stop offset="25%" stop-color="#FF6B2B"/><stop offset="55%" stop-color="#C026D3"/><stop offset="80%" stop-color="#0EA5E9"/><stop offset="100%" stop-color="#34D399"/></linearGradient>
+<linearGradient id="optGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#FF4D5A"/><stop offset="100%" stop-color="#FFB020"/></linearGradient>
+<linearGradient id="txtGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#0284C7"/><stop offset="100%" stop-color="#38BDF8"/></linearGradient>
+<linearGradient id="usdGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#34D399"/></linearGradient>
+</defs>
+<rect width="1568" height="980" fill="#0D1117"/>
+<rect width="1568" height="4" fill="url(#prism)"/>
+<text x="40" y="46" fill="#F8FAFC" font-size="28" font-weight="700">fiche — 16-Model Multi-Turn Coding-Agent Benchmarks</text>
+<text x="40" y="72" fill="#94A3B8" font-size="15">16-turn agent trajectory · kosha pricing · live core transforms · editSafe = true</text>
+<rect x="40" y="94" width="358.5" height="74" rx="10" fill="#121822" stroke="#253042"/>
+<rect x="41" y="95" width="356.5" height="3" rx="2" fill="#38BDF8"/>
+<text x="56" y="126" fill="#38BDF8" font-size="22" font-weight="700">35.1–51.9%</text>
+<text x="56" y="144" fill="#F8FAFC" font-size="13" font-weight="600">Tokens Saved</text>
+<text x="56" y="159" fill="#7C8BA1" font-size="11.5">Text compiler + optical microfiche</text>
+<rect x="416.5" y="94" width="358.5" height="74" rx="10" fill="#121822" stroke="#253042"/>
+<rect x="417.5" y="95" width="356.5" height="3" rx="2" fill="#34D399"/>
+<text x="432.5" y="126" fill="#34D399" font-size="22" font-weight="700">-1.4–40.8%</text>
+<text x="432.5" y="144" fill="#F8FAFC" font-size="13" font-weight="600">Real USD Saved</text>
+<text x="432.5" y="159" fill="#7C8BA1" font-size="11.5">Under kosha cache &amp; cliff math</text>
+<rect x="793" y="94" width="358.5" height="74" rx="10" fill="#121822" stroke="#253042"/>
+<rect x="794" y="95" width="356.5" height="3" rx="2" fill="#C084FC"/>
+<text x="809" y="126" fill="#C084FC" font-size="22" font-weight="700">80.9–90.9%</text>
+<text x="809" y="144" fill="#F8FAFC" font-size="13" font-weight="600">Prefix Cache Hit</text>
+<text x="809" y="159" fill="#7C8BA1" font-size="11.5">Longest-common-prefix continuity</text>
+<rect x="1169.5" y="94" width="358.5" height="74" rx="10" fill="#121822" stroke="#253042"/>
+<rect x="1170.5" y="95" width="356.5" height="3" rx="2" fill="#FF6B2B"/>
+<text x="1185.5" y="126" fill="#FF6B2B" font-size="22" font-weight="700">1.2–15.3 ms</text>
+<text x="1185.5" y="144" fill="#F8FAFC" font-size="13" font-weight="600">Avg Turn Latency</text>
+<text x="1185.5" y="159" fill="#7C8BA1" font-size="11.5">Measured transform overhead</text>
+<text x="48" y="204" fill="#7C8BA1" font-size="11.5" font-weight="700">MODEL &amp; PROVIDER</text>
+<text x="292" y="204" fill="#7C8BA1" font-size="11.5" font-weight="700">ENGINE</text>
+<text x="410" y="204" fill="#7C8BA1" font-size="11.5" font-weight="700">TOKENS SAVED VS REAL USD SAVED (0% → 80%)</text>
+<rect x="860" y="194" width="11" height="11" rx="3" fill="#FF6B2B"/>
+<text x="876" y="204" fill="#CBD5E1" font-size="12" font-weight="500">Tokens (Optical)</text>
+<rect x="998" y="194" width="11" height="11" rx="3" fill="#38BDF8"/>
+<text x="1014" y="204" fill="#CBD5E1" font-size="12" font-weight="500">Tokens (Text)</text>
+<rect x="1122" y="194" width="11" height="11" rx="3" fill="#34D399"/>
+<text x="1138" y="204" fill="#CBD5E1" font-size="12" font-weight="500">Real USD Saved</text>
+<text x="1385" y="204" fill="#7C8BA1" font-size="11.5" font-weight="700" text-anchor="end">CACHE HIT</text>
+<text x="1520" y="204" fill="#7C8BA1" font-size="11.5" font-weight="700" text-anchor="end">AVG / TURN</text>
+<line x1="410" y1="212" x2="410" y2="906" stroke="#334155"/>
+<text x="410" y="924" fill="#64748B" font-size="11" text-anchor="middle">0%</text>
+<line x1="595" y1="212" x2="595" y2="906" stroke="#1E293B"/>
+<text x="595" y="924" fill="#64748B" font-size="11" text-anchor="middle">20%</text>
+<line x1="780" y1="212" x2="780" y2="906" stroke="#1E293B"/>
+<text x="780" y="924" fill="#64748B" font-size="11" text-anchor="middle">40%</text>
+<line x1="965" y1="212" x2="965" y2="906" stroke="#1E293B"/>
+<text x="965" y="924" fill="#64748B" font-size="11" text-anchor="middle">60%</text>
+<line x1="1150" y1="212" x2="1150" y2="906" stroke="#1E293B"/>
+<text x="1150" y="924" fill="#64748B" font-size="11" text-anchor="middle">80%</text>
+<rect x="40" y="219" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="237" fill="#F8FAFC" font-size="13.5" font-weight="600">gpt-6-astra</text>
+<text x="48" y="253" fill="#8B949E" font-size="11.5">OpenAI / Codex</text>
+<rect x="292" y="230" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="244" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="226" width="411.625" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="829.625" y="235.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.5% tok</text>
+<rect x="410" y="242" width="339.475" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="757.475" y="251" fill="#10B981" font-size="11.5" font-weight="600">36.7% USD</text>
+<text x="1385" y="245" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="245" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">3.3 ms</text>
+<text x="48" y="280" fill="#F8FAFC" font-size="13.5" font-weight="600">gpt-6.2-astra</text>
+<text x="48" y="296" fill="#8B949E" font-size="11.5">OpenAI / Codex</text>
+<rect x="292" y="273" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="287" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="269" width="411.625" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="829.625" y="278.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.5% tok</text>
+<rect x="410" y="285" width="328.375" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="746.375" y="294" fill="#10B981" font-size="11.5" font-weight="600">35.5% USD</text>
+<text x="1385" y="288" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="288" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.5 ms</text>
+<rect x="40" y="305" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="323" fill="#F8FAFC" font-size="13.5" font-weight="600">gpt-6.2-sol</text>
+<text x="48" y="339" fill="#8B949E" font-size="11.5">OpenAI / Codex</text>
+<rect x="292" y="316" width="74" height="21" rx="5" fill="rgba(255,107,43,0.16)" stroke="rgba(255,107,43,0.45)"/>
+<text x="329" y="330" fill="#FF9E64" font-size="10.5" font-weight="700" text-anchor="middle">OPTICAL</text>
+<rect x="410" y="312" width="324.675" height="11" rx="3" fill="url(#optGrad)"/>
+<text x="742.675" y="321.5" fill="#FFB074" font-size="11.5" font-weight="600">35.1% tok</text>
+<rect x="410" y="327" width="210" height="14" rx="3" fill="rgba(244,63,94,0.16)"/>
+<text x="418" y="337.5" fill="#FB7185" font-size="10.5" font-weight="600">-1.4% USD (vision net negative)</text>
+<text x="1385" y="331" fill="#94A3B8" font-size="13" text-anchor="end">80.9%</text>
+<text x="1520" y="331" fill="#F59E0B" font-size="13" font-weight="700" text-anchor="end">15.3 ms</text>
+<text x="48" y="366" fill="#F8FAFC" font-size="13.5" font-weight="600">gpt-5.6-sol</text>
+<text x="48" y="382" fill="#8B949E" font-size="11.5">OpenAI / Codex</text>
+<rect x="292" y="359" width="74" height="21" rx="5" fill="rgba(255,107,43,0.16)" stroke="rgba(255,107,43,0.45)"/>
+<text x="329" y="373" fill="#FF9E64" font-size="10.5" font-weight="700" text-anchor="middle">OPTICAL</text>
+<rect x="410" y="355" width="324.675" height="11" rx="3" fill="url(#optGrad)"/>
+<text x="742.675" y="364.5" fill="#FFB074" font-size="11.5" font-weight="600">35.1% tok</text>
+<rect x="410" y="371" width="46.25" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="464.25" y="380" fill="#10B981" font-size="11.5" font-weight="600">5.0% USD</text>
+<text x="1385" y="374" fill="#94A3B8" font-size="13" text-anchor="end">80.9%</text>
+<text x="1520" y="374" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">10.0 ms</text>
+<rect x="40" y="391" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="409" fill="#F8FAFC" font-size="13.5" font-weight="600">gemini-4-neon</text>
+<text x="48" y="425" fill="#8B949E" font-size="11.5">Google / AGY</text>
+<rect x="292" y="402" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="416" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="398" width="415.32500000000005" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="833.325" y="407.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.9% tok</text>
+<rect x="410" y="413" width="72" height="13" rx="3" fill="#1E293B"/>
+<text x="420" y="423" fill="#94A3B8" font-size="10.5">unpriced</text>
+<text x="1385" y="417" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="417" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">2.0 ms</text>
+<text x="48" y="452" fill="#F8FAFC" font-size="13.5" font-weight="600">gemini-4-carbon</text>
+<text x="48" y="468" fill="#8B949E" font-size="11.5">Google / AGY</text>
+<rect x="292" y="445" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="459" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="441" width="415.32500000000005" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="833.325" y="450.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.9% tok</text>
+<rect x="410" y="457" width="308.95" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="726.95" y="466" fill="#10B981" font-size="11.5" font-weight="600">33.4% USD</text>
+<text x="1385" y="460" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="460" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.5 ms</text>
+<rect x="40" y="477" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="495" fill="#F8FAFC" font-size="13.5" font-weight="600">gemini-4-hydrogen</text>
+<text x="48" y="511" fill="#8B949E" font-size="11.5">Google / AGY</text>
+<rect x="292" y="488" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="502" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="484" width="415.32500000000005" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="833.325" y="493.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.9% tok</text>
+<rect x="410" y="500" width="308.95" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="726.95" y="509" fill="#10B981" font-size="11.5" font-weight="600">33.4% USD</text>
+<text x="1385" y="503" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="503" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.4 ms</text>
+<text x="48" y="538" fill="#F8FAFC" font-size="13.5" font-weight="600">gemini-4-argon</text>
+<text x="48" y="554" fill="#8B949E" font-size="11.5">Google / AGY</text>
+<rect x="292" y="531" width="74" height="21" rx="5" fill="rgba(255,107,43,0.16)" stroke="rgba(255,107,43,0.45)"/>
+<text x="329" y="545" fill="#FF9E64" font-size="10.5" font-weight="700" text-anchor="middle">OPTICAL</text>
+<rect x="410" y="527" width="367.225" height="11" rx="3" fill="url(#optGrad)"/>
+<text x="785.225" y="536.5" fill="#FFB074" font-size="11.5" font-weight="600">39.7% tok</text>
+<rect x="410" y="543" width="258.075" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="676.075" y="552" fill="#10B981" font-size="11.5" font-weight="600">27.9% USD</text>
+<text x="1385" y="546" fill="#CBD5E1" font-size="13" text-anchor="end">90.0%</text>
+<text x="1520" y="546" fill="#F59E0B" font-size="13" font-weight="700" text-anchor="end">10.5 ms</text>
+<rect x="40" y="563" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="581" fill="#F8FAFC" font-size="13.5" font-weight="600">gemini-3.8-flash</text>
+<text x="48" y="597" fill="#8B949E" font-size="11.5">Google / AGY</text>
+<rect x="292" y="574" width="74" height="21" rx="5" fill="rgba(255,107,43,0.16)" stroke="rgba(255,107,43,0.45)"/>
+<text x="329" y="588" fill="#FF9E64" font-size="10.5" font-weight="700" text-anchor="middle">OPTICAL</text>
+<rect x="410" y="570" width="480.07499999999993" height="11" rx="3" fill="url(#optGrad)"/>
+<text x="898.0749999999999" y="579.5" fill="#FFB074" font-size="11.5" font-weight="600">51.9% tok</text>
+<rect x="410" y="586" width="266.4" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="684.4" y="595" fill="#10B981" font-size="11.5" font-weight="600">28.8% USD</text>
+<text x="1385" y="589" fill="#94A3B8" font-size="13" text-anchor="end">84.0%</text>
+<text x="1520" y="589" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">9.4 ms</text>
+<text x="48" y="624" fill="#F8FAFC" font-size="13.5" font-weight="600">gemini-3.1-pro-preview</text>
+<text x="48" y="640" fill="#8B949E" font-size="11.5">Google / AGY</text>
+<rect x="292" y="617" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="631" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="613" width="415.32500000000005" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="833.325" y="622.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.9% tok</text>
+<rect x="410" y="629" width="308.025" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="726.025" y="638" fill="#10B981" font-size="11.5" font-weight="600">33.3% USD</text>
+<text x="1385" y="632" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="632" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.2 ms</text>
+<rect x="40" y="649" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="667" fill="#F8FAFC" font-size="13.5" font-weight="600">claude-opus-5-5</text>
+<text x="48" y="683" fill="#8B949E" font-size="11.5">Anthropic</text>
+<rect x="292" y="660" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="674" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="656" width="411.625" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="829.625" y="665.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.5% tok</text>
+<rect x="410" y="672" width="328.375" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="746.375" y="681" fill="#10B981" font-size="11.5" font-weight="600">35.5% USD</text>
+<text x="1385" y="675" fill="#CBD5E1" font-size="13" text-anchor="end">90.8%</text>
+<text x="1520" y="675" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.6 ms</text>
+<text x="48" y="710" fill="#F8FAFC" font-size="13.5" font-weight="600">claude-fable-5-20260609</text>
+<text x="48" y="726" fill="#8B949E" font-size="11.5">Anthropic</text>
+<rect x="292" y="703" width="74" height="21" rx="5" fill="rgba(255,107,43,0.16)" stroke="rgba(255,107,43,0.45)"/>
+<text x="329" y="717" fill="#FF9E64" font-size="10.5" font-weight="700" text-anchor="middle">OPTICAL</text>
+<rect x="410" y="699" width="403.3" height="11" rx="3" fill="url(#optGrad)"/>
+<text x="821.3" y="708.5" fill="#FFB074" font-size="11.5" font-weight="600">43.6% tok</text>
+<rect x="410" y="715" width="320.05" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="738.05" y="724" fill="#10B981" font-size="11.5" font-weight="600">34.6% USD</text>
+<text x="1385" y="718" fill="#CBD5E1" font-size="13" text-anchor="end">90.0%</text>
+<text x="1520" y="718" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">6.9 ms</text>
+<rect x="40" y="735" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="753" fill="#F8FAFC" font-size="13.5" font-weight="600">deepseek-v4-pro</text>
+<text x="48" y="769" fill="#8B949E" font-size="11.5">DeepSeek</text>
+<rect x="292" y="746" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="760" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="742" width="412.55" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="830.55" y="751.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.6% tok</text>
+<rect x="410" y="758" width="350.575" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="768.575" y="767" fill="#10B981" font-size="11.5" font-weight="600">37.9% USD</text>
+<text x="1385" y="761" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="761" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.5 ms</text>
+<text x="48" y="796" fill="#F8FAFC" font-size="13.5" font-weight="600">kimi-k3</text>
+<text x="48" y="812" fill="#8B949E" font-size="11.5">Moonshot</text>
+<rect x="292" y="789" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="803" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="785" width="412.55" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="830.55" y="794.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.6% tok</text>
+<rect x="410" y="801" width="323.75" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="741.75" y="810" fill="#10B981" font-size="11.5" font-weight="600">35.0% USD</text>
+<text x="1385" y="804" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="804" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.6 ms</text>
+<rect x="40" y="821" width="1488" height="41" rx="6" fill="rgba(255, 255, 255, 0.022)"/>
+<text x="48" y="839" fill="#F8FAFC" font-size="13.5" font-weight="600">glm-5.3</text>
+<text x="48" y="855" fill="#8B949E" font-size="11.5">z.ai</text>
+<rect x="292" y="832" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="846" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="828" width="412.55" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="830.55" y="837.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.6% tok</text>
+<rect x="410" y="844" width="370.92499999999995" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="788.925" y="853" fill="#10B981" font-size="11.5" font-weight="600">40.1% USD</text>
+<text x="1385" y="847" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="847" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.4 ms</text>
+<text x="48" y="882" fill="#F8FAFC" font-size="13.5" font-weight="600">grok-4.7</text>
+<text x="48" y="898" fill="#8B949E" font-size="11.5">xAI</text>
+<rect x="292" y="875" width="74" height="21" rx="5" fill="rgba(56,189,248,0.14)" stroke="rgba(56,189,248,0.35)"/>
+<text x="329" y="889" fill="#0284C7" font-size="10.5" font-weight="700" text-anchor="middle">TEXT</text>
+<rect x="410" y="871" width="411.625" height="11" rx="3" fill="url(#txtGrad)"/>
+<text x="829.625" y="880.5" fill="#0EA5E9" font-size="11.5" font-weight="600">44.5% tok</text>
+<rect x="410" y="887" width="377.40000000000003" height="10" rx="3" fill="url(#usdGrad)"/>
+<text x="795.4000000000001" y="896" fill="#10B981" font-size="11.5" font-weight="600">40.8% USD</text>
+<text x="1385" y="890" fill="#CBD5E1" font-size="13" text-anchor="end">90.9%</text>
+<text x="1520" y="890" fill="#10B981" font-size="13" font-weight="700" text-anchor="end">1.3 ms</text>
+<text x="40" y="964" fill="#64748B" font-size="12">Verified editSafe = true across 16 models · bench/multiturn-all-models.mts</text>
+</svg>

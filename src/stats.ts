@@ -39,6 +39,8 @@ export interface Summary {
   outputTokensTotal: number;
   cacheCreateTokensTotal: number;
   cacheReadTokensTotal: number;
+  /** Portion of `cacheReadTokensTotal` already counted inside inclusive OpenAI/Google `input_tokens`. */
+  inclusiveCacheReadTotal: number;
   /** Measured savings, raw-token basis. Σ baseline_tokens over rows whose
    *  count_tokens probe is OK — the original body priced as text. */
   baselineTokensTotal: number;
@@ -63,6 +65,12 @@ export interface Summary {
    *  be doing its job. */
   systemShaHist: Map<string, number>;
   unknownTags: Map<string, number>;
+  /** Deterministic prefix-safe text-hygiene token/char savings. */
+  textHygieneSavedTokensTotal: number;
+  textHygieneSavedCharsTotal: number;
+  /** Long-context pricing cliff avoidances. */
+  cliffAvoidedEvents: number;
+  cliffSavedUsdTotal: number;
 }
 
 export function newSummary(): Summary {
@@ -81,6 +89,7 @@ export function newSummary(): Summary {
     outputTokensTotal: 0,
     cacheCreateTokensTotal: 0,
     cacheReadTokensTotal: 0,
+    inclusiveCacheReadTotal: 0,
     baselineTokensTotal: 0,
     measuredActualTokensTotal: 0,
     baselineMeasuredEvents: 0,
@@ -92,6 +101,10 @@ export function newSummary(): Summary {
     byCwd: new Map(),
     systemShaHist: new Map(),
     unknownTags: new Map(),
+    textHygieneSavedTokensTotal: 0,
+    textHygieneSavedCharsTotal: 0,
+    cliffAvoidedEvents: 0,
+    cliffSavedUsdTotal: 0,
   };
 }
 
@@ -123,15 +136,35 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
   const hasUsage =
     typeof ev.input_tokens === 'number' ||
     typeof ev.cache_read_tokens === 'number' ||
+    typeof ev.cached_tokens === 'number' ||
     typeof ev.cache_create_tokens === 'number' ||
     typeof ev.output_tokens === 'number';
+  const isInclusiveUsage =
+    ev.accounting_provider === 'openai' ||
+    ev.accounting_provider === 'google' ||
+    (ev.cached_tokens !== undefined && ev.cache_read_tokens === undefined);
   if (hasUsage) {
     s.eventsWithUsage++;
-    s.inputTokensTotal += ev.input_tokens ?? 0;
+    const evInput = ev.input_tokens ?? 0;
+    s.inputTokensTotal += evInput;
     s.outputTokensTotal += ev.output_tokens ?? 0;
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
-    s.cacheReadTokensTotal += ev.cache_read_tokens ?? 0;
-    if ((ev.cache_read_tokens ?? 0) > 0) s.cacheHitEvents++;
+    const cacheRead = ev.cache_read_tokens ?? ev.cached_tokens ?? 0;
+    s.cacheReadTokensTotal += cacheRead;
+    if (isInclusiveUsage && cacheRead > 0) {
+      s.inclusiveCacheReadTotal += Math.min(evInput, cacheRead);
+    }
+    if (cacheRead > 0) s.cacheHitEvents++;
+  }
+  if (typeof ev.text_hygiene_saved_tokens === 'number' && ev.text_hygiene_saved_tokens > 0) {
+    s.textHygieneSavedTokensTotal += ev.text_hygiene_saved_tokens;
+  }
+  if (typeof ev.text_hygiene_saved_chars === 'number' && ev.text_hygiene_saved_chars > 0) {
+    s.textHygieneSavedCharsTotal += ev.text_hygiene_saved_chars;
+  }
+  if (typeof ev.cliff_avoided_at === 'number' && ev.cliff_avoided_at > 0) {
+    s.cliffAvoidedEvents++;
+    s.cliffSavedUsdTotal += ev.cliff_saved_usd ?? 0;
   }
 
   // Measured savings: pair count_tokens(original body) against real usage on
@@ -147,10 +180,14 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
       baseline > 0);
   if (typeof baseline === 'number' && baseline > 0 && probeOk) {
     s.baselineTokensTotal += baseline;
+    const inclusiveOverlap = isInclusiveUsage
+      ? Math.min(ev.input_tokens ?? 0, ev.cache_read_tokens ?? ev.cached_tokens ?? 0)
+      : 0;
     s.measuredActualTokensTotal +=
       (ev.input_tokens ?? 0) +
       (ev.cache_create_tokens ?? 0) +
-      (ev.cache_read_tokens ?? 0);
+      (ev.cache_read_tokens ?? 0) -
+      inclusiveOverlap;
     s.baselineMeasuredEvents++;
   }
 
@@ -199,7 +236,7 @@ export function renderTextReport(s: Summary): string {
   const sortedDur = [...s.durationMs].sort((a, b) => a - b);
   const sortedFB = [...s.firstByteMs].sort((a, b) => a - b);
 
-  lines.push('━━━ inkling stats ━━━');
+  lines.push('━━━ fiche stats ━━━');
   lines.push('');
   lines.push(`requests:       ${fmtN(s.total)}`);
   lines.push(
@@ -238,6 +275,16 @@ export function renderTextReport(s: Summary): string {
       '    moved out of the cached prefix, so charged as fresh input every turn',
     );
   }
+  if (s.textHygieneSavedTokensTotal > 0) {
+    lines.push(
+      `  text hygiene saved: ${fmtN(s.textHygieneSavedTokensTotal)} tok (${fmtN(s.textHygieneSavedCharsTotal)} chars)`,
+    );
+  }
+  if (s.cliffAvoidedEvents > 0) {
+    lines.push(
+      `  cliff avoidance:    ${fmtN(s.cliffAvoidedEvents)} req ($${s.cliffSavedUsdTotal.toFixed(4)} saved)`,
+    );
+  }
   lines.push('');
 
   lines.push('Anthropic token usage:');
@@ -245,8 +292,10 @@ export function renderTextReport(s: Summary): string {
   lines.push(`  output:        ${fmtN(s.outputTokensTotal).padStart(12)}`);
   lines.push(`  cache create:  ${fmtN(s.cacheCreateTokensTotal).padStart(12)}`);
   lines.push(`  cache read:    ${fmtN(s.cacheReadTokensTotal).padStart(12)}`);
-  const totalIn =
-    s.inputTokensTotal + s.cacheCreateTokensTotal + s.cacheReadTokensTotal;
+  const totalIn = Math.max(
+    0,
+    s.inputTokensTotal + s.cacheCreateTokensTotal + s.cacheReadTokensTotal - s.inclusiveCacheReadTotal,
+  );
   lines.push(
     `  cache hit rate (by tokens):  ${fmtPct(s.cacheReadTokensTotal, totalIn)}`,
   );
@@ -381,12 +430,17 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     outputTokensTotal: s.outputTokensTotal,
     cacheCreateTokensTotal: s.cacheCreateTokensTotal,
     cacheReadTokensTotal: s.cacheReadTokensTotal,
+    inclusiveCacheReadTotal: s.inclusiveCacheReadTotal,
     baselineTokensTotal: s.baselineTokensTotal,
     measuredActualTokensTotal: s.measuredActualTokensTotal,
     baselineMeasuredEvents: s.baselineMeasuredEvents,
     savedTokensTotal: s.baselineTokensTotal - s.measuredActualTokensTotal,
     cacheHitEvents: s.cacheHitEvents,
     eventsWithUsage: s.eventsWithUsage,
+    textHygieneSavedTokensTotal: s.textHygieneSavedTokensTotal,
+    textHygieneSavedCharsTotal: s.textHygieneSavedCharsTotal,
+    cliffAvoidedEvents: s.cliffAvoidedEvents,
+    cliffSavedUsdTotal: s.cliffSavedUsdTotal,
     durationP50: percentile(sortedDur, 50),
     durationP95: percentile(sortedDur, 95),
     firstByteP50: percentile(sortedFB, 50),
@@ -408,12 +462,12 @@ const EXIT_OK = 0;
 const EXIT_NO_FILE = 1;
 const EXIT_NO_EVENTS = 2;
 
-const STATS_HELP = `inkling stats — offline summary of the events JSONL (no proxy server)
+const STATS_HELP = `fiche stats — offline summary of the events JSONL (no proxy server)
 
 Usage:
-  inkling stats                 report from $INKLING_LOG (default ~/.inkling/events.jsonl)
-  inkling stats --json          same aggregate as machine-readable JSON
-  inkling stats --file <path>   read a specific events log
+  fiche stats                 report from $FICHE_LOG (default ~/.fiche/events.jsonl)
+  fiche stats --json          same aggregate as machine-readable JSON
+  fiche stats --file <path>   read a specific events log
 
 Exit codes:
   0  report printed
@@ -462,7 +516,7 @@ export async function runStats(
     return {
       code: EXIT_NO_FILE,
       out: '',
-      err: `events file not found: ${file}\n(run inkling and send a request first, or set INKLING_LOG)`,
+      err: `events file not found: ${file}\n(run fiche and send a request first, or set FICHE_LOG)`,
     };
   }
   if (agg.parsed === 0) {

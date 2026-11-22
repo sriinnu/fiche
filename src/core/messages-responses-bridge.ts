@@ -278,7 +278,7 @@ export function openAIResponseToAnthropicMessage(response: unknown, fallbackMode
   if (content.length === 0 && pendingReasoningSummary) {
     content.push({ type: 'text', text: pendingReasoningSummary });
   }
-  const id = typeof r.id === 'string' ? r.id.replace(/^resp_/, 'msg_') : 'msg_inkling';
+  const id = typeof r.id === 'string' ? r.id.replace(/^resp_/, 'msg_') : 'msg_fiche';
   return {
     id,
     type: 'message',
@@ -584,7 +584,7 @@ export function openAIResponsesStreamToAnthropic(
   let buffer = '';
   let pendingCR = false;
   const state: StreamState = {
-    started: false, terminated: false, id: 'msg_inkling', model: fallbackModel, nextIndex: 0,
+    started: false, terminated: false, id: 'msg_fiche', model: fallbackModel, nextIndex: 0,
     textOpen: false, sawTextDelta: false, sawTool: false, sawRefusal: false,
     pendingReasoningSummary: '', receivedReasoningSummaryDelta: false,
     calls: new Set(), callAliases: new Map(), usage: anthropicUsage(undefined),

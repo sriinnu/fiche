@@ -15,7 +15,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const tsxCli = path.join(repoRoot, 'node_modules', 'tsx', 'dist', 'cli.mjs');
 
 function git(cwd: string, args: string[]): void {
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  const r = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    },
+  });
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${r.stderr}`);
 }
 
@@ -31,13 +39,13 @@ describe('inkling export --git (end-to-end)', () => {
     // Tracked baseline so `git diff HEAD` has a HEAD to diff against.
     fs.writeFileSync(path.join(repo, 'tracked.ts'), 'export const tracked = 1;\n');
     git(repo, ['add', 'tracked.ts']);
-    git(repo, ['commit', '-q', '-m', 'base']);
+    git(repo, ['commit', '-q', '--no-verify', '--no-gpg-sign', '-m', 'base']);
     // Untracked files exercising the three untracked-path gates:
     fs.writeFileSync(path.join(repo, 'keep.ts'), 'export const keep = 42;\n'); // included
     fs.writeFileSync(path.join(repo, 'skip.md'), 'x'.repeat(5000)); // excluded by --include *.ts
     fs.writeFileSync(path.join(repo, 'huge.ts'), 'a'.repeat(1_000_001)); // oversized
     fs.writeFileSync(path.join(repo, 'bin.ts'), Buffer.from([0x41, 0x00, 0x42])); // binary
-  });
+  }, 30_000);
   afterEach(() => {
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(outDir, { recursive: true, force: true });

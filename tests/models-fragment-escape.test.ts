@@ -23,4 +23,19 @@ describe('renderModelsFragment hx-vals escaping', () => {
     const ok = renderModelsFragment(['claude-fable-5'], [], true);
     expect(ok).toContain('&quot;model&quot;:&quot;claude-fable-5&quot;');
   });
+
+  it('renders a one-click Disable all third-party button and Enable fallback', () => {
+    const withThirdParty = renderModelsFragment(
+      ['claude-fable-5', 'gemini', 'gpt-6-astra', 'deepseek', 'kimi', 'glm', 'grok'],
+      [],
+      true,
+    );
+    expect(withThirdParty).toContain('Third-party models');
+    expect(withThirdParty).toContain('Disable all third-party (4)');
+    expect(withThirdParty).toContain('&quot;list&quot;:&quot;claude-fable-5,gemini,gpt-6-astra&quot;');
+
+    const firstPartyOnly = renderModelsFragment(['claude-fable-5', 'gemini'], [], true);
+    expect(firstPartyOnly).toContain('Enable third-party');
+    expect(firstPartyOnly).not.toContain('Disable all third-party');
+  });
 });

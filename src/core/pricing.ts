@@ -29,6 +29,7 @@
  */
 
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from './baseline.js';
+import { readBrandEnv } from './env.js';
 import { envPricingOverride, resolveGptProfile } from './gpt-model-profiles.js';
 import { normalizeModelId } from './price-id.js';
 import { PRICES, PRICE_ALIASES, PRICE_SNAPSHOT, type PriceRow } from './prices.generated.js';
@@ -69,9 +70,11 @@ export const ANTHROPIC_GATE_RATES: Readonly<PriceRates> = Object.freeze({
 
 /** Which source is active. Anything other than `kosha` is legacy. */
 export function priceMode(): 'legacy' | 'kosha' {
-  const raw = (typeof process !== 'undefined' && process.env && process.env.INKLING_PRICES) || '';
+  const raw = readBrandEnv('PRICES') || '';
   return raw.trim().toLowerCase() === 'kosha' ? 'kosha' : 'legacy';
 }
+
+const PRICE_ROW_CACHE = new Map<string, PriceRow | null>();
 
 /** The snapshot row for a model: exact normalised id, then a kosha alias, then
  *  the longest snapshot id that prefixes it at a `-` boundary (a `-codex` or
@@ -79,13 +82,21 @@ export function priceMode(): 'legacy' | 'kosha' {
 export function priceRowFor(model: string | null | undefined): PriceRow | undefined {
   const id = normalizeModelId(model);
   if (!id) return undefined;
+  const cached = PRICE_ROW_CACHE.get(id);
+  if (cached !== undefined) return cached ?? undefined;
   const exact = PRICES[id] ?? (PRICE_ALIASES[id] ? PRICES[PRICE_ALIASES[id]!] : undefined);
-  if (exact) return exact;
-  let best: string | undefined;
-  for (const key of Object.keys(PRICES)) {
-    if (id.startsWith(key + '-') && (best === undefined || key.length > best.length)) best = key;
+  let resolved: PriceRow | undefined = exact;
+  if (!resolved) {
+    let best: string | undefined;
+    for (const key of Object.keys(PRICES)) {
+      if (id.startsWith(key + '-') && (best === undefined || key.length > best.length)) best = key;
+    }
+    resolved = best ? PRICES[best] : undefined;
   }
-  return best ? PRICES[best] : undefined;
+  if (PRICE_ROW_CACHE.size < 512) {
+    PRICE_ROW_CACHE.set(id, resolved ?? null);
+  }
+  return resolved;
 }
 
 /** The row as billed under `ctx`: due dated changes applied, then the band the
@@ -109,13 +120,14 @@ export function effectiveRow(row: PriceRow | undefined, ctx: PriceContext = {}):
     for (const b of r.bands ?? []) if (n > b.at || (b.incl === true && n >= b.at)) band = b;
     if (band && r.in > 0) {
       const k = band.in / r.in;
+      const bandCw1h = band.cwt?.find(([ttl]) => ttl === 3600)?.[1];
       r = {
         ...r,
         in: band.in,
         out: band.out ?? (r.out !== undefined ? r.out * k : undefined),
         cr: band.cr ?? (r.cr !== undefined ? r.cr * k : undefined),
         cw: band.cwt?.[0]?.[1] ?? (r.cw !== undefined ? r.cw * k : undefined),
-        cw1h: r.cw1h !== undefined ? r.cw1h * k : undefined,
+        cw1h: bandCw1h ?? (r.cw1h !== undefined ? r.cw1h * k : undefined),
         cwt: band.cwt ?? r.cwt?.map(([ttl, per]) => [ttl, per * k] as [number, number]),
       };
     }
@@ -123,9 +135,13 @@ export function effectiveRow(row: PriceRow | undefined, ctx: PriceContext = {}):
   return r;
 }
 
-/** Write price for a TTL: the exact tier, else the shortest tier that lasts
- *  at least that long, else the longest. No TTL or no tiers = the flat `cw`. */
+/** Write price for a TTL: explicit 3600s tier in `cwt` (e.g. band override) or `cw1h` first when ttlSec === 3600, else the shortest tier that lasts at least `ttlSec`, else `cw`. */
 function writePriceFor(row: PriceRow, ttlSec: number | undefined): number | undefined {
+  if (ttlSec === 3600) {
+    const tier3600 = row.cwt?.find(([ttl]) => ttl === 3600)?.[1];
+    if (typeof tier3600 === 'number') return tier3600;
+    if (typeof row.cw1h === 'number') return row.cw1h;
+  }
   const tiers = row.cwt;
   if (!ttlSec || !tiers || tiers.length === 0) return row.cw;
   const sorted = [...tiers].sort((a, b) => a[0] - b[0]);
@@ -158,9 +174,27 @@ function profileRates(model: string | undefined): PriceRates {
   };
 }
 
+let cachedEnvProfilesRaw = '';
+const cachedEnvPricingMap = new Map<string, ReturnType<typeof envPricingOverride>>();
+
+function memoizedEnvPricingOverride(model: string | null | undefined) {
+  const raw = readBrandEnv('GPT_PROFILES') || '';
+  if (!raw) return undefined;
+  if (raw !== cachedEnvProfilesRaw) {
+    cachedEnvProfilesRaw = raw;
+    cachedEnvPricingMap.clear();
+  }
+  const key = model ?? '';
+  if (cachedEnvPricingMap.has(key)) return cachedEnvPricingMap.get(key);
+  const resolved = envPricingOverride(model);
+  if (cachedEnvPricingMap.size >= 256) cachedEnvPricingMap.clear();
+  cachedEnvPricingMap.set(key, resolved);
+  return resolved;
+}
+
 /** Kosha-mode ratios with their source; env fields override field by field. */
 function koshaRates(model: string | undefined, ctx: PriceContext = {}): { rates: PriceRates; source: PriceSource } | undefined {
-  const env = envPricingOverride(model);
+  const env = memoizedEnvPricingOverride(model);
   const fromRow = ratesFromRow(effectiveRow(priceRowFor(model), ctx), ctx.ttlSec);
   if (!env) return fromRow ? { rates: fromRow, source: 'kosha' } : undefined;
   const base = fromRow ?? profileRates(model);
@@ -214,4 +248,125 @@ export function inputUsdPerMtok(model: string | undefined, ctx?: PriceContext): 
   if (priceMode() === 'legacy' || !koshaRates(model, ctx)) return undefined;
   const row = effectiveRow(priceRowFor(model), ctx);
   return row && row.in > 0 ? row.in : undefined;
+}
+
+export interface CliffSavingsEval {
+  readonly crossesCliff: boolean;
+  readonly cliffAt: number;
+  readonly multiplier: number;
+  readonly inputUsdBefore: number;
+  readonly inputUsdAfter: number;
+  /** Immediate single-turn USD saved assuming the unproxied path stayed warm on the higher tier. */
+  readonly netSingleTurnUsd: number;
+  /** Input+output band-step savings across the remaining prompt alone. */
+  readonly cliffSavedUsd: number;
+}
+
+function bandWriteUsdPerMtok(row: PriceRow, ttlSec?: number): number {
+  if (row.cwb === 'as-input') return row.in;
+  const cw = writePriceFor(row, ttlSec);
+  return typeof cw === 'number' && cw > 0 ? cw : row.in;
+}
+
+/**
+ * Evaluate whether shrinking a prompt from `promptTokensBefore` to
+ * `promptTokensAfter` drops the entire request below a long-context pricing
+ * cliff (e.g. OpenAI 272K, Gemini/Grok 200K, Haiku 5.5 100K, MiniMax M3 512K),
+ * turning an amortized multi-turn trade-off into an immediate turn-1 win.
+ *
+ * Returns null in legacy mode, on unpriced models, or if no cliff is crossed.
+ */
+export function evaluateCliffAvoidance(
+  model: string | null | undefined,
+  args: {
+    promptTokensBefore: number;
+    promptTokensAfter: number;
+    collapsedBaselineTokens?: number;
+    collapsedActualTokens?: number;
+    downstreamCachedTokens?: number;
+    expectedOutputTokens?: number;
+    ttlSec?: number;
+    at?: number;
+  },
+): CliffSavingsEval | null {
+  if (priceMode() === 'legacy') return null;
+  const baseRow = priceRowFor(model);
+  if (!baseRow) return null;
+  const { promptTokensBefore: beforeTok, promptTokensAfter: afterTok } = args;
+  if (!(beforeTok > afterTok) || afterTok < 0) return null;
+  const rowBefore = effectiveRow(baseRow, { promptTokens: beforeTok, at: args.at });
+  const rowAfter = effectiveRow(baseRow, { promptTokens: afterTok, at: args.at });
+  if (!rowBefore || !rowAfter || !(rowAfter.in > 0) || !(rowBefore.in > rowAfter.in)) return null;
+  if (typeof rowBefore.cr !== 'number' || typeof rowAfter.cr !== 'number') return null;
+
+  const baseDated = effectiveRow(baseRow, { at: args.at });
+  let cliffAt = 0;
+  for (const b of baseDated?.bands ?? []) {
+    const inBefore = beforeTok > b.at || (b.incl === true && beforeTok >= b.at);
+    const inAfter = afterTok > b.at || (b.incl === true && afterTok >= b.at);
+    if (inBefore && !inAfter && b.at > cliffAt) cliffAt = b.at;
+  }
+
+  const collapsedBase = Math.max(0, args.collapsedBaselineTokens ?? (beforeTok - afterTok));
+  const collapsedActual = Math.max(0, args.collapsedActualTokens ?? Math.max(0, afterTok - (beforeTok - collapsedBase)));
+  const downstreamCached = Math.max(0, Math.min(args.downstreamCachedTokens ?? 0, Math.max(0, beforeTok - collapsedBase)));
+  const keptPrefix = Math.max(0, beforeTok - collapsedBase - downstreamCached);
+  const outTok = Math.max(0, args.expectedOutputTokens ?? 0);
+
+  // Conservative comparison: unproxied path reads 100% of prompt at the upper
+  // tier's cache-read rate, while compressed path pays write rate on the
+  // newly imaged/emitted section plus any invalidated downstream suffix, and
+  // lower-tier cache-read on kept prefix tokens.
+  const unproxiedUsd =
+    (beforeTok * rowBefore.cr + outTok * (rowBefore.out ?? 0)) / 1e6;
+  const writeUsd = bandWriteUsdPerMtok(rowAfter, args.ttlSec);
+  const compressedUsd =
+    (keptPrefix * rowAfter.cr + (collapsedActual + downstreamCached) * writeUsd + outTok * (rowAfter.out ?? 0)) / 1e6;
+  const netSingleTurnUsd = unproxiedUsd - compressedUsd;
+  const cliffSavedUsd =
+    (keptPrefix * (rowBefore.cr - rowAfter.cr) + outTok * Math.max(0, (rowBefore.out ?? 0) - (rowAfter.out ?? 0))) / 1e6;
+
+  return {
+    crossesCliff: true,
+    cliffAt,
+    multiplier: rowBefore.in / rowAfter.in,
+    inputUsdBefore: rowBefore.in,
+    inputUsdAfter: rowAfter.in,
+    netSingleTurnUsd,
+    cliffSavedUsd,
+  };
+}
+
+/**
+ * Exact kosha USD bill for one request's token buckets at its billed prompt band,
+ * or undefined in legacy mode or when the model lacks input/output/read rates.
+ */
+export function estimateBillUsd(
+  model: string | null | undefined,
+  args: {
+    uncachedTokens: number;
+    cachedTokens?: number;
+    cacheWriteTokens?: number;
+    outputTokens?: number;
+    ttlSec?: number;
+    promptTokens?: number;
+    at?: number;
+  },
+): number | undefined {
+  if (priceMode() === 'legacy') return undefined;
+  const base = priceRowFor(model);
+  if (!base || memoizedEnvPricingOverride(model ?? undefined)) return undefined;
+  const totalPrompt =
+    args.promptTokens ??
+    Math.max(0, (args.uncachedTokens || 0) + (args.cachedTokens || 0) + (args.cacheWriteTokens || 0));
+  const row = effectiveRow(base, { promptTokens: totalPrompt, at: args.at });
+  if (!row || !(row.in > 0)) return undefined;
+  const uncached = Math.max(0, args.uncachedTokens || 0);
+  const cached = Math.max(0, args.cachedTokens || 0);
+  const write = Math.max(0, args.cacheWriteTokens || 0);
+  const output = Math.max(0, args.outputTokens || 0);
+  const crRate = typeof row.cr === 'number' ? row.cr : row.in;
+  const cwRate = bandWriteUsdPerMtok(row, args.ttlSec);
+  const outRate = typeof row.out === 'number' ? row.out : 0;
+  return (uncached * row.in + cached * crRate + write * cwRate + output * outRate) / 1e6;
 }

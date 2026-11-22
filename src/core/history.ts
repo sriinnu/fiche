@@ -937,6 +937,14 @@ export async function collapseHistory(
       info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
     }
   };
+  interface PreparedChunkJob {
+    readonly chunkEnd: number;
+    readonly userFrom: number;
+    readonly empty: boolean;
+    readonly chunkRender?: string;
+    readonly chunkSlot?: string;
+  }
+  const chunkJobs: PreparedChunkJob[] = [];
   let chunkStart = protectedPrefix;
   for (const chunkEnd of sortedEnds) {
     // messagesToHistorySegments already omits the user's typed words; userTurnBlocks
@@ -945,22 +953,12 @@ export async function collapseHistory(
     const userFrom = chunkStart;
     chunkStart = chunkEnd;
     if (!seg.text || seg.text.length === 0) {
-      // Transcript empty (e.g. the chunk was nothing but user prompts) — the
-      // prompts themselves still belong in the output.
-      blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+      chunkJobs.push({ chunkEnd, userFrom, empty: true });
       continue;
     }
-    // Reflow the text and its parallel slot string in lockstep so role attribution
-    // stays codepoint-aligned with the rendered text. The two have identical newline
-    // structure (slot bodies are verbatim copies), so minify/reflow mutate them the
-    // same way; reflow() only bails on a ↵ collision, which hits both identically.
     let chunkRender = seg.text;
     let chunkSlot = seg.slotText;
     if (o.reflow) {
-      // Neutralize pre-existing ↵ first (1:1 swap at identical positions in text+slot, so
-      // they stay codepoint-aligned) — otherwise reflow bails and the chunk renders raw,
-      // unpacked. This conversation's transcript literally contains ↵, which would defeat
-      // packing on exactly the long sessions where collapse matters most.
       const safeText = neutralizeSentinel(seg.text);
       const safeSlot = neutralizeSentinel(seg.slotText);
       const rt = reflow(safeText);
@@ -973,19 +971,37 @@ export async function collapseHistory(
         chunkSlot = safeSlot;
       }
     }
-    // Use the dense readable profile (not full-canvas) to keep code/config legible.
-    // colorByRole tints the structural <role> tags so turn boundaries are scannable
-    // in the history image; it's token-free (vision cost is by pixel dims, not PNG
-    // byte depth) and carries the serialize-time slot string instead of re-parsing.
-    const imgs = await renderTextToPngsWithCharLimit(
-      chunkRender,
-      o.cols,
-      DENSE_CONTENT_CHARS_PER_IMAGE,
-      { ...o.style, colorByRole: true },
-      o.maxHeightPx,
-      chunkSlot,
-    );
-    const markerCC = markerByEnd.get(chunkEnd);
+    chunkJobs.push({ chunkEnd, userFrom, empty: false, chunkRender, chunkSlot });
+  }
+
+  // Render all chunks concurrently across off-thread CompressionStream workers while
+  // preserving deterministic chunk order when assembling blocks and telemetry below.
+  const chunkStyle = { ...o.style, colorByRole: true };
+  const renderedChunkImgs = await Promise.all(
+    chunkJobs.map((job) =>
+      job.empty
+        ? Promise.resolve<RenderedImage[]>([])
+        : renderTextToPngsWithCharLimit(
+            job.chunkRender!,
+            o.cols,
+            DENSE_CONTENT_CHARS_PER_IMAGE,
+            chunkStyle,
+            o.maxHeightPx,
+            job.chunkSlot,
+          ),
+    ),
+  );
+
+  for (let jobIdx = 0; jobIdx < chunkJobs.length; jobIdx++) {
+    const job = chunkJobs[jobIdx]!;
+    if (job.empty) {
+      // Transcript empty (e.g. the chunk was nothing but user prompts) — the
+      // prompts themselves still belong in the output.
+      blocks.push(...(await userTurnBlocks(messages, job.userFrom, job.chunkEnd, countImage)));
+      continue;
+    }
+    const imgs = renderedChunkImgs[jobIdx]!;
+    const markerCC = markerByEnd.get(job.chunkEnd);
     for (let k = 0; k < imgs.length; k++) {
       const img = imgs[k]!;
       const block: ImageBlock & { cache_control?: CacheControl } = {
@@ -1004,10 +1020,10 @@ export async function collapseHistory(
     // The carry-over chunk's LAST image is the newest byte-stable history image.
     // Record its ordinal so the relocator pins the cache breakpoint here instead of
     // on the still-growing newest chunk, which busts every window advance (#11).
-    if (chunkEnd === carryOverEnd) carryOverOrdinal = imageCount - 1;
+    if (job.chunkEnd === carryOverEnd) carryOverOrdinal = imageCount - 1;
     // This chunk's user prompts, as text, immediately after the image they were
     // pulled out of — attribution stays local and the ordering matches the render.
-    blocks.push(...(await userTurnBlocks(messages, userFrom, chunkEnd, countImage)));
+    blocks.push(...(await userTurnBlocks(messages, job.userFrom, job.chunkEnd, countImage)));
   }
   if (imageCount === 0) {
     info.reason = 'render_empty';

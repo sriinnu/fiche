@@ -1,17 +1,20 @@
 /**
- * MCP server for inkling (stdio and stateless Streamable HTTP).
+ * MCP server for fiche (stdio and stateless Streamable HTTP).
  * One tool surface for every client. Tools are local, deterministic, and do
  * not send the payload anywhere.
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { readerTier } from '../core/reader-tier.js';
-import { isInklingSupportedModel } from '../core/applicability.js';
+import { shouldImageModel } from '../core/reader-tier.js';
+import { isFicheSupportedModel } from '../core/applicability.js';
 import { transformAnyRequest, countBillable, type RequestWire } from '../core/request-transform.js';
 import { supportsExplicitPromptCacheBreakpoint } from '../core/codex-cache.js';
+import { defaultEventsFilePath, readTurnReport } from '../turn-report.js';
+
+declare const __FICHE_VERSION__: string | undefined;
 
 export const MCP_PROTOCOL = '2025-03-26';
-export const SERVER_NAME = 'inkling-mcp';
-export const SERVER_VERSION = '0.17.0';
+export const SERVER_NAME = 'fiche-mcp';
+export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.17.0';
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -71,7 +74,7 @@ function tool(
 export const MCP_TOOLS = [
   tool(
     'check_model',
-    'What inkling does for a model: whether it is in compression scope, and whether it gets images (strong page readers such as Gemini, Fable 5, Sol 5.6/6.1) or passes through as text (weak or unmeasured readers such as Claude 5.5, Grok). No network.',
+    'What fiche does for a model: whether it is in compression scope, and whether it gets images (strong page readers such as Gemini, Fable 5, Sol 5.6/6.1/6.2) or uses the 4-layer text compiler and passes clean text through (weak or unmeasured readers such as Claude 5.5, Grok, DeepSeek, Kimi, Astra). No network.',
     {
       model: { type: 'string', description: 'Model id, for example claude-fable-5 or gpt-6-astra.' },
     },
@@ -79,7 +82,7 @@ export const MCP_TOOLS = [
   ),
   tool(
     'transform_request',
-    'Run inkling on an LLM request JSON object: bulky context becomes images only if the model is a strong page reader (Gemini, Fable 5, Sol 5.6/6.1); weak readers (Claude 5.5, Grok) get the request back unchanged. Set upstream to https://chatgpt.com or any /backend-api/codex/ path to force-strip prompt_cache_breakpoint.' + COST_NOTE,
+    'Run fiche on an LLM request JSON object: bulky context becomes images for strong page readers (Gemini, Fable 5, Sol 5.6/6.1/6.2); text-tier models run the 4-layer deterministic text compiler (TSCG+TOON+CASI+ACDC) with zero image rendering and pass clean payloads through unchanged. Set upstream to https://chatgpt.com or any /backend-api/codex/ path to force-strip prompt_cache_breakpoint.' + COST_NOTE,
     {
       request: { type: 'object', description: 'Provider request JSON (Anthropic messages, OpenAI responses, chat completions, or Gemini).' },
       model: { type: 'string', description: 'Model id. Overrides request.model when set.' },
@@ -120,29 +123,60 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 async function callTool(name: string, args: Record<string, unknown>) {
   stats.calls += 1;
   if (name === 'health') {
+    const envPort = Number(process.env.PORT ?? 47821);
+    const port = Number.isSafeInteger(envPort) && envPort > 0 && envPort <= 65535 ? envPort : 47821;
+    let proxy: Record<string, unknown> = {
+      running: false,
+      port,
+      hint: 'Start proxy daemon with `fiche` or `fiche service start`',
+    };
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+        signal: AbortSignal.timeout(250),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as Record<string, unknown>;
+        proxy = { running: true, ...data };
+      }
+    } catch {
+      // Proxy daemon unreachable — fast fail-open status
+    }
     return textResult({
       name: SERVER_NAME,
       version: SERVER_VERSION,
       protocol: MCP_PROTOCOL,
       codex: 'prompt_cache_breakpoint is omitted for chatgpt.com and /backend-api/codex/responses',
+      proxy,
     });
   }
-  if (name === 'stats') return textResult({ ...stats });
+  if (name === 'stats') {
+    const report = readTurnReport(defaultEventsFilePath());
+    return textResult({
+      ...stats,
+      proxy: report.lastTurn
+        ? {
+            lastTurn: report.lastTurn,
+            session: report.session,
+          }
+        : null,
+    });
+  }
   if (name === 'check_model') {
     const model = args.model;
     if (typeof model !== 'string' || !model.trim()) return textResult({ error: 'model must be a non-empty string' }, true);
     stats.checkCalls += 1;
-    const inScope = isInklingSupportedModel(model);
-    const tier = readerTier(model);
+    const inScope = isFicheSupportedModel(model);
+    const tier = shouldImageModel(model, inScope) ? 'image' : 'text';
     return textResult({
       model,
       inScope,
       readerTier: tier,
+      textEngine: tier === 'image' ? 'image+CASI+hygiene' : 'TSCG+TOON+CASI+ACDC',
       action: !inScope
-        ? 'passthrough: model is outside INKLING_MODELS'
+        ? 'passthrough: model is outside FICHE_MODELS'
         : tier === 'image'
           ? 'images for bulky stale context; live turns stay text'
-          : 'passthrough as text: this reader misreads dense glyphs or is unmeasured',
+          : 'passthrough as text: image rendering disabled; uses 4-layer text engine (TSCG+TOON+CASI+ACDC)',
     });
   }
   if (name === 'transform_request') {
@@ -155,7 +189,17 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const wire = (typeof args.wire === 'string' ? args.wire : 'auto') as RequestWire;
     const upstream = typeof args.upstream === 'string' ? args.upstream : undefined;
     const pathname = typeof args.pathname === 'string' ? args.pathname : undefined;
-    const body = new TextEncoder().encode(JSON.stringify({ ...request, ...(model ? { model } : {}) }));
+    const looksGoogleAuto =
+      wire === 'auto' &&
+      !Array.isArray(request.input) &&
+      typeof request.instructions !== 'string' &&
+      !Array.isArray(request.messages) &&
+      (request.systemInstruction !== undefined || request.contents !== undefined);
+    const isGooglePayload = wire === 'google' || looksGoogleAuto;
+    const outboundPayload = isGooglePayload
+      ? request
+      : { ...request, ...(model ? { model } : {}) };
+    const body = new TextEncoder().encode(JSON.stringify(outboundPayload));
     if (body.byteLength > MCP_MAX_BYTES) {
       return textResult({ error: `request exceeds ${MCP_MAX_BYTES} bytes` }, true);
     }
@@ -186,7 +230,10 @@ async function callTool(name: string, args: Record<string, unknown>) {
 }
 
 export async function handleMcpMessage(message: unknown): Promise<unknown | null> {
-  const rpc = asRecord(message) as JsonRpc | null;
+  const rpc = asRecord(message) as (JsonRpc & { error?: unknown }) | null;
+  if (rpc && rpc.jsonrpc === '2.0' && rpc.method === undefined && asRecord(rpc.error)) {
+    return rpc;
+  }
   if (!rpc || rpc.jsonrpc !== '2.0' || typeof rpc.method !== 'string') {
     return { jsonrpc: '2.0', id: rpc?.id ?? null, error: { code: -32600, message: 'invalid jsonrpc request' } };
   }
@@ -209,7 +256,7 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
         protocolVersion,
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: 'inkling renders bulky stale context as images only for strong page readers (Gemini, Fable 5, Sol); every other model passes through as text. This server does not store prompts.',
+        instructions: 'fiche renders bulky stale context as images for strong page readers (Gemini, Fable 5, Sol) and runs the 4-layer deterministic text compiler (TSCG+TOON+CASI+ACDC) on text-tier models while passing clean payloads through. This server does not store prompts.',
       },
     };
   }
@@ -226,6 +273,8 @@ export async function handleMcpMessage(message: unknown): Promise<unknown | null
   return { jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${rpc.method}` } };
 }
 
+const LSP_HEADER_PREFIX_RE = /^(?:content-length|content-type)\s*:/i;
+
 /** Newline-delimited JSON, plus LSP Content-Length frames if a client sends them. */
 export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message: unknown, framed: boolean) => void): string {
   let rest = buffer + chunk;
@@ -240,13 +289,15 @@ export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message:
   while (rest.length > 0) {
     // Only a leading header is framing. A JSON payload that mentions
     // "Content-Length:" must not flip the session into LSP mode.
-    if (rest.startsWith('Content-Length:')) {
-      const headerEnd = rest.indexOf('\r\n\r\n');
-      const alt = headerEnd >= 0 ? headerEnd : rest.indexOf('\n\n');
+    if (LSP_HEADER_PREFIX_RE.test(rest)) {
+      const crlfEnd = rest.indexOf('\r\n\r\n');
+      const lfEnd = rest.indexOf('\n\n');
+      const useCrlf = crlfEnd >= 0 && (lfEnd < 0 || crlfEnd <= lfEnd);
+      const alt = useCrlf ? crlfEnd : lfEnd;
       if (alt < 0) break;
+      const sep = useCrlf ? 4 : 2;
       const header = rest.slice(0, alt);
-      const match = /Content-Length:\s*(\d+)/i.exec(header);
-      const sep = headerEnd >= 0 ? 4 : 2;
+      const match = /^content-length\s*:\s*(\d+)/im.exec(header);
       if (!match) {
         rest = rest.slice(alt + sep);
         continue;
@@ -266,7 +317,11 @@ export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message:
       if (bytes.length < length) break;
       const json = bytes.subarray(0, length).toString('utf8');
       rest = bytes.subarray(length).toString('utf8');
-      try { onMessage(JSON.parse(json), true); } catch { /* ignore a bad frame */ }
+      try {
+        onMessage(JSON.parse(json), true);
+      } catch {
+        onMessage({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }, true);
+      }
       continue;
     }
     const nl = rest.indexOf('\n');
@@ -274,7 +329,11 @@ export function pushMcpChunk(buffer: string, chunk: string, onMessage: (message:
     const line = rest.slice(0, nl).replace(/\r$/, '').trim();
     rest = rest.slice(nl + 1);
     if (!line) continue;
-    try { onMessage(JSON.parse(line), false); } catch { /* ignore */ }
+    try {
+      onMessage(JSON.parse(line), false);
+    } catch {
+      onMessage({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }, false);
+    }
   }
   return rest;
 }
@@ -288,25 +347,62 @@ export function encodeMcpMessage(message: unknown, framed: boolean): string {
 export async function runStdioServer(): Promise<void> {
   let buffer = '';
   let framed = false;
-  const write = (message: unknown) => {
-    process.stdout.write(encodeMcpMessage(message, framed));
+  let stdoutBroken = false;
+  const activeRequests = new Set<Promise<void>>();
+  const onStdoutError = (err: NodeJS.ErrnoException) => {
+    if (err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED') {
+      stdoutBroken = true;
+    }
   };
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk: string) => {
-    buffer = pushMcpChunk(buffer, chunk, (message, messageFramed) => {
-      if (messageFramed) framed = true;
-      void handleMcpMessage(message).then((response) => {
+  process.stdout.on('error', onStdoutError);
+  const write = (message: unknown) => {
+    if (stdoutBroken || process.stdout.destroyed || !process.stdout.writable) return;
+    try {
+      process.stdout.write(encodeMcpMessage(message, framed));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      if (code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED') stdoutBroken = true;
+      else throw err;
+    }
+  };
+  const dispatch = (message: unknown, messageFramed: boolean) => {
+    if (messageFramed) framed = true;
+    const p = handleMcpMessage(message)
+      .then((response) => {
         if (response) write(response);
-      }).catch((err: unknown) => {
+      })
+      .catch((err: unknown) => {
         const messageText = err instanceof Error ? err.message : 'internal error';
         write({ jsonrpc: '2.0', id: null, error: { code: -32603, message: messageText } });
+      })
+      .finally(() => {
+        activeRequests.delete(p);
       });
+    activeRequests.add(p);
+  };
+  process.stdin.setEncoding('utf8');
+  const onData = (chunk: string) => {
+    buffer = pushMcpChunk(buffer, chunk, dispatch);
+  };
+  process.stdin.on('data', onData);
+  try {
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        if (buffer.trim().length > 0 && !LSP_HEADER_PREFIX_RE.test(buffer)) {
+          buffer = pushMcpChunk(buffer, '\n', dispatch);
+        }
+        resolve();
+      };
+      process.stdin.once('end', finish);
+      process.stdin.once('close', finish);
     });
-  });
-  await new Promise<void>((resolve) => {
-    process.stdin.on('end', () => resolve());
-    process.stdin.on('close', () => resolve());
-  });
+    while (activeRequests.size > 0) {
+      await Promise.allSettled([...activeRequests]);
+    }
+  } finally {
+    process.stdin.off('data', onData);
+    process.stdout.off('error', onStdoutError);
+  }
 }
 
 function loopbackHost(hostname: string): boolean {
@@ -315,7 +411,8 @@ function loopbackHost(hostname: string): boolean {
 }
 
 function originAllowed(origin: string | undefined): boolean {
-  if (!origin) return true;
+  if (origin === undefined) return true;
+  if (!origin.trim()) return false;
   try {
     return loopbackHost(new URL(origin).hostname);
   } catch {
@@ -336,7 +433,10 @@ export function hostHeaderAllowed(hostHeader: string | undefined): boolean {
   return loopbackHost(hostname);
 }
 
-export function startHttpServer(port: number): Promise<{ port: number; close: () => Promise<void> }> {
+export function startHttpServer(
+  port: number,
+  options: { ipv4Only?: boolean; retriesLeft?: number } = {},
+): Promise<{ port: number; ipv6Listening: boolean; close: () => Promise<void> }> {
   const onRequest = (req: IncomingMessage, res: ServerResponse) => {
     const origin = req.headers.origin;
     const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
@@ -409,25 +509,49 @@ export function startHttpServer(port: number): Promise<{ port: number; close: ()
     if (!target.listening) { done(); return; }
     target.close((err) => err ? fail(err) : done());
   });
+  const retriesLeft = options.retriesLeft ?? (port === 0 ? 3 : 0);
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, '127.0.0.1', () => {
       const address = server.address();
       const bound = address && typeof address === 'object' ? address.port : port;
       let settled = false;
-      const finish = () => {
+      const finish = (ipv6Listening: boolean) => {
         if (settled) return;
         settled = true;
         resolve({
           port: bound,
+          ipv6Listening,
           close: async () => {
             await closeServer(server);
             await closeServer(v6);
           },
         });
       };
-      v6.once('error', finish);
-      v6.listen(bound, '::1', finish);
+      if (options.ipv4Only) {
+        finish(false);
+        return;
+      }
+      v6.once('error', (err: NodeJS.ErrnoException) => {
+        if (settled) return;
+        if (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL') {
+          finish(false);
+          return;
+        }
+        if (port === 0 && err.code === 'EADDRINUSE' && retriesLeft > 0) {
+          settled = true;
+          void closeServer(server).then(
+            () => startHttpServer(0, { ...options, retriesLeft: retriesLeft - 1 }).then(resolve, reject),
+            reject,
+          );
+          return;
+        }
+        settled = true;
+        void closeServer(server).finally(() => {
+          reject(new Error(`failed to bind ::1:${bound} (${err.code ?? err.message}); pass --ipv4 to bind 127.0.0.1 only`));
+        });
+      });
+      v6.listen(bound, '::1', () => finish(true));
     });
   });
 }

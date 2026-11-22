@@ -152,12 +152,19 @@ describe('absolute-form authority carries the implied default port', () => {
 
   it('destroys the downstream response immediately when upstream aborts mid-stream', async () => {
     let abortUpstream: (() => void) | undefined;
-    const upstreamServer = createServer((_req, out) => {
+    const noop = () => {};
+    const upstreamServer = createServer((req, out) => {
+      req.on('error', noop);
+      out.on('error', noop);
+      req.socket?.on('error', noop);
       out.writeHead(200, { 'content-type': 'text/event-stream' });
       out.flushHeaders();
       out.write('data: {"type":"thinking_delta","delta":"hi"}\n\n');
       abortUpstream = () => out.destroy(new Error('upstream terminated'));
     });
+    upstreamServer.on('error', noop);
+    upstreamServer.on('clientError', noop);
+    upstreamServer.on('connection', (sock) => sock.on('error', noop));
     const upstreamListening = Promise.withResolvers<void>();
     upstreamServer.listen(0, '127.0.0.1', upstreamListening.resolve);
     await upstreamListening.promise;
@@ -167,13 +174,22 @@ describe('absolute-form authority carries the implied default port', () => {
       routes: [parseRoute(`api.anthropic.com/v1/*=http://127.0.0.1:${upstreamPort}`)],
       ca: CA,
     });
-    const warpServer = createServer(handleAbsoluteForm);
+    const warpServer = createServer((req, res) => {
+      req.on('error', noop);
+      res.on('error', noop);
+      req.socket?.on('error', noop);
+      handleAbsoluteForm(req, res);
+    });
+    warpServer.on('error', noop);
+    warpServer.on('clientError', noop);
+    warpServer.on('connection', (sock) => sock.on('error', noop));
     const warpListening = Promise.withResolvers<void>();
     warpServer.listen(0, '127.0.0.1', warpListening.resolve);
     await warpListening.promise;
     const warpPort = (warpServer.address() as AddressInfo).port;
 
     try {
+      let gotResponse = false;
       const responseReady = Promise.withResolvers<IncomingMessage>();
       const clientReq = httpRequest(
         {
@@ -183,10 +199,18 @@ describe('absolute-form authority carries the implied default port', () => {
           path: 'http://api.anthropic.com/v1/messages',
           headers: { host: 'api.anthropic.com', 'content-type': 'application/json' },
         },
-        responseReady.resolve,
+        (res) => {
+          gotResponse = true;
+          responseReady.resolve(res);
+        },
       );
+      clientReq.on('error', (err) => {
+        if (!gotResponse) responseReady.reject(err);
+      });
+      clientReq.on('socket', (sock) => sock.on('error', noop));
       clientReq.end('{}');
       const res = await responseReady.promise;
+      res.socket?.on('error', noop);
       const firstChunk = Promise.withResolvers<Buffer>();
       res.once('data', firstChunk.resolve);
       expect((await firstChunk.promise).toString('utf8')).toContain('thinking_delta');
@@ -198,6 +222,8 @@ describe('absolute-form authority carries the implied default port', () => {
       abortUpstream?.();
       expect(await closedPrematurely.promise).toBe(true);
     } finally {
+      warpServer.closeAllConnections?.();
+      upstreamServer.closeAllConnections?.();
       warpServer.close();
       upstreamServer.close();
     }

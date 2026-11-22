@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fiche-mcp": {
+      "command": "npx",
+      "args": ["--yes", "--package", "@sriinnu/fiche", "fiche-mcp"]
+    }
+  }
+}

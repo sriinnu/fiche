@@ -102,13 +102,29 @@ async function send(
 const BIG = { charsPerToken: 1, minCompressChars: 1 };
 
 describe('proxy pass-through', () => {
-  it.each(['claude-opus-5-5', 'claude-sonnet-5-5', 'grok-4.7'])(
-    'leaves a %s request byte-identical even with aggressive thresholds',
+  it('leaves out-of-scope claude-sonnet-5-5 byte-identical even with aggressive thresholds', async () => {
+    const body = anthropicBody('claude-sonnet-5-5');
+    const { upstream, event } = await send('/v1/messages', body, BIG);
+    expect(upstream).toBe(body);
+    expect(event?.info?.imageCount ?? 0).toBe(0);
+  });
+
+  it.each(['claude-opus-5-5', 'grok-4.7'])(
+    'never images %s: leaves byte-identical with textHygiene off and applies lossless @toon in auto mode',
     async (model) => {
       const body = anthropicBody(model);
+      const { upstream: offUpstream, event: offEvent } = await send('/v1/messages', body, { ...BIG, textHygiene: 'off' });
+      expect(offUpstream).toBe(body);
+      expect(offEvent?.info?.imageCount ?? 0).toBe(0);
+
       const { upstream, event } = await send('/v1/messages', body, BIG);
-      expect(upstream).toBe(body);
       expect(event?.info?.imageCount ?? 0).toBe(0);
+      const rawParsed = JSON.parse(body);
+      const outParsed = JSON.parse(upstream);
+      expect(outParsed.metadata).toEqual(rawParsed.metadata);
+      expect(outParsed.messages[0]).toEqual(rawParsed.messages[0]);
+      expect(outParsed.messages[1]).toEqual(rawParsed.messages[1]);
+      expect(outParsed.messages[2].content[0].content).toContain('@toon');
     },
   );
 

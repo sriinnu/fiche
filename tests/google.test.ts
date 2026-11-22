@@ -11,10 +11,11 @@ import {
 import { geminiVisionTokens } from '../src/core/gemini-model-profiles.js';
 
 describe('parseGoogleModelFromPath', () => {
-  it('extracts model name from Google AI Studio URL path', () => {
+  it('extracts model name from gateway and direct Google AI Studio URL paths', () => {
     expect(parseGoogleModelFromPath('/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent')).toBe('gemini-3.6-flash');
     expect(parseGoogleModelFromPath('/google-ai-studio/v1/models/gemini-3.6-flash:streamGenerateContent')).toBe('gemini-3.6-flash');
-    expect(parseGoogleModelFromPath('/v1beta/models/gemini-3.6-flash:streamGenerateContent')).toBeNull();
+    expect(parseGoogleModelFromPath('/v1beta/models/gemini-3.6-flash:streamGenerateContent')).toBe('gemini-3.6-flash');
+    expect(parseGoogleModelFromPath('/v1/models/gemini-4-argon:generateContent')).toBe('gemini-4-argon');
     expect(parseGoogleModelFromPath('/foo/google-ai-studio/v1beta/models/gemini-3.6-flash:generateContent')).toBeNull();
     expect(parseGoogleModelFromPath('/google-ai-studio/v1beta/models/gemini-3.6-flash:countTokens')).toBeNull();
     expect(parseGoogleModelFromPath('/v1/messages')).toBeNull();
@@ -550,10 +551,34 @@ describe('transformGoogleGenerateContent', () => {
 
     expect(result.info.compressed).toBe(true);
     expect(result.info.historyReason).toBe('collapsed');
-    // All 296 turns before keepTail=4 collapse (used to stall at 191 turns / 32 images).
-    expect(result.info.collapsedTurns).toBe(296);
+    // Full sealed chunks (>= READABLE_CHARS_PER_IMAGE each) collapse while leaving
+    // the trailing < READABLE_CHARS_PER_IMAGE remainder unsealed for cache stability.
+    expect(result.info.collapsedTurns ?? 0).toBeGreaterThanOrEqual(240);
+    expect(result.info.collapsedTurns ?? 0).toBeLessThan(296);
     expect(result.info.collapsedImages ?? 0).toBeLessThanOrEqual(16);
     expect((result.info.imageSources ?? []).join('\n')).not.toContain('internal reasoning trace 0');
+
+    // Appending one more turn must keep already-sealed history PNGs byte-identical.
+    const nextContents = [
+      ...contents,
+      {
+        role: 'model',
+        parts: [{ functionCall: { name: 'bash', args: { command: 'echo step-150' } }, thoughtSignature: 'call-sig-150' }],
+      },
+      {
+        role: 'user',
+        parts: [{ functionResponse: { name: 'bash', response: { output: 'step-output-150 '.repeat(60) } } }],
+      },
+    ];
+    const nextResult = await transformGoogleGenerateContent(
+      new TextEncoder().encode(JSON.stringify({ ...sampleBody, contents: nextContents })),
+      'gemini-4-argon',
+      { compress: true },
+    );
+    expect(nextResult.info.imagePngs?.length).toBeGreaterThanOrEqual(result.info.imagePngs?.length ?? 0);
+    for (let idx = 0; idx < (result.info.imagePngs?.length ?? 0); idx++) {
+      expect(Buffer.from(nextResult.info.imagePngs![idx]!).equals(Buffer.from(result.info.imagePngs![idx]!))).toBe(true);
+    }
   });
 
   it('compresses large omp-shaped functionResponse.response.output payloads in the active tail', async () => {
@@ -642,7 +667,7 @@ describe('transformGoogleGenerateContent', () => {
       },
     ];
 
-    for (let i = 0; i < 14; i++) {
+    for (let i = 0; i < 18; i++) {
       contents.push({
         role: 'model',
         parts: [
@@ -660,7 +685,7 @@ describe('transformGoogleGenerateContent', () => {
           {
             functionResponse: {
               name: 'read',
-              response: { output: `pkg-${i} details `.repeat(160) },
+              response: { output: `pkg-${i} details `.repeat(180) },
             },
           },
         ],
@@ -686,7 +711,7 @@ describe('transformGoogleGenerateContent', () => {
     const serialized = JSON.stringify(out.contents);
 
     // Both the parent user question and the mid-work interjection must survive as native text outside the PNGs
-    expect(serialized).toContain('CURRENT USER REQUEST (live; kept as text by inkling');
+    expect(serialized).toContain('CURRENT USER REQUEST (live; kept as text by fiche');
     expect(serialized).toContain(
       'Can you help me organize the architecture of forge into a diagram?',
     );
@@ -708,7 +733,7 @@ describe('transformGoogleGenerateContent', () => {
         parts: [{ text: 'First task: inspect old module.' }],
       },
     ];
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 16; i++) {
       contents.push({
         role: 'model',
         parts: [
@@ -726,7 +751,7 @@ describe('transformGoogleGenerateContent', () => {
           {
             functionResponse: {
               name: 'read',
-              response: { output: `old-${i} content `.repeat(160) },
+              response: { output: `old-${i} content `.repeat(180) },
             },
           },
         ],

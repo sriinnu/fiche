@@ -377,7 +377,7 @@ export function buildPromptText(
         `   factsheet.txt is the authoritative source of truth for all exact strings.\n`;
 
   return (
-    `These ${pageCount} image${pageCount !== 1 ? 's' : ''} contain source code/text rendered as PNG pages by inkling.\n\n` +
+    `These ${pageCount} image${pageCount !== 1 ? 's' : ''} contain source code/text rendered as PNG pages by fiche.\n\n` +
     fileSection +
     `Instructions for the reading agent:\n` +
     `1. Read the images in order: page-001.png through page-${lastPageStr}.png.\n` +

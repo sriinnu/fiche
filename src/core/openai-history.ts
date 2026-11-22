@@ -998,16 +998,24 @@ async function planResponsesMixedCollapse(
   for (const run of frozenRuns) {
     if (remainingImages === 0) { hitImageCap = true; break; }
     let low = 0;
-    let high = run.length + 1;
     let best: Awaited<ReturnType<typeof renderUnits>> | undefined;
-    while (low + 1 < high) {
-      const count = Math.floor((low + high) / 2);
-      const rendered = await renderUnits(run.slice(0, count));
-      if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
-        low = count;
-        best = rendered;
-      } else {
-        high = count;
+    // Fast path: render the full frozen run once before binary-searching, avoiding
+    // ceil(log2(N)) wasted intermediate PNG renders & cache evictions in the common case.
+    const full = await renderUnits(run);
+    if (full.images.length > 0 && full.images.length <= remainingImages) {
+      low = run.length;
+      best = full;
+    } else if (run.length > 1) {
+      let high = run.length;
+      while (low + 1 < high) {
+        const count = Math.floor((low + high) / 2);
+        const rendered = await renderUnits(run.slice(0, count));
+        if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+          low = count;
+          best = rendered;
+        } else {
+          high = count;
+        }
       }
     }
     if (!best || low === 0) { hitImageCap = true; break; }
@@ -1133,16 +1141,22 @@ export async function planResponsesPairCollapse(
     if (remainingImages === 0) { hitImageCap = true; break; }
 
     let low = 0;
-    let high = run.length + 1;
     let best: Awaited<ReturnType<typeof renderPairs>> | undefined;
-    while (low + 1 < high) {
-      const count = Math.floor((low + high) / 2);
-      const rendered = await renderPairs(run.slice(0, count));
-      if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
-        low = count;
-        best = rendered;
-      } else {
-        high = count;
+    const full = await renderPairs(run);
+    if (full.images.length > 0 && full.images.length <= remainingImages) {
+      low = run.length;
+      best = full;
+    } else if (run.length > 1) {
+      let high = run.length;
+      while (low + 1 < high) {
+        const count = Math.floor((low + high) / 2);
+        const rendered = await renderPairs(run.slice(0, count));
+        if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+          low = count;
+          best = rendered;
+        } else {
+          high = count;
+        }
       }
     }
     if (!best || low === 0) { hitImageCap = true; break; }

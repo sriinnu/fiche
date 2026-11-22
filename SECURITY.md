@@ -5,7 +5,7 @@ The MCP server and the proxy do not store request bodies. `health` and
 
 ## Supported versions
 
-Security fixes are applied to the latest released version of inkling. Users
+Security fixes are applied to the latest released version of `@sriinnu/fiche` (`fiche`). Users
 should upgrade to the newest release before reporting a problem that may
 already have been fixed.
 
@@ -17,7 +17,7 @@ public discussion.
 
 Use GitHub's private vulnerability reporting form:
 
-https://github.com/sriinnu/inkling/security/advisories/new
+https://github.com/sriinnu/fiche/security/advisories/new
 
 Include, where possible:
 
@@ -34,16 +34,17 @@ Please allow time for a patch before publishing details.
 
 ## Deployment security
 
-inkling handles API credentials and may process confidential prompts and tool
+fiche handles API credentials and may process confidential prompts and tool
 results. Keep the Node server on its default loopback interface unless it is
 placed behind an authenticated, encrypted reverse proxy. Non-loopback bindings
 expose the proxy API, while dashboard routes remain loopback-only.
 
 For Cloudflare Workers deployments that inject provider credentials, configure
-`INKLING_WORKER_SECRET`. The Worker fails closed when a provider credential is
-configured without this shared secret. Do not enable
-`INKLING_DEBUG_CAPTURE_4XX` in production: captured request bodies can contain
-prompts and credentials.
+`FICHE_WORKER_SECRET` (legacy `INKLING_WORKER_SECRET` is also honored, with
+`x-fiche-secret` or legacy `x-inkling-secret` headers). The Worker fails closed
+when a provider credential is configured without this shared secret. Do not
+enable `FICHE_DEBUG_CAPTURE_4XX` (or legacy `INKLING_DEBUG_CAPTURE_4XX`) in
+production: captured request bodies can contain prompts and credentials.
 
 Telemetry, diagnostic captures, rendered PNG dumps, configuration files, and
 export artifacts are protected with owner-only permissions on POSIX systems.

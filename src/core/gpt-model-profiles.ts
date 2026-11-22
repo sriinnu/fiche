@@ -20,6 +20,7 @@
  * 1568-edge / ~1.15 MP clamp). Named profiles may override this where their image
  * sizing and font geometry differ.
  */
+import { readBrandEnv } from './env.js';
 import { type RenderFont } from './render.js';
 import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
@@ -226,6 +227,9 @@ const GPT56_SOL_PROFILE: GptModelProfile = {
     // Taller 1954px pages: more chars/image, so Sol can hold a larger budget
     // without the 512px latency cliff that Grok/Qwen hit.
     maxImages: 64,
+    // Prefix-stable per-segment factsheets avoid re-rendering earlier prefix
+    // parts when new chunks seal.
+    factSheetScope: 'per-segment',
   },
   style: {
     ...BASE_STYLE,
@@ -313,7 +317,7 @@ const BUILTIN_RULES: ProfileRule[] = [
   // number. Evaluated before the generic gpt-6 family rule so gpt-6.1-sol
   // inherits Sol's native 14px profile rather than GPT6_PROFILE's 5x8 Spleen.
   {
-    test: (m) => /^gpt-(?:5\.6|6\.1)-sol(?:-|$)/.test(m),
+    test: (m) => /^gpt-(?:5\.6|6\.[12])-sol(?:-|$)/.test(m),
     profile: GPT56_SOL_PROFILE,
   },
   {
@@ -557,7 +561,7 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
     // known family explicitly so `{"gpt-5.6-sol":{...}}` inherits Sol's font
     // and geometry even when a suffixed runtime id is expected.
     const base =
-      key === 'gpt-5.6-sol' || key === 'gpt-6.1-sol'
+      key === 'gpt-5.6-sol' || key === 'gpt-6.1-sol' || key === 'gpt-6.2-sol'
         ? GPT56_SOL_PROFILE
         : resolveBuiltin(key);
     const p = v as Partial<GptModelProfile>;
@@ -647,7 +651,7 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
 }
 
 function envProfiles(): Map<string, GptModelProfile> {
-  const raw = (typeof process !== 'undefined' && process.env && process.env.INKLING_GPT_PROFILES) || '';
+  const raw = readBrandEnv('GPT_PROFILES') || '';
   if (raw !== envRaw) {
     envRaw = raw;
     envMap = parseEnvProfiles(raw);
@@ -662,7 +666,7 @@ function envProfiles(): Map<string, GptModelProfile> {
 export function envPricingOverride(
   model: string | null | undefined,
 ): { cacheReadRate?: number; cacheWriteRate?: number; outputRate?: number } | undefined {
-  const raw = (typeof process !== 'undefined' && process.env && process.env.INKLING_GPT_PROFILES) || '';
+  const raw = readBrandEnv('GPT_PROFILES') || '';
   if (!raw) return undefined;
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch { return undefined; }

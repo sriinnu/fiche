@@ -26,7 +26,23 @@ describe('review fixes', () => {
     else process.env.INKLING_FORCE_IMAGES = prev;
   });
 
-  it('returns a weak-reader request byte-identical, Claude Code identity included', async () => {
+  it('leaves clean text-tier requests byte-identical and runs non-image @toon on repetitive JSON', async () => {
+    const cleanBody = enc.encode(JSON.stringify({
+      model: 'claude-opus-5-5',
+      system: [
+        { type: 'text', text: CLAUDE_CODE_OAUTH_IDENTITY },
+        { type: 'text', text: 'Follow the repository conventions.' },
+      ],
+      messages: [{
+        role: 'user',
+        content: 'Summarize the architecture choices cleanly.',
+      }],
+    }));
+    const cleanResult = await transformAnyRequest(cleanBody, { model: 'claude-opus-5-5', wire: 'anthropic', charsPerToken: 1, minCompressChars: 1 });
+    expect(cleanResult.report.readerTier).toBe('text');
+    expect(cleanResult.report.imaged).toBe(false);
+    expect(cleanResult.body).toBe(cleanBody);
+
     const body = enc.encode(JSON.stringify({
       model: 'claude-opus-5-5',
       system: [
@@ -41,7 +57,14 @@ describe('review fixes', () => {
     const result = await transformAnyRequest(body, { model: 'claude-opus-5-5', wire: 'anthropic', charsPerToken: 1, minCompressChars: 1 });
     expect(result.report.readerTier).toBe('text');
     expect(result.report.imaged).toBe(false);
-    expect(result.body).toBe(body);
+    expect(result.report.textCompressed).toBe(true);
+    expect(result.report.textStages).toContain('toon');
+    const parsed = JSON.parse(new TextDecoder().decode(result.body)) as {
+      system: Array<{ text: string }>;
+      messages: Array<{ content: Array<{ content: string }> }>;
+    };
+    expect(parsed.system[0]?.text).toBe(CLAUDE_CODE_OAUTH_IDENTITY);
+    expect(parsed.messages[0]?.content[0]?.content).toContain('@toon');
   });
 
   it('does not reserialize a Codex body that has no breakpoint', () => {

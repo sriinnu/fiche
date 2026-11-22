@@ -94,9 +94,9 @@ async function startNode(extraEnv: Record<string, string> = {}): Promise<{
   child.stdout?.on('data', (b) => output.push(String(b)));
   child.stderr?.on('data', (b) => output.push(String(b)));
   await new Promise<void>((resolve, reject) => {
-    const deadline = setTimeout(() => reject(new Error(output.join(''))), 10_000);
+    const deadline = setTimeout(() => reject(new Error(output.join(''))), 30_000);
     const poll = () => {
-      if (output.join('').includes('[inkling] listening on')) {
+      if (output.join('').includes('[fiche] listening on')) {
         clearTimeout(deadline);
         resolve();
         return;

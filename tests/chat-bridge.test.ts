@@ -433,7 +433,7 @@ describe('openAIChatToAnthropicMessage — buffered response translation', () =>
     );
     expect(msg.stop_reason).toBe('max_tokens');
     expect(msg.model).toBe('moonshotai/kimi-k3');
-    expect(msg.id).toBe('msg_inkling');
+    expect(msg.id).toBe('msg_fiche');
   });
 
   it('emits an empty text block when the assistant returns no content', () => {

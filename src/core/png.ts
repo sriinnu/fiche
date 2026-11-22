@@ -60,17 +60,24 @@ async function deflateZlib(input: Uint8Array): Promise<Uint8Array> {
   const cs = new CompressionStream('deflate');
   const writer = cs.writable.getWriter();
   // TS 5.7 narrows Uint8Array<ArrayBufferLike> away from BufferSource; safe since we never use SharedArrayBuffer.
-  void writer.write(input as Uint8Array<ArrayBuffer>);
-  void writer.close();
+  const writeDone = (async () => {
+    await writer.write(input as Uint8Array<ArrayBuffer>);
+    await writer.close();
+  })();
 
   const reader = cs.readable.getReader();
-  const chunks: Uint8Array[] = [];
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
-  }
-  return concat(chunks);
+  const readDone = (async () => {
+    const chunks: Uint8Array[] = [];
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) chunks.push(value);
+    }
+    return concat(chunks);
+  })();
+
+  const [, deflated] = await Promise.all([writeDone, readDone]);
+  return deflated;
 }
 
 // ---- Encode --------------------------------------------------------------
@@ -96,16 +103,29 @@ function filterAverage(pixels: Uint8Array, width: number, height: number, bpp: n
   const rowBytes = width * bpp;
   const stride = rowBytes + 1;
   const out = new Uint8Array(stride * height);
-  for (let y = 0; y < height; y++) {
+  if (height === 0 || rowBytes === 0) return out;
+
+  // Row 0: upper neighbor `b` is zero everywhere.
+  out[0] = 3;
+  for (let x = 0; x < bpp; x++) {
+    out[1 + x] = pixels[x]!;
+  }
+  for (let x = bpp; x < rowBytes; x++) {
+    out[1 + x] = (pixels[x]! - (pixels[x - bpp]! >> 1)) & 0xff;
+  }
+
+  // Remaining rows: specialize no-branch inner loop.
+  for (let y = 1; y < height; y++) {
     const src = y * rowBytes;
+    const prev = src - rowBytes;
     const dst = y * stride;
     out[dst] = 3; // filter: Average
-    for (let x = 0; x < rowBytes; x++) {
-      // Off-image neighbors are defined as zero by the spec, not clamped/wrapped.
-      const a = x >= bpp ? pixels[src + x - bpp]! : 0;
-      const b = y > 0 ? pixels[src - rowBytes + x]! : 0;
-      // a + b ≤ 510 so the shift is exact; only the result wraps to a byte.
-      out[dst + 1 + x] = (pixels[src + x]! - ((a + b) >> 1)) & 0xff;
+    for (let x = 0; x < bpp; x++) {
+      out[dst + 1 + x] = (pixels[src + x]! - (pixels[prev + x]! >> 1)) & 0xff;
+    }
+    const dstData = dst + 1;
+    for (let x = bpp; x < rowBytes; x++) {
+      out[dstData + x] = (pixels[src + x]! - ((pixels[src + x - bpp]! + pixels[prev + x]!) >> 1)) & 0xff;
     }
   }
   return out;
@@ -113,6 +133,9 @@ function filterAverage(pixels: Uint8Array, width: number, height: number, bpp: n
 
 /** Encode a single-channel (grayscale) buffer as PNG bytes. pixels is row-major, length = width × height. */
 export async function encodeGrayPng(pixels: Uint8Array, width: number, height: number): Promise<Uint8Array> {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new Error(`encodeGrayPng: invalid dimensions ${width}×${height}`);
+  }
   if (pixels.length !== width * height) {
     throw new Error(`encodeGrayPng: pixels.length=${pixels.length} != ${width}×${height}=${width * height}`);
   }
@@ -136,6 +159,9 @@ export async function encodeGrayPng(pixels: Uint8Array, width: number, height: n
 
 /** Encode an RGB (3 bytes/pixel, R,G,B) buffer as PNG bytes (colorType 2 = truecolor). length = width × height × 3. */
 export async function encodeRgbPng(pixels: Uint8Array, width: number, height: number): Promise<Uint8Array> {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new Error(`encodeRgbPng: invalid dimensions ${width}×${height}`);
+  }
   if (pixels.length !== width * height * 3) {
     throw new Error(`encodeRgbPng: pixels.length=${pixels.length} != ${width}×${height}×3=${width * height * 3}`);
   }
@@ -156,12 +182,26 @@ export async function encodeRgbPng(pixels: Uint8Array, width: number, height: nu
   ]);
 }
 
-/** Base64-encode bytes. Chunks to avoid call-stack blow-up from String.fromCharCode(...bigArray). */
+type Base64CapableUint8Array = Uint8Array & { toBase64?: () => string };
+const base64Memo = new WeakMap<Uint8Array, string>();
+
+/**
+ * Base64-encode PNG bytes. Prefers native V8 `Uint8Array.prototype.toBase64` (~100x faster
+ * than char-by-char `btoa`) and memoizes the JS fallback on immutable pixel buffers.
+ */
 export function bytesToBase64(bytes: Uint8Array): string {
+  const nativeFn = (bytes as Base64CapableUint8Array).toBase64;
+  if (typeof nativeFn === 'function') {
+    return nativeFn.call(bytes);
+  }
+  const hit = base64Memo.get(bytes);
+  if (hit !== undefined) return hit;
   let binary = '';
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {
     binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
   }
-  return btoa(binary);
+  const b64 = btoa(binary);
+  base64Memo.set(bytes, b64);
+  return b64;
 }

@@ -1,4 +1,4 @@
-# Contributing to inkling
+# Contributing to fiche
 
 Small PRs with receipts merge fast.
 

@@ -1,4 +1,5 @@
-import { isInklingSupportedModel } from './applicability.js';
+import { isFicheSupportedModel } from './applicability.js';
+import { prefersText } from './reader-tier.js';
 import { countCacheControlMarkers } from './measurement.js';
 import {
   renderTextToPngsWithCharLimit,
@@ -23,7 +24,7 @@ export type { KeepSharpBlock, RecoverableBlock };
 
 export type BytesLike = Uint8Array | ArrayBuffer | ArrayBufferView;
 
-export interface InklingOptions
+export interface FicheOptions
   extends Pick<
     TransformOptions,
     'charsPerToken' | 'historyAmortizationHorizon' | 'keepSharp' | 'emitRecoverable'
@@ -32,15 +33,15 @@ export interface InklingOptions
   readonly compress?: boolean;
 }
 
-export interface InklingTransformInput {
+export interface FicheTransformInput {
   readonly body: BytesLike;
   /** Resolved upstream model when available; aliases are accepted for applicability checks. */
   readonly model?: string | null;
   readonly requestId?: string;
-  readonly options?: InklingOptions;
+  readonly options?: FicheOptions;
 }
 
-export type InklingReason =
+export type FicheReason =
   | 'applied'
   | 'unsupported_model'
   | 'parse_error'
@@ -52,10 +53,10 @@ export type InklingReason =
   | 'transform_error'
   | 'passthrough';
 
-export interface InklingTransformResult {
+export interface FicheTransformResult {
   readonly body: Uint8Array;
   readonly applied: boolean;
-  readonly reason: InklingReason;
+  readonly reason: FicheReason;
   readonly detail?: string;
   readonly info: TransformInfo;
   readonly cache: {
@@ -63,6 +64,15 @@ export interface InklingTransformResult {
     readonly markerCount: number;
   };
 }
+
+/** @deprecated Use {@link FicheOptions}. */
+export type InklingOptions = FicheOptions;
+/** @deprecated Use {@link FicheReason}. */
+export type InklingReason = FicheReason;
+/** @deprecated Use {@link FicheTransformInput}. */
+export type InklingTransformInput = FicheTransformInput;
+/** @deprecated Use {@link FicheTransformResult}. */
+export type InklingTransformResult = FicheTransformResult;
 
 function toUint8Array(bytes: BytesLike): Uint8Array {
   if (bytes instanceof Uint8Array) return bytes;
@@ -85,7 +95,7 @@ function emptyInfo(reason: string): TransformInfo {
   };
 }
 
-function classifyReason(info: TransformInfo): InklingReason {
+function classifyReason(info: TransformInfo): FicheReason {
   if (info.compressed) return 'applied';
   const r = info.reason ?? '';
   if (r.startsWith('parse_error')) return 'parse_error';
@@ -102,10 +112,10 @@ function classifyReason(info: TransformInfo): InklingReason {
  * reasons, and cache_control ownership flag (prevents hosts stacking a second injector).
  */
 export async function transformAnthropicMessages(
-  input: InklingTransformInput,
-): Promise<InklingTransformResult> {
+  input: FicheTransformInput,
+): Promise<FicheTransformResult> {
   const original = toUint8Array(input.body);
-  if (!isInklingSupportedModel(input.model)) {
+  if (!isFicheSupportedModel(input.model)) {
     return {
       body: original,
       applied: false,
@@ -117,7 +127,11 @@ export async function transformAnthropicMessages(
   }
 
   try {
-    const { body, info } = await transformRequest(original, { ...input.options, model: input.model ?? undefined });
+    const { body, info } = await transformRequest(original, {
+      ...input.options,
+      model: input.model ?? undefined,
+      imageCompress: !prefersText(input.model),
+    });
     const reason = classifyReason(info);
     const markerCount = countCacheControlMarkers(body);
     return {
@@ -210,7 +224,7 @@ export async function renderTextToImages(
 
   // Measure the content width. Reflowed source is one joined full-width line, so this is
   // byte-identical to the proxy's history render.
-  const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols);
+  const cols = opts.shrink === false ? maxCols : measureContentCols(source, maxCols, style.markerScale, style.font);
   const imgs = await renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 
   let droppedChars = 0;

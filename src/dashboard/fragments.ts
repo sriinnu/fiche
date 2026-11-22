@@ -1,5 +1,4 @@
 // Server-rendered HTML dashboard — htmx polls fragments, Alpine drives the toast tray.
-// Presentation only; server code (src/dashboard.ts, src/node.ts) needs no edits.
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
@@ -62,14 +61,13 @@ export function renderToggleFragment(enabled: boolean): string {
     ? ` hx-confirm="Turn compression off?\n\nRequests will pass straight through to Claude, unchanged. Restarting the proxy turns it back on."`
     : '';
   return (
-    banner +
     `<div class="switch">` +
-    `<span class="switch-state ${enabled ? 'on' : 'off'}"><span class="switch-dot"></span>${enabled ? 'Compression on' : 'Compression off'}</span>` +
+    `<span class="switch-state ${enabled ? 'on' : 'off'}" title="Kill switch — resets to on when you restart"><span class="switch-dot"></span>${enabled ? 'Compression on' : 'Compression off'}</span>` +
     `<button class="switch-btn" type="button" hx-post="/fragments/toggle" hx-target="#frag-toggle" hx-vals='{"enabled": ${!enabled}}'${confirm}>` +
     (enabled ? 'Disable compression' : 'Enable compression') +
     `</button>` +
-    `<span class="hint">kill switch · resets to on when you restart</span>` +
-    `</div>`
+    `</div>` +
+    banner
   );
 }
 
@@ -140,14 +138,31 @@ export function renderModelsFragment(
       `hx-vals='${escapeHtml(`{"model":${JSON.stringify(id)},"on":${!lit}}`)}'>${escapeHtml(label)}${lit ? ' ✓' : ''}</button>`
     );
   };
+  const isFirstPartyModel = (id: string): boolean => {
+    const base = id.toLowerCase().replace(/\[[^\]]*\]/g, '').split('/').pop() ?? '';
+    return (
+      base.startsWith('claude') ||
+      id.toLowerCase().includes('gemini') ||
+      /^(?:gpt|o[134])(?:[-.]|$)/.test(base)
+    );
+  };
   const claudeChips = ids.filter((id) => id.startsWith('claude')).map(chipFor).join('');
   const geminiChips = ids.filter((id) => id.includes('gemini')).map(chipFor).join('');
-  const gptChips = ids.filter((id) => id.startsWith('gpt')).map(chipFor).join('');
-  const grokChips = ids.filter((id) => id.startsWith('grok')).map(chipFor).join('');
-  const otherChips = ids
-    .filter((id) => !id.startsWith('claude') && !id.startsWith('gpt') && !id.startsWith('grok') && !id.includes('gemini'))
-    .map(chipFor)
-    .join('');
+  const gptChips = ids.filter((id) => isFirstPartyModel(id) && !id.startsWith('claude') && !id.includes('gemini')).map(chipFor).join('');
+  const thirdPartyIds = ids.filter((id) => !isFirstPartyModel(id));
+  const thirdPartyChips = thirdPartyIds.map(chipFor).join('');
+  const activeThirdParty = thirdPartyIds.filter((id) => on.has(id));
+  const firstPartyActive = active.filter((id) => isFirstPartyModel(id));
+  const thirdPartyBulkButton =
+    activeThirdParty.length > 0
+      ? `<button class="mini-btn" type="button" ` +
+        `hx-post="/fragments/models" hx-target="#frag-models" ` +
+        `hx-vals='${escapeHtml(JSON.stringify({ list: firstPartyActive.join(',') || 'off' }))}'>Disable all third-party (${activeThirdParty.length})</button>`
+      : thirdPartyIds.length > 0
+        ? `<button class="mini-btn" type="button" ` +
+          `hx-post="/fragments/models" hx-target="#frag-models" ` +
+          `hx-vals='${escapeHtml(JSON.stringify({ list: [...new Set([...active, ...thirdPartyIds])].join(',') }))}'>Enable third-party</button>`
+        : '';
   const moot = enabled
     ? ''
     : `<div class="models"><span class="hint">compression is off — these settings have no effect right now</span></div>`;
@@ -166,16 +181,58 @@ export function renderModelsFragment(
     `<div class="models">` +
     `<span class="models-label">Image OpenAI Responses models</span>` +
     gptChips +
-    grokChips +
-    otherChips +
     `<span class="hint">opt-in · no Anthropic cache_control</span>` +
     `</div>` +
     `<div class="models">` +
-    `<span class="models-label">INKLING_MODELS</span>` +
+    `<span class="models-label">Third-party models</span>` +
+    thirdPartyChips +
+    thirdPartyBulkButton +
+    `<span class="hint">4-layer deterministic text hygiene · DeepSeek, Kimi, GLM, Grok</span>` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">FICHE_MODELS</span>` +
     `<input class="models-csv" id="models-csv" type="text" name="list" ` +
     `value="${escapeHtml(active.join(','))}" spellcheck="false" autocomplete="off" ` +
     `hx-post="/fragments/models" hx-target="#frag-models" hx-trigger="change">` +
     `<span class="hint">CSV of bases, or off · applies on enter/blur · export to persist</span>` +
+    `</div>`
+  );
+}
+
+/** Render server-driven 1-click controls for 3rd-party plugins, skills & extensions. */
+export function renderPluginsFragment(
+  plugins: ReadonlyArray<{ id: string; name: string; kind: string; enabled: boolean }>,
+): string {
+  const thirdParty = plugins.filter((p) => p.kind !== 'builtin' && p.id !== 'skill:fiche');
+  if (thirdParty.length === 0) {
+    return `<div class="models"><span class="hint">No 3rd-party plugins or skills discovered in ~/.fiche/plugins or ~/.agents/skills.</span></div>`;
+  }
+  const activeCount = thirdParty.filter((p) => p.enabled).length;
+  const anyOn = activeCount > 0;
+  const bulkBtn =
+    `<button class="mini-btn" type="button" ` +
+    `hx-post="/fragments/plugins" hx-target="#frag-plugins" ` +
+    `hx-vals='${escapeHtml(JSON.stringify({ scope: 'third-party', enabled: !anyOn }))}'>` +
+    `${anyOn ? `Disable all 3rd-party (${activeCount})` : `Enable all 3rd-party (${thirdParty.length})`}</button>`;
+  const chips = thirdParty
+    .map((p) => {
+      const lit = p.enabled;
+      return (
+        `<button class="chip${lit ? ' on' : ''}" type="button" ` +
+        `hx-post="/fragments/plugins" hx-target="#frag-plugins" ` +
+        `hx-vals='${escapeHtml(JSON.stringify({ id: p.id, enabled: !lit }))}'>${escapeHtml(p.name)}${lit ? ' ✓' : ''}</button>`
+      );
+    })
+    .join('');
+  return (
+    `<div class="models">` +
+    `<span class="models-label">3rd-party toggle</span>` +
+    bulkBtn +
+    `<span class="hint">${activeCount}/${thirdParty.length} active · built-in stages &amp; fiche skill stay on</span>` +
+    `</div>` +
+    `<div class="models">` +
+    `<span class="models-label">Extensions</span>` +
+    chips +
     `</div>`
   );
 }
@@ -198,7 +255,7 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
       `<div class="hero hero-empty">` +
       `<div class="hero-eyebrow">Since start</div>` +
       `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch it with <code>inkling warp -- claude</code> to keep <code>/remote-control</code> and claude.ai connectors working. Send a message and your running savings show up right here.</div>` +
+      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch it with <code>fiche warp -- claude</code> to keep <code>/remote-control</code> and claude.ai connectors working. Send a message and your running savings show up right here.</div>` +
       `</div>`
     );
   }
@@ -281,7 +338,7 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     ? statTile(
         'Cost per request',
         `$${cAvg.toFixed(4)}`,
-        `vs $${withoutAvg.toFixed(4)} without inkling`,
+        `vs $${withoutAvg.toFixed(4)} without fiche`,
         cAvg <= withoutAvg ? 'pos' : 'neg',
         'Average cost of paid imaged requests versus the cache-aware text counterfactual for those same requests. Unmeasured requests are assigned zero savings.',
       )
@@ -354,12 +411,12 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
     `<span class="src">source: ${escapeHtml(pa.source || 'docs.anthropic.com pricing')}</span>`;
 
   const costPerRequestMath =
-    `<div><span class="k">formula:</span> <span class="v">without_inkling = actual_imaged + measured_savings</span></div>` +
+    `<div><span class="k">formula:</span> <span class="v">without_fiche = actual_imaged + measured_savings</span></div>` +
     `<div><span class="k">why:</span> <span class="v">both averages cover the same paid imaged requests. Passthrough requests are not used because the profitability gate selects a different, generally smaller population.</span></div>` +
     `<div class="sp"></div>` +
     mathRow(`actual imaged (n=${paidImaged})`, `$${(s.compressed_actual_usd || 0).toFixed(4)}`, `total · avg $${cAvg.toFixed(4)}/req`) +
     mathRow('measured savings', `$${(s.saved_usd || 0).toFixed(4)}`, 'cache-aware input-side total') +
-    mathRow('without inkling', `$${withoutAvg.toFixed(4)}/req`, '<span class="op">=</span> (actual imaged + measured savings) / n') +
+    mathRow('without fiche', `$${withoutAvg.toFixed(4)}/req`, '<span class="op">=</span> (actual imaged + measured savings) / n') +
     `<span class="src">unmeasured imaged rows remain in n and actual cost, with zero assumed savings</span>`;
 
   const pctMath =
@@ -605,7 +662,7 @@ export function renderContextMapFragment(
     `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
     (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
     capNote +
-    `<div class="split-note">inkling can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
+    `<div class="split-note">fiche can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
     `<div class="split-head">Kept as plain text <span class="split-sum">byte-exact</span></div>` +
@@ -730,7 +787,7 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
     // When source pane is open the image appears inside the pairing — don't duplicate it.
     main = showSource ? '' : `<div class="frame"><img src="${imgSrc}" alt="rendered page" /></div>`;
   } else {
-    main = `<div class="empty-note">No images yet — they appear the instant inkling compresses a request.</div>`;
+    main = `<div class="empty-note">No images yet — they appear the instant fiche compresses a request.</div>`;
   }
 
   const showBtn = pin != null ? !pinnedEvicted : hasPreview;
@@ -804,7 +861,13 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
     return `<div class="status">${escapeHtml(p.error || 'no data')}</div><table class="dtable"><tbody></tbody></table>`;
   }
   const s = p.summary;
-  const totalIn = (s.inputTokensTotal || 0) + (s.cacheCreateTokensTotal || 0) + (s.cacheReadTokensTotal || 0);
+  const totalIn = Math.max(
+    0,
+    (s.inputTokensTotal || 0) +
+      (s.cacheCreateTokensTotal || 0) +
+      (s.cacheReadTokensTotal || 0) -
+      (s.inclusiveCacheReadTotal || 0),
+  );
   const hitRateTok = totalIn > 0 ? ((s.cacheReadTokensTotal / totalIn) * 100).toFixed(1) + '%' : '-';
   const hitRateEv =
     s.eventsWithUsage > 0 ? ((s.cacheHitEvents / s.eventsWithUsage) * 100).toFixed(1) + '%' : '-';
@@ -842,173 +905,205 @@ export function renderStatsTableFragment(p: FullStatsPayload): string {
 
 // ---- page shell -------------------------------------------------------------
 
-// Favicon mirrors the .flame-dot glyph: a glossy flame sphere (radial highlight
-// at 35%/30%, --flame -> --flame-strong) ringed by a faint --flame-tint halo.
-// Inlined as a URL-encoded SVG data URI so the dashboard stays self-contained
-// (no extra route/static asset). Keep colors in sync with :root in CSS below.
-const FAVICON =
-  "data:image/svg+xml," +
-  "%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E" +
-  "%3Cdefs%3E%3CradialGradient%20id='f'%20cx='35%25'%20cy='30%25'%20r='80%25'%3E" +
-  "%3Cstop%20offset='0%25'%20stop-color='%23ffd0a8'/%3E" +
-  "%3Cstop%20offset='55%25'%20stop-color='%23ff5a1f'/%3E" +
-  "%3Cstop%20offset='100%25'%20stop-color='%23e8420a'/%3E" +
-  "%3C/radialGradient%3E%3C/defs%3E" +
-  "%3Ccircle%20cx='16'%20cy='16'%20r='15.5'%20fill='%23fff1ea'/%3E" +
-  "%3Ccircle%20cx='16'%20cy='16'%20r='10'%20fill='url(%23f)'/%3E%3C/svg%3E";
+// Concept A prismatic optical compression funnel & faceted crystal frame.
+// Exported so both the inlined data-URI favicon and /favicon.svg share one source.
+export const FICHE_ICON_SVG =
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="fiche">` +
+  `<defs>` +
+  `<linearGradient id="fa-top" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#FF4D5A"/><stop offset="52%" stop-color="#FF6B2B"/><stop offset="100%" stop-color="#FFB020"/></linearGradient>` +
+  `<linearGradient id="fa-mid" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#9333EA"/><stop offset="52%" stop-color="#C026D3"/><stop offset="100%" stop-color="#F43F8E"/></linearGradient>` +
+  `<linearGradient id="fa-bot" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stop-color="#06E3F5"/><stop offset="52%" stop-color="#0EA5E9"/><stop offset="100%" stop-color="#3B82F6"/></linearGradient>` +
+  `<linearGradient id="fa-gem-top" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#FFD166"/><stop offset="100%" stop-color="#FF70A6"/></linearGradient>` +
+  `<linearGradient id="fa-gem-bot" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#C084FC"/><stop offset="100%" stop-color="#9333EA"/></linearGradient>` +
+  `</defs>` +
+  `<rect x="8" y="8" width="240" height="240" rx="52" fill="#0B0D14" stroke="#1E293B" stroke-width="3"/>` +
+  `<g transform="translate(22 22) scale(0.828)">` +
+  `<path d="M14 74H62C88 74 96 109 127 109V119C90 119 82 102 62 102H14Z" fill="url(#fa-top)"/>` +
+  `<path d="M14 114H62C88 114 96 123 127 123V133C96 133 88 142 62 142H14Z" fill="url(#fa-mid)"/>` +
+  `<path d="M14 154H62C82 154 90 137 127 137V147C96 147 88 182 62 182H14Z" fill="url(#fa-bot)"/>` +
+  `<path d="M129 104V79H227V177H129V152H114V192H242V64H114V104Z" fill="#FFFFFF"/>` +
+  `<polygon points="178,102 165,128 152,128" fill="#FF5447"/>` +
+  `<polygon points="178,102 191,128 165,128" fill="url(#fa-gem-top)"/>` +
+  `<polygon points="178,102 204,128 191,128" fill="#22D3EE"/>` +
+  `<polygon points="152,128 165,128 178,154" fill="#F43F5E"/>` +
+  `<polygon points="165,128 191,128 178,154" fill="url(#fa-gem-bot)"/>` +
+  `<polygon points="191,128 204,128 178,154" fill="#3B82F6"/>` +
+  `</g>` +
+  `</svg>`;
+
+const FAVICON = `data:image/svg+xml,${encodeURIComponent(FICHE_ICON_SVG)}`;
 
 const CSS = `
   :root {
-    --bg: #faf6f2; --surface: #ffffff; --surface-2: #fbf4ee;
-    --border: #efe5db; --border-strong: #e4d6c8;
-    --ink: #241f1b; --ink-2: #5d534a; --muted: #9b9189;
-    --flame: #ff5a1f; --flame-strong: #e8420a; --flame-ink: #bd3a08; --flame-tint: #fff1ea;
-    --good: #1f9d57; --good-tint: #e7f6ee; --bad: #d8483b; --bad-tint: #fcebe9; --warn: #b7791f; --warn-tint: #fbf0db;
-    --img: #ff5a1f; --img-ink: #bd3a08; --img-tint: #fff1ea;
-    --txt: #2f7db0; --txt-ink: #1f5f8b; --txt-tint: #e9f3fb;
-    --radius: 14px;
-    --shadow: 0 1px 2px rgba(60,35,15,.05), 0 8px 24px rgba(60,35,15,.05);
-    --mono: 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --bg: #f8f9fb; --surface: #ffffff; --surface-2: #f1f3f6;
+    --border: #e5e7eb; --border-strong: #d1d5db;
+    --ink: #0f172a; --ink-2: #475569; --muted: #64748b;
+    --accent: #0f172a; --accent-soft: #f1f5f9;
+    --good: #15803d; --good-tint: #ecfdf5;
+    --bad: #dc2626; --bad-tint: #fef2f2;
+    --warn: #b45309; --warn-tint: #fffbeb;
+    --img: #4f46e5; --img-ink: #3730a3; --img-tint: #eef2ff;
+    --txt: #0369a1; --txt-ink: #075985; --txt-tint: #f0f9ff;
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(15,23,42,0.04);
+    --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color-scheme: light;
   }
-  /* Dark theme: same warm-flame identity, inverted neutrals. Set before first
-     paint by the <head> script (localStorage 'pp-theme' else system pref);
-     toggled by ppTheme(). Accents (flame/img/txt) are lifted for contrast. */
+  /* Dark theme: true graphite obsidian, set before first paint via localStorage 'pp-theme' else system pref. */
   :root[data-theme="dark"] {
-    --bg: #17120f; --surface: #211a15; --surface-2: #2a211b;
-    --border: #352a22; --border-strong: #46382e;
-    --ink: #f6efe8; --ink-2: #cabbac; --muted: #9a8c7d;
-    --flame: #ff6a33; --flame-strong: #e8420a; --flame-ink: #ff9a63; --flame-tint: #3a2318;
-    --good: #3fbd76; --good-tint: #15291f; --bad: #f0645a; --bad-tint: #341b18; --warn: #d99a3a; --warn-tint: #33260f;
-    --img: #ff6a33; --img-ink: #ff9a63; --img-tint: #3a2318;
-    --txt: #5aa3d6; --txt-ink: #8cc3ea; --txt-tint: #142631;
-    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.45);
+    --bg: #0b0d12; --surface: #11141b; --surface-2: #171b24;
+    --border: rgba(255,255,255,0.08); --border-strong: rgba(255,255,255,0.14);
+    --ink: #f1f5f9; --ink-2: #94a3b8; --muted: #64748b;
+    --accent: #e2e8f0; --accent-soft: rgba(255,255,255,0.06);
+    --good: #34d399; --good-tint: rgba(52,211,153,0.10);
+    --bad: #f87171; --bad-tint: rgba(248,113,113,0.10);
+    --warn: #fbbf24; --warn-tint: rgba(251,191,36,0.10);
+    --img: #818cf8; --img-ink: #c7d2fe; --img-tint: rgba(129,140,248,0.12);
+    --txt: #38bdf8; --txt-ink: #bae6fd; --txt-tint: rgba(56,189,248,0.10);
+    --shadow: 0 1px 2px rgba(0,0,0,0.3);
     color-scheme: dark;
   }
-  /* Dark fix-ups for the few intentionally hard-coded (light) spots. */
-  :root[data-theme="dark"] .banner { border-color: #6e342c; color: #f4b9b1; }
-  :root[data-theme="dark"] .banner strong { color: #ffd6cf; }
-  :root[data-theme="dark"] .toast { box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  :root[data-theme="dark"] .banner { border-color: rgba(248,113,113,0.28); color: #fecaca; }
+  :root[data-theme="dark"] .banner strong { color: #fee2e2; }
+  :root[data-theme="dark"] .toast { border-color: rgba(248,113,113,0.28); box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  :root[data-theme="dark"] #routing-help::backdrop { background: rgba(0,0,0,0.65); }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 22px 26px 64px; background: var(--bg); color: var(--ink-2);
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-    -webkit-font-smoothing: antialiased; }
+  body { margin: 0; padding: 24px 28px 64px; background: var(--bg); color: var(--ink-2);
+    font: 14px/1.5 var(--font); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+  .shell { max-width: 1180px; margin: 0 auto; }
   b, strong { color: var(--ink); }
+  code { font-family: var(--mono); font-size: 0.9em; background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; color: var(--ink); }
   .good { color: var(--good); } .bad { color: var(--bad); }
   .muted { color: var(--muted); }
 
   /* topbar */
-  .topbar { display: flex; align-items: flex-start; justify-content: space-between;
-    gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
-  .brand { display: flex; align-items: center; gap: 12px; }
-  .flame-dot { width: 14px; height: 14px; border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
-    box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
-  .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
-  .wordmark-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .topbar { display: flex; align-items: center; justify-content: space-between;
+    gap: 16px; flex-wrap: wrap; margin-bottom: 22px; padding-bottom: 16px;
+    border-bottom: 1px solid var(--border); }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .brand-mark { width: 34px; height: 34px; flex: none; display: block; }
+  .wordmark { font-size: 21px; font-weight: 700; color: var(--ink); letter-spacing: -0.03em; line-height: 1.1; }
+  .wordmark-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   /* Which machine is this? Two dashboards from two hosts look identical otherwise. */
-  .hostchip { font-size: 11.5px; font-weight: 600; color: var(--muted); padding: 1px 7px;
-    border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; }
-  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
-  .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  .hostchip { font-size: 11px; font-weight: 600; color: var(--muted); padding: 1px 8px;
+    background: var(--surface); border: 1px solid var(--border-strong); border-radius: 999px; white-space: nowrap; }
+  .tagline { font-size: 12.5px; color: var(--muted); margin-top: 2px; max-width: 520px; }
+  .controls { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+  @media (max-width: 720px) { .controls { justify-content: flex-start; } }
+  #frag-toggle { display: contents; }
 
   /* kill switch */
-  .banner { display: block; margin: 0 0 8px; padding: 9px 13px; background: var(--bad-tint);
-    border: 1px solid #f3b6af; border-radius: 9px; color: #9c2b20; font-size: 12px; max-width: 520px; }
-  .banner strong { color: #8a2117; }
-  .switch { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
-  .switch-state { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
-    padding: 3px 10px; border-radius: 999px; }
+  .banner { order: 3; flex: 0 0 100%; margin: 4px 0 0; padding: 9px 13px; background: var(--bad-tint);
+    border: 1px solid rgba(220,38,38,0.22); border-radius: 8px; color: #991b1b; font-size: 12px; }
+  .banner strong { color: #7f1d1d; }
+  .switch { order: 2; display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .switch-state { display: inline-flex; align-items: center; gap: 6px; height: 30px; font-size: 12px; font-weight: 600;
+    padding: 0 10px; border-radius: 999px; white-space: nowrap; }
   .switch-state.on { color: var(--good); background: var(--good-tint); }
   .switch-state.off { color: var(--bad); background: var(--bad-tint); }
-  .switch-dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .switch-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
   .switch-btn { background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong);
-    padding: 6px 13px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600;
-    box-shadow: var(--shadow); }
-  .switch-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
-  .hint { color: var(--muted); font-size: 11px; }
-  .theme-btn { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
-    padding: 5px 11px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 600;
-    box-shadow: var(--shadow); display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
-  .theme-btn:hover { border-color: var(--flame); color: var(--flame-ink); }
+    height: 30px; padding: 0 11px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 500;
+    box-shadow: var(--shadow); display: inline-flex; align-items: center; line-height: 1; white-space: nowrap; }
+  .switch-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
+  .hint { color: var(--muted); font-size: 11px; font-weight: 400; }
+  .theme-btn { order: 1; background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
+    height: 30px; padding: 0 11px; cursor: pointer; border-radius: 8px; font: inherit; font-size: 12px; font-weight: 500;
+    box-shadow: var(--shadow); display: inline-flex; align-items: center; gap: 6px; line-height: 1; white-space: nowrap; }
+  .theme-btn:hover { border-color: var(--accent); color: var(--ink); background: var(--accent-soft); }
 
-  /* model chips */
+  /* model chips & config dock */
+  .config-dock { margin: 16px 0 24px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); }
   .models { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
-  .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; }
+  .models-label { color: var(--ink-2); font-size: 12px; font-weight: 600; min-width: 170px; }
   .models-csv { flex: 1 1 260px; min-width: 220px; color: var(--ink); background: var(--surface);
-    border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px;
-    font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .models-csv:focus { outline: none; border-color: var(--flame-ink); }
-  .models-routing { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 18px; }
-  #routing-help { border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface);
-    color: var(--ink); max-width: 600px; padding: 16px 20px; }
-  #routing-help::backdrop { background: rgba(20, 12, 6, .4); }
+    border: 1px solid var(--border-strong); border-radius: 6px; padding: 5px 9px;
+    font: 12px/1.4 var(--mono); }
+  .models-csv:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+  .models-routing { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 0;
+    padding-top: 10px; border-top: 1px solid var(--border); }
+  #routing-help { border: 1px solid var(--border-strong); border-radius: var(--radius); background: var(--surface);
+    color: var(--ink); max-width: 600px; padding: 18px 22px; box-shadow: 0 16px 40px rgba(15,23,42,0.18); }
+  #routing-help::backdrop { background: rgba(15, 23, 42, 0.45); }
   #routing-help h3 { margin: 0 0 8px; font-size: 14px; color: var(--ink); }
   #routing-help p, #routing-help li { font-size: 12px; line-height: 1.55; color: var(--ink-2); margin: 6px 0; }
   #routing-help ul { margin: 6px 0; padding-left: 18px; }
-  #routing-help code { font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
-  #routing-help pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
-    padding: 8px 10px; margin: 8px 0; overflow-x: auto;
-    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink); }
+  #routing-help code { font: 11px var(--mono); color: var(--ink); }
+  #routing-help pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 11px; margin: 8px 0; overflow-x: auto;
+    font: 11px/1.5 var(--mono); color: var(--ink); }
   .chip { background: var(--surface); color: var(--ink-2); border: 1px solid var(--border-strong);
-    border-radius: 999px; padding: 4px 12px; cursor: pointer; font: inherit; font-size: 12px; }
-  .chip:hover { border-color: var(--flame); color: var(--flame-ink); }
-  .chip.on { background: var(--flame-tint); color: var(--flame-ink); border-color: var(--flame);
+    border-radius: 999px; padding: 4px 11px; cursor: pointer; font: inherit; font-size: 12px; font-weight: 500;
+    transition: border-color .12s, background .12s, color .12s; }
+  .chip:hover { border-color: var(--border-strong); color: var(--ink); background: var(--accent-soft); }
+  .chip.on { background: var(--accent); color: var(--surface); border-color: var(--accent);
     font-weight: 600; }
+  .chip.on:hover { background: var(--accent); color: var(--surface); border-color: var(--accent); opacity: 0.9; }
 
-  /* collapsed model-scope section (#116): the default compress scope is Fable 5
-     only, so the three family rows stay hidden until the user opts in. The
-     <details> wrapper lives in the static shell — NOT inside #frag-models —
-     because the every-2s innerHTML poll would otherwise reset its open state. */
-  .models-collapse { margin: 0 0 18px; }
+  /* collapsed config drawers (#116): <details> lives in the static shell — NOT
+     inside #frag-models — so the 2s poll never resets open state. */
+  .models-collapse { margin: 0; border-bottom: 1px solid var(--border); }
+  .models-collapse:last-child { border-bottom: none; }
   .models-collapse .models { margin: 0 0 10px; }
   .models-collapse .models:last-child { margin-bottom: 0; }
-  .models-summary { cursor: pointer; color: var(--ink-2); font-size: 12px; font-weight: 600;
-    margin: 0 0 8px; user-select: none; }
-  .models-summary:hover { color: var(--flame-ink); }
-  .models-warning { color: var(--ink-2); background: var(--surface); border: 1px solid var(--border-strong);
-    border-left: 3px solid var(--bad); border-radius: 8px; padding: 8px 12px; font-size: 12px;
+  .models-summary { cursor: pointer; list-style: none; padding: 11px 16px; color: var(--ink);
+    font-size: 12.5px; font-weight: 600; margin: 0; user-select: none;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .models-summary::-webkit-details-marker { display: none; }
+  .models-summary::before { content: '▸'; color: var(--muted); font-size: 10px; }
+  .models-collapse[open] > .models-summary::before { content: '▾'; }
+  .models-summary:hover { background: var(--surface-2); color: var(--ink); }
+  .dock-body { padding: 12px 16px 16px; border-top: 1px solid var(--border); font-size: 12.5px; color: var(--ink-2); }
+  .dock-body p { margin: 0 0 10px; }
+  .dock-body p:last-child { margin-bottom: 0; }
+  .dock-body pre { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 9px 12px; margin: 0 0 12px; overflow-x: auto; font: 12px/1.5 var(--mono); color: var(--ink); }
+  .models-warning { color: var(--ink-2); background: var(--warn-tint); border: 1px solid var(--border);
+    border-left: 2px solid var(--warn); border-radius: 8px; padding: 8px 12px; font-size: 12px;
     margin: 0 0 12px; }
 
   /* session hero */
-  #frag-session { display: block; margin-bottom: 16px; }
-  .hero { background: linear-gradient(135deg, var(--flame-tint), var(--surface) 60%); border: 1px solid var(--border);
-    border-left: 4px solid var(--flame); border-radius: var(--radius); padding: 20px 24px; box-shadow: var(--shadow); }
-  .hero-neg { border-left-color: var(--bad); }
-  .hero-eyebrow { font-size: 11.5px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  #frag-session { display: block; margin-bottom: 14px; }
+  .hero { background: var(--surface); border: 1px solid var(--border);
+    border-top: 2px solid var(--good); border-radius: var(--radius); padding: 22px 26px; box-shadow: var(--shadow); }
+  .hero-neg { border-top-color: var(--bad); }
+  .hero-empty { border-top-color: var(--border-strong); }
+  .hero-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
     color: var(--muted); margin-bottom: 8px; }
-  .hero-headline { font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; line-height: 1.1; }
-  .hero-num { font-size: 56px; font-weight: 800; line-height: 1; margin-right: 8px;
-    background: linear-gradient(135deg, #ff9a4d, var(--flame) 55%, var(--flame-strong));
-    -webkit-background-clip: text; background-clip: text; color: transparent;
-    font-variant-numeric: tabular-nums; }
-  .hero-neg .hero-num { background: linear-gradient(135deg, #f0857a, var(--bad));
-    -webkit-background-clip: text; background-clip: text; color: transparent; }
-  .hero-sub { font-size: 14.5px; color: var(--ink-2); margin-top: 12px; max-width: 720px; }
-  .hero-meta { font-size: 12px; color: var(--muted); margin-top: 10px; padding-top: 10px;
-    border-top: 1px dashed var(--border-strong); }
-  .hero-empty .hero-headline { color: var(--muted); font-size: 24px; }
+  .hero-headline { font-size: 24px; font-weight: 600; color: var(--ink); letter-spacing: -0.025em; line-height: 1.15; }
+  .hero-num { font-size: 46px; font-weight: 700; letter-spacing: -0.04em; line-height: 1; margin-right: 8px;
+    color: var(--good); font-variant-numeric: tabular-nums; }
+  .hero-neg .hero-num { color: var(--bad); }
+  .hero-sub { font-size: 14px; color: var(--ink-2); margin-top: 10px; max-width: 740px; }
+  .hero-meta { font-size: 12px; color: var(--muted); margin-top: 12px; padding-top: 10px;
+    border-top: 1px solid var(--border); }
+  .hero-empty .hero-headline { color: var(--muted); font-size: 22px; }
 
   /* stat strip */
-  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
+  .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
   @media (max-width: 1000px) { .strip { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 560px) { .strip { grid-template-columns: 1fr; } }
   .tile { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 14px 16px; box-shadow: var(--shadow); }
-  .tile-label { font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin-bottom: 8px;
-    display: flex; align-items: center; gap: 5px; }
-  .tile-value { font-size: 26px; font-weight: 800; color: var(--ink); font-variant-numeric: tabular-nums;
-    letter-spacing: -0.01em; line-height: 1.1; }
+    padding: 15px 18px; box-shadow: var(--shadow); }
+  .tile-label { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 8px; display: flex; align-items: center; gap: 5px; }
+  .tile-value { font-size: 24px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em; line-height: 1.15; }
   .tile-value.pos { color: var(--good); } .tile-value.neg { color: var(--bad); }
   .tile-value.muted-val { color: var(--muted); font-size: 18px; font-weight: 600; }
   .tile-sub { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
-  .q { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
+  .q { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; flex: none;
     border-radius: 50%; background: var(--surface-2); border: 1px solid var(--border-strong);
-    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; position: relative; outline: none; }
-  .q:hover, .q:focus-visible { color: var(--flame-ink); border-color: var(--flame); }
+    color: var(--muted); font-size: 9px; font-weight: 700; cursor: help; position: relative; outline: none;
+    text-transform: none; letter-spacing: normal; }
+  .q:hover, .q:focus-visible { color: var(--ink); border-color: var(--border-strong); background: var(--accent-soft); }
   .q::after { content: attr(data-tip); position: absolute; z-index: 50; left: 50%; bottom: calc(100% + 8px);
     width: min(280px, 75vw); transform: translate(-50%, 4px); padding: 8px 10px; border-radius: 7px;
-    background: var(--ink); color: var(--surface); box-shadow: var(--shadow); font-size: 11px; font-weight: 500;
+    background: var(--ink); color: var(--surface); box-shadow: var(--shadow); font-family: var(--font);
+    font-size: 11px; font-weight: 500; text-transform: none; letter-spacing: normal;
     line-height: 1.4; text-align: left; pointer-events: none; opacity: 0; visibility: hidden;
     transition: opacity .12s, transform .12s, visibility .12s; }
   .q::before { content: ''; position: absolute; z-index: 51; left: 50%; bottom: calc(100% + 3px);
@@ -1018,38 +1113,38 @@ const CSS = `
   .q:hover::before, .q:focus-visible::before { opacity: 1; visibility: visible; }
 
   /* drawer */
-  .drawer { margin: 0 0 14px; background: var(--surface); border: 1px solid var(--border);
+  .drawer { margin: 0 0 12px; background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
-  .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 12px 16px;
-    font-size: 13px; font-weight: 600; color: var(--flame-ink); display: flex; align-items: center; gap: 8px; }
+  .drawer > summary { cursor: pointer; user-select: none; list-style: none; padding: 11px 16px;
+    font-size: 12.5px; font-weight: 600; color: var(--ink); display: flex; align-items: center; gap: 8px; }
   .drawer > summary::-webkit-details-marker { display: none; }
-  .drawer > summary::before { content: '▸'; color: var(--flame); font-size: 11px; }
+  .drawer > summary::before { content: '▸'; color: var(--muted); font-size: 10px; }
   .drawer[open] > summary::before { content: '▾'; }
   .drawer > summary:hover { background: var(--surface-2); }
-  .drawer-intro { padding: 0 16px 10px; font-size: 12px; color: var(--ink-2); }
-  .drawer-intro em { color: var(--flame-ink); font-style: normal; font-weight: 600; }
+  .drawer-intro { padding: 10px 16px; border-top: 1px solid var(--border); font-size: 12px; color: var(--ink-2); }
+  .drawer-intro em { color: var(--ink); font-style: normal; font-weight: 600; }
   .math-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; padding: 0 16px 16px; }
   @media (max-width: 860px) { .math-grid { grid-template-columns: 1fr; } }
-  .math-block h4 { margin: 0 0 6px; font-size: 12px; color: var(--ink); }
+  .math-block h4 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--ink); }
   .formula { background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px;
     padding: 9px 11px; font: 11px/1.55 var(--mono); color: var(--ink-2); white-space: pre-wrap;
     word-break: break-word; }
-  .formula .k { color: var(--muted); } .formula .v { color: var(--ink); } .formula .op { color: var(--flame); }
+  .formula .k { color: var(--muted); } .formula .v { color: var(--ink); } .formula .op { color: var(--good); font-weight: 600; }
   .formula .sp { height: 6px; }
   .formula .src { color: var(--muted); font-size: 10px; display: block; margin-top: 7px;
     border-top: 1px solid var(--border); padding-top: 6px; }
-  .updated { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .updated { font-size: 11.5px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); animation: pulse 2s infinite; }
   @keyframes pulse { 50% { opacity: 0.35; } }
 
   /* sections */
-  .section { margin-top: 26px; }
-  .section-head { font-size: 14px; font-weight: 700; color: var(--ink); margin: 0 0 12px;
+  .section { margin-top: 28px; }
+  .section-head { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; color: var(--ink); margin: 0 0 12px;
     display: flex; align-items: baseline; gap: 10px; }
   .section-sub { font-size: 12px; font-weight: 400; color: var(--muted); }
   .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-    padding: 16px 18px; box-shadow: var(--shadow); min-width: 0; }
-  .card-head { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 18px 20px; box-shadow: var(--shadow); min-width: 0; }
+  .card-head { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
     color: var(--muted); margin: 0 0 12px; }
   .card-head.spaced { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
 
@@ -1062,8 +1157,8 @@ const CSS = `
   .empty-note { color: var(--muted); font-size: 12.5px; padding: 14px; background: var(--surface-2);
     border: 1px dashed var(--border-strong); border-radius: 10px; }
   .ctx-headline { font-size: 13px; color: var(--ink-2); margin-bottom: 10px; }
-  .ctx-title { display: inline-block; font-weight: 700; color: var(--ink); margin-right: 6px; }
-  .ctx-big { font-size: 22px; font-weight: 800; color: var(--flame); font-variant-numeric: tabular-nums; }
+  .ctx-title { display: inline-block; font-weight: 600; color: var(--ink); margin-right: 6px; }
+  .ctx-big { font-size: 22px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
   .legend { display: flex; gap: 8px; margin-bottom: 10px; }
   .tag { font-size: 11px; font-weight: 600; padding: 3px 9px 3px 22px; border-radius: 999px; position: relative; }
   .tag::before { content: ''; position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
@@ -1074,46 +1169,41 @@ const CSS = `
   .tag-txt::before { background: var(--txt); }
   .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   @media (max-width: 560px) { .split { grid-template-columns: 1fr; } }
-  .split-col { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--surface); }
-  .split-img { border-top: 3px solid var(--img); background: linear-gradient(180deg, var(--img-tint), var(--surface) 40%); }
-  .split-txt { border-top: 3px solid var(--txt); background: linear-gradient(180deg, var(--txt-tint), var(--surface) 40%); }
-  .split-head { font-size: 12px; font-weight: 700; color: var(--ink); margin-bottom: 8px; display: flex;
+  .split-col { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: var(--surface); }
+  .split-img { border-top: 2px solid var(--img); }
+  .split-txt { border-top: 2px solid var(--txt); }
+  .split-head { font-size: 12px; font-weight: 600; color: var(--ink); margin-bottom: 8px; display: flex;
     flex-direction: column; gap: 2px; }
-  .split-sum { font-size: 10.5px; font-weight: 600; color: var(--muted); }
+  .split-sum { font-size: 10.5px; font-weight: 500; color: var(--muted); }
   .ctx-row { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; padding: 4px 0;
     border-bottom: 1px solid var(--border); }
   .ctx-row:last-of-type { border-bottom: none; }
   .ctx-lbl { color: var(--ink-2); } .ctx-val { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .muted-row { color: var(--muted); font-style: italic; }
   .split-note { font-size: 10.5px; color: var(--muted); margin-top: 7px; }
-  /* Cap notes explain a turn that compressed less than the user expects, so they
-     must read as a reason, not as fine print. Warm tint, not an error colour —
-     nothing here is broken. */
-  .cap-note { color: var(--ink); border-left: 2px solid var(--flame); padding-left: 7px; }
+  .cap-note { color: var(--ink); border-left: 2px solid var(--warn); padding-left: 8px; }
   .pages-title { font-size: 11px; color: var(--ink-2); margin: 12px 0 6px; }
   .pages { display: flex; flex-wrap: wrap; gap: 6px; max-height: 320px; overflow: auto;
     background: var(--surface-2); padding: 6px; border: 1px solid var(--border); border-radius: 8px; }
   .page { height: 130px; width: auto; max-width: 230px; object-fit: contain; object-position: top left;
     image-rendering: pixelated; background: #fff; border: 1px solid var(--border-strong); border-radius: 4px;
     cursor: pointer; transition: border-color .12s, transform .12s; }
-  .page:hover { border-color: var(--flame); transform: translateY(-1px); }
+  .page:hover { border-color: var(--accent); transform: translateY(-1px); }
   .page.page-gone { width: 150px; height: 56px; background: var(--surface-2); border: 1px dashed var(--border-strong);
     color: var(--muted); font-size: 10px; cursor: default; }
 
   /* recent requests */
-  .row-view { color: var(--flame-ink); font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
+  .row-view { color: var(--ink); font-weight: 600; text-decoration: none; cursor: pointer; white-space: nowrap; }
   .row-view:hover { text-decoration: underline; }
   table.rtable, table.dtable { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .rtable th, .dtable th { text-align: left; color: var(--muted); font-weight: 600; padding: 7px 8px;
+  .rtable th, .dtable th { text-align: left; color: var(--muted); font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.04em; padding: 8px 8px;
     border-bottom: 1px solid var(--border-strong); white-space: nowrap; }
-  .rtable td, .dtable td { padding: 7px 8px; border-bottom: 1px solid var(--border);
+  .rtable td, .dtable td { padding: 8px 8px; border-bottom: 1px solid var(--border);
     font-variant-numeric: tabular-nums; vertical-align: middle; color: var(--ink-2); }
+  .rtable td code { background: transparent; border: none; padding: 0; font-size: 11.5px; }
   .rtable tr:last-child td, .dtable tr:last-child td { border-bottom: none; }
-  .rtable tbody tr:hover, .rtable tbody tr:hover { background: var(--surface-2); }
-  /* Keep wide tables inside their card: scroll horizontally rather than
-     pushing the card border out. Fires only when the nowrap columns exceed
-     the card width (narrow x-ray column / small window); no scrollbar when
-     they fit. The table keeps width:100% so it fills at wide widths. */
+  .rtable tbody tr:hover, .dtable tbody tr:hover { background: var(--surface-2); }
   #frag-recent, #frag-stats { overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
   #frag-recent table, #frag-stats table { min-width: max-content; }
   #frag-latest { overflow: auto; scrollbar-width: thin; }
@@ -1122,22 +1212,22 @@ const CSS = `
   td.neg { color: var(--bad); font-weight: 600; }
   .endp { color: var(--ink); font-family: var(--mono); font-size: 11px; }
   .empty-cell { color: var(--muted); text-align: center; padding: 18px; }
-  .pill { display: inline-block; min-width: 38px; text-align: center; font-size: 11px; font-weight: 700;
+  .pill { display: inline-block; min-width: 38px; text-align: center; font-size: 11px; font-weight: 600;
     padding: 2px 8px; border-radius: 999px; font-variant-numeric: tabular-nums; }
   .pill-good { background: var(--good-tint); color: var(--good); }
   .pill-warn { background: var(--warn-tint); color: var(--warn); }
   .pill-bad { background: var(--bad-tint); color: var(--bad); }
-  .badge { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; }
-  .mk-create { font-size: 9.5px; font-weight: 700; color: var(--muted); border: 1px solid var(--muted);
+  .badge { font-size: 10.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; }
+  .mk-create { font-size: 9.5px; font-weight: 600; color: var(--muted); border: 1px solid var(--border-strong);
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
-  .mini-btn { font-size: 11px; background: var(--surface); color: var(--flame-ink); border: 1px solid var(--border-strong);
-    border-radius: 7px; padding: 3px 9px; cursor: pointer; font-weight: 600; }
-  .mini-btn:hover { border-color: var(--flame); }
+  .mini-btn { font-size: 11px; background: var(--surface); color: var(--ink); border: 1px solid var(--border-strong);
+    border-radius: 7px; padding: 4px 10px; cursor: pointer; font-weight: 500; }
+  .mini-btn:hover { border-color: var(--accent); background: var(--accent-soft); }
   .mini-label { font-size: 11px; color: var(--muted); }
   .frame { background: #fff; border: 1px solid var(--border-strong); border-radius: 8px; padding: 5px;
     overflow: auto; max-height: 360px; scrollbar-width: thin; }
@@ -1146,7 +1236,7 @@ const CSS = `
   .viewer-caption { font-size: 11px; color: var(--muted); margin-top: 8px; display: flex; align-items: center;
     gap: 10px; flex-wrap: wrap; }
   .pairing { display: grid; grid-template-columns: 1fr; gap: 10px; margin-top: 10px; }
-  .pair-head { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 6px; display: inline-block;
+  .pair-head { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 6px; display: inline-block;
     margin-bottom: 6px; }
   .pair-img { background: var(--img-tint); color: var(--img-ink); }
   .pair-txt { background: var(--txt-tint); color: var(--txt-ink); }
@@ -1163,12 +1253,11 @@ const CSS = `
   .bar-row { display: flex; align-items: center; gap: 12px; font-size: 12px; }
   .bar-label { width: 150px; flex: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: var(--ink); font-family: var(--mono); font-size: 11px; }
-  .bar-track { flex: 1; min-width: 0; height: 16px; background: var(--surface-2); border-radius: 5px;
+  .bar-track { flex: 1; min-width: 0; height: 14px; background: var(--surface-2); border-radius: 4px;
     overflow: hidden; border: 1px solid var(--border); }
-  .bar-fill { height: 100%; border-radius: 5px 0 0 5px;
-    background: linear-gradient(90deg, #ffa766, var(--flame)); }
+  .bar-fill { height: 100%; border-radius: 4px 0 0 4px; background: var(--good); }
   .bar-val { width: 78px; flex: none; text-align: right; font-variant-numeric: tabular-nums;
-    color: var(--flame-ink); font-weight: 600; }
+    color: var(--good); font-weight: 600; }
   .bar-val.neg { color: var(--bad); }
   .axis { margin-top: 12px; color: var(--muted); font-size: 11px; }
   .empty { text-align: center; color: var(--muted); padding: 22px; font-size: 12px; }
@@ -1176,8 +1265,8 @@ const CSS = `
   /* toast tray */
   .tray { position: fixed; bottom: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px;
     z-index: 1000; pointer-events: none; }
-  .toast { background: var(--surface); color: var(--bad); border: 1px solid #f0b3ab; border-radius: 9px;
-    padding: 10px 14px; font-size: 12px; box-shadow: 0 8px 24px rgba(60,35,15,.14); display: flex;
+  .toast { background: var(--surface); color: var(--bad); border: 1px solid rgba(220,38,38,0.25); border-radius: 9px;
+    padding: 10px 14px; font-size: 12px; box-shadow: 0 8px 24px rgba(15,23,42,0.10); display: flex;
     align-items: center; gap: 12px; pointer-events: auto; max-width: 360px; }
   .toast button { background: transparent; color: inherit; border: 0; cursor: pointer; font-size: 16px;
     line-height: 1; padding: 0; }
@@ -1249,7 +1338,7 @@ export function renderPage(port: number, hostLabel = ''): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>${host ? `${host} · inkling dashboard` : 'inkling — live dashboard'}</title>
+<title>${host ? `${host} · fiche dashboard` : 'fiche — live dashboard'}</title>
 <link rel="icon" href="${FAVICON}" />
 <style>${CSS}</style>
 <script>
@@ -1264,16 +1353,56 @@ export function renderPage(port: number, hostLabel = ''): string {
 </script>
 </head>
 <body>
+<main class="shell">
 
 <header class="topbar">
   <div class="brand">
-    <span class="flame-dot"></span>
+    <svg class="brand-mark" viewBox="0 0 256 256" width="34" height="34" fill="none" aria-hidden="true">
+      <defs>
+        <linearGradient id="dash-fa-top" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#FF4D5A"/>
+          <stop offset="52%" stop-color="#FF6B2B"/>
+          <stop offset="100%" stop-color="#FFB020"/>
+        </linearGradient>
+        <linearGradient id="dash-fa-mid" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#9333EA"/>
+          <stop offset="52%" stop-color="#C026D3"/>
+          <stop offset="100%" stop-color="#F43F8E"/>
+        </linearGradient>
+        <linearGradient id="dash-fa-bot" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#06E3F5"/>
+          <stop offset="52%" stop-color="#0EA5E9"/>
+          <stop offset="100%" stop-color="#3B82F6"/>
+        </linearGradient>
+        <linearGradient id="dash-fa-gt" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#FFD166"/>
+          <stop offset="100%" stop-color="#FF70A6"/>
+        </linearGradient>
+        <linearGradient id="dash-fa-gb" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#C084FC"/>
+          <stop offset="100%" stop-color="#9333EA"/>
+        </linearGradient>
+      </defs>
+      <rect x="8" y="8" width="240" height="240" rx="52" fill="#0B0D14" stroke="#1E293B" stroke-width="3"/>
+      <g transform="translate(22, 22) scale(0.828)">
+        <path d="M 14 74 H 62 C 88 74, 96 109, 127 109 V 119 C 90 119, 82 102, 62 102 H 14 Z" fill="url(#dash-fa-top)"/>
+        <path d="M 14 114 H 62 C 88 114, 96 123, 127 123 V 133 C 96 133, 88 142, 62 142 H 14 Z" fill="url(#dash-fa-mid)"/>
+        <path d="M 14 154 H 62 C 82 154, 90 137, 127 137 V 147 C 96 147, 88 182, 62 182 H 14 Z" fill="url(#dash-fa-bot)"/>
+        <path d="M 129 104 V 79 H 227 V 177 H 129 V 152 H 114 V 192 H 242 V 64 H 114 V 104 Z" fill="#FFFFFF"/>
+        <polygon points="178,102 165,128 152,128" fill="#FF5447"/>
+        <polygon points="178,102 191,128 165,128" fill="url(#dash-fa-gt)"/>
+        <polygon points="178,102 204,128 191,128" fill="#22D3EE"/>
+        <polygon points="152,128 165,128 178,154" fill="#F43F5E"/>
+        <polygon points="165,128 191,128 178,154" fill="url(#dash-fa-gb)"/>
+        <polygon points="191,128 204,128 178,154" fill="#3B82F6"/>
+      </g>
+    </svg>
     <div>
       <div class="wordmark-row">
-        <div class="wordmark">inkling</div>
+        <div class="wordmark">fiche</div>
         ${host ? `<span class="hostchip" title="proxy host">${host}</span>` : ''}
       </div>
-      <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
+      <div class="tagline">Microfiche for coding agents — cache-safe optical &amp; text compilation.</div>
     </div>
   </div>
   <div class="controls">
@@ -1282,53 +1411,46 @@ export function renderPage(port: number, hostLabel = ''): string {
   </div>
 </header>
 
-<details class="models-collapse">
-  <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
-  <p>Warp starts the agent with the proxy already wired, no env or config edits:</p>
-  <pre>inkling warp -- claude
-inkling warp -- codex
-inkling warp -- cursor-agent</pre>
-  <p>Aliases work too (<code>inkling warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
-  <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
-  <pre>@inkling pin be concise, no walls of text
-@inkling unpin 2
-@inkling unpin all</pre>
-  <p><code>@inkling pin</code> with no text lists what is pinned.</p>
-  <p>A <code>@inkling pin …</code> line in your global or project <code>CLAUDE.md</code> (<code>AGENTS.md</code> under Codex / OpenCode) is relocated the same way, on every session, with no typing. Those are file-backed, so <code>unpin</code> and <code>unpin all</code> never touch them — edit the file to remove one.</p>
-</details>
-
-<details class="models-collapse">
-  <summary class="models-summary">Image model scope <span class="hint">Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash by default · expand to experiment with other families</span></summary>
-  <div class="models-warning">⚠ Image compression is validated for Fable 5, Gemini 3.6 Flash, and Gemini 3.7 Flash — other families can use <strong>more</strong> tokens, not less. Opt in only for deliberate experiments.</div>
-  <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
-  <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
-</details>
-
-<dialog id="routing-help" onclick="if (event.target === this) this.close()">
-  <h3>Routing Claude Code to OpenAI / Cloudflare models</h3>
-  <p>Claude models use Anthropic by default. Two optional routes can run together — set on the <strong>inkling process</strong> (keep provider credentials out of Claude Code):</p>
-  <ul>
-    <li><code>OPENAI_MODELS</code> — exact model IDs routed to OpenAI Responses (<code>OPENAI_UPSTREAM</code> + <code>OPENAI_API_KEY</code>)</li>
-    <li><code>CLOUDFLARE_MODELS</code> — exact model IDs routed to Cloudflare's OpenAI-compatible endpoint (<code>CLOUDFLARE_ACCOUNT_ID</code> + <code>CLOUDFLARE_API_TOKEN</code>)</li>
-  </ul>
-  <p>If a model appears in both lists: <code>CLOUDFLARE_MODELS &gt; OPENAI_MODELS &gt; default routing</code>.</p>
-  <pre>OPENAI_UPSTREAM=https://api.openai.com \\
-OPENAI_API_KEY=your-openai-key \\
-OPENAI_MODELS=gpt-5.6-sol \\
-CLOUDFLARE_ACCOUNT_ID=your-account-id \\
-CLOUDFLARE_API_TOKEN=your-cloudflare-token \\
-CLOUDFLARE_MODELS=moonshotai/kimi-k3 \\
-npx @sriinnu/inkling</pre>
-  <p>Non-Anthropic IDs are advertised with a <code>claude-</code> prefix because Claude Code needs a Claude-shaped ID; inkling strips it before forwarding. Switch to one inside Claude Code with <code>/model claude-&lt;model&gt;</code> — e.g. <code>/model claude-moonshotai/kimi-k3</code> — or launch with <code>claude --model claude-moonshotai/kimi-k3</code>. Verify discovery with <code>curl …/v1/models</code>.</p>
-  <p><code>INKLING_MODELS</code> above is separate: it controls image compression, not routing. Kimi K3 on Cloudflare is the only non-Anthropic model tested end to end — see <code>docs/CLAUDE_CODE_PROVIDER_ROUTING.md</code>.</p>
-  <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">close</button>
-</dialog>
-
 <div id="frag-session" hx-get="/fragments/session-summary" hx-trigger="load, every 2s" hx-swap="innerHTML">
   <div class="hero hero-empty"><div class="hero-headline">Connecting…</div></div>
 </div>
 
 <div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
+
+<div class="config-dock">
+  <details class="models-collapse">
+    <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
+    <div class="dock-body">
+      <p>Warp starts the agent with the proxy already wired, no env or config edits:</p>
+      <pre>fiche warp -- claude
+fiche warp -- codex
+fiche warp -- cursor-agent</pre>
+      <p>Aliases work too (<code>fiche warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
+      <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
+      <pre>@fiche pin be concise, no walls of text
+@fiche unpin 2
+@fiche unpin all</pre>
+      <p><code>@fiche pin</code> with no text lists what is pinned.</p>
+      <p>A <code>@fiche pin …</code> line in your global or project <code>CLAUDE.md</code> (<code>AGENTS.md</code> under Codex / OpenCode) is relocated the same way, on every session, with no typing. Those are file-backed, so <code>unpin</code> and <code>unpin all</code> never touch them — edit the file to remove one.</p>
+    </div>
+  </details>
+
+  <details class="models-collapse">
+    <summary class="models-summary">Image model scope <span class="hint">Fable 5 &amp; Gemini optical by default; 4-layer text compiler runs across text-tier models</span></summary>
+    <div class="dock-body">
+      <div class="models-warning">Optical image compression is active by default for Fable 5 and Gemini; the 4-layer text compiler runs automatically across text-tier models. Other families can use <strong>more</strong> tokens when imaged — opt in only for deliberate experiments.</div>
+      <div id="frag-models" hx-get="/fragments/models" hx-trigger="load, every 2s [!document.activeElement || document.activeElement.id !== 'models-csv']" hx-swap="innerHTML"></div>
+      <div class="models-routing"><span class="hint">imaging scope ≠ provider routing — non-Anthropic IDs also need routing env on the proxy</span> <button class="mini-btn" type="button" onclick="document.getElementById('routing-help').showModal()">routing help</button></div>
+    </div>
+  </details>
+
+  <details class="models-collapse">
+    <summary class="models-summary">3rd-party plugins &amp; extensions <span class="hint">one click toggles all external skills and plugins while keeping core compiler stages on</span></summary>
+    <div class="dock-body">
+      <div id="frag-plugins" hx-get="/fragments/plugins" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+    </div>
+  </details>
+</div>
 
 <section class="section">
   <h2 class="section-head">What happened to your context <span class="section-sub">click a request to see image vs text</span></h2>
@@ -1360,6 +1482,28 @@ npx @sriinnu/inkling</pre>
     <div id="frag-stats" hx-get="/fragments/stats" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
   </div>
 </section>
+
+</main>
+
+<dialog id="routing-help" onclick="if (event.target === this) this.close()">
+  <h3>Routing Claude Code to OpenAI / Cloudflare models</h3>
+  <p>Claude models use Anthropic by default. Two optional routes can run together — set on the <strong>fiche process</strong> (keep provider credentials out of Claude Code):</p>
+  <ul>
+    <li><code>OPENAI_MODELS</code> — exact model IDs routed to OpenAI Responses (<code>OPENAI_UPSTREAM</code> + <code>OPENAI_API_KEY</code>)</li>
+    <li><code>CLOUDFLARE_MODELS</code> — exact model IDs routed to Cloudflare's OpenAI-compatible endpoint (<code>CLOUDFLARE_ACCOUNT_ID</code> + <code>CLOUDFLARE_API_TOKEN</code>)</li>
+  </ul>
+  <p>If a model appears in both lists: <code>CLOUDFLARE_MODELS &gt; OPENAI_MODELS &gt; default routing</code>.</p>
+  <pre>OPENAI_UPSTREAM=https://api.openai.com \\
+OPENAI_API_KEY=your-openai-key \\
+OPENAI_MODELS=gpt-5.6-sol \\
+CLOUDFLARE_ACCOUNT_ID=your-account-id \\
+CLOUDFLARE_API_TOKEN=your-cloudflare-token \\
+CLOUDFLARE_MODELS=moonshotai/kimi-k3 \\
+npx @sriinnu/fiche</pre>
+  <p>Non-Anthropic IDs are advertised with a <code>claude-</code> prefix because Claude Code needs a Claude-shaped ID; fiche strips it before forwarding. Switch to one inside Claude Code with <code>/model claude-&lt;model&gt;</code> — e.g. <code>/model claude-moonshotai/kimi-k3</code> — or launch with <code>claude --model claude-moonshotai/kimi-k3</code>. Verify discovery with <code>curl …/v1/models</code>.</p>
+  <p><code>FICHE_MODELS</code> above is separate: it controls image compression, not routing. Kimi K3 on Cloudflare is the only non-Anthropic model tested end to end — see <code>docs/CLAUDE_CODE_PROVIDER_ROUTING.md</code>.</p>
+  <button class="mini-btn" type="button" onclick="this.closest('dialog').close()">close</button>
+</dialog>
 
 <div class="tray" x-data="{ toasts: [], next: 1 }"
      @pp-toast.window="const id = next++; toasts.push({ id, text: $event.detail.text }); setTimeout(() => toasts = toasts.filter(t => t.id !== id), 5000)">

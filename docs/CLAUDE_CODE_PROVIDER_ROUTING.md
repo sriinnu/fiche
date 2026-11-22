@@ -1,6 +1,6 @@
 # Using other models with Claude Code
 
-inkling supports **Claude Code only** to keep the maintenance burden small.
+This routing guide covers **Claude Code** (`OPENAI_MODELS` / `CLOUDFLARE_MODELS`).
 Routing Claude Code to other models is experimental. Kimi K3 on Cloudflare is
 the only non-Anthropic model currently tested end to end.
 
@@ -31,7 +31,7 @@ OPENAI_MODELS=gpt-5.6-sol \
 CLOUDFLARE_ACCOUNT_ID=your-account-id \
 CLOUDFLARE_API_TOKEN=your-cloudflare-token \
 CLOUDFLARE_MODELS=moonshotai/kimi-k3 \
-npx @sriinnu/inkling
+npx @sriinnu/fiche
 ```
 
 This routes:
@@ -48,7 +48,7 @@ https://api.cloudflare.com/client/v4/accounts/<account-id>/ai/v1
 
 ### Novita (OpenAI-compatible)
 
-> Community-contributed example. Not tested or endorsed by inkling; any
+> Community-contributed example. Not tested or endorsed by `fiche`; any
 > OpenAI-compatible provider works the same way.
 
 Novita exposes an OpenAI-compatible endpoint, so it goes through the same
@@ -58,7 +58,7 @@ Novita exposes an OpenAI-compatible endpoint, so it goes through the same
 OPENAI_UPSTREAM=https://api.novita.ai/openai \
 OPENAI_API_KEY=your-novita-key \
 OPENAI_MODELS=deepseek/deepseek-v3.2 \
-npx @sriinnu/inkling
+npx @sriinnu/fiche
 ```
 
 Swap `OPENAI_MODELS` for any [Novita model ID](https://novita.ai/models). This
@@ -72,11 +72,11 @@ disclaimer as everything past Kimi K3 above.
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:47821 \
-ANTHROPIC_AUTH_TOKEN=local-inkling \
+ANTHROPIC_AUTH_TOKEN=local-fiche \
 claude --model claude-moonshotai/kimi-k3
 ```
 
-inkling advertises Cloudflare model IDs with a `claude-` prefix because Claude
+`fiche` advertises Cloudflare model IDs with a `claude-` prefix because Claude
 Code requires a Claude-shaped ID. The prefix is only an alias and is removed
 before forwarding. Models can also be selected through Claude Code's `/model`
 menu.
@@ -87,5 +87,5 @@ Verify discovery with:
 curl http://127.0.0.1:47821/v1/models
 ```
 
-Keep real provider credentials on the inkling process, not in Claude Code.
-`INKLING_MODELS` is separate: it controls image compression, not routing.
+Keep real provider credentials on the `fiche` process, not in Claude Code.
+`FICHE_MODELS` (legacy `INKLING_MODELS`) is separate: it controls compression scope, not routing.
