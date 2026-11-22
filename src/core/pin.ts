@@ -413,7 +413,7 @@ function isCommandOnlyTurn(m: Message, live = false): boolean {
 function isTextOnlyAssistantMsg(m: Message | undefined): boolean {
   if (!m || m.role !== 'assistant') return false;
   if (typeof m.content === 'string') return true;
-  if (!Array.isArray(m.content)) return false;
+  if (!Array.isArray(m.content) || m.content.length === 0) return false;
   return m.content.every(
     (b) => !!b && typeof b === 'object' && (b as { type?: string }).type === 'text',
   );
@@ -469,6 +469,13 @@ export function stripPinCommands(messages: Message[]): Message[] {
   return out;
 }
 
+function continuesLeadingRun(text: string): boolean {
+  if (!LEADING_REMINDER_RE.test(text)) return false;
+  let consumed = 0;
+  for (const block of reminderBlocks(text)) consumed += block.length;
+  return !text.slice(consumed).trim();
+}
+
 function stripUserTextBlock(text: string, isMsg0: boolean): string {
   if (isMsg0 && LEADING_REMINDER_RE.test(text)) {
     let consumed = 0;
@@ -502,7 +509,7 @@ function stripFromMessage(m: Message, idx = 1): Message | null | undefined {
       const tb = blk as TextBlock;
       if (typeof tb.text === 'string') {
         const text = stripUserTextBlock(tb.text, leadingRun);
-        leadingRun = false;
+        leadingRun = leadingRun ? continuesLeadingRun(tb.text) : false;
         if (text !== tb.text) {
           changed = true;
           if (!text.trim()) {
@@ -517,6 +524,8 @@ function stripFromMessage(m: Message, idx = 1): Message | null | undefined {
           blocks.push({ ...tb, text });
           continue;
         }
+        blocks.push(blk);
+        continue;
       }
     }
     leadingRun = false;
@@ -951,6 +960,64 @@ type OpenAIPinRequest = {
   messages?: unknown;
 };
 
+function openAIItemToMessage(item: OpenAIItem): Message | undefined {
+  if (item.type !== undefined && item.type !== 'message') return undefined;
+  if (item.role !== 'user' && item.role !== 'assistant') return undefined;
+  const blocks = openAIContentBlocks(item.content);
+  const toolCalls = (item as { tool_calls?: unknown }).tool_calls;
+  const hasFnCall = Boolean((item as { function_call?: unknown }).function_call);
+  if (item.role === 'assistant' && ((Array.isArray(toolCalls) && toolCalls.length > 0) || hasFnCall)) {
+    blocks.push({ type: 'tool_use', id: '', name: '', input: {} } as unknown as ContentBlock);
+  }
+  return { role: item.role, content: blocks };
+}
+
+function stripOpenAIContent(
+  content: unknown,
+  source: 'file' | 'session',
+  isFirstUser = false,
+): { content: unknown; empty: boolean; changed: boolean } {
+  if (typeof content === 'string') {
+    const next = source === 'session'
+      ? stripUserTextBlock(content, isFirstUser)
+      : stripLines(content, 'file');
+    return { content: next, empty: !next.trim(), changed: next !== content };
+  }
+  if (!Array.isArray(content)) return { content, empty: false, changed: false };
+  let changed = false;
+  let leadingRun = isFirstUser;
+  const out: unknown[] = [];
+  for (const raw of content) {
+    const part = raw as { type?: string; text?: unknown };
+    const isTextType =
+      part &&
+      typeof part === 'object' &&
+      (part.type === undefined ||
+        part.type === 'text' ||
+        part.type === 'input_text' ||
+        part.type === 'output_text') &&
+      typeof part.text === 'string';
+    if (isTextType) {
+      const next = source === 'session'
+        ? stripUserTextBlock(part.text as string, leadingRun)
+        : stripLines(part.text as string, 'file');
+      leadingRun = leadingRun ? continuesLeadingRun(part.text as string) : false;
+      if (next !== part.text) {
+        changed = true;
+        if (!next.trim()) continue;
+        out.push({ ...part, text: next });
+        continue;
+      }
+      out.push(raw);
+      continue;
+    } else {
+      leadingRun = false;
+    }
+    out.push(raw);
+  }
+  return { content: out, empty: out.length === 0, changed };
+}
+
 /** Move OpenAI-wire pin commands to the latest user input, using the same
  * trailing system-reminder block as the Messages transformer. */
 export function relocateOpenAIPins(req: OpenAIPinRequest): number {
@@ -990,19 +1057,72 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
   if (!stringInput && !target && !appendTrailing) return 0;
 
   if (typeof req.instructions === 'string') {
-    req.instructions = stripLines(req.instructions, 'file');
+    const cleanedInst = stripLines(req.instructions, 'file');
+    if (cleanedInst !== req.instructions) {
+      if (!cleanedInst.trim()) {
+        delete (req as { instructions?: unknown }).instructions;
+      } else {
+        req.instructions = cleanedInst;
+      }
+    }
   }
   if (items) {
-    for (const raw of items) {
+    const keptItems: unknown[] = [];
+    let nonSystemIdx = 0;
+    for (let i = 0; i < items.length; i++) {
+      const raw = items[i];
       const item = raw as OpenAIItem;
-      if (item.role !== 'system' && item.role !== 'developer' && item.role !== 'user') continue;
-      const src: 'file' | 'session' = item.role === 'user' ? 'session' : 'file';
-      item.content = stripOpenAIContent(item.content, src);
+      if (item.role === 'system' || item.role === 'developer') {
+        const res = stripOpenAIContent(item.content, 'file', false);
+        if (res.changed && res.empty) continue;
+        if (res.changed) item.content = res.content;
+        keptItems.push(item);
+        continue;
+      }
+      const curMsgIdx = nonSystemIdx++;
+      const isMessageItem = item.type === undefined || item.type === 'message';
+      if (!isMessageItem || (item.role !== 'user' && item.role !== 'assistant')) {
+        keptItems.push(raw);
+        continue;
+      }
+      const isTarget = item === target;
+      if (!isTarget && item.role === 'user') {
+        const msg = openAIItemToMessage(item);
+        const nextRaw = items[i + 1] as OpenAIItem | undefined;
+        const nextMsg = nextRaw && !isResponses ? openAIItemToMessage(nextRaw)
+          : nextRaw && isResponses && nextRaw !== target ? openAIItemToMessage(nextRaw)
+          : undefined;
+        if (msg && isCommandOnlyTurn(msg) && isPinReply(nextMsg)) {
+          i++; // splice command-only turn + synthesized reply pair
+          continue;
+        }
+        const res = stripOpenAIContent(item.content, 'session', curMsgIdx === 0);
+        if (res.changed && res.empty) {
+          if (isTextOnlyAssistantMsg(nextMsg)) {
+            i++;
+            continue;
+          }
+          // Preserve unmodified so we never emit an empty user message.
+          keptItems.push(item);
+          continue;
+        }
+        if (res.changed) item.content = res.content;
+        keptItems.push(item);
+        continue;
+      }
+      if (isTarget) {
+        const res = stripOpenAIContent(item.content, 'session', curMsgIdx === 0);
+        if (res.changed) item.content = res.content;
+        keptItems.push(item);
+        continue;
+      }
+      keptItems.push(item);
     }
+    items.splice(0, items.length, ...keptItems);
   }
 
   if (stringInput) {
-    const cleaned = stripLines(req.input as string, 'session').trimEnd();
+    const cleaned = stripUserTextBlock(req.input as string, true).trimEnd();
     req.input = cleaned ? `${cleaned}\n\n${pinText}` : pinText;
   } else if (target) {
     if (typeof target.content === 'string') {
@@ -1021,24 +1141,56 @@ export function relocateOpenAIPins(req: OpenAIPinRequest): number {
   return pinText.length;
 }
 
-function stripOpenAIContent(content: unknown, source: 'file' | 'session'): unknown {
-  if (typeof content === 'string') return stripLines(content, source);
-  if (!Array.isArray(content)) return content;
-  return content.map((raw) => {
-    const part = raw as { type?: string; text?: unknown };
-    if (!part || typeof part.text !== 'string') return raw;
-    if (part.type !== undefined && part.type !== 'text'
-      && part.type !== 'input_text' && part.type !== 'output_text') return raw;
-    return { ...part, text: stripLines(part.text, source) };
-  });
-}
-
-type GooglePinPart = { text?: unknown; [key: string]: unknown };
+type GooglePinPart = { text?: unknown; thought?: unknown; [key: string]: unknown };
 type GooglePinContent = { role?: string; parts?: GooglePinPart[]; [key: string]: unknown };
 type GooglePinRequest = {
   systemInstruction?: { parts?: GooglePinPart[]; [key: string]: unknown };
   contents?: GooglePinContent[];
 };
+
+function googleContentToMessage(content: GooglePinContent): Message {
+  const blocks: ContentBlock[] = [];
+  if (Array.isArray(content.parts)) {
+    for (const part of content.parts) {
+      if (part && typeof part.text === 'string' && part.thought !== true) {
+        blocks.push({ type: 'text', text: part.text });
+      } else {
+        blocks.push({ type: 'non_text' } as unknown as ContentBlock);
+      }
+    }
+  }
+  return { role: content.role === 'user' ? 'user' : 'assistant', content: blocks };
+}
+
+function stripGoogleParts(
+  parts: GooglePinPart[],
+  source: 'file' | 'session',
+  isFirstUser = false,
+): { parts: GooglePinPart[]; empty: boolean; changed: boolean } {
+  let changed = false;
+  let leadingRun = isFirstUser;
+  const out: GooglePinPart[] = [];
+  for (const part of parts) {
+    if (part && typeof part.text === 'string' && part.thought !== true) {
+      const next = source === 'session'
+        ? stripUserTextBlock(part.text, leadingRun)
+        : stripLines(part.text, 'file');
+      leadingRun = leadingRun ? continuesLeadingRun(part.text) : false;
+      if (next !== part.text) {
+        changed = true;
+        if (!next.trim()) continue;
+        out.push({ ...part, text: next });
+        continue;
+      }
+      out.push(part);
+      continue;
+    } else {
+      leadingRun = false;
+    }
+    out.push(part);
+  }
+  return { parts: out, empty: out.length === 0, changed };
+}
 
 /** Gemini-wire equivalent of relocateOpenAIPins. */
 export function relocateGooglePins(req: GooglePinRequest): number {
@@ -1049,14 +1201,7 @@ export function relocateGooglePins(req: GooglePinRequest): number {
         .filter(Boolean)
         .join('\n')
     : '';
-  const messages: Message[] = req.contents.map((content) => ({
-    role: content.role === 'user' ? 'user' : 'assistant',
-    content: Array.isArray(content.parts)
-      ? content.parts
-          .filter((part) => typeof part?.text === 'string')
-          .map((part) => ({ type: 'text', text: part.text as string }))
-      : [],
-  }));
+  const messages: Message[] = req.contents.map(googleContentToMessage);
   const pins = foldPins(messages, systemText || undefined);
   if (pins.length === 0) return 0;
   const pinText = pinBlockText(pins);
@@ -1068,18 +1213,50 @@ export function relocateGooglePins(req: GooglePinRequest): number {
   if (!canAppendToLast && !hasAnyUser) return 0;
 
   if (Array.isArray(req.systemInstruction?.parts)) {
-    req.systemInstruction.parts = req.systemInstruction.parts.map((part) =>
-      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text, 'file') } : part,
-    );
+    const sysRes = stripGoogleParts(req.systemInstruction.parts, 'file', false);
+    if (sysRes.changed && sysRes.empty) {
+      delete req.systemInstruction;
+    } else if (sysRes.changed) {
+      req.systemInstruction.parts = sysRes.parts;
+    }
   }
-  for (const content of req.contents) {
-    if (content.role !== 'user' || !Array.isArray(content.parts)) continue;
-    content.parts = content.parts.map((part) =>
-      typeof part?.text === 'string' ? { ...part, text: stripLines(part.text, 'session') } : part,
-    );
+  const target = canAppendToLast ? last : undefined;
+  const keptContents: GooglePinContent[] = [];
+  for (let i = 0; i < req.contents.length; i++) {
+    const content = req.contents[i]!;
+    const isTarget = content === target;
+    if (!isTarget && content.role === 'user' && Array.isArray(content.parts)) {
+      const msg = messages[i]!;
+      const nextMsg = messages[i + 1];
+      if (isCommandOnlyTurn(msg) && isPinReply(nextMsg)) {
+        i++; // splice command-only turn + synthesized reply pair
+        continue;
+      }
+      const res = stripGoogleParts(content.parts, 'session', i === 0);
+      if (res.changed && res.empty) {
+        if (isTextOnlyAssistantMsg(nextMsg)) {
+          i++;
+          continue;
+        }
+        // Keep unmodified if dropping alone would leave an empty user turn.
+        keptContents.push(content);
+        continue;
+      }
+      if (res.changed) content.parts = res.parts;
+      keptContents.push(content);
+      continue;
+    }
+    if (isTarget && Array.isArray(content.parts)) {
+      const res = stripGoogleParts(content.parts, 'session', i === 0);
+      if (res.changed) content.parts = res.parts;
+      keptContents.push(content);
+      continue;
+    }
+    keptContents.push(content);
   }
-  if (canAppendToLast && last && Array.isArray(last.parts)) {
-    last.parts.push({ text: pinText });
+  req.contents.splice(0, req.contents.length, ...keptContents);
+  if (target && Array.isArray(target.parts)) {
+    target.parts.push({ text: pinText });
   } else {
     req.contents.push({ role: 'user', parts: [{ text: pinText }] });
   }

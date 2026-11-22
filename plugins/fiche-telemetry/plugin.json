@@ -1,7 +1,7 @@
 {
   "name": "fiche-telemetry",
   "displayName": "Fiche",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Zero-token per-turn & session token/dollar savings telemetry, context compiler skills, and Fiche MCP tools for coding agents.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

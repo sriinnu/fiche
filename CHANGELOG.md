@@ -4,6 +4,16 @@
 features or behaviour changes, patch = fixes). Where the code comes from is in
 the README's Credits section.
 
+## 0.18.0
+
+- **Restart-proof analytics & Tokmeter-style telemetry**: `DashboardState.replay()` restores lifetime, 90-day local-date (`YYYY-MM-DD`), per-model, and active-session accumulators across daemon restarts from `~/.fiche/events.jsonl` and `.1` using a bounded 50-row tail ring buffer, finite numeric validation, and `/fragments/analytics` with interactive 14-day `Tokens`/`USD` bar charts and proportional per-model breakdowns.
+- **Native `FicheBar.app` v0.18.0 (`Agents` tab + live attachment status)**:
+  - `Lifetime` / `Today` hero switcher with weighted + raw subtitles, 14-day `DailySavingsChartView` (`Tokens`/`USD` toggle + hover readout), and proportional `By Model` bars.
+  - Universal `Agents` tab discovering installed Desktop Apps (`Antigravity`, `Antigravity IDE`, `Cursor`, `Claude`, `Windsurf`, `Zed`, `OpenCode`, `ChatGPT (Codex)`, `Codex`, `Runic`) and Coding CLIs (`claude`, `codex`, `agy`, `gemini`, `opencode`, `cursor-agent`, `amp`, `pi`, `aider`) with live process-tree attachment indicators (`Attached`, `Running direct`, `Stopped`, `N attached` / `N direct`), safe shell RC auto-wrap installer (`~/.zshrc`, `$ZDOTDIR`, `~/.bashrc`), and built-in FAQ.
+- **Core, Warp, Bridge & FileTracker hardening (Carbon Audit Wave 2)**:
+  - Fixed `collapseHistory` adaptive post-render image budget enforcement + bounded density re-budget, `userTurnBlocks` profile render options, `FACTSHEET_PAGE_CHARS` export & repeat tally, OpenAI/Google pin relocation guards, `isFileReadToolName` compound namespaces, `CODE_DECL_LINE_RE` ReDoS guard, and `FileTracker` active-rewrite buffering with atomic cleanup.
+  - Hardened `fiche warp` CA/TLS (RFC 5280 SKI/AKI/SPKI, SNI validation, per-CONNECT 30s handshake timeout, strict route path normalization, ChatGPT/Codex `app.asar` + Electron proxy flags, and `FICHE_BYPASS=1` shell-wrapper flow) and Responses/Chat bridge `reasoning`/`stop_reason`/fragmented SSE sniffing.
+
 ## 0.17.0
 
 - Rebranded from `@sriinnu/inkling` to **`@sriinnu/fiche`** (`fiche` and

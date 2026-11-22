@@ -5,7 +5,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -18,15 +18,43 @@ export interface ResolvedMacApp {
 
 const DEFAULT_APP_SEARCH_DIRS = ['/Applications', join(homedir(), 'Applications')] as const;
 
+function sanitizeExecutableName(raw: string): string | null {
+  const exe = raw.trim();
+  if (!exe || exe === '.' || exe === '..' || exe.includes('/') || exe.includes('\\') || exe.includes('\0')) {
+    return null;
+  }
+  return exe;
+}
+
+/** Parse CFBundleExecutable from an XML Info.plist without requiring macOS `plutil`. */
+export function parseXmlBundleExecutable(infoPlistPath: string): string | null {
+  let xml: string;
+  try {
+    xml = readFileSync(infoPlistPath, 'utf8');
+  } catch {
+    return null;
+  }
+  if (xml.startsWith('bplist')) return null;
+  const match = /<key>\s*CFBundleExecutable\s*<\/key>\s*<string>([^<]+)<\/string>/i.exec(xml);
+  if (!match?.[1]) return null;
+  const decoded = match[1]
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&amp;', '&');
+  return sanitizeExecutableName(decoded);
+}
+
 function readBundleExecutable(infoPlistPath: string): string | null {
   const pl = spawnSync('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', infoPlistPath], {
     encoding: 'utf8',
   });
   if (pl.status === 0) {
-    const exe = (pl.stdout ?? '').trim();
+    const exe = sanitizeExecutableName(pl.stdout ?? '');
     if (exe) return exe;
   }
-  return null;
+  return parseXmlBundleExecutable(infoPlistPath);
 }
 
 function findAppBundlePath(spec: string, searchDirs: readonly string[]): string | null {
@@ -78,7 +106,11 @@ export function resolveMacAppBundle(
   const executablePath = join(appPath, 'Contents/MacOS', exeName);
   if (!existsSync(executablePath)) return null;
 
-  const isElectron = existsSync(join(appPath, 'Contents/Frameworks/Electron Framework.framework'));
+  const isElectron =
+    existsSync(join(appPath, 'Contents/Frameworks/Electron Framework.framework')) ||
+    existsSync(join(appPath, 'Contents/Resources/app.asar')) ||
+    existsSync(join(appPath, 'Contents/Resources/app.asar.unpacked')) ||
+    existsSync(join(appPath, 'Contents/Frameworks/Codex Framework.framework'));
   const appName = basename(appPath).replace(/\.app$/i, '');
 
   return { appPath, executablePath, appName, isElectron };
@@ -89,14 +121,23 @@ export function buildWarpAppArgs(
   app: ResolvedMacApp,
   proxyUrl: string,
   extraArgs: readonly string[] = [],
+  opts?: { spkiPins?: readonly string[]; proxyBypassList?: string },
 ): string[] {
   if (app.isElectron) {
-    return [app.executablePath, `--proxy-server=${proxyUrl}`, ...extraArgs];
+    const args = [app.executablePath, `--proxy-server=${proxyUrl}`];
+    if (opts?.proxyBypassList) {
+      args.push(`--proxy-bypass-list=${opts.proxyBypassList}`);
+    }
+    if (opts?.spkiPins && opts.spkiPins.length > 0) {
+      args.push(`--ignore-certificate-errors-spki-list=${opts.spkiPins.join(',')}`);
+    }
+    args.push(...extraArgs);
+    return args;
   }
   return [app.executablePath, ...extraArgs];
 }
 
-const CLI_WRAPPERS = ['claude', 'codex', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi'] as const;
+const CLI_WRAPPERS = ['claude', 'codex', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi', 'aider'] as const;
 
 /** Render POSIX zsh/bash shell helpers (or transparent wrappers when `--wrap` is set). */
 export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string } = {}): string {
@@ -105,7 +146,7 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
   const lines: string[] = [
     '# Added by `fiche shell-init` — route coding agent CLIs & macOS apps via local Fiche proxy.',
     `export FICHE_BIN=${safeBin}`,
-    'fiche-app() { "$FICHE_BIN" warp --app "$@"; }',
+    'fiche-app() { if [ "$#" -eq 0 ]; then "$FICHE_BIN" warp --app; else local app="$1"; shift; "$FICHE_BIN" warp --app "$app" -- "$@"; fi; }',
     'fclaude() { "$FICHE_BIN" warp -- claude "$@"; }',
     'fcodex() { "$FICHE_BIN" warp -- codex "$@"; }',
     'fagy() { "$FICHE_BIN" warp -- agy "$@"; }',
@@ -114,6 +155,7 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
     'fcursor() { "$FICHE_BIN" warp -- cursor-agent "$@"; }',
     'famp() { "$FICHE_BIN" warp -- amp "$@"; }',
     'fpi() { "$FICHE_BIN" warp -- pi "$@"; }',
+    'faider() { "$FICHE_BIN" warp -- aider "$@"; }',
   ];
 
   if (opts.wrap) {
@@ -121,7 +163,7 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
     lines.push('# Transparent CLI wrappers (set FICHE_BYPASS=1 to skip proxy for one invocation)');
     for (const cli of CLI_WRAPPERS) {
       lines.push(
-        `${cli}() { [ "\${FICHE_BYPASS:-0}" = "1" ] && command ${cli} "$@" || "$FICHE_BIN" warp -- ${cli} "$@"; }`,
+        `${cli}() { if [ "\${FICHE_BYPASS:-0}" = "1" ]; then command ${cli} "$@"; else "$FICHE_BIN" warp -- ${cli} "$@"; fi; }`,
       );
     }
   }

@@ -121,7 +121,7 @@ Create `~/Library/Application Support/Runic/mcpservers/fiche/runic-mcp-plugin.js
   "apiVersion": 1,
   "id": "fiche",
   "name": "Fiche Context Compiler",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "executable": "fiche-runic-tool.mjs",
   "tools": [
     {

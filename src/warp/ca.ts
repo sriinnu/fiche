@@ -13,7 +13,9 @@
  */
 
 import {
+  createHash,
   createPrivateKey,
+  createPublicKey,
   generateKeyPairSync,
   randomBytes,
   sign,
@@ -23,7 +25,7 @@ import {
 import * as tls from 'node:tls';
 import { createSecureContext, type SecureContext } from 'node:tls';
 import { isIP } from 'node:net';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -45,11 +47,17 @@ const textEncoder = new TextEncoder();
 const OID_ECDSA_SHA256 = '1.2.840.10045.4.3.2';
 const OID_COMMON_NAME = '2.5.4.3';
 const OID_ORGANIZATION = '2.5.4.10';
-const OID_BASIC_CONSTRAINTS = '2.5.29.19';
+const OID_SUBJECT_KEY_IDENTIFIER = '2.5.29.14';
 const OID_KEY_USAGE = '2.5.29.15';
-const OID_EXT_KEY_USAGE = '2.5.29.37';
 const OID_SUBJECT_ALT_NAME = '2.5.29.17';
+const OID_BASIC_CONSTRAINTS = '2.5.29.19';
+const OID_AUTHORITY_KEY_IDENTIFIER = '2.5.29.35';
+const OID_EXT_KEY_USAGE = '2.5.29.37';
 const OID_SERVER_AUTH = '1.3.6.1.5.5.7.3.1';
+
+/** DER encoding of OID 2.5.29.14 (subjectKeyIdentifier) used to detect legacy CAs missing SKI. */
+const SKI_OID_DER = Buffer.from([0x06, 0x03, 0x55, 0x1d, 0x0e]);
+const MAX_LEAF_CONTEXTS = 256;
 
 const CA_COMMON_NAME = 'inkling warp local CA';
 const CA_ORGANIZATION = 'inkling';
@@ -85,36 +93,102 @@ function keyUsageExtension(bits: number[]): Uint8Array {
 }
 
 /** GeneralName: dNSName is [2] IMPLICIT IA5String, iPAddress is [7] OCTET STRING. */
-function subjectAltNameExtension(host: string): Uint8Array {
+function subjectAltNameExtension(host: string, critical = false): Uint8Array {
   if (isIP(host)) {
     const octets =
       isIP(host) === 4
         ? Uint8Array.from(host.split('.').map((o) => Number.parseInt(o, 10)))
         : ipv6Bytes(host);
-    return extension(OID_SUBJECT_ALT_NAME, false, seq(contextTag(7, octets, false)));
+    return extension(OID_SUBJECT_ALT_NAME, critical, seq(contextTag(7, octets, false)));
   }
-  // [2] IMPLICIT IA5String is the IA5String content under a different tag, so
-  // re-encode the content rather than slicing the header off ia5String(): that
-  // header is 3 bytes, not 2, once the host reaches 128 chars, and the leftover
-  // length byte lands inside the name.
+  // [2] IMPLICIT IA5String requires 7-bit ASCII characters.
+  if (/[^\x20-\x7e]/.test(host)) {
+    throw new Error(`Invalid non-ASCII DNS SAN host: ${host}`);
+  }
+  // Re-encode content rather than slicing header off ia5String() so >127-char hosts encode cleanly.
   return extension(
     OID_SUBJECT_ALT_NAME,
-    false,
+    critical,
     seq(contextTag(2, textEncoder.encode(host), false)),
   );
 }
 
+function readDerTlv(
+  buf: Uint8Array,
+  offset: number,
+): { tag: number; contentStart: number; contentEnd: number; next: number } {
+  const tag = buf[offset]!;
+  const lenByte = buf[offset + 1]!;
+  let len = 0;
+  let contentStart = offset + 2;
+  if (lenByte < 0x80) {
+    len = lenByte;
+  } else {
+    const count = lenByte & 0x7f;
+    for (let i = 0; i < count; i++) {
+      len = len * 256 + buf[offset + 2 + i]!;
+    }
+    contentStart = offset + 2 + count;
+  }
+  const contentEnd = contentStart + len;
+  return { tag, contentStart, contentEnd, next: contentEnd };
+}
+
+/** RFC 5280 §4.2.1.2 Method 1: 160-bit SHA-1 of the BIT STRING subjectPublicKey value (without unused-bits byte). */
+function subjectKeyIdentifier(pubKey: KeyObject): Uint8Array {
+  const spki = new Uint8Array(pubKey.export({ type: 'spki', format: 'der' }));
+  const outer = readDerTlv(spki, 0);
+  const alg = readDerTlv(spki, outer.contentStart);
+  const bitStr = readDerTlv(spki, alg.next);
+  const rawKey = spki.subarray(bitStr.contentStart + 1, bitStr.contentEnd);
+  return new Uint8Array(createHash('sha1').update(rawKey).digest());
+}
+
+function spkiSha256Base64(pubKey: KeyObject): string {
+  const spki = pubKey.export({ type: 'spki', format: 'der' });
+  return createHash('sha256').update(spki).digest('base64');
+}
+
+function writeFileAtomic(filePath: string, content: string, mode: number): void {
+  const tmp = `${filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
+  try {
+    writeFileSync(tmp, content, { mode });
+    chmodSync(tmp, mode);
+    renameSync(tmp, filePath);
+    chmodSync(filePath, mode);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* ignore cleanup error */
+    }
+    throw err;
+  }
+}
+
 function ipv6Bytes(host: string): Uint8Array {
-  const [head, tail] = host.split('::');
+  const cleanHost = host.split('%')[0] ?? host;
+  const lastColon = cleanHost.lastIndexOf(':');
+  let normalized = cleanHost;
+  if (lastColon >= 0 && cleanHost.slice(lastColon + 1).includes('.')) {
+    const octets = cleanHost.slice(lastColon + 1).split('.').map((o) => Number.parseInt(o, 10));
+    if (octets.length === 4 && octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+      const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+      const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+      normalized = `${cleanHost.slice(0, lastColon + 1)}${hi}:${lo}`;
+    }
+  }
+  const [head, tail] = normalized.split('::');
   const parse = (part: string) => (part ? part.split(':').filter(Boolean) : []);
   const left = parse(head ?? '');
   const right = parse(tail ?? '');
   const groups =
     tail === undefined
       ? left
-      : [...left, ...Array(8 - left.length - right.length).fill('0'), ...right];
+      : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right];
   const out = new Uint8Array(16);
   groups.forEach((group, i) => {
+    if (i >= 8) return;
     const v = Number.parseInt(group, 16);
     out[i * 2] = (v >> 8) & 0xff;
     out[i * 2 + 1] = v & 0xff;
@@ -221,10 +295,13 @@ export function readSystemRoots(
 
 export class CertificateAuthority {
   private readonly leaves = new Map<string, SecureContext>();
+  private readonly leafSki: Uint8Array;
+  readonly spkiPins: readonly string[];
 
   private constructor(
     private readonly certPem: string,
     private readonly caKey: KeyObject,
+    private readonly caSki: Uint8Array,
     private readonly leafKey: KeyObject,
     private readonly leafKeyPem: string,
     readonly certPath: string,
@@ -232,7 +309,11 @@ export class CertificateAuthority {
     readonly bundlePath: string,
     /** Where the roots came from (a file path or {@link OS_STORE}); null when `bundlePath` is CA-only. */
     readonly systemRootsPath: string | null,
-  ) {}
+    readonly spkiPin: string,
+  ) {
+    this.leafSki = subjectKeyIdentifier(leafKey);
+    this.spkiPins = [spkiSha256Base64(leafKey), spkiPin];
+  }
 
   /**
    * Write `warp-ca-bundle.pem` = our CA + the system roots, for the env vars
@@ -243,18 +324,22 @@ export class CertificateAuthority {
     const bundlePath = join(dir, 'warp-ca-bundle.pem');
     const { pem: roots, source } = readSystemRoots();
     const sep = roots && !roots.endsWith('\n') ? '\n' : '';
-    writeFileSync(bundlePath, certPem + roots + sep, { mode: 0o644 });
+    writeFileAtomic(bundlePath, certPem + roots + sep, 0o644);
     return { bundlePath, systemRootsPath: source };
   }
 
   /**
-   * Load the persisted CA, or create and persist one. A CA that fails to load
-   * or has expired is replaced rather than reported: it is entirely derived
-   * state, and the only cost of regenerating is that the child process trusts a
-   * new root it is about to be handed anyway.
+   * Load the persisted CA, or create and persist one. A CA that fails to load,
+   * lacks modern strict-X509 extensions (SKI), mismatches its key, or has expired
+   * is replaced rather than reported: it is entirely derived state.
    */
   static loadOrCreate(dir: string): CertificateAuthority {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      /* ignore */
+    }
     const certPath = join(dir, 'warp-ca.pem');
     const keyPath = join(dir, 'warp-ca-key.pem');
 
@@ -262,18 +347,39 @@ export class CertificateAuthority {
       const certPem = readFileSync(certPath, 'utf8');
       const keyPem = readFileSync(keyPath, 'utf8');
       const parsed = new X509Certificate(certPem);
-      if (new Date(parsed.validTo).getTime() > Date.now()) {
-        const caKey = createPrivateKey(keyPem);
+      const caKey = createPrivateKey(keyPem);
+      const caPubFromKey = createPublicKey(caKey).export({ type: 'spki', format: 'der' });
+      const caPubFromCert = parsed.publicKey.export({ type: 'spki', format: 'der' });
+      const hasSki = parsed.raw.includes(SKI_OID_DER);
+      const now = Date.now();
+      const validFrom = new Date(parsed.validFrom).getTime();
+      const validTo = new Date(parsed.validTo).getTime();
+      if (
+        parsed.ca === true &&
+        validFrom <= now &&
+        validTo > now + 365 * 24 * 60 * 60 * 1000 &&
+        hasSki &&
+        Buffer.from(caPubFromKey).equals(Buffer.from(caPubFromCert))
+      ) {
+        try {
+          chmodSync(keyPath, 0o600);
+        } catch {
+          /* ignore */
+        }
+        const caSki = subjectKeyIdentifier(parsed.publicKey);
+        const spkiPin = spkiSha256Base64(parsed.publicKey);
         const leaf = newKeyPair();
         const bundle = CertificateAuthority.writeBundle(dir, certPem);
         return new CertificateAuthority(
           certPem,
           caKey,
+          caSki,
           leaf.publicKey,
           privateKeyPem(leaf.privateKey),
           certPath,
           bundle.bundlePath,
           bundle.systemRootsPath,
+          spkiPin,
         );
       }
     } catch {
@@ -282,6 +388,8 @@ export class CertificateAuthority {
 
     const ca = newKeyPair();
     const name = distinguishedName(CA_COMMON_NAME, CA_ORGANIZATION);
+    const caSki = subjectKeyIdentifier(ca.publicKey);
+    const spkiPin = spkiSha256Base64(ca.publicKey);
     const now = Date.now();
     const der = buildCertificate({
       subject: name,
@@ -294,25 +402,55 @@ export class CertificateAuthority {
         // pathLen 0: this root may sign leaves, never intermediates.
         extension(OID_BASIC_CONSTRAINTS, true, seq(bool(true), integer(0))),
         keyUsageExtension([0, 5, 6]),
+        extension(OID_SUBJECT_KEY_IDENTIFIER, false, octetString(caSki)),
+        extension(OID_AUTHORITY_KEY_IDENTIFIER, false, seq(contextTag(0, caSki, false))),
       ],
     });
 
     const certPem = pem('CERTIFICATE', der);
-    writeFileSync(certPath, certPem, { mode: 0o644 });
-    writeFileSync(keyPath, privateKeyPem(ca.privateKey), { mode: 0o600 });
-    chmodSync(keyPath, 0o600);
+    // Write private key first so readers never observe a new cert paired with a stale key.
+    writeFileAtomic(keyPath, privateKeyPem(ca.privateKey), 0o600);
+    writeFileAtomic(certPath, certPem, 0o644);
 
     const leaf = newKeyPair();
     const bundle = CertificateAuthority.writeBundle(dir, certPem);
     return new CertificateAuthority(
       certPem,
       ca.privateKey,
+      caSki,
       leaf.publicKey,
       privateKeyPem(leaf.privateKey),
       certPath,
       bundle.bundlePath,
       bundle.systemRootsPath,
+      spkiPin,
     );
+  }
+
+  /** Mint a leaf X.509 PEM certificate signed by this CA for `host`. */
+  mintLeafCertPem(host: string): string {
+    const stripped = host.replace(/\.$/, '');
+    const name = isIP(stripped) ? stripped : stripped.toLowerCase();
+    const now = Date.now();
+    // RFC 5280 caps CommonName at 64 chars; for long hosts use an empty Subject DN + critical SAN.
+    const subject = name.length > 64 ? seq() : distinguishedName(name);
+    const sanCritical = name.length > 64;
+    const der = buildCertificate({
+      subject,
+      issuer: distinguishedName(CA_COMMON_NAME, CA_ORGANIZATION),
+      subjectPublicKey: this.leafKey,
+      signingKey: this.caKey,
+      notBefore: new Date(now - 60 * 60 * 1000),
+      notAfter: new Date(now + 365 * 24 * 60 * 60 * 1000),
+      extensions: [
+        keyUsageExtension([0]),
+        extension(OID_EXT_KEY_USAGE, false, seq(oid(OID_SERVER_AUTH))),
+        subjectAltNameExtension(name, sanCritical),
+        extension(OID_SUBJECT_KEY_IDENTIFIER, false, octetString(this.leafSki)),
+        extension(OID_AUTHORITY_KEY_IDENTIFIER, false, seq(contextTag(0, this.caSki, false))),
+      ],
+    });
+    return pem('CERTIFICATE', der);
   }
 
   /**
@@ -322,31 +460,26 @@ export class CertificateAuthority {
    * first request to each host.
    */
   secureContextFor(host: string): SecureContext {
-    const name = host.replace(/\.$/, '');
+    const stripped = host.replace(/\.$/, '');
+    const name = isIP(stripped) ? stripped : stripped.toLowerCase();
     const cached = this.leaves.get(name);
-    if (cached) return cached;
+    if (cached) {
+      this.leaves.delete(name);
+      this.leaves.set(name, cached);
+      return cached;
+    }
 
-    const now = Date.now();
-    const der = buildCertificate({
-      subject: distinguishedName(name),
-      issuer: distinguishedName(CA_COMMON_NAME, CA_ORGANIZATION),
-      subjectPublicKey: this.leafKey,
-      signingKey: this.caKey,
-      notBefore: new Date(now - 60 * 60 * 1000),
-      notAfter: new Date(now + 365 * 24 * 60 * 60 * 1000),
-      extensions: [
-        keyUsageExtension([0]),
-        extension(OID_EXT_KEY_USAGE, false, seq(oid(OID_SERVER_AUTH))),
-        subjectAltNameExtension(name),
-      ],
-    });
-
+    const leafPem = this.mintLeafCertPem(name);
     const context = createSecureContext({
       key: this.leafKeyPem,
       // Ship the root alongside the leaf so the child validates the whole chain
       // from NODE_EXTRA_CA_CERTS without a separate fetch.
-      cert: pem('CERTIFICATE', der) + this.certPem,
+      cert: leafPem + this.certPem,
     });
+    if (this.leaves.size >= MAX_LEAF_CONTEXTS) {
+      const oldest = this.leaves.keys().next().value;
+      if (oldest !== undefined) this.leaves.delete(oldest);
+    }
     this.leaves.set(name, context);
     return context;
   }

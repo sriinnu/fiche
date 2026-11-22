@@ -224,7 +224,12 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     env.REQUESTS_CA_BUNDLE = ca.bundlePath; // Python requests / httpx
     env.FICHE_BYPASS = '1'; // prevent recursive wrapper execution inside shell-init functions
 
-    const execArgv = options.app ? buildWarpAppArgs(options.app, proxyUrl, command) : command;
+    const execArgv = options.app
+      ? buildWarpAppArgs(options.app, proxyUrl, command, {
+          spkiPins: ca.spkiPins,
+          proxyBypassList: 'localhost;127.0.0.1;[::1]',
+        })
+      : command;
     const child = spawnResolved(execArgv, env);
     // The child's proxy and CA point at this process. If warp dies for any
     // reason the child is reparented to init and keeps running against a closed
@@ -273,7 +278,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     process.on('uncaughtException', die);
     process.on('unhandledRejection', die);
     child.on('error', (err) => {
-      console.error(`[fiche] warp: cannot run ${command[0]}: ${err.message}`);
+      console.error(`[fiche] warp: cannot run ${execArgv[0]}: ${err.message}`);
       process.exit(127);
     });
     // SIGHUP and SIGQUIT matter as much as the interactive two: closing the

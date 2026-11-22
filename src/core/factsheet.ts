@@ -58,7 +58,7 @@ const MAX_URLS = 8;
 const MAX_SEEN = 2048; // defensive bound on distinct tokens entering substring-collapse
 const MAX_SCAN = 262_144; // defensive input bound; tool_results are already paged
 // Match render DENSE_CONTENT_CHARS_PER_IMAGE without importing render (cycle-free).
-const FACTSHEET_PAGE_CHARS = 28_080;
+export const FACTSHEET_PAGE_CHARS = 28_080;
 const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (base64, minified) — skip
 
 const M_DIGIT = 1 << 0;
@@ -263,10 +263,14 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
         } else {
           spanSeen.add(key);
         }
-        counts.set(tok, (counts.get(tok) ?? 0) + 1);
+        const prev = counts.get(tok);
+        if (prev !== undefined) {
+          counts.set(tok, prev + 1);
+        } else if (counts.size < MAX_SEEN) {
+          counts.set(tok, 1);
+        }
       }
     }
-    if (counts.size >= MAX_SEEN) break;
   }
   // Phase 1 — substring collapse (length-desc): keep the most-specific form, folding e.g.
   // a URL's path-portion into the full URL. Cross-tier on purpose. Total order (length,
@@ -432,7 +436,7 @@ export function factSheetText(text: string, format: FactSheetFormat = 'full', co
 /** Extract once; coverage remains an emission-time input, never cached state. */
 export function prepareFactSheet(text: string, format: FactSheetFormat = 'full'): (coveredText?: string | ReadonlySet<string>) => string {
   if (!text) return () => '';
-  const entries = text.length <= MAX_SCAN
+  const entries = text.length <= FACTSHEET_PAGE_CHARS
     ? extractFactSheetEntries(text)
     : extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS).kept;
   const full = factSheetTextFromEntries(entries, format);
@@ -443,8 +447,7 @@ export function prepareFactSheet(text: string, format: FactSheetFormat = 'full')
         ? coveredText.includes(entry.token)
         : coveredText.has(entry.token);
       if (!covered) return true;
-      const first = text.indexOf(entry.token);
-      return text.indexOf(entry.token, first + entry.token.length) !== -1;
+      return entry.count >= 2;
     }), format);
   };
 }

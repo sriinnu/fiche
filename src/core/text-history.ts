@@ -23,6 +23,7 @@ import { evaluateCliffAvoidance, priceMode, resolvePriceRates } from './pricing.
 export interface TextEpochBlock {
   readonly msgIndex: number;
   readonly refId: string;
+  readonly toolName?: string;
   readonly getText: () => string;
   readonly setText: (next: string) => void;
 }

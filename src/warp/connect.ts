@@ -13,18 +13,33 @@
  *    absolute-form/CONNECT traffic a forward proxy handles.
  */
 
-import { Agent as HttpAgent, request as httpRequest } from 'node:http';
+import {
+  Agent as HttpAgent,
+  createServer as createHttpServer,
+  request as httpRequest,
+} from 'node:http';
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
 import {
   Agent as HttpsAgent,
-  createServer as createHttpsServer,
   request as httpsRequest,
 } from 'node:https';
-import { connect as netConnect, type Socket } from 'node:net';
-import { connect as tlsConnect, type TLSSocket } from 'node:tls';
+import { connect as netConnect, isIP, type Socket } from 'node:net';
+import { connect as tlsConnect, TLSSocket, type SecureContext } from 'node:tls';
 
 import type { CertificateAuthority } from './ca.js';
-import { hostCouldMatch, matchRoute, rewriteUrl, type Route } from './route.js';
+import { hostCouldMatch, matchRoute, normalizeRoutePath, rewriteUrl, type Route } from './route.js';
+
+const DNS_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.?$/i;
+
+function isValidSniHost(name: string): boolean {
+  if (isIP(name) !== 0) return true;
+  return name.length > 0 && name.length <= 253 && DNS_HOST_RE.test(name);
+}
+
+function normalizeHostKey(host: string): string {
+  const stripped = host.replace(/\.$/, '');
+  return isIP(stripped) !== 0 ? stripped : stripped.toLowerCase();
+}
 
 /**
  * Hop-by-hop headers are meaningful only on a single connection, so they must
@@ -145,12 +160,23 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   ) => {
     req.socket?.setNoDelay?.(true);
     res.socket?.setNoDelay?.(true);
-    const path = requestUri.split('?')[0] ?? '/';
-    const route = matchRoute(routes, hostPort, path);
-
+    let normalizedOrigin: URL;
+    let resolvedReq: URL;
     let target: URL;
     try {
-      target = new URL(route ? rewriteUrl(route, requestUri) : `${origin}${requestUri}`);
+      normalizedOrigin = new URL(origin);
+      resolvedReq = new URL(requestUri, normalizedOrigin);
+      if (resolvedReq.origin !== normalizedOrigin.origin) {
+        throw new Error('origin mismatch');
+      }
+      const path = normalizeRoutePath(resolvedReq.pathname);
+      const normalizedUri = path + resolvedReq.search;
+      const route = matchRoute(routes, hostPort, path);
+      target = new URL(route ? rewriteUrl(route, normalizedUri) : `${origin}${normalizedUri}`);
+      if (route && !announced.has(route.pattern)) {
+        announced.add(route.pattern);
+        onDivert?.(hostPort, path, target.origin);
+      }
     } catch {
       if (!res.headersSent && !res.writableEnded && !res.destroyed) {
         res.writeHead(400, { 'content-type': 'text/plain' });
@@ -158,15 +184,15 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       }
       return;
     }
-    if (route && !announced.has(route.pattern)) {
-      announced.add(route.pattern);
-      onDivert?.(hostPort, path, target.origin);
-    }
 
     const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
+    const hostname =
+      target.hostname.startsWith('[') && target.hostname.endsWith(']')
+        ? target.hostname.slice(1, -1)
+        : target.hostname;
     const outbound = send({
       protocol: target.protocol,
-      hostname: target.hostname,
+      hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
       method: req.method,
       path: target.pathname + target.search,
@@ -229,11 +255,19 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     req.pipe(outbound);
   };
 
+  const connectTargets = new WeakMap<Socket, { host: string; port: string }>();
+  const PROXY_ONLY_UPGRADE_HEADERS = new Set([
+    'proxy-authorization',
+    'proxy-connection',
+    'proxy-authenticate',
+  ]);
+
   const handleDecrypted = (req: IncomingMessage, res: ServerResponse): void => {
+    const bound = connectTargets.get(req.socket);
     const servername = (req.socket as TLSSocket).servername || '';
-    // A client that CONNECTed to a non-443 port repeats it in Host, which is
-    // the only place the original port survives the hijack into mitmServer.
-    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    // Prefer the authoritative CONNECT authority over the HTTP Host header so
+    // an inner request cannot domain-front across an already-established tunnel.
+    const { host, port } = bound ?? splitHostPort(servername || req.headers.host || '', '443');
     forward(req, res, authority(host, port), req.url ?? '/', `https://${authority(host, port)}`);
   };
 
@@ -245,20 +279,24 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    * never produce a 101).
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
+    const bound = connectTargets.get(req.socket) ?? connectTargets.get(clientSocket);
     const servername = (req.socket as TLSSocket).servername || '';
-    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    const { host, port } = bound ?? splitHostPort(servername || req.headers.host || '', '443');
     const portNum = parsePort(port);
     if (!host || portNum === null) {
       clientSocket.destroy();
       return;
     }
-    const upstream = tlsConnect({ host, port: portNum, servername: host }, () => {
+    const upstream = tlsConnect(
+      { host, port: portNum, servername: isIP(host) !== 0 ? undefined : host },
+      () => {
       if (clientSocket.destroyed) {
         upstream.destroy();
         return;
       }
       const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
       for (const [key, value] of Object.entries(req.headers)) {
+        if (PROXY_ONLY_UPGRADE_HEADERS.has(key.toLowerCase())) continue;
         for (const v of Array.isArray(value) ? value : [value]) {
           if (v !== undefined) lines.push(`${key}: ${v}`);
         }
@@ -274,22 +312,11 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     });
   };
 
-  // Forcing http/1.1 via ALPN keeps the decrypted stream parseable by
-  // http.Server; without it Node negotiates h2 and the request handler never
-  // fires. This server never listens — it exists to be handed hijacked sockets.
-  const mitmServer = createHttpsServer({
-    SNICallback: (name, cb) => {
-      try {
-        cb(null, ca.secureContextFor(name));
-      } catch (err) {
-        cb(err as Error);
-      }
-    },
-    ALPNProtocols: ['http/1.1'],
-  });
-  mitmServer.on('request', handleDecrypted);
-  mitmServer.on('upgrade', handleUpgrade);
-  mitmServer.on('clientError', (_err, socket) => socket.destroy());
+  // Non-listening HTTP parser fed per-CONNECT TLSSockets once TLS handshake completes.
+  const decryptedServer = createHttpServer();
+  decryptedServer.on('request', handleDecrypted);
+  decryptedServer.on('upgrade', handleUpgrade);
+  decryptedServer.on('clientError', (_err, socket) => socket.destroy());
 
   const handleConnect = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
     clientSocket.setNoDelay?.(true);
@@ -322,11 +349,71 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
 
+    // Mint a fallback SecureContext bound to the CONNECT target host before replying 200
+    // so no-SNI clients (e.g., IP literals) complete TLS cleanly and failures return 502.
+    let fallbackContext: SecureContext;
+    try {
+      fallbackContext = ca.secureContextFor(host);
+    } catch {
+      clientSocket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+      return;
+    }
     clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
     if (head?.length) clientSocket.unshift(head);
-    // Handing the raw socket to the TLS server lets Node do the handshake, the
-    // HTTP parsing and the upgrade detection for us.
-    mitmServer.emit('connection', clientSocket);
+
+    const hostNorm = normalizeHostKey(host);
+    const hostIsIp = isIP(hostNorm) !== 0;
+    const tlsSocket = new TLSSocket(clientSocket, {
+      isServer: true,
+      secureContext: fallbackContext,
+      SNICallback: (name, cb) => {
+        try {
+          if (!name) {
+            cb(null, fallbackContext);
+            return;
+          }
+          if (!isValidSniHost(name)) {
+            cb(new Error('invalid SNI hostname'));
+            return;
+          }
+          const sniNorm = normalizeHostKey(name);
+          if (!hostIsIp) {
+            if (sniNorm !== hostNorm) {
+              cb(new Error('SNI mismatch with CONNECT target'));
+              return;
+            }
+          } else if (sniNorm !== hostNorm && !hostCouldMatch(routes, authority(sniNorm, port))) {
+            cb(new Error('SNI not permitted for IP CONNECT target'));
+            return;
+          }
+          cb(null, ca.secureContextFor(sniNorm));
+        } catch (err) {
+          cb(err as Error);
+        }
+      },
+      ALPNProtocols: ['http/1.1'],
+    });
+    connectTargets.set(tlsSocket, { host, port });
+    const handshakeTimer = setTimeout(() => {
+      if (!tlsSocket.destroyed) tlsSocket.destroy();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+    }, 30_000);
+    handshakeTimer.unref();
+    const clearHandshakeTimer = () => clearTimeout(handshakeTimer);
+    clientSocket.on('error', () => {
+      clearHandshakeTimer();
+      if (!tlsSocket.destroyed) tlsSocket.destroy();
+    });
+    tlsSocket.on('error', () => {
+      clearHandshakeTimer();
+      if (!tlsSocket.destroyed) tlsSocket.destroy();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+    });
+    tlsSocket.once('close', clearHandshakeTimer);
+    tlsSocket.once('secure', () => {
+      clearHandshakeTimer();
+      if (!tlsSocket.destroyed) decryptedServer.emit('connection', tlsSocket);
+    });
   };
 
   const handleAbsoluteForm = (req: IncomingMessage, res: ServerResponse): void => {

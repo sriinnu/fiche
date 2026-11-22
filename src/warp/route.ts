@@ -95,16 +95,34 @@ export function parseRoute(spec: string): Route {
 
   const hostGlob = pattern.split('/')[0]!;
   const hostRe = new RegExp(`^${hostGlob.toLowerCase().split('*').map(quoteMeta).join('.*')}$`, 'i');
-  const hasPort = /:\d/.test(hostGlob);
+  const hasPort = /\]:\d+$|^[^[\]]+:\d+$/.test(hostGlob);
 
   return { pattern, re, hostRe, hasPort, target, prefix };
 }
 
-/** Drop a trailing ":port", leaving IPv6 literals in brackets intact. */
+/** Drop a trailing ":port", leaving IPv6 literals intact. */
 function stripPort(hostPort: string): string {
-  if (hostPort.startsWith('[')) return hostPort.slice(0, hostPort.indexOf(']') + 1);
-  const i = hostPort.lastIndexOf(':');
-  return i > 0 ? hostPort.slice(0, i) : hostPort;
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']');
+    return end > 0 ? hostPort.slice(0, end + 1) : hostPort;
+  }
+  const firstColon = hostPort.indexOf(':');
+  const lastColon = hostPort.lastIndexOf(':');
+  // Unbracketed IPv6 literal has 2+ colons and no port suffix.
+  if (firstColon !== lastColon) return hostPort;
+  return lastColon > 0 ? hostPort.slice(0, lastColon) : hostPort;
+}
+
+/** Collapse dot-segments and repeated slashes so traversal paths cannot match prefix globs. */
+export function normalizeRoutePath(path: string): string {
+  const cleaned = path.replaceAll('\\', '/').replace(/^\/+/, '/');
+  const safe = cleaned.startsWith('/') ? cleaned : `/${cleaned}`;
+  try {
+    const u = new URL(`http://route.invalid${safe}`);
+    return u.pathname.replace(/\/{2,}/g, '/');
+  } catch {
+    return safe;
+  }
 }
 
 /**
@@ -116,8 +134,9 @@ function stripPort(hostPort: string): string {
 export function matchRoute(routes: readonly Route[], hostPort: string, path: string): Route | null {
   const lower = hostPort.toLowerCase();
   const bare = stripPort(lower);
+  const normalizedPath = normalizeRoutePath(path);
   for (const route of routes) {
-    if (route.re.test((route.hasPort ? lower : bare) + path)) return route;
+    if (route.re.test((route.hasPort ? lower : bare) + normalizedPath)) return route;
   }
   return null;
 }

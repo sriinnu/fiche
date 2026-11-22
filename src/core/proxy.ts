@@ -1972,17 +1972,21 @@ let responseContentType: string | undefined;
         // configuration, not a question. Answer it here unless compression is
         // paused/disabled: passthrough mode must forward `@fiche pin` untouched.
         if (transformOpts?.compress !== false && (isMessages || isOpenAIChat || isOpenAIResponses)) {
-          const pinReply = isMessages
-            ? pinCommandResponse(bodyIn)
-            : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
-          if (pinReply) {
-            return new Response(pinReply.body, {
-              status: 200,
-              headers: {
-                'content-type': pinReply.contentType,
-                'cache-control': 'no-cache',
-              },
-            });
+          try {
+            const pinReply = isMessages
+              ? pinCommandResponse(bodyIn)
+              : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
+            if (pinReply) {
+              return new Response(pinReply.body, {
+                status: 200,
+                headers: {
+                  'content-type': pinReply.contentType,
+                  'cache-control': 'no-cache',
+                },
+              });
+            }
+          } catch {
+            // Fail open: malformed pin parsing must never abort a live agent request.
           }
         }
         // /v1/messages is only a wire schema: Claude Code can target a non-
@@ -2047,7 +2051,9 @@ let responseContentType: string | undefined;
         // which stay text unless INKLING_FORCE_IMAGES=1. When compression is not
         // switched off, weak/text-only/third-party models still receive
         // prefix-safe deterministic text hygiene (`imageCompress: false`).
-        const imageThisRequest = shouldImageModel(routeModel, modelOk);
+        const imageThisRequest =
+          transformOpts?.stageToggles?.optical !== false &&
+          shouldImageModel(routeModel, modelOk);
         const hygieneForcedOn = resolveTextHygieneMode(transformOpts?.textHygiene) === 'on';
         const familyInScope = modelOk || isInConfiguredModelBases(routeModel);
         const killSwitchOff = transformOpts?.compress === false || (!familyInScope && !hygieneForcedOn);
@@ -2080,7 +2086,11 @@ let responseContentType: string | undefined;
           r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
         }
         if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
-          r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
+          try {
+            r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
+          } catch {
+            // Fail open if response/body scrubbing encounters an unexpected shape.
+          }
         }
         transformMs = Date.now() - tTransform;
         // CloudCode PA (`/v1internal:*`) has no `:countTokens` endpoint, and
@@ -2091,50 +2101,54 @@ let responseContentType: string | undefined;
           (r.info.imageCount ?? 0) > 0 &&
           !url.pathname.startsWith('/v1internal:')
         ) {
-          const countUrl = new URL(
-            (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
-              /:(?:generateContent|streamGenerateContent)$/,
-              ':countTokens',
-            ),
-          );
-          for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
-          countUrl.searchParams.delete('alt');
-          const countHeaders = applyGatewayHeadersIfTargeted(
-            filterHeaders(req.headers, STRIP_REQ_HEADERS),
-            countUrl.toString(),
-          );
-          stripAnthropicCredentials(countHeaders);
-          countHeaders.delete('content-encoding');
-          countHeaders.set('content-type', 'application/json');
-          const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
-          const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
-          if (googleSyncProbe) {
-            const [baseline, transformed] = await Promise.all([
-              countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
-              countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
-            ]);
-            if (baseline !== null && transformed !== null) {
-              if (transformed >= baseline) {
-                r = {
-                  body: bodyIn,
-                  info: revertedGoogleInfo(
-                    r.info,
-                    `not_profitable (${transformed} >= ${baseline} tokens)`,
-                    'ok',
-                  ),
-                };
+          try {
+            const countUrl = new URL(
+              (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
+                /:(?:generateContent|streamGenerateContent)$/,
+                ':countTokens',
+              ),
+            );
+            for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
+            countUrl.searchParams.delete('alt');
+            const countHeaders = applyGatewayHeadersIfTargeted(
+              filterHeaders(req.headers, STRIP_REQ_HEADERS),
+              countUrl.toString(),
+            );
+            stripAnthropicCredentials(countHeaders);
+            countHeaders.delete('content-encoding');
+            countHeaders.set('content-type', 'application/json');
+            const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
+            const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
+            if (googleSyncProbe) {
+              const [baseline, transformed] = await Promise.all([
+                countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
+                countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
+              ]);
+              if (baseline !== null && transformed !== null) {
+                if (transformed >= baseline) {
+                  r = {
+                    body: bodyIn,
+                    info: revertedGoogleInfo(
+                      r.info,
+                      `not_profitable (${transformed} >= ${baseline} tokens)`,
+                      'ok',
+                    ),
+                  };
+                } else {
+                  r.info.baselineTokens = baseline;
+                  r.info.baselineProbeStatus = 'ok';
+                }
               } else {
-                r.info.baselineTokens = baseline;
-                r.info.baselineProbeStatus = 'ok';
+                // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
+                // Retain local profitability decision computed by transformGoogleGenerateContent.
+                r.info.baselineProbeStatus = 'failed';
               }
             } else {
-              // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
-              // Retain local profitability decision computed by transformGoogleGenerateContent.
-              r.info.baselineProbeStatus = 'failed';
+              baselineStatusApplies = true;
+              baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!);
             }
-          } else {
-            baselineStatusApplies = true;
-            baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!);
+          } catch {
+            r.info.baselineProbeStatus = 'failed';
           }
         }
         if (!modelOk && !r.info.compressed) r.info.reason = 'unsupported_model';
@@ -2146,9 +2160,14 @@ let responseContentType: string | undefined;
           reqBodySha256 = await sha256Bytes(r.body);
           reqBodySha8 = reqBodySha256.slice(0, 8);
         }
-        const requestByteLimit = requestModel
-          ? resolveGptProfile(requestModel).maxSerializedRequestBytes
-          : undefined;
+        let requestByteLimit: number | undefined;
+        try {
+          requestByteLimit = requestModel
+            ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+            : undefined;
+        } catch {
+          requestByteLimit = undefined;
+        }
         if (r.info.compressed && requestByteLimit !== undefined) {
           if (r.body.byteLength > requestByteLimit) {
             r.info.sizeLimitOutcome = 'rejected';
@@ -2169,45 +2188,52 @@ let responseContentType: string | undefined;
         // Probes go to the configured Anthropic upstream with the host's keys; a
         // followed request's prompt must not be copied there.
         if (isMessages && messagesAnthropic && !follow) {
-          baselineStatusApplies = true;
-          // Probes fire on the ORIGINAL body before the main forward so all three overlap.
-          // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
-          const ctBody = buildBaselineCountTokensBody(bodyIn);
-          if (ctBody) {
-            // Mirror the actual outbound request base+path: count_tokens lives at
-            // `<messages-path>/count_tokens`, so provider-prefixed routes like
-            // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
-            // joined like the main forward so a `…/anthropic` base isn't doubled.
-            const ctUrl = providerPrefixed
-              ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
-              : upstream + url.pathname + '/count_tokens';
-            const ctHeaders = applyGatewayHeadersIfTargeted(
-              filterHeaders(req.headers, STRIP_REQ_HEADERS),
-              ctUrl,
-            );
-            ctHeaders.delete('content-encoding');
-            ctHeaders.set('content-type', 'application/json');
-            const ctAuth = resolveAuthToken(config);
-            if (config.apiKey) ctHeaders.delete('authorization');
-            if (ctAuth) ctHeaders.delete('x-api-key');
-            if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-            // The probe carries the client's frozen bearer otherwise, so it 401s
-            // exactly when the main forward starts succeeding on the fresh one.
-            if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
-            baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
-            // Null = no markers → cacheable=0 by definition, no probe needed.
-            const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
-            if (ctCacheableBody) {
-              baselineCacheablePromise = countTokensUpstream(
+          try {
+            baselineStatusApplies = true;
+            // Probes fire on the ORIGINAL body before the main forward so all three overlap.
+            // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
+            const ctBody = buildBaselineCountTokensBody(bodyIn);
+            if (ctBody) {
+              // Mirror the actual outbound request base+path: count_tokens lives at
+              // `<messages-path>/count_tokens`, so provider-prefixed routes like
+              // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
+              // joined like the main forward so a `…/anthropic` base isn't doubled.
+              const ctUrl = providerPrefixed
+                ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
+                : upstream + url.pathname + '/count_tokens';
+              const ctHeaders = applyGatewayHeadersIfTargeted(
+                filterHeaders(req.headers, STRIP_REQ_HEADERS),
                 ctUrl,
-                ctCacheableBody,
-                new Headers(ctHeaders),
               );
+              ctHeaders.delete('content-encoding');
+              ctHeaders.set('content-type', 'application/json');
+              const ctAuth = resolveAuthToken(config);
+              if (config.apiKey) ctHeaders.delete('authorization');
+              if (ctAuth) ctHeaders.delete('x-api-key');
+              if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+              // The probe carries the client's frozen bearer otherwise, so it 401s
+              // exactly when the main forward starts succeeding on the fresh one.
+              if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
+              baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
+              // Null = no markers → cacheable=0 by definition, no probe needed.
+              const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
+              if (ctCacheableBody) {
+                baselineCacheablePromise = countTokensUpstream(
+                  ctUrl,
+                  ctCacheableBody,
+                  new Headers(ctHeaders),
+                );
+              }
             }
+          } catch {
+            // Telemetry-only count_tokens probes must never abort the live request.
           }
         }
       } catch (e) {
-        if ((bridgedGptMessages || bridgedChatMessages) && (e as Error).name === 'MessagesBridgeInvalidRequest') {
+        if (
+          (bridgedGptMessages || bridgedChatMessages) &&
+          ((e as Error).name === 'MessagesBridgeInvalidRequest' || e instanceof SyntaxError)
+        ) {
           fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
           return new Response(JSON.stringify({
             type: 'error',
