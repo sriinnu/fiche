@@ -463,9 +463,11 @@ export function startHttpServer(
       received += chunk.length;
       if (received > MCP_MAX_BYTES) {
         rejected = true;
-        res.writeHead(413, { 'content-type': 'application/json' });
+        // Signal `Connection: close` so keep-alive clients (e.g. Node 24 globalAgent)
+        // never pool/reuse this socket, and drain without abruptly triggering EPIPE.
+        res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
         res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'body too large' } }));
-        req.destroy();
+        req.resume();
         return;
       }
       chunks.push(chunk);
