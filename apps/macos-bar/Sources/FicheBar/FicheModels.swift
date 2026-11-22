@@ -174,12 +174,71 @@ struct PricingAssumptions: Decodable, Sendable, Equatable {
     }
 }
 
+struct DailySavingsPoint: Decodable, Identifiable, Sendable, Equatable {
+    let date: String
+    let requests: Int
+    let compressed: Int
+    let imaged: Int
+    let textCompressed: Int
+    let baselineInputWeighted: Double
+    let actualInputWeighted: Double
+    let savedTokens: Double
+    let rawSavedTokens: Double
+    let savedPct: Double
+    let savedUsd: Double
+    let cliffSavedUsd: Double
+    let isToday: Bool
+
+    var id: String { date }
+
+    var shortDateLabel: String {
+        if isToday { return "Today" }
+        let parts = date.split(separator: "-")
+        guard parts.count == 3, let month = Int(parts[1]), let day = Int(parts[2]), (1...12).contains(month) else {
+            return date
+        }
+        let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        return "\(months[month - 1]) \(day)"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.date = c.firstString("date") ?? ""
+        self.requests = c.firstInt("requests") ?? 0
+        self.compressed = c.firstInt("compressed", "compressed_requests", "compressedRequests") ?? 0
+        self.imaged = c.firstInt("imaged", "imaged_requests", "imagedRequests") ?? 0
+        self.textCompressed = c.firstInt("text_compressed", "textCompressed", "text_compressed_requests") ?? 0
+        let baseline = c.firstDouble("baseline_input_weighted", "baselineInputWeighted") ?? 0
+        let actual = c.firstDouble("actual_input_weighted", "actualInputWeighted") ?? 0
+        self.baselineInputWeighted = baseline
+        self.actualInputWeighted = actual
+        self.savedTokens = c.firstDouble("saved_tokens", "savedTokens", "saved_input_tokens") ?? max(0, baseline - actual)
+        self.rawSavedTokens = c.firstDouble("raw_saved_tokens", "rawSavedTokens") ?? 0
+        self.savedPct = c.firstDouble("saved_pct", "savedPct") ?? 0
+        self.savedUsd = c.firstDouble("saved_usd", "savedUsd") ?? 0
+        self.cliffSavedUsd = c.firstDouble("cliff_saved_usd", "cliffSavedUsd") ?? 0
+        self.isToday = c.firstBool("is_today", "isToday") ?? false
+    }
+}
+
+struct DiscoveredCLIAgent: Identifiable, Sendable, Equatable {
+    let id: String
+    let name: String
+    let command: String
+    let provider: String
+    let installed: Bool
+    let binaryPath: String?
+}
+
 struct ModelStats: Decodable, Sendable, Equatable {
     let requests: Int
     let compressedRequests: Int
+    let imagedRequests: Int
+    let textCompressedRequests: Int
     let baselineInputWeighted: Double
     let actualInputWeighted: Double
     let savedInputTokens: Double
+    let rawSavedTokens: Double
     let savedPct: Double
     let savedUsd: Double
     let cliffAvoidedEvents: Int
@@ -189,6 +248,8 @@ struct ModelStats: Decodable, Sendable, Equatable {
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
         self.requests = c.firstInt("requests", "turns", "count") ?? 0
         self.compressedRequests = c.firstInt("compressed_requests", "compressedRequests", "compressed") ?? 0
+        self.imagedRequests = c.firstInt("imaged", "imaged_requests", "imagedRequests") ?? 0
+        self.textCompressedRequests = c.firstInt("text_compressed", "textCompressed", "text_compressed_requests") ?? 0
         let baseline = c.firstDouble("baseline_input_weighted", "baselineInputWeighted", "baseline_tokens", "baselineTokens") ?? 0
         let actual = c.firstDouble("actual_input_weighted", "actualInputWeighted", "actual_tokens", "actualTokens") ?? 0
         let saved = c.firstDouble("saved_input_tokens", "savedInputTokens", "saved_tokens", "savedTokens")
@@ -196,6 +257,7 @@ struct ModelStats: Decodable, Sendable, Equatable {
         self.baselineInputWeighted = baseline
         self.actualInputWeighted = actual
         self.savedInputTokens = saved
+        self.rawSavedTokens = c.firstDouble("raw_saved_tokens", "rawSavedTokens") ?? 0
         if let pct = c.firstDouble("saved_pct", "savedPct", "saved_pct_input_only") {
             self.savedPct = pct
         } else if baseline > 0 {
@@ -212,10 +274,13 @@ struct ModelStats: Decodable, Sendable, Equatable {
 struct ProxyStatsResponse: Decodable, Sendable, Equatable {
     let requests: Int
     let compressedRequests: Int
+    let imagedRequests: Int
+    let textCompressedRequests: Int
     let passthrough: Int
     let baselineInputWeighted: Double
     let actualInputWeighted: Double
     let savedInputTokens: Double
+    let rawSavedTokens: Double
     let savedPct: Double
     let savedUsd: Double
     let cliffAvoidedEvents: Int
@@ -226,15 +291,20 @@ struct ProxyStatsResponse: Decodable, Sendable, Equatable {
     let pricingAssumptions: PricingAssumptions?
     let allowedModels: [String]?
     let byModel: [String: ModelStats]
+    let today: DailySavingsPoint?
+    let daily: [DailySavingsPoint]
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
         self.requests = c.firstInt("requests") ?? 0
         self.compressedRequests = c.firstInt("compressed_requests", "compressedRequests") ?? 0
+        self.imagedRequests = c.firstInt("imaged_requests", "imagedRequests") ?? 0
+        self.textCompressedRequests = c.firstInt("text_compressed_requests", "textCompressedRequests") ?? 0
         self.passthrough = c.firstInt("passthrough") ?? 0
         self.baselineInputWeighted = c.firstDouble("baseline_input_weighted", "baselineInputWeighted") ?? 0
         self.actualInputWeighted = c.firstDouble("actual_input_weighted", "actualInputWeighted") ?? 0
         self.savedInputTokens = c.firstDouble("saved_input_tokens", "savedInputTokens") ?? 0
+        self.rawSavedTokens = c.firstDouble("raw_saved_tokens", "rawSavedTokens") ?? 0
         self.savedPct = c.firstDouble("saved_pct", "saved_pct_input_only", "savedPct") ?? 0
         self.savedUsd = c.firstDouble("saved_usd", "savedUsd") ?? 0
         self.cliffAvoidedEvents = c.firstInt("cliff_avoided_events", "cliffAvoidedEvents") ?? 0
@@ -247,6 +317,8 @@ struct ProxyStatsResponse: Decodable, Sendable, Equatable {
         self.byModel = (try? c.decodeIfPresent([String: ModelStats].self, forKey: DynamicCodingKey("by_model")))
             ?? (try? c.decodeIfPresent([String: ModelStats].self, forKey: DynamicCodingKey("byModel")))
             ?? [:]
+        self.today = try? c.decodeIfPresent(DailySavingsPoint.self, forKey: DynamicCodingKey("today"))
+        self.daily = (try? c.decodeIfPresent([DailySavingsPoint].self, forKey: DynamicCodingKey("daily"))) ?? []
     }
 }
 

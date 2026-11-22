@@ -73,6 +73,7 @@ import {
   renderContextMapFragment,
   renderSessionSummaryFragment,
   renderHeaderFragment,
+  renderAnalyticsFragment,
   renderRecentFragment,
   renderLatestFragment,
   renderSessionsFragment,
@@ -94,6 +95,8 @@ import {
   type StagePluginDescriptor,
 } from './core/stage-plugins.js';
 import type {
+  DailySavingsPoint,
+  ModelStatsPayload,
   StatsPayload,
   RecentPayload,
   SessionsPayload,
@@ -102,6 +105,46 @@ import type {
 } from './dashboard/types.js';
 
 const RECENT_CAP = 50;
+const DAILY_CHART_DAYS = 14;
+const MAX_DAILY_BUCKETS = 90;
+
+function localDateKey(ms: number): string {
+  const d = new Date(ms);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+interface DailyBucket {
+  requests: number;
+  compressed: number;
+  imaged: number;
+  textCompressed: number;
+  baselineInputWeighted: number;
+  actualInputWeighted: number;
+  rawSavedTokens: number;
+  pricedBaselineInputWeighted: number;
+  pricedActualInputWeighted: number;
+  pricedSavedUsd: number;
+  cliffSavedUsd: number;
+}
+
+function emptyDailyBucket(): DailyBucket {
+  return {
+    requests: 0,
+    compressed: 0,
+    imaged: 0,
+    textCompressed: 0,
+    baselineInputWeighted: 0,
+    actualInputWeighted: 0,
+    rawSavedTokens: 0,
+    pricedBaselineInputWeighted: 0,
+    pricedActualInputWeighted: 0,
+    pricedSavedUsd: 0,
+    cliffSavedUsd: 0,
+  };
+}
 
 /** How many rendered PNGs to keep in the in-memory image ring. Matches
  *  RECENT_CAP so every visible recent-requests row can still resolve its
@@ -144,6 +187,9 @@ export interface RecentRow {
   size_in?: number;
   compressed: boolean;
   cc_added?: number;
+  image_count?: number;
+  compression_mode?: 'optical' | 'text' | 'none';
+  text_hygiene_stages?: string[];
   input_tokens?: number;
   /** From /v1/messages `usage.output_tokens`. Identical with/without
    *  compression — shown so the operator can see why an output-heavy
@@ -246,6 +292,9 @@ interface SessionTotals {
 interface Totals {
   requests: number;
   compressedRequests: number;
+  imagedRequests: number;
+  textCompressedRequests: number;
+  rawSavedTokens: number;
   /** Sum of weighted actual input tokens we paid for, across all events that
    *  also carried a baseline_tokens measurement (input + cache_create×1.25 +
    *  cache_read×0.10). */
@@ -342,6 +391,9 @@ function emptyTotals(startedAt = Date.now() / 1000): Totals {
   return {
     requests: 0,
     compressedRequests: 0,
+    imagedRequests: 0,
+    textCompressedRequests: 0,
+    rawSavedTokens: 0,
     actualInputWeighted: 0,
     baselineInputWeighted: 0,
     outputWeighted: 0,
@@ -616,6 +668,9 @@ export class DashboardState {
    * only currently enabled model families, so toggling a model updates the
    * overall numbers without discarding its history. */
   private readonly totalsByModel = new Map<string, Totals>();
+  /** Daily accounting partitioned by local YYYY-MM-DD and exact model id.
+   *  Capped to MAX_DAILY_BUCKETS days in memory. */
+  private readonly dailyByDateModel = new Map<string, Map<string, DailyBucket>>();
   /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
    *  Each request that rendered an image pushes one entry; the matching
    *  RecentRow carries `img_id` so the dashboard can pull any image still in
@@ -699,6 +754,255 @@ export class DashboardState {
     return combined;
   }
 
+  private dailyBucketFor(dateKey: string, model: string | undefined): DailyBucket {
+    let byModel = this.dailyByDateModel.get(dateKey);
+    if (!byModel) {
+      byModel = new Map<string, DailyBucket>();
+      this.dailyByDateModel.set(dateKey, byModel);
+      if (this.dailyByDateModel.size > MAX_DAILY_BUCKETS) {
+        let oldestKey: string | undefined;
+        for (const k of this.dailyByDateModel.keys()) {
+          if (oldestKey === undefined || k < oldestKey) oldestKey = k;
+        }
+        if (oldestKey !== undefined) this.dailyByDateModel.delete(oldestKey);
+      }
+    }
+    const modelKey = model ?? '';
+    let bucket = byModel.get(modelKey);
+    if (!bucket) {
+      bucket = emptyDailyBucket();
+      byModel.set(modelKey, bucket);
+    }
+    return bucket;
+  }
+
+  private classifyCompressionMode(
+    compressed: boolean,
+    imageCount: number,
+    hygieneTok: number,
+    hygieneStages?: readonly string[],
+    reason?: string,
+  ): {
+    opticalCompressed: boolean;
+    textOnlyCompressed: boolean;
+    compressionMode: 'optical' | 'text' | 'none';
+  } {
+    const textOnlyCompressed =
+      compressed &&
+      imageCount === 0 &&
+      (hygieneTok > 0 || (hygieneStages?.length ?? 0) > 0 || reason === 'text_hygiene');
+    const opticalCompressed = compressed && !textOnlyCompressed;
+    const compressionMode: 'optical' | 'text' | 'none' = opticalCompressed
+      ? 'optical'
+      : textOnlyCompressed
+        ? 'text'
+        : 'none';
+    return { opticalCompressed, textOnlyCompressed, compressionMode };
+  }
+
+  private recordAccumulators(args: {
+    model: string | undefined;
+    eventMs: number;
+    compressed: boolean;
+    opticalCompressed: boolean;
+    textOnlyCompressed: boolean;
+    haveUsage: boolean;
+    creditSaving: boolean;
+    dollarEligible: boolean;
+    actualInputEff: number;
+    baselineInputEff: number;
+    outputEquiv: number;
+    rawActual: number;
+    rawBaseline: number;
+    inp: number;
+    out: number;
+    cc: number;
+    cr: number;
+    cc1h: number;
+    cachedTok: number;
+    writeTok: number;
+    googleOrGpt: boolean;
+    sid: string | undefined;
+    hygieneTok: number;
+    hygieneChars: number;
+    cliffAvoided: boolean;
+    cliffUsd: number;
+    measurement?: {
+      textChars: number;
+      thinkingChars: number;
+      toolUseChars: number;
+      redactedBlockCount: number;
+    };
+  }): void {
+    const {
+      model,
+      eventMs,
+      compressed,
+      opticalCompressed,
+      textOnlyCompressed,
+      haveUsage,
+      creditSaving,
+      dollarEligible,
+      actualInputEff,
+      baselineInputEff,
+      outputEquiv,
+      rawActual,
+      rawBaseline,
+      inp,
+      out,
+      cc,
+      cr,
+      cc1h,
+      cachedTok,
+      writeTok,
+      googleOrGpt,
+      sid,
+      hygieneTok,
+      hygieneChars,
+      cliffAvoided,
+      cliffUsd,
+      measurement,
+    } = args;
+
+    const totals = this.totalsForModel(model);
+    const daily = this.dailyBucketFor(localDateKey(eventMs), model);
+
+    totals.requests += 1;
+    daily.requests += 1;
+    if (compressed) {
+      totals.compressedRequests += 1;
+      daily.compressed += 1;
+    }
+    if (opticalCompressed) {
+      totals.imagedRequests += 1;
+      daily.imaged += 1;
+    }
+    if (textOnlyCompressed) {
+      totals.textCompressedRequests += 1;
+      daily.textCompressed += 1;
+    }
+    if (hygieneTok > 0) totals.textHygieneSavedTokens += hygieneTok;
+    if (hygieneChars > 0) totals.textHygieneSavedChars += hygieneChars;
+    if (cliffAvoided) {
+      totals.cliffAvoidedEvents += 1;
+      totals.cliffSavedUsd += cliffUsd;
+      daily.cliffSavedUsd += cliffUsd;
+    }
+
+    const rawSaved = creditSaving && rawBaseline > 0 ? Math.max(0, rawBaseline - rawActual) : 0;
+
+    if (creditSaving) {
+      totals.baselineInputWeighted += baselineInputEff;
+      totals.actualInputWeighted += actualInputEff;
+      totals.outputWeighted += outputEquiv;
+      totals.rawSavedTokens += rawSaved;
+
+      daily.baselineInputWeighted += baselineInputEff;
+      daily.actualInputWeighted += actualInputEff;
+      daily.rawSavedTokens += rawSaved;
+
+      if (dollarEligible) {
+        totals.pricedBaselineInputWeighted += baselineInputEff;
+        totals.pricedActualInputWeighted += actualInputEff;
+        totals.pricedOutputWeighted += outputEquiv;
+
+        daily.pricedBaselineInputWeighted += baselineInputEff;
+        daily.pricedActualInputWeighted += actualInputEff;
+
+        const usdPerMtok = inputUsdPerMtok(model, { promptTokens: inp + cc + cr });
+        if (usdPerMtok !== undefined) {
+          const rowUsd = ((baselineInputEff - actualInputEff) * usdPerMtok) / 1e6;
+          totals.pricedSavedUsd += rowUsd;
+          totals.usdPricedRequests += 1;
+          daily.pricedSavedUsd += rowUsd;
+        } else {
+          totals.usdUnpricedRequests += 1;
+        }
+      }
+    }
+
+    if (haveUsage && dollarEligible) {
+      totals.allBaselineEquivalentWeighted += baselineInputEff;
+      totals.allActualInputWeighted += actualInputEff;
+      totals.allOutputWeighted += outputEquiv;
+      totals.allUsageRequests += 1;
+      let rowActualUsdKosha = 0;
+      if (priceMode() === 'kosha') {
+        const bill = googleOrGpt
+          ? estimateBillUsd(model, {
+              uncachedTokens: Math.max(0, inp - cachedTok - writeTok),
+              cachedTokens: cachedTok,
+              cacheWriteTokens: writeTok,
+              outputTokens: out,
+              promptTokens: inp,
+            })
+          : estimateBillUsd(model, {
+              uncachedTokens: inp,
+              cachedTokens: cr,
+              cacheWriteTokens: cc,
+              outputTokens: out,
+              ttlSec: cc1h > 0 && cc1h >= cc ? 3600 : 300,
+              promptTokens: inp + cc + cr,
+            });
+        rowActualUsdKosha = bill ?? ((actualInputEff + outputEquiv) * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+      }
+      if (compressed) {
+        totals.compressedPaidRequests += 1;
+        totals.compressedActualInputWeighted += actualInputEff;
+        totals.compressedOutputWeighted += outputEquiv;
+        totals.compressedActualUsdKosha += rowActualUsdKosha;
+      } else {
+        totals.passthroughPaidRequests += 1;
+        totals.passthroughActualInputWeighted += actualInputEff;
+        totals.passthroughOutputWeighted += outputEquiv;
+        totals.passthroughActualUsdKosha += rowActualUsdKosha;
+      }
+    }
+
+    if (typeof sid === 'string' && sid.length > 0) {
+      this.currentSessionId = sid;
+      let s = this.sessions.get(sid);
+      if (!s) {
+        s = {
+          sessionId: sid,
+          baselineInputWeighted: 0,
+          actualInputWeighted: 0,
+          baselineMeasuredCount: 0,
+          allActualInputWeighted: 0,
+          allOutputWeighted: 0,
+          rawActualTokens: 0,
+          rawBaselineTokens: 0,
+          rawOutputTokens: 0,
+        };
+        this.sessions.set(sid, s);
+        if (this.sessions.size > DashboardState.SESSION_CAP) {
+          const firstKey = this.sessions.keys().next().value;
+          if (firstKey !== undefined) this.sessions.delete(firstKey);
+        }
+      }
+      if (creditSaving && dollarEligible) {
+        s.baselineInputWeighted += baselineInputEff;
+        s.actualInputWeighted += actualInputEff;
+        s.baselineMeasuredCount += 1;
+        s.rawActualTokens += rawActual;
+        s.rawBaselineTokens += rawBaseline;
+        s.rawOutputTokens += out;
+      }
+      if (haveUsage && dollarEligible) {
+        s.allActualInputWeighted += actualInputEff;
+        s.allOutputWeighted += outputEquiv;
+      }
+    }
+
+    if (measurement) {
+      totals.textCharsMeasured += measurement.textChars;
+      totals.thinkingCharsMeasured += measurement.thinkingChars;
+      totals.toolUseCharsMeasured += measurement.toolUseChars;
+      totals.redactedBlockCountMeasured += measurement.redactedBlockCount;
+      totals.eventsWithMeasurement += 1;
+    }
+  }
+
   /** Stash every rendered image into the ring (called from onRequest with the
    *  raw ProxyEvent before info.firstImagePng is dropped by toTrackEvent).
    *  Returns the assigned image ids in render order; empty array when there
@@ -754,7 +1058,7 @@ export class DashboardState {
     const u = ev.usage;
     const info = ev.info;
     const compressed = info?.compressed === true;
-    const totals = this.totalsForModel(ev.model);
+    const eventMs = Date.now();
 
     const inp = u?.input_tokens ?? 0;
     const out = u?.output_tokens ?? 0;
@@ -1018,176 +1322,60 @@ export class DashboardState {
       }
     }
 
-    totals.requests += 1;
-    if (compressed) totals.compressedRequests += 1;
-    if (info?.textHygieneSavedTokens) totals.textHygieneSavedTokens += info.textHygieneSavedTokens;
-    if (info?.textHygieneSavedChars) totals.textHygieneSavedChars += info.textHygieneSavedChars;
-    if (info?.cliffAvoided) {
-      totals.cliffAvoidedEvents += 1;
-      totals.cliffSavedUsd += info.cliffAvoided.savedUsd;
-    }
-
-    // Token headline: compressed rows with a usable measured or local
-    // baseline. An
-    // uncompressed row contributes zero saved (baseline === actual), so
-    // including it here would only dilute the "saved on rows we moved" %.
+    const imageCount = info?.imageCount ?? 0;
+    const hygieneTok = info?.textHygieneSavedTokens ?? 0;
+    const hygieneChars = info?.textHygieneSavedChars ?? 0;
+    const hygieneStages = info?.textHygieneStages;
+    const { opticalCompressed, textOnlyCompressed, compressionMode } = this.classifyCompressionMode(
+      compressed,
+      imageCount,
+      hygieneTok,
+      hygieneStages,
+      info?.reason,
+    );
     const dollarEligible = !google || priceMode() === 'kosha';
-    if (creditSaving) {
-      totals.baselineInputWeighted += baselineInputEff;
-      totals.actualInputWeighted += actualInputEff;
-      totals.outputWeighted += outputEquiv;
-      if (dollarEligible) {
-        totals.pricedBaselineInputWeighted += baselineInputEff;
-        totals.pricedActualInputWeighted += actualInputEff;
-        totals.pricedOutputWeighted += outputEquiv;
-        // Kosha mode: dollars at this model's own input price. Unpriced rows
-        // are counted, never converted at a guessed rate.
-        // The band is picked on the prompt as billed: uncached + written + read.
-        // When compression pulled a request under a band line, the saving is
-        // valued at the lower band: an understatement, never an overstatement.
-        const usdPerMtok = inputUsdPerMtok(ev.model, { promptTokens: inp + cc + cr });
-        if (usdPerMtok !== undefined) {
-          totals.pricedSavedUsd += ((baselineInputEff - actualInputEff) * usdPerMtok) / 1e6;
-          totals.usdPricedRequests += 1;
-        } else {
-          totals.usdUnpricedRequests += 1;
-        }
-      }
-    }
-    // All-rows COUNTERFACTUAL spend, ungated on the probe — the honest
-    // denominator for "did inkling move my real bill". Measured rows
-    // contribute their cache-aware baseline (what the unproxied path
-    // would have billed); unmeasured/probe-failed/passthrough rows
-    // contribute their actual input (inkling either didn't run or we
-    // can't measure the counterfactual, so actual ≈ baseline). This
-    // keeps the ratio bounded at 100% — you can't save more than you
-    // would have paid.
-    if (haveUsage && dollarEligible) {
-      // baselineInputEff already folds the uncompressed/probe-failed fallback
-      // to actualInputEff, so passthrough rows contribute zero saved here.
-      totals.allBaselineEquivalentWeighted += baselineInputEff;
-      totals.allActualInputWeighted += actualInputEff;
-      totals.allOutputWeighted += outputEquiv;
-      totals.allUsageRequests += 1;
-      let rowActualUsdKosha = 0;
-      if (priceMode() === 'kosha') {
-        const cachedTok = u?.cached_tokens ?? 0;
-        const writeTok = u?.cache_write_tokens ?? 0;
-        const bill = google || gpt
-          ? estimateBillUsd(ev.model, {
-              uncachedTokens: Math.max(0, inp - cachedTok - writeTok),
-              cachedTokens: cachedTok,
-              cacheWriteTokens: writeTok,
-              outputTokens: out,
-              promptTokens: inp,
-            })
-          : estimateBillUsd(ev.model, {
-              uncachedTokens: inp,
-              cachedTokens: cr,
-              cacheWriteTokens: cc,
-              outputTokens: out,
-              ttlSec: cc1h > 0 && cc1h >= cc ? 3600 : 300,
-              promptTokens: inp + cc + cr,
-            });
-        rowActualUsdKosha = bill ?? ((actualInputEff + outputEquiv) * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
-      }
-      // Direct observed compressed-vs-passthrough split. No counterfactual,
-      // no probe gating — just partition the paid-rows set by which path
-      // actually ran this turn. Headline answers "is the compressed path
-      // cheaper per request on real traffic". Selection bias (the gate
-      // routes each turn) is real; sample counts go to the UI so the
-      // operator can judge sufficiency.
-      if (compressed) {
-        totals.compressedPaidRequests += 1;
-        totals.compressedActualInputWeighted += actualInputEff;
-        totals.compressedOutputWeighted += outputEquiv;
-        totals.compressedActualUsdKosha += rowActualUsdKosha;
-      } else {
-        totals.passthroughPaidRequests += 1;
-        totals.passthroughActualInputWeighted += actualInputEff;
-        totals.passthroughOutputWeighted += outputEquiv;
-        totals.passthroughActualUsdKosha += rowActualUsdKosha;
-      }
-    }
 
-    // Per-session aggregation. Uses the SAME baseline/actual/output math as
-    // the global accumulators above, partitioned by `info.firstUserSha8`
-    // so the dashboard's "current session" panel can show what's happening
-    // RIGHT NOW instead of stale lifetime numbers. Untagged events (no
-    // firstUserSha8 — cold start, passthrough probe failures) are skipped
-    // rather than bucketed into a synthetic "unknown" session.
-    const sid = info?.firstUserSha8;
-    if (typeof sid === 'string' && sid.length > 0) {
-      this.currentSessionId = sid;
-      let s = this.sessions.get(sid);
-      if (!s) {
-        s = {
-          sessionId: sid,
-          baselineInputWeighted: 0,
-          actualInputWeighted: 0,
-          baselineMeasuredCount: 0,
-          allActualInputWeighted: 0,
-          allOutputWeighted: 0,
-          rawActualTokens: 0,
-          rawBaselineTokens: 0,
-          rawOutputTokens: 0,
-        };
-        this.sessions.set(sid, s);
-        // Cap memory — drop the first (oldest by insertion order) session
-        // when over budget. We no longer track lastSeen privately on the
-        // class — insertion order is a fine proxy because `currentSessionId`
-        // (set above on every update) is what the serve path uses to pick
-        // the most-recent session, not a scan of `this.sessions`.
-        if (this.sessions.size > DashboardState.SESSION_CAP) {
-          const firstKey = this.sessions.keys().next().value;
-          if (firstKey !== undefined) this.sessions.delete(firstKey);
-        }
-      }
-      // Reuse the same haveUsage / haveBaseline guards + the
-      // baselineInputEff / actualInputEff locals computed earlier in
-      // update() so the lifetime totals block (above) and the per-session
-      // block (here) read the same values. Re-deriving them here would
-      // duplicate the cache-aware-baseline math and invite drift.
-      if (creditSaving && dollarEligible) {
-        s.baselineInputWeighted += baselineInputEff;
-        s.actualInputWeighted += actualInputEff;
-        s.baselineMeasuredCount += 1;
-        // RAW, rate-free compression: real tokens sent vs the same body as text.
-        s.rawActualTokens += rawActual;
-        s.rawBaselineTokens += rawBaseline;
-        s.rawOutputTokens += out; // not compressed; added to BOTH sides for the honest total
-      }
-      // ALL-rows session bill — mirrors the global `if (haveUsage)` block
-      // above (allActualInputWeighted / allOutputWeighted). Used as the
-      // honest denominator for the session's saved-% so caching wins on
-      // unmeasured requests still count toward "what you actually paid".
-      if (haveUsage && dollarEligible) {
-        s.allActualInputWeighted += actualInputEff;
-        s.allOutputWeighted += outputEquiv;
-      }
-    }
-
-    // Measurement totals are independent of usage/baseline gating — they
-    // accumulate whenever the scanner produced numbers. The scanner sets
-    // measurement to undefined on 5xx (no body to scan) and on unknown
-    // content-types; we count an event as "measured" when it has any.
-    const m = ev.measurement;
-    if (m) {
-      totals.textCharsMeasured += m.textChars;
-      totals.thinkingCharsMeasured += m.thinkingChars;
-      totals.toolUseCharsMeasured += m.toolUseChars;
-      totals.redactedBlockCountMeasured += m.redactedBlockCount;
-      totals.eventsWithMeasurement += 1;
-    }
+    this.recordAccumulators({
+      model: ev.model,
+      eventMs,
+      compressed,
+      opticalCompressed,
+      textOnlyCompressed,
+      haveUsage,
+      creditSaving,
+      dollarEligible,
+      actualInputEff,
+      baselineInputEff,
+      outputEquiv,
+      rawActual,
+      rawBaseline,
+      inp,
+      out,
+      cc,
+      cr,
+      cc1h,
+      cachedTok: u?.cached_tokens ?? 0,
+      writeTok: u?.cache_write_tokens ?? 0,
+      googleOrGpt: google || gpt,
+      sid: info?.firstUserSha8,
+      hygieneTok,
+      hygieneChars,
+      cliffAvoided: Boolean(info?.cliffAvoided),
+      cliffUsd: info?.cliffAvoided?.savedUsd ?? 0,
+      measurement: ev.measurement,
+    });
 
     const row: RecentRow = {
-      ts: Date.now() / 1000,
+      ts: eventMs / 1000,
       method: ev.method,
       path: ev.path,
       model: ev.model,
       status: ev.status,
       compressed,
-      cc_added: compressed ? 1 : undefined,
+      cc_added: opticalCompressed ? 1 : undefined,
+      image_count: imageCount,
+      compression_mode: compressionMode,
+      ...(hygieneStages && hygieneStages.length > 0 ? { text_hygiene_stages: [...hygieneStages] } : {}),
       input_tokens: haveUsage ? inp : undefined,
       output_tokens: haveUsage ? out : undefined,
       cache_create: haveUsage ? cc : undefined,
@@ -1204,279 +1392,347 @@ export class DashboardState {
   }
 
 
-  /** On startup, fold the last N entries from the JSONL events file back
-   *  into the ring buffer so a process restart doesn't show an empty table.
-   *  Cumulative totals are *not* restored (the file may have rotated, and
-   *  double-counting is worse than starting fresh). */
+  /** On startup, stream historical JSONL logs (`${filePath}.1` then `filePath`)
+   *  line-by-line to restore full lifetime, per-model, daily, and active-session
+   *  accumulators across restarts while keeping `recent` & `contextHistory`
+   *  bounded to `RECENT_CAP`. */
   async replay(filePath: string): Promise<void> {
-    try {
-      await fs.promises.access(filePath, fs.constants.R_OK);
-    } catch {
-      return; // no file yet, nothing to replay
-    }
-    const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    const tail: TrackEvent[] = [];
-    for await (const line of rl) {
-      if (!line) continue;
+    const candidates = [`${filePath}.1`, filePath];
+    let anyReadable = false;
+    for (const candidate of candidates) {
       try {
-        const ev = JSON.parse(line) as TrackEvent;
-        tail.push(ev);
-        if (tail.length > RECENT_CAP) tail.shift();
+        await fs.promises.access(candidate, fs.constants.R_OK);
+        anyReadable = true;
       } catch {
-        /* skip malformed line */
+        continue;
       }
-    }
-    // Replay mirrors the live update() warmth logic (per-session baselineWarmth,
-    // cr-grounded) so it produces byte-identical per-row numbers to update().
-    for (const t of tail) {
-      const inp = t.input_tokens ?? 0;
-      const out = t.output_tokens ?? 0;
-      const cc = t.cache_create_tokens ?? 0;
-      const cc5m = t.cache_create_5m_tokens;
-      const cc1h = t.cache_create_1h_tokens ?? 0;
-      const cr = t.cache_read_tokens ?? 0;
-      const compressed = t.compressed === true;
-      const gpt = isOpenAIEvent(t.path, t.accounting_provider);
-      const google = t.accounting_provider === 'google'
-        || t.path.includes('google-ai-studio') || t.path.toLowerCase().includes('generatecontent');
+      const stream = fs.createReadStream(candidate, { encoding: 'utf8' });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      for await (const line of rl) {
+        if (!line) continue;
+        let t: TrackEvent;
+        try {
+          t = JSON.parse(line) as TrackEvent;
+        } catch {
+          continue; // skip malformed line
+        }
+        const parsedMs = Date.parse(t.ts);
+        const eventMs = Number.isFinite(parsedMs) ? parsedMs : Date.now();
+        const inp = t.input_tokens ?? 0;
+        const out = t.output_tokens ?? 0;
+        const cc = t.cache_create_tokens ?? 0;
+        const cc5m = t.cache_create_5m_tokens;
+        const cc1h = t.cache_create_1h_tokens ?? 0;
+        const cr = t.cache_read_tokens ?? 0;
+        const compressed = t.compressed === true;
+        const gpt = isOpenAIEvent(t.path, t.accounting_provider);
+        const google = t.accounting_provider === 'google'
+          || t.path.includes('google-ai-studio') || t.path.toLowerCase().includes('generatecontent');
 
-      // Same unified accounting as update(); see the branch comments there.
-      let haveUsage: boolean;
-      let haveBaseline: boolean;
-      let creditSaving: boolean;
-      let actualInputEff: number;
-      let baselineInputEff: number;
-      let rawActual: number;
-      let rawBaseline: number;
-      let baselineForRow: number;
-      let cacheReadForRow: number;
-      let warmForRow: boolean; // text-baseline warmth for the Context Map narration
+        // Same unified accounting as update(); see the branch comments there.
+        let haveUsage: boolean;
+        let haveBaseline: boolean;
+        let creditSaving: boolean;
+        let actualInputEff: number;
+        let baselineInputEff: number;
+        let outputEquiv: number;
+        let rawActual: number;
+        let rawBaseline: number;
+        let baselineForRow: number;
+        let cacheReadForRow: number;
+        let warmForRow: boolean; // text-baseline warmth for the Context Map narration
 
-      if (google) {
-        const e = googleEff({
-          model: t.model,
-          inputTokens: inp,
-          outputTokens: out,
-          cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
-          compressed,
-          baselineTokens: (t as { baseline_tokens?: number }).baseline_tokens ?? 0,
-          baselineProbeStatus:
-            (t as { baseline_probe_status?: string }).baseline_probe_status,
-          imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
-          baselineImagedTokens:
-            (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
-          nativeInjectedTokens:
-            (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
-          textHygieneSavedTokens: t.text_hygiene_saved_tokens ?? 0,
-        });
-        haveUsage = e.haveUsage;
-        haveBaseline = e.haveBaseline;
-        creditSaving = e.creditSaving;
-        actualInputEff = e.actualInputEff;
-        baselineInputEff = e.baselineInputEff;
-        rawActual = inp;
-        rawBaseline = e.rawBaseline;
-        baselineForRow = creditSaving ? e.rawBaseline : 0;
-        cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
-        warmForRow = e.warmForRow;
-      } else if (gpt) {
-        const sidGptR = (t as { first_user_sha8?: string }).first_user_sha8;
-        const cachedGptR = (t as { cached_tokens?: number }).cached_tokens ?? 0;
-        const completionSecGptR = Date.parse(t.ts) / 1000;
-        const requestStartSecGptR = completionSecGptR - Math.max(0, t.duration_ms || 0) / 1000;
-        const gptPrevR = typeof sidGptR === 'string' && sidGptR.length > 0
-          ? this.openaiWarmth.get(sidGptR)
-          : undefined;
-        const pxShaGptR = t.cache_prefix_sha8 ?? (t as { history_image_sha8?: string }).history_image_sha8;
-        const warmthGptR = deriveOpenAIBaselineWarmth(
-          gptPrevR,
-          requestStartSecGptR,
-          cachedGptR,
-          (t as { system_sha8?: string }).system_sha8,
-          t.model,
-          OPENAI_CACHE_TTL_SEC,
-          pxShaGptR,
-        );
-        const e = gptEff({
-          model: t.model,
-          inputTokens: inp,
-          outputTokens: out,
-          cachedTokens: cachedGptR,
-          cacheWriteTokens: t.cache_write_tokens ?? 0,
-          imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
-          baselineImagedTokens:
-            (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
-          nativeInjectedTokens:
-            (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
-          textHygieneSavedTokens: t.text_hygiene_saved_tokens ?? 0,
-          warmth: warmthGptR,
-          compressed,
-        });
-        if (typeof sidGptR === 'string' && sidGptR.length > 0 && e.haveUsage) {
-          this.openaiWarmth.set(sidGptR, {
-            ts: completionSecGptR,
-            cachedOrPrefixTokens: cachedGptR > 0 ? cachedGptR : Math.max(gptPrevR?.cachedOrPrefixTokens ?? 0, inp),
-            prefixSha: (t as { system_sha8?: string }).system_sha8 ?? gptPrevR?.prefixSha,
-            pxPrefixSha: pxShaGptR ?? gptPrevR?.pxPrefixSha,
-            model: t.model ?? gptPrevR?.model,
+        if (google) {
+          const e = googleEff({
+            model: t.model,
+            inputTokens: inp,
+            outputTokens: out,
+            cachedTokens: (t as { cached_tokens?: number }).cached_tokens ?? 0,
+            compressed,
+            baselineTokens: (t as { baseline_tokens?: number }).baseline_tokens ?? 0,
+            baselineProbeStatus:
+              (t as { baseline_probe_status?: string }).baseline_probe_status,
+            imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
+            baselineImagedTokens:
+              (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
+            nativeInjectedTokens:
+              (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
+            textHygieneSavedTokens: t.text_hygiene_saved_tokens ?? 0,
           });
-          if (this.openaiWarmth.size > DashboardState.SESSION_CAP) {
-            const firstKey = this.openaiWarmth.keys().next().value;
-            if (firstKey !== undefined) this.openaiWarmth.delete(firstKey);
-          }
-        }
-        haveUsage = e.haveUsage;
-        haveBaseline = e.haveBaseline;
-        creditSaving = e.creditSaving;
-        actualInputEff = e.actualInputEff;
-        baselineInputEff = e.baselineInputEff;
-        rawActual = e.rawActual;
-        rawBaseline = e.rawBaseline;
-        baselineForRow = e.rawBaseline;
-        cacheReadForRow = cachedGptR;
-        warmForRow = warmthGptR.warm;
-      } else {
-        haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
-        const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
-        const cacheable = (t as { baseline_cacheable_tokens?: number })
-          .baseline_cacheable_tokens ?? 0;
-        const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
-        // Same gating rule as update(): require an explicit 'ok' status when
-        // present; fall back to "have a baseline number" for legacy JSONL.
-        const probeOk = probeStatus === 'ok'
-          || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
-        haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
-        actualInputEff = haveUsage
-          ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(t.model))
-          : 0;
-        // Mirror update(): only credit the cache-modeled counterfactual on
-        // compressed rows. Uncompressed/passthrough rows fall back to the
-        // actual cost so they show zero saved (no fabricated savings).
-        creditSaving = haveBaseline && haveUsage && compressed;
-        // Warmth is reconstructed from persisted completion ts + duration_ms
-        // exactly as update() saw it live.
-        const sidR = (t as { first_user_sha8?: string }).first_user_sha8;
-        const prefixShaR = (t as { system_sha8?: string }).system_sha8;
-        const completionSecR = Date.parse(t.ts) / 1000;
-        const requestStartSecR = completionSecR - Math.max(0, t.duration_ms || 0) / 1000;
-        const warmthPrevR =
-          typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
-        const toolsShaR = (t as { cache_prefix_tools_sha8?: string }).cache_prefix_tools_sha8;
-        const { warm: warmR, prevCacheable: prevCacheableR } = deriveBaselineWarmth(
-          warmthPrevR,
-          requestStartSecR,
-          cacheable,
-          cr,
-          DashboardState.CACHE_TTL_SEC,
-          prefixShaR,
-          toolsShaR,
-          { pxPrefixSha: t.cache_prefix_sha8, model: t.model },
-        );
-        baselineInputEff = creditSaving
-          ? computeBaselineInputEffWithCacheTier(
-              baseline as number,
-              cacheable,
-              inp,
-              cc,
-              cr,
-              warmR,
-              prevCacheableR,
-              cc1h,
-              cc5m,
-              anthropicReadRate(t.model),
-            )
-          : actualInputEff;
-        const hygieneTokR = t.text_hygiene_saved_tokens ?? 0;
-        if (!haveBaseline && compressed && haveUsage && hygieneTokR > 0 && ((t as { image_count?: number }).image_count ?? 0) === 0) {
-          haveBaseline = true;
-          creditSaving = true;
-          const deltaWeightR = cr > 0
-            ? anthropicReadRate(t.model)
-            : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
-          baselineInputEff = actualInputEff + hygieneTokR * deltaWeightR;
-        }
-        if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
-          this.baselineWarmth.set(sidR, {
-            ts: completionSecR,
-            cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
-            prefixSha: prefixShaR ?? warmthPrevR?.prefixSha,
-            toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
-            pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
-            model: t.model ?? warmthPrevR?.model,
-            ttlSec: observedCacheTtlSec(cc1h, warmthPrevR?.ttlSec),
+          haveUsage = e.haveUsage;
+          haveBaseline = e.haveBaseline;
+          creditSaving = e.creditSaving;
+          actualInputEff = e.actualInputEff;
+          baselineInputEff = e.baselineInputEff;
+          outputEquiv = e.outputEquiv;
+          rawActual = inp;
+          rawBaseline = e.rawBaseline;
+          baselineForRow = creditSaving ? e.rawBaseline : 0;
+          cacheReadForRow = (t as { cached_tokens?: number }).cached_tokens ?? 0;
+          warmForRow = e.warmForRow;
+        } else if (gpt) {
+          const sidGptR = (t as { first_user_sha8?: string }).first_user_sha8;
+          const cachedGptR = (t as { cached_tokens?: number }).cached_tokens ?? 0;
+          const completionSecGptR = eventMs / 1000;
+          const requestStartSecGptR = completionSecGptR - Math.max(0, t.duration_ms || 0) / 1000;
+          const gptPrevR = typeof sidGptR === 'string' && sidGptR.length > 0
+            ? this.openaiWarmth.get(sidGptR)
+            : undefined;
+          const pxShaGptR = t.cache_prefix_sha8 ?? (t as { history_image_sha8?: string }).history_image_sha8;
+          const warmthGptR = deriveOpenAIBaselineWarmth(
+            gptPrevR,
+            requestStartSecGptR,
+            cachedGptR,
+            (t as { system_sha8?: string }).system_sha8,
+            t.model,
+            OPENAI_CACHE_TTL_SEC,
+            pxShaGptR,
+          );
+          const e = gptEff({
+            model: t.model,
+            inputTokens: inp,
+            outputTokens: out,
+            cachedTokens: cachedGptR,
+            cacheWriteTokens: t.cache_write_tokens ?? 0,
+            imageTokens: (t as { image_tokens?: number }).image_tokens ?? 0,
+            baselineImagedTokens:
+              (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens ?? 0,
+            nativeInjectedTokens:
+              (t as { native_injected_tokens?: number }).native_injected_tokens ?? 0,
+            textHygieneSavedTokens: t.text_hygiene_saved_tokens ?? 0,
+            warmth: warmthGptR,
+            compressed,
           });
-          if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
-            const firstKey = this.baselineWarmth.keys().next().value;
-            if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
+          if (typeof sidGptR === 'string' && sidGptR.length > 0 && e.haveUsage) {
+            this.openaiWarmth.set(sidGptR, {
+              ts: completionSecGptR,
+              cachedOrPrefixTokens: cachedGptR > 0 ? cachedGptR : Math.max(gptPrevR?.cachedOrPrefixTokens ?? 0, inp),
+              prefixSha: (t as { system_sha8?: string }).system_sha8 ?? gptPrevR?.prefixSha,
+              pxPrefixSha: pxShaGptR ?? gptPrevR?.pxPrefixSha,
+              model: t.model ?? gptPrevR?.model,
+            });
+            if (this.openaiWarmth.size > DashboardState.SESSION_CAP) {
+              const firstKey = this.openaiWarmth.keys().next().value;
+              if (firstKey !== undefined) this.openaiWarmth.delete(firstKey);
+            }
           }
+          haveUsage = e.haveUsage;
+          haveBaseline = e.haveBaseline;
+          creditSaving = e.creditSaving;
+          actualInputEff = e.actualInputEff;
+          baselineInputEff = e.baselineInputEff;
+          outputEquiv = e.outputEquiv;
+          rawActual = e.rawActual;
+          rawBaseline = e.rawBaseline;
+          baselineForRow = e.rawBaseline;
+          cacheReadForRow = cachedGptR;
+          warmForRow = warmthGptR.warm;
+        } else {
+          haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0;
+          const baseline = (t as { baseline_tokens?: number }).baseline_tokens;
+          const cacheable = (t as { baseline_cacheable_tokens?: number })
+            .baseline_cacheable_tokens ?? 0;
+          const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
+          // Same gating rule as update(): require an explicit 'ok' status when
+          // present; fall back to "have a baseline number" for legacy JSONL.
+          const probeOk = probeStatus === 'ok'
+            || (probeStatus === undefined && typeof baseline === 'number' && baseline > 0);
+          haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
+          actualInputEff = haveUsage
+            ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(t.model))
+            : 0;
+          // Mirror update(): only credit the cache-modeled counterfactual on
+          // compressed rows. Uncompressed/passthrough rows fall back to the
+          // actual cost so they show zero saved (no fabricated savings).
+          creditSaving = haveBaseline && haveUsage && compressed;
+          // Warmth is reconstructed from persisted completion ts + duration_ms
+          // exactly as update() saw it live.
+          const sidR = (t as { first_user_sha8?: string }).first_user_sha8;
+          const prefixShaR = (t as { system_sha8?: string }).system_sha8;
+          const completionSecR = eventMs / 1000;
+          const requestStartSecR = completionSecR - Math.max(0, t.duration_ms || 0) / 1000;
+          const warmthPrevR =
+            typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
+          const toolsShaR = (t as { cache_prefix_tools_sha8?: string }).cache_prefix_tools_sha8;
+          const { warm: warmR, prevCacheable: prevCacheableR } = deriveBaselineWarmth(
+            warmthPrevR,
+            requestStartSecR,
+            cacheable,
+            cr,
+            DashboardState.CACHE_TTL_SEC,
+            prefixShaR,
+            toolsShaR,
+            { pxPrefixSha: t.cache_prefix_sha8, model: t.model },
+          );
+          baselineInputEff = creditSaving
+            ? computeBaselineInputEffWithCacheTier(
+                baseline as number,
+                cacheable,
+                inp,
+                cc,
+                cr,
+                warmR,
+                prevCacheableR,
+                cc1h,
+                cc5m,
+                anthropicReadRate(t.model),
+              )
+            : actualInputEff;
+          const hygieneTokR = t.text_hygiene_saved_tokens ?? 0;
+          if (!haveBaseline && compressed && haveUsage && hygieneTokR > 0 && ((t as { image_count?: number }).image_count ?? 0) === 0) {
+            haveBaseline = true;
+            creditSaving = true;
+            const deltaWeightR = cr > 0
+              ? anthropicReadRate(t.model)
+              : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+            baselineInputEff = actualInputEff + hygieneTokR * deltaWeightR;
+          }
+          if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
+            this.baselineWarmth.set(sidR, {
+              ts: completionSecR,
+              cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
+              prefixSha: prefixShaR ?? warmthPrevR?.prefixSha,
+              toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
+              pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
+              model: t.model ?? warmthPrevR?.model,
+              ttlSec: observedCacheTtlSec(cc1h, warmthPrevR?.ttlSec),
+            });
+            if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
+              const firstKey = this.baselineWarmth.keys().next().value;
+              if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
+            }
+          }
+          outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
+          rawActual = inp + cc + cr;
+          rawBaseline = baseline ?? (creditSaving && hygieneTokR > 0 ? rawActual + hygieneTokR : 0);
+          baselineForRow = rawBaseline;
+          cacheReadForRow = cr;
+          warmForRow = warmR;
         }
-        rawActual = inp + cc + cr;
-        rawBaseline = baseline ?? (creditSaving && hygieneTokR > 0 ? rawActual + hygieneTokR : 0);
-        baselineForRow = rawBaseline;
-        cacheReadForRow = cr;
-        warmForRow = warmR;
-      }
-      // Rebuild the Context Map breakdown so old rows keep their "Saved" value
-      // and "Details" link after a restart. The PNG ring is in-memory and gone,
-      // so thumbnails can't return (imageIds: [], flagged `restored`) — but the
-      // headline %, buckets and Saved delta all reconstruct from the persisted
-      // event with the same cache-weighted math as the live update() path.
-      const imageCount = (t as { image_count?: number }).image_count ?? 0;
-      let imgId: number | undefined;
-      if (compressed && haveUsage && (imageCount > 0 || rawBaseline > 0)) {
-        imgId = this.nextImageId++;
-        this.contextHistory.push({
-          id: imgId,
-          baselineTokens: baselineForRow,
-          realInput: rawActual,
-          baselineInputEff,
-          actualInputEff,
-          haveBaseline,
-          cacheRead: cacheReadForRow,
-          warm: warmForRow,
-          output: out,
+
+        const imageCount = (t as { image_count?: number }).image_count ?? 0;
+        const hygieneTok = t.text_hygiene_saved_tokens ?? 0;
+        const hygieneChars = t.text_hygiene_saved_chars ?? 0;
+        const hygieneStages = Array.isArray(t.text_hygiene_stages) ? t.text_hygiene_stages : undefined;
+        const { opticalCompressed, textOnlyCompressed, compressionMode } = this.classifyCompressionMode(
+          compressed,
           imageCount,
-          nativeImages: (t as { native_images?: number }).native_images,
-          wireImages: (t as { wire_images?: number }).wire_images,
-          imageBudgetSkips: (t as { image_budget_skips?: number }).image_budget_skips,
-          baselineImagedTokens: (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens,
-          buckets: { ...((t as { bucket_chars?: Record<string, number> }).bucket_chars ?? {}) },
-          imageIds: [], // PNG ring is in-memory; not restorable across restart
-          compressed,
+          hygieneTok,
+          hygieneStages,
+          t.reason,
+        );
+        const dollarEligible = !google || priceMode() === 'kosha';
+        const hasMeas =
+          t.text_chars_measured !== undefined ||
+          t.thinking_chars_measured !== undefined ||
+          t.tool_use_chars_measured !== undefined ||
+          t.redacted_block_count_measured !== undefined;
+        const measurement = hasMeas
+          ? {
+              textChars: t.text_chars_measured ?? 0,
+              thinkingChars: t.thinking_chars_measured ?? 0,
+              toolUseChars: t.tool_use_chars_measured ?? 0,
+              redactedBlockCount: t.redacted_block_count_measured ?? 0,
+            }
+          : undefined;
+        const cliffUsd = t.cliff_saved_usd ?? 0;
+        const cliffAvoided = cliffUsd > 0 || t.cliff_avoided_at !== undefined;
+
+        this.recordAccumulators({
           model: t.model,
-          responsesComposition: (t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition,
-          responsesUnexplainedTokens: (t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition
-            ? Math.max(0, rawBaseline - ((t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition?.totalLocal ?? 0))
-            : undefined,
-          restored: true,
+          eventMs,
+          compressed,
+          opticalCompressed,
+          textOnlyCompressed,
+          haveUsage,
+          creditSaving,
+          dollarEligible,
+          actualInputEff,
+          baselineInputEff,
+          outputEquiv,
+          rawActual,
+          rawBaseline,
+          inp,
+          out,
+          cc,
+          cr,
+          cc1h,
+          cachedTok: (t as { cached_tokens?: number }).cached_tokens ?? 0,
+          writeTok: t.cache_write_tokens ?? 0,
+          googleOrGpt: google || gpt,
+          sid: (t as { first_user_sha8?: string }).first_user_sha8,
+          hygieneTok,
+          hygieneChars,
+          cliffAvoided,
+          cliffUsd,
+          measurement,
         });
-        if (this.contextHistory.length > RECENT_CAP) {
-          this.contextHistory.splice(0, this.contextHistory.length - RECENT_CAP);
+
+        // Rebuild the Context Map breakdown so old rows keep their "Saved" value
+        // and "Details" link after a restart. The PNG ring is in-memory and gone,
+        // so thumbnails can't return (imageIds: [], flagged `restored`) — but the
+        // headline %, buckets and Saved delta all reconstruct from the persisted
+        // event with the same cache-weighted math as the live update() path.
+        let imgId: number | undefined;
+        if (compressed && haveUsage && (imageCount > 0 || rawBaseline > 0)) {
+          imgId = this.nextImageId++;
+          this.contextHistory.push({
+            id: imgId,
+            baselineTokens: baselineForRow,
+            realInput: rawActual,
+            baselineInputEff,
+            actualInputEff,
+            haveBaseline,
+            cacheRead: cacheReadForRow,
+            warm: warmForRow,
+            output: out,
+            imageCount,
+            nativeImages: (t as { native_images?: number }).native_images,
+            wireImages: (t as { wire_images?: number }).wire_images,
+            imageBudgetSkips: (t as { image_budget_skips?: number }).image_budget_skips,
+            baselineImagedTokens: (t as { baseline_imaged_tokens?: number }).baseline_imaged_tokens,
+            buckets: { ...((t as { bucket_chars?: Record<string, number> }).bucket_chars ?? {}) },
+            imageIds: [], // PNG ring is in-memory; not restorable across restart
+            compressed,
+            model: t.model,
+            responsesComposition: (t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition,
+            responsesUnexplainedTokens: (t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition
+              ? Math.max(0, rawBaseline - ((t as { responses_composition?: ContextMapData['responsesComposition'] }).responses_composition?.totalLocal ?? 0))
+              : undefined,
+            restored: true,
+          });
+          if (this.contextHistory.length > RECENT_CAP) {
+            this.contextHistory.splice(0, this.contextHistory.length - RECENT_CAP);
+          }
         }
+        const row: RecentRow = {
+          ts: eventMs / 1000,
+          method: t.method,
+          path: t.path,
+          model: t.model,
+          status: t.status,
+          compressed,
+          cc_added: opticalCompressed ? 1 : undefined,
+          image_count: imageCount,
+          compression_mode: compressionMode,
+          ...(hygieneStages && hygieneStages.length > 0 ? { text_hygiene_stages: [...hygieneStages] } : {}),
+          input_tokens: t.input_tokens,
+          output_tokens: t.output_tokens,
+          cache_create: t.cache_create_tokens,
+          cache_read: gpt || google ? cacheReadForRow : t.cache_read_tokens,
+          actual_input: haveUsage ? round1(actualInputEff) : undefined,
+          baseline_input:
+            creditSaving ? round1(baselineInputEff) : undefined,
+          session_saved_so_far_delta:
+            creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
+          img_id: imgId,
+          img_ids: imgId !== undefined ? [imgId] : undefined,
+        };
+        this.recent.push(row);
+        if (this.recent.length > RECENT_CAP) this.recent.shift();
       }
-      const row: RecentRow = {
-        ts: Date.parse(t.ts) / 1000,
-        method: t.method,
-        path: t.path,
-        model: t.model,
-        status: t.status,
-        compressed,
-        cc_added: compressed ? 1 : undefined,
-        input_tokens: t.input_tokens,
-        output_tokens: t.output_tokens,
-        cache_create: t.cache_create_tokens,
-        cache_read: gpt || google ? cacheReadForRow : t.cache_read_tokens,
-        actual_input: haveUsage ? round1(actualInputEff) : undefined,
-        baseline_input:
-          creditSaving ? round1(baselineInputEff) : undefined,
-        session_saved_so_far_delta:
-          creditSaving ? round1(baselineInputEff - actualInputEff) : undefined,
-        img_id: imgId,
-        img_ids: imgId !== undefined ? [imgId] : undefined,
-      };
-      this.recent.push(row);
     }
+    if (!anyReadable) return;
   }
 
   // ---- HTTP handlers ------------------------------------------------------
@@ -1617,13 +1873,65 @@ export class DashboardState {
       totals.passthroughPaidRequests >= SUFFICIENT;
     const splitDeltaUsd = compressedAvgUsd - passthroughAvgUsd;
 
-    const uptimeSec = Date.now() / 1000 - totals.startedAt;
+    const nowMs = Date.now();
+    const todayDate = new Date(nowMs);
+    const todayKey = localDateKey(nowMs);
+    const daily: DailySavingsPoint[] = [];
+    for (let offset = DAILY_CHART_DAYS - 1; offset >= 0; offset--) {
+      const d = new Date(todayDate.getFullYear(), todayDate.getMonth(), todayDate.getDate() - offset);
+      const dateKey = localDateKey(d.getTime());
+      const byModelMap = this.dailyByDateModel.get(dateKey);
+      const sum = emptyDailyBucket();
+      if (byModelMap) {
+        for (const [model, b] of byModelMap) {
+          if (!isFicheSupportedModel(model) && (this.totalsByModel.get(model)?.textHygieneSavedTokens ?? 0) <= 0) {
+            continue;
+          }
+          sum.requests += b.requests;
+          sum.compressed += b.compressed;
+          sum.imaged += b.imaged;
+          sum.textCompressed += b.textCompressed;
+          sum.baselineInputWeighted += b.baselineInputWeighted;
+          sum.actualInputWeighted += b.actualInputWeighted;
+          sum.rawSavedTokens += b.rawSavedTokens;
+          sum.pricedBaselineInputWeighted += b.pricedBaselineInputWeighted;
+          sum.pricedActualInputWeighted += b.pricedActualInputWeighted;
+          sum.pricedSavedUsd += b.pricedSavedUsd;
+          sum.cliffSavedUsd += b.cliffSavedUsd;
+        }
+      }
+      const daySaved = sum.baselineInputWeighted - sum.actualInputWeighted;
+      const dayPricedSaved = sum.pricedBaselineInputWeighted - sum.pricedActualInputWeighted;
+      const dayUsd = priceMode() === 'kosha'
+        ? sum.pricedSavedUsd
+        : (dayPricedSaved * ASSUMED_INPUT_USD_PER_MTOK) / 1e6;
+      daily.push({
+        date: dateKey,
+        requests: sum.requests,
+        compressed: sum.compressed,
+        imaged: sum.imaged,
+        text_compressed: sum.textCompressed,
+        baseline_input_weighted: Math.round(sum.baselineInputWeighted),
+        actual_input_weighted: Math.round(sum.actualInputWeighted),
+        saved_tokens: Math.round(daySaved),
+        raw_saved_tokens: Math.round(sum.rawSavedTokens),
+        saved_pct: sum.baselineInputWeighted > 0 ? round1((daySaved / sum.baselineInputWeighted) * 100) : 0,
+        saved_usd: round4(dayUsd),
+        cliff_saved_usd: round4(sum.cliffSavedUsd),
+        is_today: dateKey === todayKey,
+      });
+    }
+
+    const uptimeSec = nowMs / 1000 - totals.startedAt;
     const payload = {
       requests: totals.requests,
       compressed_requests: totals.compressedRequests,
+      imaged_requests: totals.imagedRequests,
+      text_compressed_requests: totals.textCompressedRequests,
       baseline_input_weighted: Math.round(baseline),
       actual_input_weighted: Math.round(actual),
       saved_input_tokens: Math.round(saved),
+      raw_saved_tokens: Math.round(totals.rawSavedTokens),
       // saved_pct kept for back-compat with existing dashboard HTML; it is
       // the input-only number. New code should read saved_pct_input_only.
       saved_pct: round1(pctInput),
@@ -1692,20 +2000,13 @@ export class DashboardState {
       compression_enabled: this.compressionEnabled,
       allowed_models: getAllowedModelBases(),
       by_model: (() => {
-        const byModel: Record<string, {
-          requests: number;
-          compressed: number;
-          baseline_input_weighted: number;
-          actual_input_weighted: number;
-          saved_tokens: number;
-          saved_pct: number;
-          saved_usd: number;
-        }> = {};
+        const byModel: Record<string, ModelStatsPayload> = {};
         for (const [model, t] of this.totalsByModel) {
           const key = model || 'unknown';
           const baseline = Math.round(t.baselineInputWeighted);
           const actual = Math.round(t.actualInputWeighted);
           const savedTokens = Math.round(t.baselineInputWeighted - t.actualInputWeighted);
+          const rawSaved = Math.round(t.rawSavedTokens);
           const savedUsd = round4(
             priceMode() === 'kosha'
               ? t.pricedSavedUsd
@@ -1718,26 +2019,38 @@ export class DashboardState {
             byModel[key] = {
               requests: prev.requests + t.requests,
               compressed: prev.compressed + t.compressedRequests,
+              imaged: prev.imaged + t.imagedRequests,
+              text_compressed: prev.text_compressed + t.textCompressedRequests,
               baseline_input_weighted: nextBaseline,
               actual_input_weighted: prev.actual_input_weighted + actual,
               saved_tokens: nextSaved,
+              raw_saved_tokens: prev.raw_saved_tokens + rawSaved,
               saved_pct: nextBaseline > 0 ? Math.round((nextSaved / nextBaseline) * 1000) / 10 : 0,
               saved_usd: round4(prev.saved_usd + savedUsd),
+              cliff_avoided_events: prev.cliff_avoided_events + t.cliffAvoidedEvents,
+              cliff_saved_usd: round4(prev.cliff_saved_usd + t.cliffSavedUsd),
             };
           } else {
             byModel[key] = {
               requests: t.requests,
               compressed: t.compressedRequests,
+              imaged: t.imagedRequests,
+              text_compressed: t.textCompressedRequests,
               baseline_input_weighted: baseline,
               actual_input_weighted: actual,
               saved_tokens: savedTokens,
+              raw_saved_tokens: rawSaved,
               saved_pct: baseline > 0 ? Math.round((savedTokens / baseline) * 1000) / 10 : 0,
               saved_usd: savedUsd,
+              cliff_avoided_events: t.cliffAvoidedEvents,
+              cliff_saved_usd: round4(t.cliffSavedUsd),
             };
           }
         }
         return byModel;
       })(),
+      today: daily[daily.length - 1],
+      daily,
       // Rendered-page cache — a live process gauge, not a fold over the event
       // ring, so it is the one number here that survives no traffic at all.
       // `max_bytes` ships alongside `bytes` because utilisation is the actionable
@@ -1857,6 +2170,10 @@ export class DashboardState {
       case 'header': {
         const s = (await this.serveStats().json()) as StatsPayload;
         return htmlResponse(renderHeaderFragment(s, port));
+      }
+      case 'analytics': {
+        const s = (await this.serveStats().json()) as StatsPayload;
+        return htmlResponse(renderAnalyticsFragment(s));
       }
       case 'recent': {
         const r = (await this.serveRecent().json()) as RecentPayload;

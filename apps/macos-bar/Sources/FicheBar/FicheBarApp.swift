@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ("slate.png", .slate, .darkAqua, .activity),
             ("terminal.png", .terminal, .darkAqua, .activity),
             ("midnight.png", .midnight, .darkAqua, .activity),
+            ("agents-editorial.png", .editorial, .aqua, .agents),
             ("control-editorial.png", .editorial, .aqua, .control),
             ("control-native.png", .native, .aqua, .control),
             ("control-slate.png", .slate, .darkAqua, .control),

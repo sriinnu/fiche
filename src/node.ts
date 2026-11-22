@@ -30,9 +30,11 @@ import {
   mergeStagePlugins,
   parsePluginManifest,
   parseSkillManifest,
+  stageTogglesFromOverrides,
   type PluginOverrides,
   type StagePluginDescriptor,
 } from './core/stage-plugins.js';
+import { FileTracker } from './file-tracker.js';
 import {
   chatCompletionsUrl,
 } from './core/messages-chat-bridge.js';
@@ -228,18 +230,46 @@ function resolvePluginsConfigFile(): string {
     || path.join(os.homedir(), '.config', 'fiche', 'plugins.json');
 }
 
+const FORBIDDEN_OVERRIDE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+let pluginOverridesCache:
+  | { file: string; mtimeMs: number; overrides: PluginOverrides }
+  | undefined;
+
 function loadPluginOverrides(file = resolvePluginsConfigFile()): PluginOverrides {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const out: PluginOverrides = {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return Object.create(null) as PluginOverrides;
+    }
+    const out = Object.create(null) as PluginOverrides;
     for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (FORBIDDEN_OVERRIDE_KEYS.has(k)) continue;
       if (typeof v === 'boolean') out[k] = v;
     }
     return out;
   } catch {
-    return {};
+    return Object.create(null) as PluginOverrides;
   }
+}
+
+function getActivePluginOverrides(file = resolvePluginsConfigFile()): PluginOverrides {
+  let mtimeMs = -1;
+  try {
+    mtimeMs = fs.statSync(file).mtimeMs;
+  } catch {
+    mtimeMs = -1;
+  }
+  if (
+    pluginOverridesCache &&
+    pluginOverridesCache.file === file &&
+    pluginOverridesCache.mtimeMs === mtimeMs
+  ) {
+    return pluginOverridesCache.overrides;
+  }
+  const overrides = mtimeMs >= 0 ? loadPluginOverrides(file) : (Object.create(null) as PluginOverrides);
+  pluginOverridesCache = { file, mtimeMs, overrides };
+  return overrides;
 }
 
 function savePluginOverrides(overrides: PluginOverrides, file = resolvePluginsConfigFile()): void {
@@ -247,12 +277,19 @@ function savePluginOverrides(overrides: PluginOverrides, file = resolvePluginsCo
   const parentExists = fs.existsSync(dir);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (!parentExists) fs.chmodSync(dir, 0o700);
+  const sanitized = Object.create(null) as PluginOverrides;
+  for (const [k, v] of Object.entries(overrides)) {
+    if (!FORBIDDEN_OVERRIDE_KEYS.has(k) && typeof v === 'boolean') {
+      sanitized[k] = v;
+    }
+  }
   const tmp = `${file}.tmp-${process.pid}`;
   try {
-    fs.writeFileSync(tmp, `${JSON.stringify(overrides, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(tmp, `${JSON.stringify(sanitized, null, 2)}\n`, { mode: 0o600 });
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, file);
     fs.chmodSync(file, 0o600);
+    pluginOverridesCache = undefined;
   } catch (err) {
     try { fs.unlinkSync(tmp); } catch { /* ignore */ }
     throw err;
@@ -837,143 +874,7 @@ function ensurePrivateDirectory(dir: string): void {
 
 // ---- FileTracker ----------------------------------------------------------
 
-/**
- * Append-only JSONL tracker with size-based rotation. One line per request.
- *
- * Node-only — uses node:fs. The Worker host uses tracker.JsonLogTracker with
- * console.log instead (Cloudflare ingests that as Workers Logs).
- *
- * Rotation: when the current file exceeds MAX_FILE_BYTES (100 MB by default),
- * it's renamed to `<path>.1` (overwriting any previous .1) and a fresh file
- * is opened. Keeps one generation of history; for longer retention pipe
- * the file off-host yourself.
- *
- * Failures here NEVER propagate — the proxy must keep serving requests even
- * if the disk is full or the path is unwritable.
- */
-class FileTracker implements Tracker {
-  private fd: number | null = null;
-  private fdIno: number | null = null;
-  private fdDev: number | null = null;
-  private bytesWritten = 0;
-  private brokenLogged = false;
-  private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
-
-  constructor(private readonly filePath: string) {}
-
-  private ensureOpen(): boolean {
-    if (this.fd != null) {
-      let needsReopen = false;
-      try {
-        const st = fs.statSync(this.filePath);
-        if (this.fdIno !== null && (st.ino !== this.fdIno || st.dev !== this.fdDev)) {
-          needsReopen = true;
-        }
-      } catch {
-        // File unlinked or rotated externally — reopen the fresh path.
-        needsReopen = true;
-      }
-      if (!needsReopen) return true;
-      try { fs.closeSync(this.fd); } catch { /* ignore */ }
-      this.fd = null;
-      this.fdIno = null;
-      this.fdDev = null;
-      this.bytesWritten = 0;
-    }
-    try {
-      const parent = path.dirname(this.filePath);
-      const parentExists = fs.existsSync(parent);
-      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
-      if (!parentExists) fs.chmodSync(parent, 0o700);
-    } catch {
-      /* dir may already exist or be unmkable; openSync below will surface */
-    }
-    try {
-      this.fd = fs.openSync(this.filePath, 'a', 0o600);
-      const fst = fs.fstatSync(this.fd);
-      this.fdIno = fst.ino;
-      this.fdDev = fst.dev;
-      this.bytesWritten = fst.size;
-      fs.chmodSync(this.filePath, 0o600);
-      return true;
-    } catch (err) {
-      if (!this.brokenLogged) {
-  // eslint-disable-next-line no-console -- FileTracker error logging
-        console.error(
-          `[fiche] FileTracker disabled — cannot open ${this.filePath}: ${(err as Error).message}`,
-        );
-        this.brokenLogged = true;
-      }
-      return false;
-    }
-  }
-
-  private rotate(): void {
-    if (this.fd != null) {
-      try {
-        fs.closeSync(this.fd);
-      } catch {
-        /* ignore */
-      }
-      this.fd = null;
-      this.fdIno = null;
-      this.fdDev = null;
-    }
-    try {
-      fs.renameSync(this.filePath, this.filePath + '.1');
-    } catch {
-      /* if rename fails (e.g. .1 locked) we'll just keep growing — better
-         than dropping events */
-    }
-    this.bytesWritten = 0;
-  }
-
-  emit(ev: TrackEvent): void {
-    if (!this.ensureOpen()) return;
-    try {
-      const line = JSON.stringify(ev) + '\n';
-      const buf = Buffer.from(line, 'utf8');
-      fs.writeSync(this.fd!, buf);
-      this.bytesWritten += buf.length;
-      if (this.bytesWritten > FileTracker.MAX_FILE_BYTES) this.rotate();
-    } catch (err) {
-      if (!this.brokenLogged) {
-        console.error(
-          `[fiche] FileTracker write failed: ${(err as Error).message}`,
-        );
-        this.brokenLogged = true;
-      }
-    }
-  }
-
-  flush(): void {
-    if (this.fd != null) {
-      try {
-        fs.fsyncSync(this.fd);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  close(): void {
-    if (this.fd != null) {
-      try {
-        fs.fsyncSync(this.fd);
-      } catch {
-        /* ignore */
-      }
-      try {
-        fs.closeSync(this.fd);
-      } catch {
-        /* ignore */
-      }
-      this.fd = null;
-      this.fdIno = null;
-      this.fdDev = null;
-    }
-  }
-}
+// FileTracker lives in ./file-tracker.ts so prune() coordination stays decoupled cleanly.
 
 // ---- 4xx body sidecar writer ---------------------------------------------
 
@@ -1872,13 +1773,19 @@ async function main(): Promise<void> {
       // still logging real usage + count_tokens baselines to its own INKLING_LOG.
       // (The dashboard kill switch does the same thing at runtime.)
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
+      const toggles = stageTogglesFromOverrides(getActivePluginOverrides());
+      const hasDisabledStage =
+        !toggles.optical || !toggles.tscg || !toggles.toon || !toggles.acdc || !toggles.casi;
       const rawHorizon = (readBrandEnv('HISTORY_AMORTIZATION_HORIZON') ?? '').trim();
       const parsedHorizon = rawHorizon ? Number.parseInt(rawHorizon, 10) : NaN;
       if (Number.isFinite(parsedHorizon) && parsedHorizon >= 1 && parsedHorizon <= 100) {
-        return { historyAmortizationHorizon: parsedHorizon };
+        return {
+          historyAmortizationHorizon: parsedHorizon,
+          ...(hasDisabledStage ? { stageToggles: toggles } : {}),
+        };
       }
       // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return {};
+      return hasDisabledStage ? { stageToggles: toggles } : {};
     },
     onRequest: (e) => {
       const task = (async () => {

@@ -28,6 +28,14 @@ import { encodeToon } from './toon.js';
 export type TextHygieneMode = 'auto' | 'on' | 'off';
 
 export interface TextHygieneOptions {
+  /** Tool name associated with a single-block cleanToolOutput call (used for editSafe file-read protection). */
+  toolName?: string;
+  /** Whether to run Stage 1 TSCG static/schema compilation when `deepTextCompact` is enabled (default true). */
+  enableTscg?: boolean;
+  /** Whether to run Stage 2 TOON encoding on tabular JSON (default true). */
+  enableToon?: boolean;
+  /** Whether to run Stage 3 ACDC frozen-epoch history compaction when `deepTextCompact` is enabled (default true). */
+  enableAcdc?: boolean;
   /** Whether to run Stage 3 Drain structural log folding (default true). */
   foldLogs?: boolean;
   /** Enable TSCG static/schema compilation + ACDC frozen-epoch history compaction. */
@@ -87,7 +95,22 @@ const ALT_LINE_NUMBER_RE = /^L\d{1,7}:\s/;
 const DIFF_HEADER_RE = /^(?:diff --git |@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@|\*\*\* (?:Begin Patch|Update File:|Add File:|Delete File:))/;
 const DIFF_FILE_PAIR_RE = /^--- [^\n]+\n\+\+\+ [^\n]+/m;
 const CODE_DECL_LINE_RE =
-  /^\s*(?:export\s+(?:default\s+)?(?:async\s+)?|pub(?:\([^)]*\))?\s+(?:async\s+)?|async\s+)?(?:function\s+\w+|class\s+\w+|interface\s+\w+|type\s+\w+\s*=|enum\s+\w+|struct\s+\w+|trait\s+\w+|impl\b|fn\s+\w+|func\s+(?:\([^)]*\)\s*)?\w+|def\s+\w+|import\s+(?:\{|\*|\w)|from\s+\S+\s+import\b|#include\s*[<"])/;
+  /^\s*(?:(?:(?:export(?:\s+default)?|pub(?:\([^)]*\))?|public|private|protected|internal|static|final|abstract|override|readonly|sealed|open|suspend|async)\s+){0,4}(?:function\s+\w+|class\s+\w+|interface\s+\w+|record\s+\w+|protocol\s+\w+|actor\s+\w+|extension\s+\w+|namespace\s+[\w.]+|type\s+\w+\s*(?:=|struct\b|interface\b)|enum\s+\w+|struct\s+\w+|trait\s+\w+|impl\b|fn\s+\w+|func\s+(?:\([^)]*\)\s*)?\w+|def\s+\w+|(?:const|let|var|val)\s+\w+\s*(?::[^=\n]+)?=\s*(?:async\s+)?(?:\([^)]*\)\s*=>|function\b|class\b|\{|\[)|import\s+(?:\{|\*|"|\(|\w)|from\s+\S+\s+import\b|package\s+[\w.]+|using\s+[\w.]+\s*;|#include\s*[<"]|template\s*<)|(?:public|private|protected|internal)\s+(?:static\s+)?(?:final\s+)?(?:async\s+)?[A-Za-z_][\w.<>,[\]?]*\s+[A-Za-z_]\w*\s*\()/;
+
+const FILE_READ_TOOL_RE =
+  /^(?:read|read_file|view_file|view_file_outline|view_code_item|cat|get_file_contents|get_file|read_text_file|read_resource|open_file|fs_read|file_read|show_file|inspect_file)$/i;
+
+/** True when a tool name represents a file/resource read whose exact whitespace/JSON keys must stay untouched for Edit/apply_patch. */
+export function isFileReadToolName(name: string | undefined): boolean {
+  if (!name) return false;
+  const trimmed = name.trim();
+  const bare = trimmed.includes('__')
+    ? trimmed.slice(trimmed.lastIndexOf('__') + 2)
+    : trimmed.includes('.')
+      ? trimmed.slice(trimmed.lastIndexOf('.') + 1)
+      : trimmed;
+  return FILE_READ_TOOL_RE.test(bare);
+}
 const STACK_PREFIX_RE =
   /^\s*(?:at\s+\S+\s*\(|Caused by:|File "|Traceback \(most recent call last\))/i;
 const FILE_EXT_LOC_RE =
@@ -374,6 +397,7 @@ function emulateTerminal(
 function encodeStructuredJson(
   text: string,
   _aggressiveToon: boolean,
+  enableToon = true,
 ): { text: string; stage: 'toon' | 'json' } | null {
   const hasNewline = text.includes('\n');
   if (text.length < 256) return null;
@@ -392,9 +416,11 @@ function encodeStructuredJson(
     const parsed: unknown = JSON.parse(trimmed);
     if (parsed === null || typeof parsed !== 'object') return null;
     const minJsonBox: { json?: string } = {};
-    const toon = encodeToon(parsed, minJsonBox);
-    if (toon !== null && toon.length < text.length) {
-      return { text: toon, stage: 'toon' };
+    if (enableToon) {
+      const toon = encodeToon(parsed, minJsonBox);
+      if (toon !== null && toon.length < text.length) {
+        return { text: toon, stage: 'toon' };
+      }
     }
     if (!hasNewline) return null;
     const min = minJsonBox.json ?? JSON.stringify(parsed);
@@ -606,7 +632,7 @@ function cleanToolOutputCore(
   // Strip ANSI first so colored diffs, bat pipes, and ripgrep results stay code-protected.
   const ansiStripped = stripAnsiSequences(text);
   const strippedAnsi = ansiStripped !== text;
-  const codeProtected = isCodeOrDiffProtected(ansiStripped);
+  const codeProtected = isFileReadToolName(opts?.toolName) || isCodeOrDiffProtected(ansiStripped);
   const foldLogs = opts?.foldLogs !== false;
   const stages: string[] = [];
   let current = ansiStripped;
@@ -620,7 +646,11 @@ function cleanToolOutputCore(
   }
 
   if (!codeProtected) {
-    const structured = encodeStructuredJson(current, opts?.aggressiveToon === true);
+    const structured = encodeStructuredJson(
+      current,
+      opts?.aggressiveToon === true,
+      opts?.enableToon !== false,
+    );
     if (structured !== null) {
       current = structured.text;
       stages.push(structured.stage);
@@ -687,7 +717,7 @@ function runWireTextEngine(args: {
   const stages = new Set<string>();
   let cliffAvoided: { at: number; multiplier: number; savedUsd: number } | undefined;
 
-  if (effectiveOpts?.deepTextCompact) {
+  if (effectiveOpts?.deepTextCompact && effectiveOpts.enableTscg !== false) {
     const schemaRes = compileToolSchemas(tools, wire);
     if (schemaRes.changed) {
       staticSavedChars += schemaRes.savedChars;
@@ -717,7 +747,8 @@ function runWireTextEngine(args: {
   for (let i = 0; i < toolSlots.length; i++) {
     const tSlot = toolSlots[i]!;
     const cur = origToolTexts[i]!;
-    const cleaned = cleanToolOutputCore(cur, effectiveOpts);
+    const slotOpts = tSlot.toolName ? { ...effectiveOpts, toolName: tSlot.toolName } : effectiveOpts;
+    const cleaned = cleanToolOutputCore(cur, slotOpts);
     if (cleaned.changed) {
       tSlot.setText(cleaned.text);
       stage2SavedChars += cur.length - cleaned.text.length;
@@ -727,7 +758,12 @@ function runWireTextEngine(args: {
 
   // Stage 3: ACDC frozen-epoch digestion runs BEFORE CASI so CASI never indexes a block
   // that becomes an epoch digest (and never creates circular live-tail references to digests).
-  if (effectiveOpts?.deepTextCompact && toolSlots.length > 0 && totalMessages > 6) {
+  if (
+    effectiveOpts?.deepTextCompact &&
+    effectiveOpts.enableAcdc !== false &&
+    toolSlots.length > 0 &&
+    totalMessages > 6
+  ) {
     let remainingChars = 0;
     if (effectiveOpts.rawBodyBytes && effectiveOpts.rawBodyBytes > 0) {
       remainingChars = Math.max(
@@ -840,6 +876,7 @@ export function applyAnthropicTextHygiene(
   }
 
   const toolSlots: TextEpochBlock[] = [];
+  const toolNameById = new Map<string, string>();
   const messages = Array.isArray(req.messages) ? req.messages : [];
   for (let mIdx = 0; mIdx < messages.length; mIdx++) {
     const rawMsg = messages[mIdx];
@@ -849,13 +886,19 @@ export function applyAnthropicTextHygiene(
     for (let bIdx = 0; bIdx < msg.content.length; bIdx++) {
       const rawBlk = msg.content[bIdx];
       if (!rawBlk || typeof rawBlk !== 'object') continue;
-      const blk = rawBlk as { type?: unknown; tool_use_id?: unknown; content?: unknown };
+      const blk = rawBlk as { type?: unknown; id?: unknown; name?: unknown; tool_use_id?: unknown; content?: unknown };
+      if (blk.type === 'tool_use' && typeof blk.id === 'string' && typeof blk.name === 'string') {
+        toolNameById.set(blk.id, blk.name);
+        continue;
+      }
       if (blk.type !== 'tool_result') continue;
+      const toolName = typeof blk.tool_use_id === 'string' ? toolNameById.get(blk.tool_use_id) : undefined;
       const baseRef = typeof blk.tool_use_id === 'string' && blk.tool_use_id ? blk.tool_use_id : `tr_${mIdx}_${bIdx}`;
       if (typeof blk.content === 'string') {
         toolSlots.push({
           msgIndex: mIdx,
           refId: baseRef,
+          toolName,
           getText: () => blk.content as string,
           setText: (next: string) => {
             blk.content = next;
@@ -870,6 +913,7 @@ export function applyAnthropicTextHygiene(
             toolSlots.push({
               msgIndex: mIdx,
               refId: `${baseRef}#${pIdx}`,
+              toolName,
               getText: () => part.text as string,
               setText: (next: string) => {
                 part.text = next;
@@ -902,11 +946,22 @@ export function applyOpenAIChatTextHygiene(
 ): WireHygieneStats {
   const staticSlots: StaticTextSlot[] = [];
   const toolSlots: TextEpochBlock[] = [];
+  const toolNameById = new Map<string, string>();
   const messages = Array.isArray(req.messages) ? req.messages : [];
   for (let mIdx = 0; mIdx < messages.length; mIdx++) {
     const rawMsg = messages[mIdx];
     if (!rawMsg || typeof rawMsg !== 'object') continue;
-    const msg = rawMsg as { role?: unknown; tool_call_id?: unknown; content?: unknown };
+    const msg = rawMsg as { role?: unknown; name?: unknown; tool_call_id?: unknown; tool_calls?: unknown; content?: unknown };
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      for (const rawTc of msg.tool_calls) {
+        if (!rawTc || typeof rawTc !== 'object') continue;
+        const tc = rawTc as { id?: unknown; function?: { name?: unknown } };
+        if (typeof tc.id === 'string' && typeof tc.function?.name === 'string') {
+          toolNameById.set(tc.id, tc.function.name);
+        }
+      }
+      continue;
+    }
     if (msg.role === 'system' || msg.role === 'developer') {
       if (typeof msg.content === 'string') {
         staticSlots.push({
@@ -932,11 +987,18 @@ export function applyOpenAIChatTextHygiene(
       continue;
     }
     if (msg.role !== 'tool') continue;
+    const toolName =
+      typeof msg.name === 'string' && msg.name
+        ? msg.name
+        : typeof msg.tool_call_id === 'string'
+          ? toolNameById.get(msg.tool_call_id)
+          : undefined;
     const baseRef = typeof msg.tool_call_id === 'string' && msg.tool_call_id ? msg.tool_call_id : `tool_${mIdx}`;
     if (typeof msg.content === 'string') {
       toolSlots.push({
         msgIndex: mIdx,
         refId: baseRef,
+        toolName,
         getText: () => msg.content as string,
         setText: (next: string) => {
           msg.content = next;
@@ -951,6 +1013,7 @@ export function applyOpenAIChatTextHygiene(
           toolSlots.push({
             msgIndex: mIdx,
             refId: `${baseRef}#${pIdx}`,
+            toolName,
             getText: () => part.text as string,
             setText: (next: string) => {
               part.text = next;
@@ -991,12 +1054,13 @@ export function applyOpenAIResponsesTextHygiene(
   }
 
   const toolSlots: TextEpochBlock[] = [];
+  const toolNameById = new Map<string, string>();
   const items = Array.isArray(req.input) ? req.input : [];
   let leadingStatic = true;
   for (let iIdx = 0; iIdx < items.length; iIdx++) {
     const rawItem = items[iIdx];
     if (!rawItem || typeof rawItem !== 'object') continue;
-    const item = rawItem as { type?: unknown; role?: unknown; call_id?: unknown; content?: unknown; output?: unknown };
+    const item = rawItem as { type?: unknown; id?: unknown; name?: unknown; role?: unknown; call_id?: unknown; content?: unknown; output?: unknown };
     if (leadingStatic && (item.role === 'system' || item.role === 'developer')) {
       if (typeof item.content === 'string') {
         staticSlots.push({
@@ -1022,12 +1086,19 @@ export function applyOpenAIResponsesTextHygiene(
       continue;
     }
     leadingStatic = false;
+    if ((item.type === 'function_call' || item.type === 'custom_tool_call') && typeof item.name === 'string') {
+      if (typeof item.call_id === 'string' && item.call_id) toolNameById.set(item.call_id, item.name);
+      if (typeof item.id === 'string' && item.id) toolNameById.set(item.id, item.name);
+      continue;
+    }
     if (item.type !== 'function_call_output' && item.type !== 'custom_tool_call_output') continue;
+    const toolName = typeof item.call_id === 'string' ? toolNameById.get(item.call_id) : undefined;
     const baseRef = typeof item.call_id === 'string' && item.call_id ? item.call_id : `out_${iIdx}`;
     if (typeof item.output === 'string') {
       toolSlots.push({
         msgIndex: iIdx,
         refId: baseRef,
+        toolName,
         getText: () => item.output as string,
         setText: (next: string) => {
           item.output = next;
@@ -1042,6 +1113,7 @@ export function applyOpenAIResponsesTextHygiene(
           toolSlots.push({
             msgIndex: iIdx,
             refId: `${baseRef}#${pIdx}`,
+            toolName,
             getText: () => part.text as string,
             setText: (next: string) => {
               part.text = next;
@@ -1113,7 +1185,8 @@ export function applyGoogleTextHygiene(
       if (!rawPart || typeof rawPart !== 'object') continue;
       const fr = (rawPart as { functionResponse?: unknown }).functionResponse;
       if (!fr || typeof fr !== 'object') continue;
-      const frName = typeof (fr as { name?: unknown }).name === 'string' ? (fr as { name: string }).name : 'fn';
+      const rawFrName = typeof (fr as { name?: unknown }).name === 'string' ? (fr as { name: string }).name : undefined;
+      const frName = rawFrName ?? 'fn';
       const response = (fr as { response?: unknown }).response;
       if (response && typeof response === 'object' && !Array.isArray(response)) {
         const respObj = response as Record<string, unknown>;
@@ -1122,6 +1195,7 @@ export function applyGoogleTextHygiene(
             toolSlots.push({
               msgIndex: cIdx,
               refId: `${frName}@${cIdx}.${pIdx}.${k}`,
+              toolName: rawFrName,
               getText: () => respObj[k] as string,
               setText: (next: string) => {
                 respObj[k] = next;
@@ -1140,6 +1214,7 @@ export function applyGoogleTextHygiene(
             toolSlots.push({
               msgIndex: cIdx,
               refId: `${frName}@${cIdx}.${pIdx}.p${spIdx}`,
+              toolName: rawFrName,
               getText: () => sub.text as string,
               setText: (next: string) => {
                 sub.text = next;

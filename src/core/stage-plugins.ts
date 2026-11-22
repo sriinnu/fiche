@@ -23,6 +23,14 @@ export interface StagePluginDescriptor {
 
 export type PluginOverrides = Record<string, boolean>;
 
+export interface StageToggles {
+  readonly optical: boolean;
+  readonly tscg: boolean;
+  readonly toon: boolean;
+  readonly acdc: boolean;
+  readonly casi: boolean;
+}
+
 const VALID_STAGES: ReadonlySet<PipelineStage> = new Set([
   'pre-hygiene',
   'hygiene',
@@ -135,9 +143,10 @@ export function parseSkillManifest(
   sourcePath?: string,
 ): StagePluginDescriptor | null {
   const cleanFallback = fallbackId.trim();
-  if (!cleanFallback) return null;
+  const slug = cleanFallback.startsWith('skill:') ? cleanFallback.slice('skill:'.length) : cleanFallback;
+  if (!isValidPluginId(slug)) return null;
   const fmMatch = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(markdown);
-  let name = cleanFallback;
+  let name = slug;
   let description = '';
   if (fmMatch && fmMatch[1]) {
     for (const rawLine of fmMatch[1].split(/\r?\n/)) {
@@ -152,7 +161,7 @@ export function parseSkillManifest(
       else if (key === 'description' && val) description = val;
     }
   }
-  const idBase = cleanFallback.startsWith('skill:') ? cleanFallback : `skill:${cleanFallback}`;
+  const idBase = `skill:${slug}`;
   return {
     id: idBase,
     name,
@@ -171,14 +180,31 @@ export function mergeStagePlugins(
 ): StagePluginDescriptor[] {
   const byId = new Map<string, StagePluginDescriptor>();
   for (const builtin of BUILTIN_STAGE_PLUGINS) {
-    const enabled = typeof overrides[builtin.id] === 'boolean' ? overrides[builtin.id]! : builtin.enabled;
+    const enabled = Object.hasOwn(overrides, builtin.id) && typeof overrides[builtin.id] === 'boolean'
+      ? overrides[builtin.id]!
+      : builtin.enabled;
     byId.set(builtin.id, { ...builtin, enabled });
   }
   for (const item of discovered) {
     // Built-in stage IDs stay authoritative so third-party manifests cannot shadow core stages.
     if (byId.has(item.id)) continue;
-    const enabled = typeof overrides[item.id] === 'boolean' ? overrides[item.id]! : item.enabled;
+    const enabled = Object.hasOwn(overrides, item.id) && typeof overrides[item.id] === 'boolean'
+      ? overrides[item.id]!
+      : item.enabled;
     byId.set(item.id, { ...item, enabled });
   }
   return [...byId.values()];
+}
+
+/** Derive active pipeline stage toggles from persisted plugin overrides (`plugins.json`). */
+export function stageTogglesFromOverrides(overrides: PluginOverrides = {}): StageToggles {
+  const flag = (id: string): boolean =>
+    !(Object.hasOwn(overrides, id) && overrides[id] === false);
+  return {
+    optical: flag('optical-microfiche'),
+    tscg: flag('tscg-schema'),
+    toon: flag('toon-structured'),
+    acdc: flag('acdc-epochs'),
+    casi: flag('casi-delta'),
+  };
 }

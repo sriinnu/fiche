@@ -13,15 +13,18 @@
  *    absolute-form/CONNECT traffic a forward proxy handles.
  */
 
-import { Agent as HttpAgent, request as httpRequest } from 'node:http';
+import {
+  Agent as HttpAgent,
+  createServer as createHttpServer,
+  request as httpRequest,
+} from 'node:http';
 import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:http';
 import {
   Agent as HttpsAgent,
-  createServer as createHttpsServer,
   request as httpsRequest,
 } from 'node:https';
 import { connect as netConnect, type Socket } from 'node:net';
-import { connect as tlsConnect, type TLSSocket } from 'node:tls';
+import { connect as tlsConnect, TLSSocket, type SecureContext } from 'node:tls';
 
 import type { CertificateAuthority } from './ca.js';
 import { hostCouldMatch, matchRoute, rewriteUrl, type Route } from './route.js';
@@ -145,22 +148,29 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   ) => {
     req.socket?.setNoDelay?.(true);
     res.socket?.setNoDelay?.(true);
-    const path = requestUri.split('?')[0] ?? '/';
-    const route = matchRoute(routes, hostPort, path);
-
+    let normalizedOrigin: URL;
+    let resolvedReq: URL;
     let target: URL;
     try {
-      target = new URL(route ? rewriteUrl(route, requestUri) : `${origin}${requestUri}`);
+      normalizedOrigin = new URL(origin);
+      resolvedReq = new URL(requestUri, normalizedOrigin);
+      if (resolvedReq.origin !== normalizedOrigin.origin) {
+        throw new Error('origin mismatch');
+      }
+      const path = resolvedReq.pathname;
+      const normalizedUri = resolvedReq.pathname + resolvedReq.search;
+      const route = matchRoute(routes, hostPort, path);
+      target = new URL(route ? rewriteUrl(route, normalizedUri) : `${origin}${normalizedUri}`);
+      if (route && !announced.has(route.pattern)) {
+        announced.add(route.pattern);
+        onDivert?.(hostPort, path, target.origin);
+      }
     } catch {
       if (!res.headersSent && !res.writableEnded && !res.destroyed) {
         res.writeHead(400, { 'content-type': 'text/plain' });
         res.end('fiche warp: bad request target');
       }
       return;
-    }
-    if (route && !announced.has(route.pattern)) {
-      announced.add(route.pattern);
-      onDivert?.(hostPort, path, target.origin);
     }
 
     const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -229,11 +239,19 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     req.pipe(outbound);
   };
 
+  const connectTargets = new WeakMap<Socket, { host: string; port: string }>();
+  const PROXY_ONLY_UPGRADE_HEADERS = new Set([
+    'proxy-authorization',
+    'proxy-connection',
+    'proxy-authenticate',
+  ]);
+
   const handleDecrypted = (req: IncomingMessage, res: ServerResponse): void => {
+    const bound = connectTargets.get(req.socket);
     const servername = (req.socket as TLSSocket).servername || '';
-    // A client that CONNECTed to a non-443 port repeats it in Host, which is
-    // the only place the original port survives the hijack into mitmServer.
-    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    // Prefer the authoritative CONNECT authority over the HTTP Host header so
+    // an inner request cannot domain-front across an already-established tunnel.
+    const { host, port } = bound ?? splitHostPort(servername || req.headers.host || '', '443');
     forward(req, res, authority(host, port), req.url ?? '/', `https://${authority(host, port)}`);
   };
 
@@ -245,8 +263,9 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    * never produce a 101).
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
+    const bound = connectTargets.get(req.socket) ?? connectTargets.get(clientSocket);
     const servername = (req.socket as TLSSocket).servername || '';
-    const { host, port } = splitHostPort(req.headers.host || servername, '443');
+    const { host, port } = bound ?? splitHostPort(servername || req.headers.host || '', '443');
     const portNum = parsePort(port);
     if (!host || portNum === null) {
       clientSocket.destroy();
@@ -259,6 +278,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       }
       const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
       for (const [key, value] of Object.entries(req.headers)) {
+        if (PROXY_ONLY_UPGRADE_HEADERS.has(key.toLowerCase())) continue;
         for (const v of Array.isArray(value) ? value : [value]) {
           if (v !== undefined) lines.push(`${key}: ${v}`);
         }
@@ -274,22 +294,11 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     });
   };
 
-  // Forcing http/1.1 via ALPN keeps the decrypted stream parseable by
-  // http.Server; without it Node negotiates h2 and the request handler never
-  // fires. This server never listens — it exists to be handed hijacked sockets.
-  const mitmServer = createHttpsServer({
-    SNICallback: (name, cb) => {
-      try {
-        cb(null, ca.secureContextFor(name));
-      } catch (err) {
-        cb(err as Error);
-      }
-    },
-    ALPNProtocols: ['http/1.1'],
-  });
-  mitmServer.on('request', handleDecrypted);
-  mitmServer.on('upgrade', handleUpgrade);
-  mitmServer.on('clientError', (_err, socket) => socket.destroy());
+  // Non-listening HTTP parser fed per-CONNECT TLSSockets once TLS handshake completes.
+  const decryptedServer = createHttpServer();
+  decryptedServer.on('request', handleDecrypted);
+  decryptedServer.on('upgrade', handleUpgrade);
+  decryptedServer.on('clientError', (_err, socket) => socket.destroy());
 
   const handleConnect = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
     clientSocket.setNoDelay?.(true);
@@ -324,9 +333,38 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
 
     clientSocket.write('HTTP/1.1 200 Connection established\r\n\r\n');
     if (head?.length) clientSocket.unshift(head);
-    // Handing the raw socket to the TLS server lets Node do the handshake, the
-    // HTTP parsing and the upgrade detection for us.
-    mitmServer.emit('connection', clientSocket);
+    // Mint a fallback SecureContext bound to the CONNECT target host so no-SNI
+    // clients (e.g., IP literals) still complete the TLS handshake cleanly.
+    let fallbackContext: SecureContext;
+    try {
+      fallbackContext = ca.secureContextFor(host);
+    } catch {
+      clientSocket.destroy();
+      return;
+    }
+    const tlsSocket = new TLSSocket(clientSocket, {
+      isServer: true,
+      secureContext: fallbackContext,
+      SNICallback: (name, cb) => {
+        try {
+          cb(null, ca.secureContextFor(name || host));
+        } catch (err) {
+          cb(err as Error);
+        }
+      },
+      ALPNProtocols: ['http/1.1'],
+    });
+    connectTargets.set(tlsSocket, { host, port });
+    clientSocket.on('error', () => {
+      if (!tlsSocket.destroyed) tlsSocket.destroy();
+    });
+    tlsSocket.on('error', () => {
+      if (!tlsSocket.destroyed) tlsSocket.destroy();
+      if (!clientSocket.destroyed) clientSocket.destroy();
+    });
+    tlsSocket.once('secure', () => {
+      if (!tlsSocket.destroyed) decryptedServer.emit('connection', tlsSocket);
+    });
   };
 
   const handleAbsoluteForm = (req: IncomingMessage, res: ServerResponse): void => {

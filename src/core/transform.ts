@@ -68,6 +68,7 @@ import {
   resolveTextHygieneMode,
   type TextHygieneMode,
 } from './text-hygiene.js';
+import type { StageToggles } from './stage-plugins.js';
 
 /** Gate rates for one request, priced once: the cache TTL its markers ask for
  *  and its size as it arrived. Keyed by the parsed request, so every gate in
@@ -202,6 +203,8 @@ export interface TransformOptions {
    * 400 `prompt_cache_breakpoint is not supported on this model`.
    */
   explicitPromptCacheBreakpoints?: boolean;
+  /** Per-stage enable flags synced from `~/.config/fiche/plugins.json`. */
+  stageToggles?: Partial<StageToggles>;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
@@ -233,6 +236,7 @@ const DEFAULTS: Required<TransformOptions> = {
   gptHistory: {},
   model: '',
   explicitPromptCacheBreakpoints: true,
+  stageToggles: {},
 };
 
 /**
@@ -2629,11 +2633,15 @@ export async function transformRequest(
     }
   }
 
+  const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
   const hygieneStats = isTextHygieneActive(o.textHygiene)
     ? applyAnthropicTextHygiene(req, {
-        foldLogs: !o.imageCompress,
-        deepTextCompact: !o.imageCompress,
-        enableCasi: typeof opts.keepSharp !== 'function',
+        foldLogs: !effectiveImageCompress,
+        deepTextCompact: !effectiveImageCompress,
+        enableTscg: o.stageToggles?.tscg,
+        enableToon: o.stageToggles?.toon,
+        enableAcdc: o.stageToggles?.acdc,
+        enableCasi: o.stageToggles?.casi !== false && typeof opts.keepSharp !== 'function',
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: o.model,
         expectedOutputTokens: o.expectedOutputTokens,
@@ -2649,7 +2657,7 @@ export async function transformRequest(
     info.textHygieneStages = [...hygieneStats.stages];
     if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
   }
-  if (!o.imageCompress) {
+  if (!effectiveImageCompress) {
     if (pinsRewrote) applyPins(req, info, pins);
     if (hygieneStats?.changed) {
       const firstUser = firstUserText(req);

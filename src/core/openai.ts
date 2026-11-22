@@ -43,6 +43,7 @@ import {
   resolveTextHygieneMode,
   type TextHygieneMode,
 } from './text-hygiene.js';
+import type { StageToggles } from './stage-plugins.js';
 import { stripSchemaDescriptions } from './schema-strip.js';
 import {
   GPT_HISTORY_DEFAULTS,
@@ -321,6 +322,7 @@ interface OpenAIResolvedOptions {
   gptHistory?: Partial<GptHistoryOptions>;
   /** See TransformOptions.explicitPromptCacheBreakpoints. Default on. */
   explicitPromptCacheBreakpoints: boolean;
+  stageToggles?: Partial<StageToggles>;
 }
 
 const DEFAULTS: OpenAIResolvedOptions = {
@@ -336,6 +338,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   reflow: true,
   collapseHistory: true,
   explicitPromptCacheBreakpoints: true,
+  stageToggles: {},
 };
 
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
@@ -353,6 +356,7 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     collapseHistory: opts.collapseHistory ?? DEFAULTS.collapseHistory,
     gptHistory: opts.gptHistory,
     explicitPromptCacheBreakpoints: opts.explicitPromptCacheBreakpoints !== false,
+    stageToggles: opts.stageToggles ?? {},
   };
 }
 
@@ -1317,10 +1321,15 @@ export async function transformOpenAIChatCompletions(
   if (pinChars > 0) info.pinChars = pinChars;
   const chatNativeImageBytes = countOpenAINativeImageBytes(req.messages);
 
+  const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
   const hygieneStats = isTextHygieneActive(o.textHygiene)
     ? applyOpenAIChatTextHygiene(req, {
-        foldLogs: !o.imageCompress,
-        deepTextCompact: !o.imageCompress,
+        foldLogs: !effectiveImageCompress,
+        deepTextCompact: !effectiveImageCompress,
+        enableTscg: o.stageToggles?.tscg,
+        enableToon: o.stageToggles?.toon,
+        enableAcdc: o.stageToggles?.acdc,
+        enableCasi: o.stageToggles?.casi,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: req.model,
         expectedOutputTokens: o.expectedOutputTokens,
@@ -1350,7 +1359,7 @@ export async function transformOpenAIChatCompletions(
   if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed)) {
     getPinBody();
   }
-  if (!o.imageCompress) {
+  if (!effectiveImageCompress) {
     if (hygieneStats?.changed) {
       const firstUser = firstUserText(req);
       if (firstUser) info.firstUserSha8 = await sha8(firstUser);
@@ -1613,10 +1622,15 @@ export async function transformOpenAIResponses(
   if (pinChars > 0) info.pinChars = pinChars;
   const respNativeImageBytes = countOpenAINativeImageBytes(req.input);
 
+  const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
   const hygieneStats = isTextHygieneActive(o.textHygiene)
     ? applyOpenAIResponsesTextHygiene(req, {
-        foldLogs: !o.imageCompress,
-        deepTextCompact: !o.imageCompress,
+        foldLogs: !effectiveImageCompress,
+        deepTextCompact: !effectiveImageCompress,
+        enableTscg: o.stageToggles?.tscg,
+        enableToon: o.stageToggles?.toon,
+        enableAcdc: o.stageToggles?.acdc,
+        enableCasi: o.stageToggles?.casi,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: req.model,
         expectedOutputTokens: o.expectedOutputTokens,
@@ -1646,7 +1660,7 @@ export async function transformOpenAIResponses(
   if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed)) {
     getPinBodyResp();
   }
-  if (!o.imageCompress) {
+  if (!effectiveImageCompress) {
     if (hygieneStats?.changed) {
       const inputArr = Array.isArray(req.input) ? req.input as Array<ResponsesInputItem | Record<string, unknown>> : [];
       const firstUser = firstResponsesUserText(typeof req.input === 'string', typeof req.input === 'string' ? req.input : undefined, inputArr);

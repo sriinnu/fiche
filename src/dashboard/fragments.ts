@@ -255,7 +255,7 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
       `<div class="hero hero-empty">` +
       `<div class="hero-eyebrow">Since start</div>` +
       `<div class="hero-headline">Warming up…</div>` +
-      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch it with <code>fiche warp -- claude</code> to keep <code>/remote-control</code> and claude.ai connectors working. Send a message and your running savings show up right here.</div>` +
+      `<div class="hero-sub">Point Claude Code at this proxy with <code>ANTHROPIC_BASE_URL</code>, or launch any CLI/app with <code>fiche warp -- claude</code> (or enable <code>fiche shell-init --wrap</code> in your shell) to route all coding agents transparently. Send a message and your running savings show up right here.</div>` +
       `</div>`
     );
   }
@@ -272,16 +272,31 @@ export function renderSessionSummaryFragment(s: StatsPayload): string {
   const positive = inputPct >= 0;
   const bigNum = `${Math.abs(inputPct).toFixed(0)}%`;
   const word = positive ? 'fewer tokens' : 'more tokens';
+  const imaged = s.imaged_requests ?? 0;
+  const textComp = s.text_compressed_requests ?? 0;
+  const modeSummary =
+    imaged > 0 && textComp > 0
+      ? `${numFmt(imaged)} imaged · ${numFmt(textComp)} text-compacted`
+      : textComp > 0
+        ? `${numFmt(textComp)} text-compacted`
+        : `${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged`;
+  const todayStr =
+    s.today && s.today.requests > 0
+      ? ` · Today: ${s.today.saved_tokens >= 0 ? '-' : '+'}${kFmt(Math.abs(s.today.saved_tokens))} wtd${s.today.saved_usd > 0 ? ` ($${s.today.saved_usd.toFixed(2)})` : ''}`
+      : '';
+  const rawSavedNote =
+    (s.raw_saved_tokens ?? 0) > 0 ? `${kFmt(s.raw_saved_tokens)} raw tokens stripped · ` : '';
 
   return (
     `<div class="hero${positive ? '' : ' hero-neg'}">` +
-    `<div class="hero-eyebrow">Since start · ${numFmt(measured)} request${measured === 1 ? '' : 's'} imaged</div>` +
+    `<div class="hero-eyebrow">Lifetime · ${modeSummary}${todayStr}</div>` +
     `<div class="hero-headline"><span class="hero-num">${bigNum}</span> ${word}</div>` +
     `<div class="hero-sub">` +
     `<strong>${kFmt(actualW)}</strong> provider-accounted input tokens vs <strong>${kFmt(baselineW)}</strong> if this same context ` +
     `stayed plain text. Your latest messages and model output are never compressed.` +
     `</div>` +
     `<div class="hero-meta">` +
+    rawSavedNote +
     `Provider-token basis; cache discounts applied where measurable · ` +
     `output untouched (${kFmt(rawOutput)}) · no $ assumptions` +
     `</div>` +
@@ -376,9 +391,18 @@ export function renderHeaderFragment(s: StatsPayload, port: number): string {
         'Cache-aware estimate for requests covered by the configured pricing assumptions. Other providers remain excluded.',
       );
 
+  const imagedCount = s.imaged_requests ?? 0;
+  const textCompCount = s.text_compressed_requests ?? 0;
+  const requestsSub =
+    imagedCount > 0 && textCompCount > 0
+      ? `${numFmt(imagedCount)} imaged · ${numFmt(textCompCount)} text-compacted`
+      : textCompCount > 0
+        ? `${numFmt(textCompCount)} text-compacted`
+        : `${numFmt(s.compressed_requests)} turned into images`;
+
   const strip =
     `<div class="strip">` +
-    statTile('Requests', numFmt(s.requests), `${numFmt(s.compressed_requests)} turned into images`) +
+    statTile('Requests', numFmt(s.requests), requestsSub) +
     statTile(
       'Input tokens saved',
       numFmt(s.saved_input_tokens),
@@ -718,9 +742,12 @@ export function renderRecentFragment(p: RecentPayload): string {
                 : saved < 0
                   ? `<td class="num neg">${numFmt(saved)}${createNote}</td>`
                   : `<td class="num">0</td>`;
-            const imaged = e.cc_added
-              ? `<span class="badge badge-img">image</span>`
-              : `<span class="badge badge-txt">text</span>`;
+            const imaged =
+              e.compression_mode === 'optical' || (!e.compression_mode && e.cc_added)
+                ? `<span class="badge badge-img">image</span>`
+                : e.compression_mode === 'text'
+                  ? `<span class="badge badge-hyg" title="${escapeHtml((e.text_hygiene_stages ?? []).join(', ') || '4-layer deterministic text hygiene')}">text-hygiene</span>`
+                  : `<span class="badge badge-txt">text</span>`;
             return (
               `<tr>` +
               `<td class="muted">${i + 1}</td>` +
@@ -810,6 +837,159 @@ export function renderLatestFragment(inp: LatestFragmentInput): string {
   }
 
   return pinBar + main + `<div class="viewer-caption">${caption} ${srcBtn}</div>` + pane;
+}
+
+export function renderAnalyticsFragment(s: StatsPayload): string {
+  const days = s.daily ?? [];
+  const today = s.today;
+  const hasToday = Boolean(today && today.requests > 0);
+  const rawSaved = s.raw_saved_tokens ?? 0;
+  const imagedCount = s.imaged_requests ?? 0;
+  const textCount = s.text_compressed_requests ?? 0;
+
+  const summaryKpis =
+    `<div class="analytics-kpis">` +
+    `<div class="akpi">` +
+    `<div class="akpi-lbl">Today</div>` +
+    `<div class="akpi-val">${today ? `${kFmt(today.saved_tokens)} <span class="akpi-unit">wtd</span>` : '0 <span class="akpi-unit">wtd</span>'}</div>` +
+    `<div class="akpi-sub">${hasToday && today ? `${kFmt(today.raw_saved_tokens)} raw · $${today.saved_usd.toFixed(2)} · ${numFmt(today.requests)} req` : 'no requests today yet'}</div>` +
+    `</div>` +
+    `<div class="akpi">` +
+    `<div class="akpi-lbl">Lifetime</div>` +
+    `<div class="akpi-val">${kFmt(s.saved_input_tokens)} <span class="akpi-unit">wtd</span></div>` +
+    `<div class="akpi-sub">${kFmt(rawSaved)} raw · $${(s.saved_usd ?? 0).toFixed(2)} · ${numFmt(imagedCount)} img / ${numFmt(textCount)} txt</div>` +
+    `</div>` +
+    `</div>`;
+
+  const buildDailySvg = (metric: 'tokens' | 'usd'): string => {
+    const W = 640;
+    const H = 156;
+    const padL = 10;
+    const padR = 54;
+    const padT = 14;
+    const padB = 24;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+    const vals = days.map((d) => Math.max(0, metric === 'usd' ? d.saved_usd : d.saved_tokens));
+    const maxVal = Math.max(metric === 'usd' ? 0.01 : 1, ...vals);
+    const fmtTick = (v: number): string =>
+      metric === 'usd' ? `$${v >= 10 ? v.toFixed(1) : v.toFixed(2)}` : kFmt(v);
+
+    const gridLines = [0, 0.5, 1]
+      .map((frac) => {
+        const y = padT + plotH * (1 - frac);
+        const label = fmtTick(maxVal * frac);
+        return (
+          `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${padL + plotW}" y2="${y.toFixed(1)}" ` +
+          `stroke="var(--border)" stroke-dasharray="${frac === 0 ? '' : '3 3'}" stroke-width="1"/>` +
+          `<text x="${padL + plotW + 6}" y="${(y + 3).toFixed(1)}" font-size="9.5" fill="var(--muted)" font-family="var(--mono)">${escapeHtml(label)}</text>`
+        );
+      })
+      .join('');
+
+    const count = Math.max(1, days.length);
+    const slotW = plotW / count;
+    const barW = Math.max(8, Math.min(28, slotW * 0.64));
+    const bars = days
+      .map((d, i) => {
+        const v = vals[i] ?? 0;
+        const barH = v > 0 ? Math.max(3, (v / maxVal) * plotH) : 2;
+        const x = padL + i * slotW + (slotW - barW) / 2;
+        const y = padT + plotH - barH;
+        const tip = `${d.date}: ${kFmt(d.saved_tokens)} wtd · ${kFmt(d.raw_saved_tokens)} raw · $${d.saved_usd.toFixed(2)} · ${d.requests} req${d.is_today ? ' (Live today)' : ''}`;
+        const fill = v > 0 ? 'var(--good)' : 'var(--border-strong)';
+        const extra = d.is_today
+          ? ` opacity="0.58" stroke="var(--good)" stroke-dasharray="3 2" stroke-width="1.2"`
+          : '';
+        return (
+          `<g>` +
+          `<title>${escapeHtml(tip)}</title>` +
+          `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}" rx="3" fill="${fill}"${extra}/>` +
+          `</g>`
+        );
+      })
+      .join('');
+
+    const xLabelIdxs = days.length > 0 ? [...new Set([0, Math.floor((days.length - 1) / 2), days.length - 1])] : [];
+    const xLabels = xLabelIdxs
+      .map((idx) => {
+        const d = days[idx]!;
+        const cx = padL + idx * slotW + slotW / 2;
+        const txt = d.is_today ? 'Today' : d.date.slice(5);
+        return `<text x="${cx.toFixed(1)}" y="${H - 6}" text-anchor="middle" font-size="9.5" fill="var(--muted)" font-family="var(--mono)">${escapeHtml(txt)}</text>`;
+      })
+      .join('');
+
+    const cls = metric === 'usd' ? 'daily-svg daily-svg-usd' : 'daily-svg daily-svg-tokens';
+    const dataAttr = metric === 'usd' ? 'daily-usd' : 'daily';
+    return (
+      `<svg class="${cls}" data-chart="${dataAttr}" viewBox="0 0 ${W} ${H}" role="img" aria-label="14-day daily savings (${metric})">` +
+      gridLines +
+      bars +
+      xLabels +
+      `</svg>`
+    );
+  };
+
+  const dailyPanel =
+    `<div class="card">` +
+    `<div class="chart-head">` +
+    `<h3 class="card-head" style="margin:0">Daily savings (14d)</h3>` +
+    `<div class="metric-tabs">` +
+    `<button type="button" class="mini-btn metric-btn metric-btn-tokens on" onclick="ppSetMetric('tokens')">Tokens</button>` +
+    `<button type="button" class="mini-btn metric-btn metric-btn-usd" onclick="ppSetMetric('usd')">USD</button>` +
+    `</div>` +
+    `</div>` +
+    (days.length > 0
+      ? buildDailySvg('tokens') + buildDailySvg('usd')
+      : `<div class="empty-note">Daily chart populates automatically as requests arrive.</div>`) +
+    `<div class="axis">Solid: sealed day · Dashed (58%): Live today (unsealed)</div>` +
+    `</div>`;
+
+  const modelEntries = Object.entries(s.by_model ?? {}).sort((a, b) => {
+    const diffTok = b[1].saved_tokens - a[1].saved_tokens;
+    if (diffTok !== 0) return diffTok;
+    const diffReq = b[1].requests - a[1].requests;
+    if (diffReq !== 0) return diffReq;
+    return a[0].localeCompare(b[0]);
+  });
+  const maxModelTok = Math.max(1, ...modelEntries.map(([, m]) => Math.max(0, m.saved_tokens)));
+  const modelBars =
+    modelEntries.length === 0
+      ? `<div class="empty-note">No per-model traffic recorded yet.</div>`
+      : `<div class="bars">` +
+        modelEntries
+          .map(([model, m]) => {
+            const pctW = m.saved_tokens > 0 ? Math.max(2, (m.saved_tokens / maxModelTok) * 100) : 0;
+            const fill = pctW > 0 ? `<div class="bar-fill" style="width:${pctW.toFixed(1)}%"></div>` : '';
+            const modeDetail = `${numFmt(m.requests)} req · ${numFmt(m.imaged)} img · ${numFmt(m.text_compressed)} txt`;
+            const valLabel = `${kFmt(m.saved_tokens)} wtd · ${kFmt(m.raw_saved_tokens)} raw · $${m.saved_usd.toFixed(2)}`;
+            return (
+              `<div class="mbar-row">` +
+              `<div class="mbar-top">` +
+              `<span class="mbar-name" title="${escapeHtml(model)}">${escapeHtml(model)}</span>` +
+              `<span class="mbar-val">${valLabel}</span>` +
+              `</div>` +
+              `<div class="bar-track">${fill}</div>` +
+              `<div class="mbar-sub">${modeDetail}</div>` +
+              `</div>`
+            );
+          })
+          .join('') +
+        `</div>`;
+
+  const modelsPanel =
+    `<div class="card">` +
+    `<h3 class="card-head">By model (tokens saved &amp; USD)</h3>` +
+    modelBars +
+    `</div>`;
+
+  return (
+    `<div class="analytics-wrap" data-metric="tokens">` +
+    summaryKpis +
+    `<div class="analytics-grid">${dailyPanel}${modelsPanel}</div>` +
+    `</div>`
+  );
 }
 
 // ---- sessions bar chart --------------------------------------------------
@@ -944,6 +1124,7 @@ const CSS = `
     --warn: #b45309; --warn-tint: #fffbeb;
     --img: #4f46e5; --img-ink: #3730a3; --img-tint: #eef2ff;
     --txt: #0369a1; --txt-ink: #075985; --txt-tint: #f0f9ff;
+    --hyg: #0f766e; --hyg-ink: #115e59; --hyg-tint: #ccfbf1;
     --radius: 12px;
     --shadow: 0 1px 2px rgba(15,23,42,0.04);
     --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -961,6 +1142,7 @@ const CSS = `
     --warn: #fbbf24; --warn-tint: rgba(251,191,36,0.10);
     --img: #818cf8; --img-ink: #c7d2fe; --img-tint: rgba(129,140,248,0.12);
     --txt: #38bdf8; --txt-ink: #bae6fd; --txt-tint: rgba(56,189,248,0.10);
+    --hyg: #2dd4bf; --hyg-ink: #99f6e4; --hyg-tint: rgba(45,212,191,0.12);
     --shadow: 0 1px 2px rgba(0,0,0,0.3);
     color-scheme: dark;
   }
@@ -1221,7 +1403,33 @@ const CSS = `
   .mk-create { font-size: 9.5px; font-weight: 600; color: var(--muted); border: 1px solid var(--border-strong);
     border-radius: 999px; padding: 0 5px; margin-left: 4px; vertical-align: 1px; cursor: help; white-space: nowrap; }
   .badge-img { background: var(--img-tint); color: var(--img-ink); }
+  .badge-hyg { background: var(--hyg-tint); color: var(--hyg-ink); }
   .badge-txt { background: var(--txt-tint); color: var(--txt-ink); }
+
+  /* analytics (daily + per-model) */
+  .analytics-wrap { display: flex; flex-direction: column; gap: 12px; }
+  .analytics-kpis { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  @media (max-width: 640px) { .analytics-kpis { grid-template-columns: 1fr; } }
+  .akpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px 18px; box-shadow: var(--shadow); }
+  .akpi-lbl { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  .akpi-val { font-size: 22px; font-weight: 700; color: var(--ink); font-variant-numeric: tabular-nums; margin-top: 4px; }
+  .akpi-unit { font-size: 12px; font-weight: 500; color: var(--muted); }
+  .akpi-sub { font-size: 11.5px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .analytics-grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 960px) { .analytics-grid { grid-template-columns: 1fr; } }
+  .chart-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .metric-tabs { display: inline-flex; gap: 4px; }
+  .metric-btn.on { background: var(--accent); color: var(--surface); border-color: var(--accent); font-weight: 600; }
+  .daily-svg { display: block; width: 100%; height: auto; }
+  .analytics-wrap[data-metric="tokens"] .daily-svg-usd { display: none; }
+  .analytics-wrap[data-metric="usd"] .daily-svg-tokens { display: none; }
+  .mbar-row { display: flex; flex-direction: column; gap: 4px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+  .mbar-row:last-child { border-bottom: none; padding-bottom: 0; }
+  .mbar-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; font-size: 12px; }
+  .mbar-name { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mbar-val { font-variant-numeric: tabular-nums; color: var(--good); font-weight: 600; font-size: 11.5px; white-space: nowrap; }
+  .mbar-sub { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
 
   /* inspector */
   .viewer-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -1274,7 +1482,20 @@ const CSS = `
 
 // Client glue: window.pp (pin+source state) → hx-vals; preserves <details> open state across swaps; routes htmx errors to toast tray.
 const GLUE_JS = `
-  window.pp = { pin: null, src: false };
+  window.pp = { pin: null, src: false, chartMetric: 'tokens' };
+  function ppApplyMetric() {
+    var m = window.pp.chartMetric === 'usd' ? 'usd' : 'tokens';
+    var wrap = document.querySelector('#frag-analytics .analytics-wrap');
+    if (wrap) {
+      wrap.setAttribute('data-metric', m);
+      wrap.querySelectorAll('.metric-btn-tokens').forEach(function (b) { b.classList.toggle('on', m === 'tokens'); });
+      wrap.querySelectorAll('.metric-btn-usd').forEach(function (b) { b.classList.toggle('on', m === 'usd'); });
+    }
+  }
+  function ppSetMetric(m) {
+    window.pp.chartMetric = m === 'usd' ? 'usd' : 'tokens';
+    ppApplyMetric();
+  }
   function ppPin(id) {
     window.pp.pin = id;
     htmx.trigger('#frag-latest', 'pp-refresh');
@@ -1293,6 +1514,9 @@ const GLUE_JS = `
       const d = document.getElementById(id);
       if (d) d.setAttribute('open', '');
     });
+    if (ev.detail.target && ev.detail.target.id === 'frag-analytics') {
+      ppApplyMetric();
+    }
   });
   document.body.addEventListener('htmx:responseError', function (ev) {
     window.dispatchEvent(new CustomEvent('pp-toast', {
@@ -1417,15 +1641,27 @@ export function renderPage(port: number, hostLabel = ''): string {
 
 <div id="frag-header" hx-get="/fragments/header" hx-trigger="load, every 2s" hx-swap="innerHTML"></div>
 
+<section class="section" id="analytics-section">
+  <h2 class="section-head">Daily &amp; per-model savings <span class="section-sub">lifetime &amp; daily tokens + kosha USD</span></h2>
+  <div id="frag-analytics" hx-get="/fragments/analytics" hx-trigger="load, every 5s" hx-swap="innerHTML"></div>
+</section>
+
 <div class="config-dock">
   <details class="models-collapse">
-    <summary class="models-summary">Connect an agent <span class="hint">warp launches any CLI through this proxy · pin keeps instructions last in the request</span></summary>
+    <summary class="models-summary">Connect an agent <span class="hint">auto-wrap every CLI or launch any desktop app · instant FICHE_BYPASS=1 · @fiche pin</span></summary>
     <div class="dock-body">
-      <p>Warp starts the agent with the proxy already wired, no env or config edits:</p>
+      <p><strong>Option 1 — One-time automatic shell setup</strong> (recommended; routes <code>claude</code>, <code>codex</code>, <code>agy</code>, <code>gemini</code>, <code>opencode</code>, <code>cursor-agent</code>, <code>amp</code>, <code>pi</code>, <code>aider</code> through Fiche automatically):</p>
+      <pre>eval "$(fiche shell-init --wrap)"   # add to ~/.zshrc or ~/.bashrc</pre>
+      <p><strong>Option 2 — Wrap any CLI or Desktop app explicitly</strong> (with zero config edits):</p>
       <pre>fiche warp -- claude
 fiche warp -- codex
-fiche warp -- cursor-agent</pre>
-      <p>Aliases work too (<code>fiche warp -- pp</code>), and <code>--route PATTERN=http://host:port</code> adds routes beyond <code>api.anthropic.com</code> (a PATTERN that names a port matches only that port, e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code> warps an agent pointed at another local proxy). Without warp, point the agent at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code> yourself.</p>
+fiche warp -- agy
+fiche warp -- gemini
+fiche warp -- opencode
+fiche warp -- aider
+fiche warp --app Antigravity</pre>
+      <p>Desktop apps (Antigravity, Cursor, Claude, Windsurf, Zed, OpenCode, ChatGPT) and CLIs can also be launched with 1 click from the <strong>Agents</strong> tab in <code>FicheBar.app</code>. Already-running apps/terminals must be restarted once after wiring so they inherit the local proxy and TLS trust. Use <code>FICHE_BYPASS=1 claude</code> or the top pause switch for instant passthrough.</p>
+      <p>Custom upstream routes use <code>--route PATTERN=http://host:port</code> (e.g. <code>--route '127.0.0.1:9090/v1/*=http://127.0.0.1:${port}'</code>). Without warp, point HTTP-capable clients at <code>ANTHROPIC_BASE_URL=http://127.0.0.1:${port}</code>.</p>
       <p>Pin instructions from inside the session — they get moved to the end of every request, where the model actually reads them:</p>
       <pre>@fiche pin be concise, no walls of text
 @fiche unpin 2

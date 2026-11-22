@@ -626,6 +626,7 @@ async function userTurnBlocks(
   fromInclusive: number,
   upToExclusive: number,
   onImage: (img: RenderedImage) => void,
+  renderOpts?: { cols: number; style: RenderStyle; maxHeightPx?: number; reflow: boolean },
 ): Promise<ContentBlock[]> {
   const out: ContentBlock[] = [];
   let pending: string[] = [];
@@ -676,11 +677,17 @@ async function userTurnBlocks(
       type: 'text',
       text: `[${imaged.length} user turn(s) from this session were too long to carry as text; they are rendered verbatim, in turn order, in the image(s) immediately below, separate from the history transcript. Each begins with its own <user t="N"> tag. PRIOR context, not the current request.\n${previews}]`,
     });
+    const rawUserText = imaged.map((u) => `<user t="${u.idx}">\n${u.typed}\n</user>`).join('\n\n');
+    const safeUserText = neutralizeSentinel(rawUserText);
+    const renderUserText = (renderOpts?.reflow ?? true)
+      ? (reflow(safeUserText) ?? safeUserText)
+      : rawUserText;
     const imgs = await renderTextToPngsWithCharLimit(
-      imaged.map((u) => `<user t="${u.idx}">\n${u.typed}\n</user>`).join('\n\n'),
-      DENSE_CONTENT_COLS,
+      renderUserText,
+      renderOpts?.cols ?? DENSE_CONTENT_COLS,
       DENSE_CONTENT_CHARS_PER_IMAGE,
-      DENSE_RENDER_STYLE,
+      renderOpts?.style ?? DENSE_RENDER_STYLE,
+      renderOpts?.maxHeightPx,
     );
     for (const img of imgs) {
       out.push({
@@ -835,97 +842,324 @@ export async function collapseHistory(
     }
     collapseLen = trimmedLen;
     msgLen.length = collapseLen - protectedPrefix;
+    userImgLen.length = collapseLen - protectedPrefix;
     info.budgetTrimmed = true;
   }
 
-  // Exclude slab messages (protectedPrefix) from serialization.
-  const text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
-  if (!text || text.length === 0) {
-    info.reason = 'render_empty';
-    return { messages, info };
-  }
-  // Reflow for RENDERING ONLY: pack short lines + mark hard breaks with ↵ so the
-  // newline-heavy transcript fills full rows instead of one line per row. Same
-  // glyph size (cols unchanged) → identical legibility, fewer images, more saved.
-  // `text` stays original — it backs `collapsedChars` and the cache byte-stability.
-  const safeText = neutralizeSentinel(text);
-  const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
-  if (!isProfitable(renderText, o.cols)) { // pass string, not length — see ProfitableFn
-    info.reason = 'not_profitable';
-    info.collapsedChars = text.length; // surface what we DIDN'T compress
-    return { messages, info };
-  }
-  // APPEND-ONLY rendering. Render the collapse range [protectedPrefix..collapseLen)
-  // as independent image blocks on an ABSOLUTE message grid anchored at
-  // protectedPrefix (step = freezeChunk). A completed chunk's bytes are fixed by
-  // its message range alone, so old chunks stay byte-identical as the conversation
-  // grows (cache_read forever); only the newest partial chunk re-renders.
-  //
-  // Chunk-end positions = the absolute grid ∪ caller cache_control marks: a marked
-  // message forces a split right after it, and that chunk's LAST image carries the
-  // caller's marker — so a roaming breakpoint survives as an aligned, independently
-  // cacheable image boundary instead of being silently flattened (count conserved,
-  // never added). Each chunk is reflowed and rendered on its own, which is what
-  // makes the bytes a pure function of the chunk's messages.
-  //
-  // The grid step is ADAPTIVE. A fixed 10-message step emits ≥1 page per chunk no
-  // matter how little text the chunk holds: a long session of short turns rendered
-  // 317 pages at 43% fill and 500'd the request (#161). Doubling the step merges
-  // neighbouring chunks — pages fill up, count drops ~2× per doubling — while
-  // keeping chunk boundaries a SUBSET of the base grid, so a chunk frozen at the
-  // coarse step spans whole base chunks and stays byte-identical as long as the
-  // step never shrinks again (the caller pins it via minFreezeStep).
-  const baseStep = o.freezeChunk > 0 ? o.freezeChunk : collapseLen - protectedPrefix;
-  const rangeLen = collapseLen - protectedPrefix;
-  const pagesFor = (s: number): number => {
-    let pages = 0;
-    for (let a = 0; a < rangeLen; a += s) {
-      const b = Math.min(a + s, rangeLen);
-      const chars = sumLen(a, b);
-      if (chars > 0) pages += Math.ceil(chars / pageChars);
-      // Over-cap user prompts in this chunk are batched into their own image(s).
-      const uchars = sumOf(userImgLen, a, b);
-      if (uchars > 0) pages += Math.ceil(uchars / pageChars);
-    }
-    return pages;
-  };
-  // Caller cache_control marks force extra splits below; charge one page each so a
-  // marked request can't slip past the budget the estimate just cleared.
-  let markSplits = 0;
-  for (let i = protectedPrefix; i < collapseLen; i++) {
-    if (messageCacheControl(messages[i]!) !== undefined) markSplits++;
-  }
-  let step = baseStep;
-  // Sticky floor first: a session already repacked coarse must STAY coarse.
-  while (step < o.minFreezeStep && step < rangeLen) step *= 2;
-  // packFill trades the append-only freeze for ~2× fewer image tokens and is only
-  // set when the upstream cache is dead anyway (cold session / after a 500).
-  const packedPages = Math.max(1, Math.ceil(sumLen(0, rangeLen) / pageChars));
-  const goal = Math.min(budget, o.packFill ? packedPages + 1 : Infinity);
-  while (step < rangeLen && pagesFor(step) + markSplits > goal) step *= 2;
-  info.freezeStep = step;
-  const ends = new Set<number>();
-  for (let e = protectedPrefix + step; e < collapseLen; e += step) ends.add(e);
-  const markerByEnd = new Map<number, CacheControl>();
-  for (let i = protectedPrefix; i < collapseLen; i++) {
-    const cc = messageCacheControl(messages[i]!);
-    if (cc !== undefined) {
-      ends.add(i + 1);
-      markerByEnd.set(i + 1, cc);
-    }
-  }
-  ends.add(collapseLen);
-  const sortedEnds = [...ends].filter((e) => e > protectedPrefix && e <= collapseLen).sort((a, b) => a - b);
+  const emptyInfo = (reason: HistoryCollapseInfo['reason']): HistoryCollapseInfo => ({
+    collapsedTurns: 0,
+    collapsedChars: 0,
+    collapsedImages: 0,
+    collapsedImageBytes: 0,
+    collapsedImagePixels: 0,
+    collapsedPngs: [],
+    collapsedImageDims: [],
+    droppedChars: 0,
+    droppedCodepoints: new Map(),
+    reason,
+  });
 
-  // Carry-over anchor end: the largest FULLY grid-aligned chunk boundary strictly
-  // before collapseLen. That chunk's bytes are frozen across window advances, unlike
-  // the newest partial chunk — so it's the stable place to pin the cache breakpoint (#11).
+  interface AssembledChunk {
+    readonly chunkEnd: number;
+    readonly blocks: ContentBlock[];
+    readonly imgs: RenderedImage[];
+    readonly transcriptImgCount: number;
+  }
+
+  let effPageChars = pageChars;
+  let text = '';
+  let assembledChunks: AssembledChunk[] = [];
   let carryOverEnd = -1;
-  for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
-  let carryOverOrdinal = -1;
+  const maxBudgetAttempts = 3;
+
+  for (let attempt = 0; attempt < maxBudgetAttempts; attempt++) {
+    msgLen.length = collapseLen - protectedPrefix;
+    userImgLen.length = collapseLen - protectedPrefix;
+
+    // Exclude slab messages (protectedPrefix) from serialization.
+    text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
+    if (!text || text.length === 0) {
+      info.reason = 'render_empty';
+      return { messages, info };
+    }
+    // Reflow for RENDERING ONLY: pack short lines + mark hard breaks with ↵ so the
+    // newline-heavy transcript fills full rows instead of one line per row. Same
+    // glyph size (cols unchanged) → identical legibility, fewer images, more saved.
+    // `text` stays original — it backs `collapsedChars` and the cache byte-stability.
+    const safeText = neutralizeSentinel(text);
+    const renderText = o.reflow ? reflow(safeText) ?? safeText : text;
+    if (!isProfitable(renderText, o.cols)) { // pass string, not length — see ProfitableFn
+      info.reason = 'not_profitable';
+      info.collapsedChars = text.length; // surface what we DIDN'T compress
+      return { messages, info };
+    }
+    // APPEND-ONLY rendering. Render the collapse range [protectedPrefix..collapseLen)
+    // as independent image blocks on an ABSOLUTE message grid anchored at
+    // protectedPrefix (step = freezeChunk). A completed chunk's bytes are fixed by
+    // its message range alone, so old chunks stay byte-identical as the conversation
+    // grows (cache_read forever); only the newest partial chunk re-renders.
+    //
+    // Chunk-end positions = the absolute grid ∪ caller cache_control marks: a marked
+    // message forces a split right after it, and that chunk's LAST image carries the
+    // caller's marker — so a roaming breakpoint survives as an aligned, independently
+    // cacheable image boundary instead of being silently flattened (count conserved,
+    // never added). Each chunk is reflowed and rendered on its own, which is what
+    // makes the bytes a pure function of the chunk's messages.
+    //
+    // The grid step is ADAPTIVE. A fixed 10-message step emits ≥1 page per chunk no
+    // matter how little text the chunk holds: a long session of short turns rendered
+    // 317 pages at 43% fill and 500'd the request (#161). Doubling the step merges
+    // neighbouring chunks — pages fill up, count drops ~2× per doubling — while
+    // keeping chunk boundaries a SUBSET of the base grid, so a chunk frozen at the
+    // coarse step spans whole base chunks and stays byte-identical as long as the
+    // step never shrinks again (the caller pins it via minFreezeStep).
+    const baseStep = o.freezeChunk > 0 ? o.freezeChunk : collapseLen - protectedPrefix;
+    const rangeLen = collapseLen - protectedPrefix;
+    const pagesFor = (s: number): number => {
+      let pages = 0;
+      for (let a = 0; a < rangeLen; a += s) {
+        const b = Math.min(a + s, rangeLen);
+        const chars = sumLen(a, b);
+        if (chars > 0) pages += Math.ceil(chars / effPageChars);
+        // Over-cap user prompts in this chunk are batched into their own image(s).
+        const uchars = sumOf(userImgLen, a, b);
+        if (uchars > 0) pages += Math.ceil(uchars / effPageChars);
+      }
+      return pages;
+    };
+    // Caller cache_control marks force extra splits below; charge one page each so a
+    // marked request can't slip past the budget the estimate just cleared.
+    let markSplits = 0;
+    for (let i = protectedPrefix; i < collapseLen; i++) {
+      if (messageCacheControl(messages[i]!) !== undefined) markSplits++;
+    }
+    let step = baseStep;
+    // Sticky floor first: a session already repacked coarse must STAY coarse.
+    while (step < o.minFreezeStep && step < rangeLen) step *= 2;
+    // packFill trades the append-only freeze for ~2× fewer image tokens and is only
+    // set when the upstream cache is dead anyway (cold session / after a 500).
+    const packedPages = Math.max(1, Math.ceil(sumLen(0, rangeLen) / effPageChars));
+    const goal = Math.min(budget, o.packFill ? packedPages + 1 : Infinity);
+    while (step < rangeLen && pagesFor(step) + markSplits > goal) step *= 2;
+    info.freezeStep = o.minFreezeStep > 0 ? Math.max(step, o.minFreezeStep) : step;
+    const ends = new Set<number>();
+    for (let e = protectedPrefix + step; e < collapseLen; e += step) ends.add(e);
+    const markerByEnd = new Map<number, CacheControl>();
+    for (let i = protectedPrefix; i < collapseLen; i++) {
+      const cc = messageCacheControl(messages[i]!);
+      if (cc !== undefined) {
+        ends.add(i + 1);
+        markerByEnd.set(i + 1, cc);
+      }
+    }
+    ends.add(collapseLen);
+    const sortedEnds = [...ends].filter((e) => e > protectedPrefix && e <= collapseLen).sort((a, b) => a - b);
+
+    // Carry-over anchor end: the largest FULLY grid-aligned chunk boundary strictly
+    // before collapseLen. That chunk's bytes are frozen across window advances, unlike
+    // the newest partial chunk — so it's the stable place to pin the cache breakpoint (#11).
+    carryOverEnd = -1;
+    for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
+
+    interface PreparedChunkJob {
+      readonly chunkEnd: number;
+      readonly userFrom: number;
+      readonly empty: boolean;
+      readonly chunkRender?: string;
+      readonly chunkSlot?: string;
+    }
+    const chunkJobs: PreparedChunkJob[] = [];
+    let chunkStart = protectedPrefix;
+    for (const chunkEnd of sortedEnds) {
+      // messagesToHistorySegments already omits the user's typed words; userTurnBlocks
+      // below carries them as text so a prompt is never read back out of pixels.
+      const seg = messagesToHistorySegments(messages, chunkEnd, chunkStart);
+      const userFrom = chunkStart;
+      chunkStart = chunkEnd;
+      if (!seg.text || seg.text.length === 0) {
+        chunkJobs.push({ chunkEnd, userFrom, empty: true });
+        continue;
+      }
+      let chunkRender = seg.text;
+      let chunkSlot = seg.slotText;
+      if (o.reflow) {
+        const safeTextSeg = neutralizeSentinel(seg.text);
+        const safeSlotSeg = neutralizeSentinel(seg.slotText);
+        const rt = reflow(safeTextSeg);
+        const rs = reflow(safeSlotSeg);
+        if (rt !== null && rs !== null) {
+          chunkRender = rt;
+          chunkSlot = rs;
+        } else {
+          chunkRender = safeTextSeg;
+          chunkSlot = safeSlotSeg;
+        }
+      }
+      chunkJobs.push({ chunkEnd, userFrom, empty: false, chunkRender, chunkSlot });
+    }
+
+    // Render all chunks concurrently across off-thread CompressionStream workers while
+    // preserving deterministic chunk order when assembling blocks and telemetry below.
+    const chunkStyle = { ...o.style, colorByRole: true };
+    const renderedChunkImgs = await Promise.all(
+      chunkJobs.map((job) =>
+        job.empty
+          ? Promise.resolve<RenderedImage[]>([])
+          : renderTextToPngsWithCharLimit(
+              job.chunkRender!,
+              o.cols,
+              DENSE_CONTENT_CHARS_PER_IMAGE,
+              chunkStyle,
+              o.maxHeightPx,
+              job.chunkSlot,
+            ),
+      ),
+    );
+
+    const userRenderOpts = {
+      cols: o.cols,
+      style: o.style,
+      maxHeightPx: o.maxHeightPx,
+      reflow: o.reflow,
+    };
+
+    assembledChunks = [];
+
+    for (let jobIdx = 0; jobIdx < chunkJobs.length; jobIdx++) {
+      const job = chunkJobs[jobIdx]!;
+      const chunkBlocks: ContentBlock[] = [];
+      const chunkImgs: RenderedImage[] = [];
+      let transcriptImgCount = 0;
+      if (job.empty) {
+        // Transcript empty (e.g. the chunk was nothing but user prompts) — the
+        // prompts themselves still belong in the output.
+        chunkBlocks.push(
+          ...(await userTurnBlocks(
+            messages,
+            job.userFrom,
+            job.chunkEnd,
+            (img) => chunkImgs.push(img),
+            userRenderOpts,
+          )),
+        );
+        assembledChunks.push({ chunkEnd: job.chunkEnd, blocks: chunkBlocks, imgs: chunkImgs, transcriptImgCount: 0 });
+        continue;
+      }
+      const imgs = renderedChunkImgs[jobIdx]!;
+      transcriptImgCount = imgs.length;
+      const markerCC = markerByEnd.get(job.chunkEnd);
+      for (let k = 0; k < imgs.length; k++) {
+        const img = imgs[k]!;
+        const block: ImageBlock & { cache_control?: CacheControl } = {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: bytesToBase64(img.png),
+          },
+        };
+        // Mark the LAST image of a marked segment — the caller's breakpoint anchor.
+        if (markerCC !== undefined && k === imgs.length - 1) block.cache_control = markerCC;
+        chunkBlocks.push(block);
+        chunkImgs.push(img);
+      }
+      // This chunk's user prompts, as text, immediately after the image they were
+      // pulled out of — attribution stays local and the ordering matches the render.
+      chunkBlocks.push(
+        ...(await userTurnBlocks(
+          messages,
+          job.userFrom,
+          job.chunkEnd,
+          (img) => chunkImgs.push(img),
+          userRenderOpts,
+        )),
+      );
+      assembledChunks.push({ chunkEnd: job.chunkEnd, blocks: chunkBlocks, imgs: chunkImgs, transcriptImgCount });
+    }
+
+    let totalImages = 0;
+    for (const ch of assembledChunks) totalImages += ch.imgs.length;
+
+    if (!Number.isFinite(budget) || totalImages <= budget) {
+      break;
+    }
+
+    // Post-render hard budget guard: chars/pageChars can underestimate actual rendered
+    // PNG counts on short-line transcripts, coarse steps, or reflowed user turns.
+    // First try trimming to the largest valid closed chunk prefix within budget; if
+    // even the first chunk exceeds budget, tighten collapseLen using observed density.
+    let cum = 0;
+    const cumByChunk: number[] = [];
+    for (const ch of assembledChunks) {
+      cum += ch.imgs.length;
+      cumByChunk.push(cum);
+    }
+    let keepIdx = -1;
+    for (let k = assembledChunks.length - 1; k >= 0; k--) {
+      const candidateEnd = assembledChunks[k]!.chunkEnd;
+      if (
+        cumByChunk[k]! <= budget &&
+        cumByChunk[k]! > 0 &&
+        candidateEnd - protectedPrefix >= o.minCollapsePrefix &&
+        findClosedPrefixBoundary(messages, candidateEnd) + 1 === candidateEnd
+      ) {
+        keepIdx = k;
+        break;
+      }
+    }
+    if (keepIdx >= 0) {
+      assembledChunks.length = keepIdx + 1;
+      collapseLen = assembledChunks[keepIdx]!.chunkEnd;
+      info.budgetTrimmed = true;
+      text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
+      if (!text || text.length === 0) {
+        return { messages, info: emptyInfo('render_empty') };
+      }
+      carryOverEnd = -1;
+      for (let e = protectedPrefix + step; e < collapseLen; e += step) carryOverEnd = e;
+      break;
+    }
+
+    if (attempt === maxBudgetAttempts - 1) {
+      return { messages, info: emptyInfo('over_budget') };
+    }
+
+    // Even the first chunk exceeded budget (e.g. coarse adaptive step merged into one
+    // chunk or short-line wrap reduced effective chars/image). Measure actual yield
+    // and re-budget to a closed prefix that fits without bailing out at 0 turns.
+    const c0Imgs = cumByChunk[0] ?? totalImages;
+    const useChunk0 = assembledChunks.length > 0 && c0Imgs > budget;
+    const sampleSpan = useChunk0
+      ? Math.min(rangeLen, assembledChunks[0]!.chunkEnd - protectedPrefix)
+      : rangeLen;
+    const sampleImgs = useChunk0 ? c0Imgs : totalImages;
+    const sampleChars = sumLen(0, sampleSpan) + sumOf(userImgLen, 0, sampleSpan);
+    if (sampleImgs <= 0 || sampleChars <= 0) {
+      return { messages, info: emptyInfo('over_budget') };
+    }
+    const observedCharsPerImg = Math.max(1, Math.floor(sampleChars / sampleImgs));
+    effPageChars = Math.min(effPageChars, observedCharsPerImg);
+    const targetChars = Math.max(0, Math.floor(sampleChars * (budget / sampleImgs) * 0.9));
+    let acc2 = 0;
+    let k2 = 0;
+    while (k2 < sampleSpan && acc2 + msgLen[k2]! + userImgLen[k2]! <= targetChars) {
+      acc2 += msgLen[k2]! + userImgLen[k2]!;
+      k2++;
+    }
+    let nextLen = findClosedPrefixBoundary(messages, protectedPrefix + k2) + 1;
+    if (nextLen >= collapseLen) {
+      nextLen = findClosedPrefixBoundary(messages, collapseLen - 1) + 1;
+    }
+    if (nextLen - protectedPrefix < o.minCollapsePrefix) {
+      return { messages, info: emptyInfo('over_budget') };
+    }
+    collapseLen = nextLen;
+    info.budgetTrimmed = true;
+  }
 
   const blocks: ContentBlock[] = [];
   let imageCount = 0;
+  let carryOverOrdinal = -1;
   const countImage = (img: RenderedImage) => {
     imageCount++;
     info.collapsedImageBytes += img.png.length;
@@ -937,93 +1171,16 @@ export async function collapseHistory(
       info.droppedCodepoints.set(cp, (info.droppedCodepoints.get(cp) ?? 0) + n);
     }
   };
-  interface PreparedChunkJob {
-    readonly chunkEnd: number;
-    readonly userFrom: number;
-    readonly empty: boolean;
-    readonly chunkRender?: string;
-    readonly chunkSlot?: string;
-  }
-  const chunkJobs: PreparedChunkJob[] = [];
-  let chunkStart = protectedPrefix;
-  for (const chunkEnd of sortedEnds) {
-    // messagesToHistorySegments already omits the user's typed words; userTurnBlocks
-    // below carries them as text so a prompt is never read back out of pixels.
-    const seg = messagesToHistorySegments(messages, chunkEnd, chunkStart);
-    const userFrom = chunkStart;
-    chunkStart = chunkEnd;
-    if (!seg.text || seg.text.length === 0) {
-      chunkJobs.push({ chunkEnd, userFrom, empty: true });
-      continue;
-    }
-    let chunkRender = seg.text;
-    let chunkSlot = seg.slotText;
-    if (o.reflow) {
-      const safeText = neutralizeSentinel(seg.text);
-      const safeSlot = neutralizeSentinel(seg.slotText);
-      const rt = reflow(safeText);
-      const rs = reflow(safeSlot);
-      if (rt !== null && rs !== null) {
-        chunkRender = rt;
-        chunkSlot = rs;
-      } else {
-        chunkRender = safeText;
-        chunkSlot = safeSlot;
+
+  for (const ch of assembledChunks) {
+    blocks.push(...ch.blocks);
+    for (let i = 0; i < ch.imgs.length; i++) {
+      countImage(ch.imgs[i]!);
+      // Record after the last transcript image of carryOverEnd (before any over-cap user turn images).
+      if (ch.chunkEnd === carryOverEnd && ch.transcriptImgCount > 0 && i === ch.transcriptImgCount - 1) {
+        carryOverOrdinal = imageCount - 1;
       }
     }
-    chunkJobs.push({ chunkEnd, userFrom, empty: false, chunkRender, chunkSlot });
-  }
-
-  // Render all chunks concurrently across off-thread CompressionStream workers while
-  // preserving deterministic chunk order when assembling blocks and telemetry below.
-  const chunkStyle = { ...o.style, colorByRole: true };
-  const renderedChunkImgs = await Promise.all(
-    chunkJobs.map((job) =>
-      job.empty
-        ? Promise.resolve<RenderedImage[]>([])
-        : renderTextToPngsWithCharLimit(
-            job.chunkRender!,
-            o.cols,
-            DENSE_CONTENT_CHARS_PER_IMAGE,
-            chunkStyle,
-            o.maxHeightPx,
-            job.chunkSlot,
-          ),
-    ),
-  );
-
-  for (let jobIdx = 0; jobIdx < chunkJobs.length; jobIdx++) {
-    const job = chunkJobs[jobIdx]!;
-    if (job.empty) {
-      // Transcript empty (e.g. the chunk was nothing but user prompts) — the
-      // prompts themselves still belong in the output.
-      blocks.push(...(await userTurnBlocks(messages, job.userFrom, job.chunkEnd, countImage)));
-      continue;
-    }
-    const imgs = renderedChunkImgs[jobIdx]!;
-    const markerCC = markerByEnd.get(job.chunkEnd);
-    for (let k = 0; k < imgs.length; k++) {
-      const img = imgs[k]!;
-      const block: ImageBlock & { cache_control?: CacheControl } = {
-        type: 'image',
-        source: {
-          type: 'base64',
-          media_type: 'image/png',
-          data: bytesToBase64(img.png),
-        },
-      };
-      // Mark the LAST image of a marked segment — the caller's breakpoint anchor.
-      if (markerCC !== undefined && k === imgs.length - 1) block.cache_control = markerCC;
-      blocks.push(block);
-      countImage(img);
-    }
-    // The carry-over chunk's LAST image is the newest byte-stable history image.
-    // Record its ordinal so the relocator pins the cache breakpoint here instead of
-    // on the still-growing newest chunk, which busts every window advance (#11).
-    if (job.chunkEnd === carryOverEnd) carryOverOrdinal = imageCount - 1;
-    // This chunk's user prompts, as text, immediately after the image they were
-    // pulled out of — attribution stays local and the ordering matches the render.
-    blocks.push(...(await userTurnBlocks(messages, job.userFrom, job.chunkEnd, countImage)));
   }
   if (imageCount === 0) {
     info.reason = 'render_empty';

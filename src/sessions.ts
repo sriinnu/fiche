@@ -492,11 +492,36 @@ export function selectSessionsToRemove(
  * delete the matching 4xx-body sidecars. Atomic: writes to a sibling `.tmp`
  * file with fsync, then renames over the original.
  *
- * Concurrency note: if the live proxy appends during prune, those new lines
- * will be lost (the proxy holds an fd to the pre-rename inode and keeps
- * writing to it). For a single-user dev tool that's an acceptable tradeoff;
- * the dashboard's confirm dialog warns the user before the destructive op.
+ * Concurrency note: `rewriteEventsFile` serializes against both concurrent prune
+ * calls on the same path and any registered in-process {@link FileTracker}
+ * coordinator (which buffers incoming `emit()` calls in memory during the
+ * rewrite and flushes them into the new temp file before atomic rename).
+ * External writers appending while no in-process coordinator is active are also
+ * tailed synchronously right before `fsyncSync` + `renameSync`.
  */
+export interface EventsFileCoordinator {
+  runDuringRewrite<T>(
+    fn: (flushPending: (outFd: number, writeLine?: (outFd: number, line: string) => void) => void) => Promise<T>,
+  ): Promise<T>;
+}
+
+const eventsFileCoordinators = new Map<string, EventsFileCoordinator>();
+const rewriteLocks = new Map<string, Promise<void>>();
+
+/** Register an in-process append coordinator (e.g. `FileTracker`) for `eventsFile`. */
+export function registerEventsFileCoordinator(
+  eventsFile: string,
+  coordinator: EventsFileCoordinator,
+): () => void {
+  const key = path.resolve(eventsFile);
+  eventsFileCoordinators.set(key, coordinator);
+  return () => {
+    if (eventsFileCoordinators.get(key) === coordinator) {
+      eventsFileCoordinators.delete(key);
+    }
+  };
+}
+
 export async function prune(
   paths: SessionsPaths,
   opts: PruneOptions,
@@ -565,43 +590,111 @@ export async function prune(
   return report;
 }
 
+function writeFilteredLine(outFd: number, line: string, toRemove: Set<string>): void {
+  if (!line.trim()) return;
+  let ev: TrackEvent;
+  try {
+    ev = JSON.parse(line) as TrackEvent;
+  } catch {
+    // Preserve malformed lines so we don't silently eat data we can't parse.
+    fs.writeSync(outFd, line + '\n');
+    return;
+  }
+  if (toRemove.has(sessionIdOf(ev))) return;
+  fs.writeSync(outFd, line + '\n');
+}
+
 async function rewriteEventsFile(
   eventsFile: string,
   toRemove: Set<string>,
 ): Promise<void> {
-  if (!fs.existsSync(eventsFile)) return;
-  const tmp = `${eventsFile}.tmp.${process.pid}`;
-  // Open with 'w' (truncate) and 0o600 permissions so pruned logs never expose prompts.
-  const outFd = fs.openSync(tmp, 'w', 0o600);
+  const key = path.resolve(eventsFile);
+  const prevLock = rewriteLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const currentLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  rewriteLocks.set(key, currentLock);
+  await prevLock;
+
   try {
-    const stream = fs.createReadStream(eventsFile, { encoding: 'utf8' });
-    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of rl) {
-      if (!line.trim()) continue;
-      let ev: TrackEvent;
+    const runRewrite = async (
+      flushPending?: (outFd: number, writeLine?: (outFd: number, line: string) => void) => void,
+    ): Promise<void> => {
+      if (!fs.existsSync(eventsFile)) return;
+      const tmp = `${eventsFile}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+      // Open with 'w' (truncate) and 0o600 permissions so pruned logs never expose prompts.
+      const outFd = fs.openSync(tmp, 'w', 0o600);
       try {
-        ev = JSON.parse(line) as TrackEvent;
-      } catch {
-        // Preserve malformed lines so we don't silently eat data we can't parse.
-        fs.writeSync(outFd, line + '\n');
-        continue;
+        let streamBytes = 0;
+        const stream = fs.createReadStream(eventsFile);
+        stream.on('data', (chunk: string | Buffer) => {
+          streamBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, 'utf8');
+        });
+        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+        for await (const line of rl) {
+          writeFilteredLine(outFd, line, toRemove);
+        }
+        // Catch up any lines appended externally during async streaming before locking in rename.
+        try {
+          const finalSize = fs.statSync(eventsFile).size;
+          if (finalSize > streamBytes) {
+            const extraBuf = Buffer.allocUnsafe(finalSize - streamBytes);
+            const rfd = fs.openSync(eventsFile, 'r');
+            let readTotal = 0;
+            try {
+              while (readTotal < extraBuf.length) {
+                const n = fs.readSync(rfd, extraBuf, readTotal, extraBuf.length - readTotal, streamBytes + readTotal);
+                if (n <= 0) break;
+                readTotal += n;
+              }
+            } finally {
+              fs.closeSync(rfd);
+            }
+            if (readTotal > 0) {
+              const tailText = extraBuf.subarray(0, readTotal).toString('utf8');
+              for (const tailLine of tailText.split(/\r?\n/)) {
+                writeFilteredLine(outFd, tailLine, toRemove);
+              }
+            }
+          }
+        } catch {
+          /* ignore stat race */
+        }
+        if (flushPending) {
+          flushPending(outFd, (fd, rawLine) => writeFilteredLine(fd, rawLine, toRemove));
+        }
+        fs.fsyncSync(outFd);
+      } catch (err) {
+        try {
+          fs.closeSync(outFd);
+        } catch {
+          /* ignore */
+        }
+        try {
+          fs.unlinkSync(tmp);
+        } catch {
+          /* ignore cleanup error */
+        }
+        throw err;
       }
-      if (toRemove.has(sessionIdOf(ev))) continue;
-      fs.writeSync(outFd, line + '\n');
+      fs.closeSync(outFd);
+      fs.renameSync(tmp, eventsFile);
+      fs.chmodSync(eventsFile, 0o600);
+    };
+
+    const coordinator = eventsFileCoordinators.get(key);
+    if (coordinator) {
+      await coordinator.runDuringRewrite((flushPending) => runRewrite(flushPending));
+    } else {
+      await runRewrite();
     }
-    fs.fsyncSync(outFd);
-  } catch (err) {
-    fs.closeSync(outFd);
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      /* ignore cleanup error */
+  } finally {
+    release();
+    if (rewriteLocks.get(key) === currentLock) {
+      rewriteLocks.delete(key);
     }
-    throw err;
   }
-  fs.closeSync(outFd);
-  fs.renameSync(tmp, eventsFile);
-  fs.chmodSync(eventsFile, 0o600);
 }
 
 // ---- disk usage ------------------------------------------------------------

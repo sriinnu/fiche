@@ -106,6 +106,10 @@ final class DaemonController: ObservableObject {
     @Published private(set) var plugins: [PluginDescriptor] = []
     @Published private(set) var pluginsDir: String?
     @Published private(set) var isLoginAgentInstalled: Bool = false
+    @Published private(set) var isShellAutoWrapInstalled: Bool = false
+    @Published private(set) var discoveredDesktopApps: [String] = []
+    @Published private(set) var discoveredCLIAgents: [DiscoveredCLIAgent] = []
+    @Published private(set) var transientNotice: String? = nil
     @Published private(set) var isBusy: Bool = false
     @Published private(set) var lastError: String?
     @Published private(set) var lastUpdatedAt: Date?
@@ -116,6 +120,7 @@ final class DaemonController: ObservableObject {
     private let session: URLSession
     private let pollBox = TaskCancellationBox()
     private var hasPerformedStartupCheck = false
+    private var noticeGeneration: Int = 0
 
     var isPreviewMode: Bool { isPreview }
 
@@ -150,7 +155,9 @@ final class DaemonController: ObservableObject {
         self.session = URLSession(configuration: config)
 
         self.isLoginAgentInstalled = Self.checkLaunchAgentExists()
+        self.isShellAutoWrapInstalled = Self.checkShellAutoWrapInstalled()
         startPolling()
+        refreshAgentDiscovery()
     }
 
     private init(previewTheme: ThemeID) {
@@ -181,14 +188,17 @@ final class DaemonController: ObservableObject {
         """
         let statsJSON = """
         {
-          "requests": 11,
+          "requests": 14,
           "compressed_requests": 7,
-          "passthrough": 4,
-          "baseline_input_weighted": 47756,
-          "actual_input_weighted": 26170,
-          "saved_input_tokens": 21586,
-          "saved_pct": 45.2,
-          "saved_usd": 0.0432,
+          "imaged_requests": 7,
+          "text_compressed_requests": 0,
+          "passthrough": 7,
+          "baseline_input_weighted": 88420,
+          "actual_input_weighted": 36140,
+          "saved_input_tokens": 52280,
+          "raw_saved_tokens": 123500,
+          "saved_pct": 59.1,
+          "saved_usd": 0.142,
           "cliff_avoided_events": 0,
           "cliff_saved_usd": 0,
           "uptime_sec": 528,
@@ -202,35 +212,75 @@ final class DaemonController: ObservableObject {
             "evictions": 0,
             "oversized": 0
           },
+          "today": {
+            "date": "2026-11-22",
+            "requests": 5,
+            "compressed": 4,
+            "imaged": 4,
+            "text_compressed": 0,
+            "baseline_input_weighted": 31200,
+            "actual_input_weighted": 12800,
+            "saved_tokens": 18400,
+            "raw_saved_tokens": 41200,
+            "saved_pct": 59.0,
+            "saved_usd": 0.048,
+            "cliff_saved_usd": 0,
+            "is_today": true
+          },
+          "daily": [
+            {"date":"2026-11-09","requests":0,"compressed":0,"imaged":0,"text_compressed":0,"baseline_input_weighted":0,"actual_input_weighted":0,"saved_tokens":0,"raw_saved_tokens":0,"saved_pct":0,"saved_usd":0,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-10","requests":4,"compressed":3,"imaged":3,"text_compressed":0,"baseline_input_weighted":18000,"actual_input_weighted":8200,"saved_tokens":9800,"raw_saved_tokens":21000,"saved_pct":54.4,"saved_usd":0.025,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-11","requests":6,"compressed":5,"imaged":4,"text_compressed":1,"baseline_input_weighted":28000,"actual_input_weighted":11200,"saved_tokens":16800,"raw_saved_tokens":34500,"saved_pct":60.0,"saved_usd":0.042,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-12","requests":3,"compressed":2,"imaged":2,"text_compressed":0,"baseline_input_weighted":12000,"actual_input_weighted":5600,"saved_tokens":6400,"raw_saved_tokens":14200,"saved_pct":53.3,"saved_usd":0.016,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-13","requests":0,"compressed":0,"imaged":0,"text_compressed":0,"baseline_input_weighted":0,"actual_input_weighted":0,"saved_tokens":0,"raw_saved_tokens":0,"saved_pct":0,"saved_usd":0,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-14","requests":8,"compressed":6,"imaged":5,"text_compressed":1,"baseline_input_weighted":42000,"actual_input_weighted":16400,"saved_tokens":25600,"raw_saved_tokens":58000,"saved_pct":61.0,"saved_usd":0.068,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-15","requests":5,"compressed":4,"imaged":3,"text_compressed":1,"baseline_input_weighted":24000,"actual_input_weighted":9800,"saved_tokens":14200,"raw_saved_tokens":31000,"saved_pct":59.2,"saved_usd":0.036,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-16","requests":7,"compressed":5,"imaged":4,"text_compressed":1,"baseline_input_weighted":35000,"actual_input_weighted":14000,"saved_tokens":21000,"raw_saved_tokens":46000,"saved_pct":60.0,"saved_usd":0.055,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-17","requests":9,"compressed":7,"imaged":6,"text_compressed":1,"baseline_input_weighted":48000,"actual_input_weighted":18900,"saved_tokens":29100,"raw_saved_tokens":64000,"saved_pct":60.6,"saved_usd":0.079,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-18","requests":4,"compressed":3,"imaged":2,"text_compressed":1,"baseline_input_weighted":19000,"actual_input_weighted":8100,"saved_tokens":10900,"raw_saved_tokens":24500,"saved_pct":57.4,"saved_usd":0.029,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-19","requests":11,"compressed":9,"imaged":7,"text_compressed":2,"baseline_input_weighted":61000,"actual_input_weighted":22500,"saved_tokens":38500,"raw_saved_tokens":89000,"saved_pct":63.1,"saved_usd":0.108,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-20","requests":6,"compressed":5,"imaged":4,"text_compressed":1,"baseline_input_weighted":29000,"actual_input_weighted":11900,"saved_tokens":17100,"raw_saved_tokens":38000,"saved_pct":59.0,"saved_usd":0.044,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-21","requests":9,"compressed":7,"imaged":7,"text_compressed":0,"baseline_input_weighted":57220,"actual_input_weighted":23340,"saved_tokens":33880,"raw_saved_tokens":82300,"saved_pct":59.2,"saved_usd":0.094,"cliff_saved_usd":0,"is_today":false},
+            {"date":"2026-11-22","requests":5,"compressed":4,"imaged":4,"text_compressed":0,"baseline_input_weighted":31200,"actual_input_weighted":12800,"saved_tokens":18400,"raw_saved_tokens":41200,"saved_pct":59.0,"saved_usd":0.048,"cliff_saved_usd":0,"is_today":true}
+          ],
           "by_model": {
             "gemini-4-argon-high": {
               "requests": 7,
               "compressed_requests": 7,
-              "baseline_input_weighted": 47756,
-              "actual_input_weighted": 26170,
-              "saved_input_tokens": 21586,
-              "saved_pct": 45.2,
-              "saved_usd": 0.0432,
+              "imaged": 7,
+              "text_compressed": 0,
+              "baseline_input_weighted": 57220,
+              "actual_input_weighted": 23340,
+              "saved_input_tokens": 33880,
+              "raw_saved_tokens": 82300,
+              "saved_pct": 59.2,
+              "saved_usd": 0.094,
+              "cliff_avoided_events": 0,
+              "cliff_saved_usd": 0
+            },
+            "claude-opus-5": {
+              "requests": 4,
+              "compressed_requests": 4,
+              "imaged": 0,
+              "text_compressed": 4,
+              "baseline_input_weighted": 31200,
+              "actual_input_weighted": 12800,
+              "saved_input_tokens": 18400,
+              "raw_saved_tokens": 41200,
+              "saved_pct": 59.0,
+              "saved_usd": 0.048,
               "cliff_avoided_events": 0,
               "cliff_saved_usd": 0
             },
             "gemini-4-neon-high": {
               "requests": 3,
               "compressed_requests": 0,
+              "imaged": 0,
+              "text_compressed": 0,
               "baseline_input_weighted": 0,
               "actual_input_weighted": 0,
               "saved_input_tokens": 0,
-              "saved_pct": 0,
-              "saved_usd": 0,
-              "cliff_avoided_events": 0,
-              "cliff_saved_usd": 0
-            },
-            "gemini-3.5-flash-lite": {
-              "requests": 1,
-              "compressed_requests": 0,
-              "baseline_input_weighted": 0,
-              "actual_input_weighted": 0,
-              "saved_input_tokens": 0,
+              "raw_saved_tokens": 0,
               "saved_pct": 0,
               "saved_usd": 0,
               "cliff_avoided_events": 0,
@@ -274,6 +324,16 @@ final class DaemonController: ObservableObject {
             PluginDescriptor(id: "skill:baton-handover", name: "baton-handover", description: "External session baton handover extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:code-mode", name: "code-mode", description: "External code-mode workflow extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:tokmeter", name: "tokmeter", description: "External token meter inspection extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
+        ]
+        self.isShellAutoWrapInstalled = false
+        self.discoveredDesktopApps = ["Antigravity", "Cursor", "Claude"]
+        self.discoveredCLIAgents = [
+            DiscoveredCLIAgent(id: "claude", name: "Claude Code", command: "claude", provider: "Anthropic", installed: true, binaryPath: "/Users/demo/.local/bin/claude"),
+            DiscoveredCLIAgent(id: "codex", name: "OpenAI Codex", command: "codex", provider: "OpenAI", installed: true, binaryPath: "/usr/local/bin/codex"),
+            DiscoveredCLIAgent(id: "agy", name: "Antigravity CLI", command: "agy", provider: "Google / Multi", installed: true, binaryPath: "/Users/demo/.local/bin/agy"),
+            DiscoveredCLIAgent(id: "gemini", name: "Gemini CLI", command: "gemini", provider: "Google", installed: true, binaryPath: "/Users/demo/.local/bin/gemini"),
+            DiscoveredCLIAgent(id: "opencode", name: "OpenCode", command: "opencode", provider: "Multi", installed: true, binaryPath: "/Users/demo/.opencode/bin/opencode"),
+            DiscoveredCLIAgent(id: "aider", name: "Aider", command: "aider", provider: "Multi", installed: false, binaryPath: nil),
         ]
     }
 
@@ -800,15 +860,31 @@ final class DaemonController: ObservableObject {
         }
     }
 
-    static func discoverInstalledDesktopApps() -> [String] {
+    nonisolated static let supportedCLICatalog: [(command: String, name: String, provider: String)] = [
+        ("claude", "Claude Code", "Anthropic"),
+        ("codex", "OpenAI Codex", "OpenAI"),
+        ("agy", "Antigravity CLI", "Google / Multi"),
+        ("gemini", "Gemini CLI", "Google"),
+        ("opencode", "OpenCode", "Multi"),
+        ("cursor-agent", "Cursor Agent", "Multi"),
+        ("amp", "Amp", "Multi"),
+        ("pi", "Pi Agent", "Multi"),
+        ("aider", "Aider", "Multi"),
+    ]
+
+    private static let allowedCLICommands: Set<String> = Set(supportedCLICatalog.map(\.command))
+
+    nonisolated static func discoverInstalledDesktopApps() -> [String] {
         let candidates = [
             "Antigravity",
             "Antigravity IDE",
-            "Claude",
             "Cursor",
+            "Claude",
+            "Windsurf",
+            "Zed",
             "OpenCode",
-            "Runic",
             "ChatGPT",
+            "Runic",
         ]
         let fm = FileManager.default
         let userApps = fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path
@@ -818,9 +894,196 @@ final class DaemonController: ObservableObject {
         }
     }
 
+    nonisolated static func discoverInstalledCLIAgents() -> [DiscoveredCLIAgent] {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        var searchDirs: [String] = []
+        if let envPath = ProcessInfo.processInfo.environment["PATH"] {
+            searchDirs.append(contentsOf: envPath.split(separator: ":").map(String.init))
+        }
+        searchDirs.append(contentsOf: [
+            "\(home)/.local/bin",
+            "\(home)/.opencode/bin",
+            "\(home)/.antigravity/antigravity/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.npm-global/bin",
+            "\(home)/.pnpm-global/bin",
+            "\(home)/Library/pnpm",
+            "\(home)/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+        ])
+
+        let versionRoots = [
+            "\(home)/.nvm/versions/node",
+            "\(home)/.fnm/node-versions",
+            "\(home)/.local/share/mise/installs/node",
+            "\(home)/.volta/tools/image/node",
+        ]
+        for root in versionRoots {
+            guard let entries = try? fm.contentsOfDirectory(atPath: root) else { continue }
+            let sorted = entries.sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+            for ver in sorted {
+                searchDirs.append("\(root)/\(ver)/bin")
+                searchDirs.append("\(root)/\(ver)/installation/bin")
+            }
+        }
+
+        var uniqueDirs: [String] = []
+        var seenDirs = Set<String>()
+        for dir in searchDirs where !dir.isEmpty && seenDirs.insert(dir).inserted {
+            uniqueDirs.append(dir)
+        }
+
+        return supportedCLICatalog.map { entry in
+            var foundPath: String?
+            for dir in uniqueDirs {
+                let candidate = "\(dir)/\(entry.command)"
+                if fm.isExecutableFile(atPath: candidate) {
+                    foundPath = candidate
+                    break
+                }
+            }
+            return DiscoveredCLIAgent(
+                id: entry.command,
+                name: entry.name,
+                command: entry.command,
+                provider: entry.provider,
+                installed: foundPath != nil,
+                binaryPath: foundPath
+            )
+        }
+    }
+
+    func refreshAgentDiscovery() {
+        guard !isPreview else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let apps = Self.discoverInstalledDesktopApps()
+            let clis = Self.discoverInstalledCLIAgents()
+            let autoWrap = Self.checkShellAutoWrapInstalled()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.discoveredDesktopApps = apps
+                self.discoveredCLIAgents = clis
+                self.isShellAutoWrapInstalled = autoWrap
+            }
+        }
+    }
+
+    func showTransientNotice(_ message: String) {
+        noticeGeneration &+= 1
+        let gen = noticeGeneration
+        transientNotice = message
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(2_200))
+            guard let self, self.noticeGeneration == gen else { return }
+            self.transientNotice = nil
+        }
+    }
+
+    func copyToClipboard(_ text: String, label: String = "Copied to clipboard") {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        showTransientNotice(label)
+    }
+
+    nonisolated private static func shellSingleQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
+    }
+
+    func launchCLIAgentInTerminal(_ command: String) {
+        guard Self.allowedCLICommands.contains(command) else {
+            lastError = "Unsupported CLI agent: \(command)"
+            return
+        }
+        guard !isPreview else { return }
+        lastError = nil
+        let targetCli = command
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let nodePath = Self.resolveNodeBinary()
+            let ficheCmd: String
+            if let exe = Self.resolveFicheExecutable(nodePath: nodePath) {
+                switch exe {
+                case .binary(let bin):
+                    ficheCmd = "\(Self.shellSingleQuote(bin)) warp -- \(targetCli)"
+                case .nodeScript(let node, let script):
+                    ficheCmd = "\(Self.shellSingleQuote(node)) \(Self.shellSingleQuote(script)) warp -- \(targetCli)"
+                }
+            } else {
+                ficheCmd = "fiche warp -- \(targetCli)"
+            }
+
+            let script = """
+            on run argv
+                set cmd to item 1 of argv
+                tell application "Terminal"
+                    activate
+                    do script cmd
+                end tell
+            end run
+            """
+            let res = Self.runProcessSync(executable: "/usr/bin/osascript", arguments: ["-e", script, ficheCmd])
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if res.exitCode != 0 {
+                    let msg = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.lastError = msg.isEmpty ? "Could not open Terminal for \(targetCli)." : msg
+                } else {
+                    self.showTransientNotice("Opening \(targetCli) via Fiche in Terminal…")
+                }
+            }
+        }
+    }
+
+    nonisolated static func checkShellAutoWrapInstalled() -> Bool {
+        let zshrcURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc")
+        guard let content = try? String(contentsOf: zshrcURL, encoding: .utf8) else { return false }
+        return content.contains("fiche shell-init") && content.contains("--wrap")
+    }
+
+    func installShellAutoWrap() {
+        guard !isPreview else { return }
+        lastError = nil
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let fm = FileManager.default
+            let zshrcURL = fm.homeDirectoryForCurrentUser.appendingPathComponent(".zshrc")
+            let existing = (try? String(contentsOf: zshrcURL, encoding: .utf8)) ?? ""
+            if existing.contains("fiche shell-init") && existing.contains("--wrap") {
+                await MainActor.run { [weak self] in
+                    self?.isShellAutoWrapInstalled = true
+                    self?.showTransientNotice("Auto-wrap already enabled in ~/.zshrc")
+                }
+                return
+            }
+
+            let snippet = """
+
+            # Fiche: auto-route coding CLIs through local proxy (bypass anytime with FICHE_BYPASS=1)
+            if command -v fiche >/dev/null 2>&1; then
+              eval "$(fiche shell-init --wrap)"
+            fi
+            """
+            let sep = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
+            let updated = existing + sep + snippet.trimmingCharacters(in: .newlines) + "\n"
+            do {
+                try updated.write(to: zshrcURL, atomically: true, encoding: .utf8)
+                await MainActor.run { [weak self] in
+                    self?.isShellAutoWrapInstalled = true
+                    self?.showTransientNotice("Added auto-wrap to ~/.zshrc — open a new terminal to activate")
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.lastError = "Failed to update ~/.zshrc: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
     func launchDesktopAppViaFiche(_ appName: String) {
         guard !isPreview else { return }
         lastError = nil
+        showTransientNotice("Launching \(appName) via Fiche…")
         Task.detached(priority: .userInitiated) {
             let nodePath = Self.resolveNodeBinary()
             guard let exe = Self.resolveFicheExecutable(nodePath: nodePath) else {

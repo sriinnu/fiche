@@ -99,6 +99,15 @@ function functionOutput(content: unknown, isError: boolean, imageDetail = 'high'
   return pieces;
 }
 
+function reasoningEffort(value: unknown): string | undefined {
+  const thinking = object(value);
+  if (thinking?.type !== 'enabled') return undefined;
+  const budget = typeof thinking.budget_tokens === 'number' ? thinking.budget_tokens : 0;
+  if (budget >= 32000) return 'high';
+  if (budget >= 8000) return 'medium';
+  return 'low';
+}
+
 function mapToolChoice(value: unknown): unknown {
   const choice = object(value);
   if (!choice || typeof choice.type !== 'string') return value;
@@ -160,6 +169,9 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
             call_id: part.tool_use_id,
             output: functionOutput(part.content, part.is_error === true, imageDetail),
           });
+        } else if (message.role === 'assistant'
+          && (part?.type === 'thinking' || part?.type === 'redacted_thinking')) {
+          continue;
         } else {
           ordinary.push(...inputParts([rawPart], `${String(message.role)} message`, String(message.role), imageDetail));
         }
@@ -175,6 +187,8 @@ export function anthropicMessagesToOpenAIResponses(body: Uint8Array): Uint8Array
   for (const key of ['stream', 'temperature', 'top_p', 'metadata']) {
     if (req[key] !== undefined) out[key] = req[key];
   }
+  const effort = reasoningEffort(req.thinking);
+  if (effort !== undefined) out.reasoning = { effort };
   if (Array.isArray(req.stop_sequences)) out.stop = req.stop_sequences;
   if (req.tool_choice !== undefined) out.tool_choice = mapToolChoice(req.tool_choice);
   const toolChoice = object(req.tool_choice);
@@ -207,13 +221,14 @@ function anthropicUsage(raw: unknown): JsonObject {
   };
 }
 
-function parseArguments(value: unknown): unknown {
+function parseArguments(value: unknown, allowRawFallback = false): unknown {
   // Empty string = a no-argument tool call; treat as {} rather than throwing.
   // Mirrors the Chat bridge (messages-chat-bridge.ts) and the streaming path,
   // which both yield input:{} for empty args. Without this, JSON.parse('')
   // throws and fails the whole turn on a benign no-arg tool call.
   if (typeof value !== 'string' || value.trim() === '') return {};
   try { return JSON.parse(value); } catch {
+    if (allowRawFallback) return { _raw: value };
     throw new Error('OpenAI returned malformed function-call arguments');
   }
 }
@@ -244,6 +259,10 @@ function reasoningSummary(item: JsonObject): string {
 /** Convert one completed Responses JSON object into Anthropic Messages JSON. */
 export function openAIResponseToAnthropicMessage(response: unknown, fallbackModel: string): JsonObject {
   const r = object(response) ?? {};
+  const truncated =
+    r.status === 'incomplete' ||
+    r.stop_reason === 'max_tokens' ||
+    object(r.incomplete_details)?.reason === 'max_output_tokens';
   const content: JsonObject[] = [];
   let hasToolUse = false;
   let sawRefusal = false;
@@ -268,7 +287,7 @@ export function openAIResponseToAnthropicMessage(response: unknown, fallbackMode
           type: 'tool_use',
           id: typeof item.call_id === 'string' ? item.call_id : String(item.id ?? ''),
           name: item.name,
-          input: parseArguments(item.arguments),
+          input: parseArguments(item.arguments, truncated),
         });
       } else if (item?.type === 'reasoning') {
         pendingReasoningSummary += reasoningSummary(item);
@@ -575,6 +594,51 @@ function streamEvent(event: string, value: JsonObject, state: StreamState): stri
 }
 
 /** Incrementally translate Responses SSE without buffering model output. */
+const MAX_SSE_BUFFER_CHARS = 4 * 1024 * 1024;
+
+function streamWithPrependedChunk(
+  firstChunk: Uint8Array,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  let sentFirst = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!sentFirst) {
+        sentFirst = true;
+        controller.enqueue(firstChunk);
+        return;
+      }
+      const next = await reader.read();
+      if (next.done) controller.close();
+      else controller.enqueue(next.value);
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    },
+  });
+}
+
+async function readRemainingBytes(
+  firstChunk: Uint8Array,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [firstChunk];
+  let total = firstChunk.byteLength;
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    chunks.push(next.value);
+    total += next.value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
 export function openAIResponsesStreamToAnthropic(
   body: ReadableStream<Uint8Array>,
   fallbackModel: string,
@@ -590,6 +654,7 @@ export function openAIResponsesStreamToAnthropic(
     calls: new Set(), callAliases: new Map(), usage: anthropicUsage(undefined),
   };
   const process = (chunk: string, controller: TransformStreamDefaultController<Uint8Array>, final = false): void => {
+    if (state.terminated) return;
     let normalized = chunk;
     if (pendingCR) {
       normalized = '\r' + normalized;
@@ -600,19 +665,26 @@ export function openAIResponsesStreamToAnthropic(
       pendingCR = true;
     }
     buffer += normalized.replace(/\r\n|\r/g, '\n');
+    let start = 0;
     let end: number;
-    while ((end = buffer.indexOf('\n\n')) >= 0) {
-      const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+    while ((end = buffer.indexOf('\n\n', start)) >= 0) {
+      const block = buffer.slice(start, end);
+      start = end + 2;
       let event = '';
       const data: string[] = [];
       for (const line of block.split('\n')) {
         if (line.startsWith('event:')) event = line.slice(6).trim();
         else if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
       }
-      if (!event || data.length === 0 || data[0] === '[DONE]') continue;
+      if (data.length === 0) continue;
+      const payload = data.join('\n');
+      if (payload === '[DONE]') continue;
       if (state.terminated) continue;
       try {
-        const rendered = streamEvent(event, JSON.parse(data.join('\n')) as JsonObject, state);
+        const parsed = JSON.parse(payload) as JsonObject;
+        const resolvedEvent = event || (typeof parsed.type === 'string' ? parsed.type : '');
+        if (!resolvedEvent) continue;
+        const rendered = streamEvent(resolvedEvent, parsed, state);
         if (rendered) controller.enqueue(encoder.encode(rendered));
       } catch {
         controller.enqueue(encoder.encode(sse('error', {
@@ -620,6 +692,14 @@ export function openAIResponsesStreamToAnthropic(
         })));
         state.terminated = true;
       }
+    }
+    buffer = start > 0 ? buffer.slice(start) : buffer;
+    if (!state.terminated && buffer.length > MAX_SSE_BUFFER_CHARS) {
+      controller.enqueue(encoder.encode(sse('error', {
+        type: 'error', error: { type: 'api_error', message: 'OpenAI stream event exceeded maximum size' },
+      })));
+      state.terminated = true;
+      buffer = '';
     }
   };
   return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
@@ -676,6 +756,35 @@ export async function openAIResponsesToAnthropicResponse(
     return new Response(openAIResponsesStreamToAnthropic(response.body, fallbackModel), {
       status: response.status, statusText: response.statusText, headers,
     });
+  }
+  if (!contentType.includes('json')) {
+    const reader = response.body.getReader();
+    const peekDecoder = new TextDecoder();
+    for (;;) {
+      const first = await reader.read();
+      if (first.done) {
+        headers.set('content-type', 'application/json');
+        return new Response(JSON.stringify(openAIResponseToAnthropicMessage({}, fallbackModel)), {
+          status: response.status, statusText: response.statusText, headers,
+        });
+      }
+      if (first.value.byteLength === 0) continue;
+      const head = peekDecoder.decode(first.value, { stream: true }).trimStart();
+      if (head.startsWith('event:') || head.startsWith('data:') || head.startsWith(':')) {
+        headers.set('content-type', 'text/event-stream; charset=utf-8');
+        const replay = streamWithPrependedChunk(first.value, reader);
+        return new Response(openAIResponsesStreamToAnthropic(replay, fallbackModel), {
+          status: response.status, statusText: response.statusText, headers,
+        });
+      }
+      const bytes = await readRemainingBytes(first.value, reader);
+      const parsed = JSON.parse(new TextDecoder().decode(bytes));
+      const converted = openAIResponseToAnthropicMessage(parsed, fallbackModel);
+      headers.set('content-type', 'application/json');
+      return new Response(JSON.stringify(converted), {
+        status: response.status, statusText: response.statusText, headers,
+      });
+    }
   }
   const converted = openAIResponseToAnthropicMessage(await response.json(), fallbackModel);
   headers.set('content-type', 'application/json');

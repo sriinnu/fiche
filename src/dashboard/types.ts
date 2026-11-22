@@ -1,15 +1,51 @@
 // JSON payload shapes for the dashboard. Single source of truth — update here when src/dashboard.ts changes.
 
+/** Per-day local aggregation point (Tokmeter-style timeline). */
+export interface DailySavingsPoint {
+  date: string; // local YYYY-MM-DD
+  requests: number;
+  compressed: number;
+  imaged: number;
+  text_compressed: number;
+  baseline_input_weighted: number;
+  actual_input_weighted: number;
+  saved_tokens: number;
+  raw_saved_tokens: number;
+  saved_pct: number;
+  saved_usd: number;
+  cliff_saved_usd: number;
+  is_today: boolean;
+}
+
+/** Per-model aggregate slice inside /proxy-stats. */
+export interface ModelStatsPayload {
+  requests: number;
+  compressed: number;
+  imaged: number;
+  text_compressed: number;
+  baseline_input_weighted: number;
+  actual_input_weighted: number;
+  saved_tokens: number;
+  raw_saved_tokens: number;
+  saved_pct: number;
+  saved_usd: number;
+  cliff_avoided_events: number;
+  cliff_saved_usd: number;
+}
+
 /** /proxy-stats payload. */
 export interface StatsPayload {
   port: number;
   uptime_sec: number;
   requests: number;
   compressed_requests: number;
+  imaged_requests?: number;
+  text_compressed_requests?: number;
   passthrough: number;
   baseline_input_weighted: number;
   actual_input_weighted: number;
   saved_input_tokens: number;
+  raw_saved_tokens?: number;
   /** Back-compat duplicate of `saved_pct_input_only`. */
   saved_pct: number;
   saved_pct_input_only: number;
@@ -42,6 +78,13 @@ export interface StatsPayload {
   measured_tool_use_chars: number;
   measured_redacted_block_count: number;
   events_with_measurement: number;
+  cliff_avoided_events?: number;
+  cliff_saved_usd?: number;
+  text_hygiene_saved_tokens?: number;
+  text_hygiene_saved_chars?: number;
+  by_model?: Record<string, ModelStatsPayload>;
+  today?: DailySavingsPoint;
+  daily?: DailySavingsPoint[];
   uptime_sec_unused?: never; // future-proof
   compression_enabled: boolean;
 }
@@ -72,6 +115,9 @@ export interface RecentRow {
   size_in?: number;
   compressed: boolean;
   cc_added?: number;
+  image_count?: number;
+  compression_mode?: 'optical' | 'text' | 'none';
+  text_hygiene_stages?: string[];
   input_tokens?: number;
   output_tokens?: number;
   cache_create?: number;

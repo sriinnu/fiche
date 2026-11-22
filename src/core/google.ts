@@ -40,6 +40,7 @@ import {
   resolveTextHygieneMode,
   type TextHygieneMode,
 } from './text-hygiene.js';
+import type { StageToggles } from './stage-plugins.js';
 export interface GooglePart {
   text?: string;
   inlineData?: {
@@ -1001,6 +1002,7 @@ export async function transformGoogleGenerateContent(
     maxImagesPerToolResult?: number;
     cols?: number;
     reflow?: boolean;
+    stageToggles?: Partial<StageToggles>;
   } = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
   const isGemini = isGeminiModel(modelName);
@@ -1044,10 +1046,19 @@ export async function transformGoogleGenerateContent(
 
   const nativeImageBytes = countGoogleInlineImageBytes(req);
 
+  const opticalEnabled =
+    measuredProfile &&
+    options.imageCompress !== false &&
+    options.stageToggles?.optical !== false;
+
   const hygieneStats = isTextHygieneActive(options.textHygiene)
     ? applyGoogleTextHygiene(req, {
-        foldLogs: !measuredProfile || options.imageCompress === false,
-        deepTextCompact: !measuredProfile || options.imageCompress === false,
+        foldLogs: !opticalEnabled,
+        deepTextCompact: !opticalEnabled,
+        enableTscg: options.stageToggles?.tscg,
+        enableToon: options.stageToggles?.toon,
+        enableAcdc: options.stageToggles?.acdc,
+        enableCasi: options.stageToggles?.casi,
         aggressiveToon: resolveTextHygieneMode(options.textHygiene) === 'on',
         model: modelName,
         expectedOutputTokens: options.expectedOutputTokens,
@@ -1072,7 +1083,7 @@ export async function transformGoogleGenerateContent(
     return cachedPinBody;
   };
 
-  if (!measuredProfile || options.imageCompress === false) {
+  if (!opticalEnabled) {
     if (hygieneStats?.changed) {
       info.compressed = true;
       info.reason = 'text_hygiene';

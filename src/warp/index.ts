@@ -224,7 +224,12 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     env.REQUESTS_CA_BUNDLE = ca.bundlePath; // Python requests / httpx
     env.FICHE_BYPASS = '1'; // prevent recursive wrapper execution inside shell-init functions
 
-    const execArgv = options.app ? buildWarpAppArgs(options.app, proxyUrl, command) : command;
+    const execArgv = options.app
+      ? buildWarpAppArgs(options.app, proxyUrl, command, {
+          spkiPins: ca.spkiPins,
+          proxyBypassList: 'localhost;127.0.0.1;[::1]',
+        })
+      : command;
     const child = spawnResolved(execArgv, env);
     // The child's proxy and CA point at this process. If warp dies for any
     // reason the child is reparented to init and keeps running against a closed

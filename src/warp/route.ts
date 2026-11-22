@@ -107,6 +107,25 @@ function stripPort(hostPort: string): string {
   return i > 0 ? hostPort.slice(0, i) : hostPort;
 }
 
+/** Collapse dot-segments and repeated slashes so traversal paths cannot match prefix globs. */
+export function normalizeRoutePath(path: string): string {
+  const slashPath = path.startsWith('/') ? path : `/${path}`;
+  if (
+    !slashPath.includes('..') &&
+    !slashPath.includes('//') &&
+    !slashPath.includes('\\') &&
+    !slashPath.includes('/./')
+  ) {
+    return slashPath;
+  }
+  try {
+    const u = new URL(slashPath.replaceAll('\\', '/'), 'http://route.invalid');
+    return u.pathname.replace(/\/{2,}/g, '/');
+  } catch {
+    return slashPath;
+  }
+}
+
 /**
  * First match wins, so earlier rules shadow later ones.
  *
@@ -116,8 +135,9 @@ function stripPort(hostPort: string): string {
 export function matchRoute(routes: readonly Route[], hostPort: string, path: string): Route | null {
   const lower = hostPort.toLowerCase();
   const bare = stripPort(lower);
+  const normalizedPath = normalizeRoutePath(path);
   for (const route of routes) {
-    if (route.re.test((route.hasPort ? lower : bare) + path)) return route;
+    if (route.re.test((route.hasPort ? lower : bare) + normalizedPath)) return route;
   }
   return null;
 }

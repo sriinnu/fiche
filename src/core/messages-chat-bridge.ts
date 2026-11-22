@@ -273,9 +273,10 @@ function anthropicUsage(raw: unknown): JsonObject {
   };
 }
 
-function parseArguments(value: unknown): unknown {
+function parseArguments(value: unknown, allowRawFallback = false): unknown {
   if (typeof value !== 'string' || value.trim() === '') return {};
   try { return JSON.parse(value); } catch {
+    if (allowRawFallback) return { _raw: value };
     throw new Error('OpenAI returned malformed function-call arguments');
   }
 }
@@ -296,6 +297,7 @@ function stopReason(finish: unknown, hasToolUse: boolean): string {
 export function openAIChatToAnthropicMessage(response: unknown, fallbackModel: string): JsonObject {
   const r = object(response) ?? {};
   const choice = Array.isArray(r.choices) ? object(r.choices[0]) : undefined;
+  const truncated = choice?.finish_reason === 'length';
   const message = object(choice?.message) ?? {};
   const content: JsonObject[] = [];
   let hasToolUse = false;
@@ -320,7 +322,7 @@ export function openAIChatToAnthropicMessage(response: unknown, fallbackModel: s
         type: 'tool_use',
         id: typeof call?.id === 'string' ? call.id : `call_${content.length}`,
         name: fn.name,
-        input: parseArguments(fn.arguments),
+        input: parseArguments(fn.arguments, truncated),
       });
     }
   }
@@ -486,6 +488,51 @@ function finalizeStream(state: StreamState): string {
 }
 
 /** Incrementally translate Chat Completions SSE without buffering model output. */
+const MAX_SSE_BUFFER_CHARS = 4 * 1024 * 1024;
+
+function streamWithPrependedChunk(
+  firstChunk: Uint8Array,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  let sentFirst = false;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (!sentFirst) {
+        sentFirst = true;
+        controller.enqueue(firstChunk);
+        return;
+      }
+      const next = await reader.read();
+      if (next.done) controller.close();
+      else controller.enqueue(next.value);
+    },
+    async cancel(reason) {
+      await reader.cancel(reason);
+    },
+  });
+}
+
+async function readRemainingBytes(
+  firstChunk: Uint8Array,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = [firstChunk];
+  let total = firstChunk.byteLength;
+  for (;;) {
+    const next = await reader.read();
+    if (next.done) break;
+    chunks.push(next.value);
+    total += next.value.byteLength;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
 export function openAIChatStreamToAnthropic(
   body: ReadableStream<Uint8Array>,
   fallbackModel: string,
@@ -500,13 +547,16 @@ export function openAIChatStreamToAnthropic(
     nextIndex: 0, textOpen: false, sawTool: false, calls: new Map(),
   };
   const process = (chunk: string, controller: TransformStreamDefaultController<Uint8Array>, final = false): void => {
+    if (state.terminated) return;
     let normalized = chunk;
     if (pendingCR) { normalized = '\r' + normalized; pendingCR = false; }
     if (!final && normalized.endsWith('\r')) { normalized = normalized.slice(0, -1); pendingCR = true; }
     buffer += normalized.replace(/\r\n|\r/g, '\n');
+    let start = 0;
     let end: number;
-    while ((end = buffer.indexOf('\n\n')) >= 0) {
-      const block = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+    while ((end = buffer.indexOf('\n\n', start)) >= 0) {
+      const block = buffer.slice(start, end);
+      start = end + 2;
       const data: string[] = [];
       for (const line of block.split('\n')) {
         if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
@@ -524,6 +574,14 @@ export function openAIChatStreamToAnthropic(
         })));
         state.terminated = true;
       }
+    }
+    buffer = start > 0 ? buffer.slice(start) : buffer;
+    if (!state.terminated && buffer.length > MAX_SSE_BUFFER_CHARS) {
+      controller.enqueue(encoder.encode(sse('error', {
+        type: 'error', error: { type: 'api_error', message: 'OpenAI stream event exceeded maximum size' },
+      })));
+      state.terminated = true;
+      buffer = '';
     }
   };
   return body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
@@ -577,6 +635,35 @@ export async function openAIChatToAnthropicResponse(
     return new Response(openAIChatStreamToAnthropic(response.body, fallbackModel), {
       status: response.status, statusText: response.statusText, headers,
     });
+  }
+  if (!contentType.includes('json')) {
+    const reader = response.body.getReader();
+    const peekDecoder = new TextDecoder();
+    for (;;) {
+      const first = await reader.read();
+      if (first.done) {
+        headers.set('content-type', 'application/json');
+        return new Response(JSON.stringify(openAIChatToAnthropicMessage({}, fallbackModel)), {
+          status: response.status, statusText: response.statusText, headers,
+        });
+      }
+      if (first.value.byteLength === 0) continue;
+      const head = peekDecoder.decode(first.value, { stream: true }).trimStart();
+      if (head.startsWith('data:') || head.startsWith('event:') || head.startsWith(':')) {
+        headers.set('content-type', 'text/event-stream; charset=utf-8');
+        const replay = streamWithPrependedChunk(first.value, reader);
+        return new Response(openAIChatStreamToAnthropic(replay, fallbackModel), {
+          status: response.status, statusText: response.statusText, headers,
+        });
+      }
+      const bytes = await readRemainingBytes(first.value, reader);
+      const parsed = JSON.parse(new TextDecoder().decode(bytes));
+      const converted = openAIChatToAnthropicMessage(parsed, fallbackModel);
+      headers.set('content-type', 'application/json');
+      return new Response(JSON.stringify(converted), {
+        status: response.status, statusText: response.statusText, headers,
+      });
+    }
   }
   const converted = openAIChatToAnthropicMessage(await response.json(), fallbackModel);
   headers.set('content-type', 'application/json');

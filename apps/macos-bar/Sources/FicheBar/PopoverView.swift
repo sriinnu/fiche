@@ -5,9 +5,24 @@ import SwiftUI
 
 enum PopoverTab: String, CaseIterable, Identifiable {
     case activity = "Activity"
+    case agents = "Agents"
     case models = "Models"
     case stages = "Stages"
     case control = "Control"
+
+    var id: String { rawValue }
+}
+
+private enum HeroScope: String, CaseIterable, Identifiable {
+    case lifetime = "Lifetime"
+    case today = "Today"
+
+    var id: String { rawValue }
+}
+
+private enum DailyChartMetric: String, CaseIterable, Identifiable {
+    case tokens = "Tokens"
+    case usd = "USD"
 
     var id: String { rawValue }
 }
@@ -197,6 +212,10 @@ private enum ModelClassification {
 struct PopoverView: View {
     @ObservedObject var controller: DaemonController
     @State private var selectedTab: PopoverTab
+    @State private var heroScope: HeroScope = .lifetime
+    @State private var dailyMetric: DailyChartMetric = .tokens
+    @State private var showAllCLIs: Bool = false
+    @State private var expandedFAQ: Set<String> = []
     @State private var portDraft: String = ""
     @State private var logoWhisper: String? = nil
     @State private var livePulseActive: Bool = false
@@ -216,6 +235,10 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 0) {
             headerRow(theme: theme)
 
+            if let notice = controller.transientNotice {
+                transientNoticeBanner(notice, theme: theme)
+            }
+
             if controller.phase == .stopped || (controller.lastError?.isEmpty == false) {
                 offlineOrErrorBand(theme: theme)
                 Spacer().frame(height: theme.usesInsetCards ? 8 : 6)
@@ -234,6 +257,8 @@ struct PopoverView: View {
                     switch selectedTab {
                     case .activity:
                         activityTab(theme: theme)
+                    case .agents:
+                        agentsTab(theme: theme)
                     case .models:
                         modelsTab(theme: theme)
                     case .stages:
@@ -255,6 +280,7 @@ struct PopoverView: View {
         .onAppear {
             portDraft = String(controller.daemonPort)
             controller.refreshNow()
+            controller.refreshAgentDiscovery()
             if !controller.isPreviewMode {
                 withAnimation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true)) {
                     livePulseActive = true
@@ -266,6 +292,23 @@ struct PopoverView: View {
                 portDraft = String(newPort)
             }
         }
+    }
+
+    private func transientNoticeBanner(_ notice: String, theme: Theme) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(theme.live)
+            Text(notice)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(theme.primaryText)
+                .lineLimit(2)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(theme.live.opacity(0.11))
+        .overlay(alignment: .bottom) { Hairline() }
     }
 
     // MARK: - Header Row
@@ -452,12 +495,16 @@ struct PopoverView: View {
 
     private func heroSavingsBand(theme: Theme) -> some View {
         let stats = controller.stats
-        let savedTokens = stats?.savedInputTokens ?? 0
-        let savedPct = stats?.savedPct ?? 0
-        let baseTokens = stats?.baselineInputWeighted ?? 0
-        let actualTokens = stats?.actualInputWeighted ?? 0
-        let savedUsd = stats?.savedUsd ?? 0
-        let cliffUsd = stats?.cliffSavedUsd ?? 0
+        let today = stats?.today
+        let isToday = heroScope == .today
+        let savedTokens = isToday ? (today?.savedTokens ?? 0) : (stats?.savedInputTokens ?? 0)
+        let rawSaved = isToday ? (today?.rawSavedTokens ?? 0) : (stats?.rawSavedTokens ?? 0)
+        let savedPct = isToday ? (today?.savedPct ?? 0) : (stats?.savedPct ?? 0)
+        let baseTokens = isToday ? (today?.baselineInputWeighted ?? 0) : (stats?.baselineInputWeighted ?? 0)
+        let actualTokens = isToday ? (today?.actualInputWeighted ?? 0) : (stats?.actualInputWeighted ?? 0)
+        let savedUsd = isToday ? (today?.savedUsd ?? 0) : (stats?.savedUsd ?? 0)
+        let cliffUsd = isToday ? (today?.cliffSavedUsd ?? 0) : (stats?.cliffSavedUsd ?? 0)
+        let scopeRequests = isToday ? (today?.requests ?? 0) : (stats?.requests ?? 0)
         let pctColor = savedPct >= 1 ? theme.live : theme.secondaryText
         let sessionSavedRaw = controller.lastTurn?.session?.savedTokens ?? 0
         let weightedRatio: Double = {
@@ -468,6 +515,9 @@ struct PopoverView: View {
         }()
 
         let weightedTooltip: String = {
+            if rawSaved > 0 {
+                return "Cache-weighted bill-equivalent tokens saved (\(heroScope.rawValue)). Raw uncached + cached prompt tokens stripped: \(Fmt.tokens(rawSaved))."
+            }
             if sessionSavedRaw > 0 {
                 return "Cache-weighted bill-equivalent tokens (cache reads weighted ~0.05×). Raw prompt tokens stripped this session: \(Fmt.tokens(sessionSavedRaw))."
             }
@@ -475,8 +525,8 @@ struct PopoverView: View {
         }()
 
         let usdTooltip: String = cliffUsd > 0
-            ? "Estimated USD saved using \(controller.priceMode) pricing (includes \(Fmt.usd(cliffUsd)) context-cliff avoidance)."
-            : "Estimated USD saved across weighted input & cache pricing (\(controller.priceMode) snapshot)."
+            ? "Estimated USD saved (\(heroScope.rawValue)) using \(controller.priceMode) pricing (includes \(Fmt.usd(cliffUsd)) context-cliff avoidance)."
+            : "Estimated USD saved (\(heroScope.rawValue)) across weighted input & cache pricing (\(controller.priceMode) snapshot)."
 
         let ratioTooltip: String = {
             if savedPct >= 55 {
@@ -488,7 +538,7 @@ struct PopoverView: View {
             if savedPct > 0 {
                 return "Active compaction: \(Fmt.pct(savedPct)) weighted reduction."
             }
-            return "Awaiting compressible multi-turn traffic."
+            return isToday ? "No compressed traffic recorded today yet." : "Awaiting compressible multi-turn traffic."
         }()
 
         return Band(isHero: true) {
@@ -509,20 +559,28 @@ struct PopoverView: View {
                         .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(theme.secondaryText)
                     Spacer()
-                    if let pid = controller.daemonPid {
-                        Text("pid:\(String(pid))")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(theme.tertiaryText)
-                    }
+                    heroScopeToggle(theme: theme)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
 
                 Hairline()
+            } else {
+                HStack(spacing: 8) {
+                    heroScopeToggle(theme: theme)
+                    Spacer()
+                    Text(scopeRequests > 0 ? "\(scopeRequests) req" : "ready")
+                        .font(.system(size: 10, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundStyle(theme.tertiaryText)
+                }
+                .padding(.horizontal, theme.usesInsetCards ? 12 : 16)
+                .padding(.top, 7)
+                .padding(.bottom, 1)
             }
 
             HStack(alignment: .top, spacing: 0) {
-                // Left: Tokens Saved (Weighted)
+                // Left: Tokens Saved (Weighted + Raw subtitle)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
                         Text("TOKENS SAVED")
@@ -564,18 +622,20 @@ struct PopoverView: View {
                     }
 
                     Text(
-                        baseTokens > 0
-                            ? "\(Fmt.tokens(actualTokens)) / \(Fmt.tokens(baseTokens)) weighted"
-                            : "awaiting traffic"
+                        rawSaved > 0
+                            ? "\(Fmt.tokens(rawSaved)) raw · \(Fmt.tokens(actualTokens))/\(Fmt.tokens(baseTokens)) wtd"
+                            : (baseTokens > 0
+                                ? "\(Fmt.tokens(actualTokens)) / \(Fmt.tokens(baseTokens)) wtd"
+                                : (isToday ? "no traffic today" : "awaiting traffic"))
                     )
-                    .font(.system(size: theme.layout == .instrumentation ? 10 : 11))
+                    .font(.system(size: theme.layout == .instrumentation ? 9.5 : 10.5))
                     .foregroundStyle(theme.secondaryText)
                     .monospacedDigit()
                     .lineLimit(1)
-                    .minimumScaleFactor(0.84)
+                    .minimumScaleFactor(0.80)
                 }
                 .padding(.horizontal, theme.usesInsetCards ? 14 : 16)
-                .padding(.vertical, 10)
+                .padding(.vertical, 9)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
                 .help(weightedTooltip)
@@ -609,14 +669,14 @@ struct PopoverView: View {
                             ? "\(controller.priceMode) · cliff +\(Fmt.usd(cliffUsd))"
                             : "\(controller.priceMode) pricing"
                     )
-                    .font(.system(size: theme.layout == .instrumentation ? 10 : 11))
+                    .font(.system(size: theme.layout == .instrumentation ? 9.5 : 10.5))
                     .foregroundStyle(theme.secondaryText)
                     .monospacedDigit()
                     .lineLimit(1)
-                    .minimumScaleFactor(0.88)
+                    .minimumScaleFactor(0.86)
                 }
                 .padding(.horizontal, theme.usesInsetCards ? 14 : 16)
-                .padding(.vertical, 10)
+                .padding(.vertical, 9)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
                 .help(usdTooltip)
@@ -636,6 +696,41 @@ struct PopoverView: View {
 
             latestTurnStrip(theme: theme)
         }
+    }
+
+    private func heroScopeToggle(theme: Theme) -> some View {
+        HStack(spacing: 2) {
+            ForEach(HeroScope.allCases) { scope in
+                let active = heroScope == scope
+                Button {
+                    withAnimation(.spring(response: 0.24, dampingFraction: 0.8)) {
+                        heroScope = scope
+                    }
+                } label: {
+                    Text(scope.rawValue)
+                        .font(.system(size: 9.5, weight: active ? .semibold : .medium, design: theme.fontDesign))
+                        .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background {
+                            if active {
+                                RoundedRectangle(cornerRadius: max(3, theme.badgeRadius), style: .continuous)
+                                    .fill(theme.controlPill)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: max(3, theme.badgeRadius), style: .continuous)
+                                            .strokeBorder(theme.hairline, lineWidth: 0.5)
+                                    )
+                            }
+                        }
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(
+            theme.controlRail,
+            in: RoundedRectangle(cornerRadius: max(4, theme.badgeRadius + 2), style: .continuous)
+        )
     }
 
     private func latestTurnStrip(theme: Theme) -> some View {
@@ -717,16 +812,18 @@ struct PopoverView: View {
     private func tabBar(theme: Theme) -> some View {
         switch theme.tabStyle {
         case .editorial:
-            HStack(alignment: .firstTextBaseline, spacing: 14) {
+            HStack(alignment: .firstTextBaseline, spacing: 11) {
                 ForEach(Array(PopoverTab.allCases.enumerated()), id: \.element) { index, tab in
                     let active = tab == selectedTab
                     Button {
                         selectTab(tab)
                     } label: {
                         Text(tab.rawValue)
-                            .font(.system(size: 13.5, weight: active ? .heavy : .medium))
+                            .font(.system(size: 12.5, weight: active ? .heavy : .medium))
                             .fontWidth(theme.fontWidth)
                             .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
                             .padding(.vertical, 8)
                             .overlay(alignment: .bottom) {
                                 if active {
@@ -741,7 +838,7 @@ struct PopoverView: View {
                     .buttonStyle(.plain)
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
-                Spacer()
+                Spacer(minLength: 0)
             }
             .padding(.horizontal, 16)
 
@@ -753,8 +850,10 @@ struct PopoverView: View {
                         selectTab(tab)
                     } label: {
                         Text(tab.rawValue)
-                            .font(.system(size: 12, weight: active ? .semibold : .medium))
+                            .font(.system(size: 11, weight: active ? .semibold : .medium))
                             .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 5.5)
                             .background {
@@ -798,13 +897,15 @@ struct PopoverView: View {
                     } label: {
                         VStack(spacing: 3) {
                             Text(tab.rawValue.uppercased())
-                                .font(.system(size: 10, weight: active ? .bold : .medium))
-                                .tracking(0.5)
+                                .font(.system(size: 8.8, weight: active ? .bold : .medium))
+                                .tracking(0.3)
                                 .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.85)
 
                             RoundedRectangle(cornerRadius: 1, style: .continuous)
                                 .fill(active ? theme.accent : Color.white.opacity(0.08))
-                                .frame(width: active ? 22 : 10, height: 2)
+                                .frame(width: active ? 20 : 10, height: 2)
                                 .matchedGeometryEffect(
                                     id: active ? "activeTabIndicator" : "inactive-\(tab.rawValue)",
                                     in: tabNamespace
@@ -844,20 +945,22 @@ struct PopoverView: View {
 
         case .terminal:
             // tmux-inspired crisp indexed tab strip
-            HStack(spacing: 6) {
+            HStack(spacing: 3) {
                 ForEach(Array(PopoverTab.allCases.enumerated()), id: \.element) { index, tab in
                     let active = tab == selectedTab
                     Button {
                         selectTab(tab)
                     } label: {
-                        HStack(spacing: 3) {
+                        HStack(spacing: 2) {
                             Text("\(index + 1):")
                                 .foregroundStyle(active ? theme.accent : theme.tertiaryText)
                             Text(tab.rawValue.lowercased())
                                 .fontWeight(active ? .bold : .regular)
                                 .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
                         }
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: 10, design: .monospaced))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 5.5)
                         .background {
@@ -893,15 +996,17 @@ struct PopoverView: View {
 
         case .celestialPills:
             // Apple Weather translucent twilight capsules
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 ForEach(Array(PopoverTab.allCases.enumerated()), id: \.element) { index, tab in
                     let active = tab == selectedTab
                     Button {
                         selectTab(tab)
                     } label: {
                         Text(tab.rawValue)
-                            .font(.system(size: 12, weight: active ? .semibold : .medium, design: .rounded))
+                            .font(.system(size: 11, weight: active ? .semibold : .medium, design: .rounded))
                             .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 5.5)
                             .background {
@@ -934,15 +1039,33 @@ struct PopoverView: View {
         withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
             selectedTab = tab
         }
+        if tab == .agents {
+            controller.refreshAgentDiscovery()
+        }
     }
 
     // MARK: - Tab 1: Activity
 
     private func activityTab(theme: Theme) -> some View {
         let modelRows = controller.sortedByModelStats
+        let maxModelSaved = max(modelRows.map { $0.stats.savedInputTokens }.max() ?? 0, 1)
         let stats = controller.stats
+        let dailyPoints = stats?.daily ?? []
 
         return VStack(alignment: .leading, spacing: 0) {
+            SectionHeader(
+                title: "Daily (14d)",
+                trailing: dailyPoints.last(where: { $0.isToday }) != nil ? "Today live" : nil
+            )
+
+            Band {
+                DailySavingsChartView(
+                    points: dailyPoints,
+                    metric: $dailyMetric,
+                    theme: theme
+                )
+            }
+
             SectionHeader(
                 title: "By Model",
                 trailing: modelRows.isEmpty ? nil : "\(modelRows.count)"
@@ -962,7 +1085,12 @@ struct PopoverView: View {
                 } else {
                     ForEach(Array(modelRows.enumerated()), id: \.element.model) { idx, row in
                         if idx > 0 { Hairline(inset: 14) }
-                        activityModelRow(model: row.model, stats: row.stats, theme: theme)
+                        activityModelRow(
+                            model: row.model,
+                            stats: row.stats,
+                            maxSavedTokens: maxModelSaved,
+                            theme: theme
+                        )
                     }
                 }
             }
@@ -1003,78 +1131,426 @@ struct PopoverView: View {
 
             SectionHeader(title: "Lifetime")
             Band {
-                HStack(spacing: 0) {
-                    lifetimeStatCell(
-                        label: "Requests",
-                        value: "\(stats?.requests ?? 0)",
-                        theme: theme
-                    )
-                    VerticalHairline()
-                    lifetimeStatCell(
-                        label: "Compressed",
-                        value: "\(stats?.compressedRequests ?? 0)",
-                        theme: theme
-                    )
-                    VerticalHairline()
-                    lifetimeStatCell(
-                        label: "Render Cache",
-                        value: renderCacheLabel(stats?.renderCache),
-                        theme: theme
-                    )
-                    .help(renderCacheTooltip(stats?.renderCache))
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        lifetimeStatCell(
+                            label: "Lifetime Raw",
+                            value: Fmt.tokens(stats?.rawSavedTokens ?? 0),
+                            theme: theme
+                        )
+                        VerticalHairline()
+                        lifetimeStatCell(
+                            label: "Requests",
+                            value: "\(stats?.requests ?? 0)",
+                            theme: theme
+                        )
+                    }
+                    Hairline()
+                    HStack(spacing: 0) {
+                        lifetimeStatCell(
+                            label: "Optical / Text",
+                            value: "\(stats?.imagedRequests ?? 0) / \(stats?.textCompressedRequests ?? 0)",
+                            theme: theme
+                        )
+                        VerticalHairline()
+                        lifetimeStatCell(
+                            label: "Render Cache",
+                            value: renderCacheLabel(stats?.renderCache),
+                            theme: theme
+                        )
+                        .help(renderCacheTooltip(stats?.renderCache))
+                    }
                 }
             }
         }
     }
 
-    private func activityModelRow(model: String, stats: ModelStats, theme: Theme) -> some View {
+    private func activityModelRow(
+        model: String,
+        stats: ModelStats,
+        maxSavedTokens: Double,
+        theme: Theme
+    ) -> some View {
         let engine = ModelClassification.engineMode(for: model)
+        let ratio = stats.savedInputTokens > 0
+            ? min(max(stats.savedInputTokens / max(maxSavedTokens, 1), 0), 1)
+            : 0
 
-        return HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(model)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(theme.primaryText)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(model)
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(model)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(theme.primaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(model)
 
-                    engineBadge(engine, theme: theme)
-                }
+                        engineBadge(engine, theme: theme)
+                    }
 
-                Text("\(stats.compressedRequests)/\(stats.requests) requests")
+                    Text(
+                        stats.rawSavedTokens > 0
+                            ? "\(stats.compressedRequests)/\(stats.requests) req · \(Fmt.tokens(stats.rawSavedTokens)) raw"
+                            : "\(stats.compressedRequests)/\(stats.requests) requests"
+                    )
                     .font(.caption)
                     .foregroundStyle(theme.secondaryText)
                     .monospacedDigit()
+                }
+
+                Spacer(minLength: 6)
+
+                VStack(alignment: .trailing, spacing: 2) {
+                    HStack(spacing: 4) {
+                        if stats.savedPct >= 0.5 {
+                            Text("-\(Fmt.pct(stats.savedPct))")
+                                .font(.subheadline.weight(.semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(theme.live)
+                        } else if stats.savedInputTokens > 0 {
+                            Text("-\(Fmt.tokens(stats.savedInputTokens))")
+                                .font(.subheadline.weight(.semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(theme.live)
+                        } else {
+                            Text("0%")
+                                .font(.subheadline)
+                                .monospacedDigit()
+                                .foregroundStyle(theme.secondaryText)
+                        }
+                    }
+
+                    Text(
+                        stats.savedInputTokens > 0
+                            ? "\(Fmt.tokens(stats.savedInputTokens)) wtd · \(Fmt.usd(stats.savedUsd))"
+                            : Fmt.usd(stats.savedUsd)
+                    )
+                    .font(.caption)
+                    .foregroundStyle(theme.secondaryText)
+                    .monospacedDigit()
+                }
             }
 
-            Spacer(minLength: 6)
+            if ratio > 0 {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 2, style: .continuous)
+                            .fill(theme.controlRail)
+                        RoundedRectangle(cornerRadius: 2, style: .continuous)
+                            .fill(engine == .optical ? theme.accent : theme.live)
+                            .frame(width: max(4, geo.size.width * ratio))
+                    }
+                }
+                .frame(height: 3.5)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+    }
 
-            VStack(alignment: .trailing, spacing: 2) {
-                HStack(spacing: 4) {
-                    if stats.savedPct >= 0.5 {
-                        Text("-\(Fmt.pct(stats.savedPct))")
-                            .font(.subheadline.weight(.semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(theme.live)
-                    } else if stats.savedInputTokens > 0 {
-                        Text("-\(Fmt.tokens(stats.savedInputTokens))")
-                            .font(.subheadline.weight(.semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(theme.live)
-                    } else {
-                        Text("0%")
-                            .font(.subheadline)
-                            .monospacedDigit()
+    // MARK: - Tab 2: Agents (Universal Launcher + CLI FAQ)
+
+    private func agentsTab(theme: Theme) -> some View {
+        let isOnline = controller.phase != .stopped
+        let apps = controller.discoveredDesktopApps.isEmpty
+            ? DaemonController.discoverInstalledDesktopApps()
+            : controller.discoveredDesktopApps
+        let clis = controller.discoveredCLIAgents.isEmpty
+            ? DaemonController.discoverInstalledCLIAgents()
+            : controller.discoveredCLIAgents
+        let installedCLIs = clis.filter(\.installed)
+        let otherCLIs = clis.filter { !$0.installed }
+
+        return VStack(alignment: .leading, spacing: 0) {
+            SectionHeader(
+                title: "Desktop Apps",
+                trailing: apps.isEmpty ? nil : "\(apps.count) found"
+            )
+
+            Band {
+                if apps.isEmpty {
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("No supported IDE / desktop apps found")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(theme.primaryText)
+                            Text("Launch any Electron/Chromium app via CLI:")
+                                .font(.caption)
+                                .foregroundStyle(theme.secondaryText)
+                            Text("fiche warp --app Antigravity")
+                                .font(.caption.monospaced())
+                                .foregroundStyle(theme.accent)
+                        }
+                        Spacer()
+                        Button {
+                            controller.copyToClipboard("fiche warp --app Antigravity", label: "Copied command")
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                } else {
+                    ForEach(Array(apps.enumerated()), id: \.element) { idx, appName in
+                        if idx > 0 { Hairline(inset: 14) }
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(appName)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(theme.primaryText)
+                                    .lineLimit(1)
+                                Text("fiche warp --app \(appName)")
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(theme.secondaryText)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer(minLength: 6)
+                            Button {
+                                controller.copyToClipboard("fiche warp --app \(appName)", label: "Copied: fiche warp --app \(appName)")
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.borderless)
                             .foregroundStyle(theme.secondaryText)
+                            .help("Copy CLI command")
+
+                            Button("Open") {
+                                controller.launchDesktopAppViaFiche(appName)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(theme.accent)
+                            .controlSize(.small)
+                            .disabled(!isOnline || controller.isBusy)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                    }
+                }
+            }
+
+            SectionHeader(
+                title: "Coding CLIs",
+                trailing: "\(installedCLIs.count) installed"
+            )
+
+            Band {
+                // Auto-Wrap Status Card
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(controller.isShellAutoWrapInstalled ? theme.live : theme.warn)
+                                .frame(width: 6, height: 6)
+                            Text(
+                                controller.isShellAutoWrapInstalled
+                                    ? "Auto-wrap active in ~/.zshrc"
+                                    : "Auto-wrap not in ~/.zshrc"
+                            )
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(theme.primaryText)
+                        }
+                        Text(
+                            controller.isShellAutoWrapInstalled
+                                ? "New terminal sessions auto-route claude, codex, agy, gemini, opencode…"
+                                : "Route all coding CLIs automatically in every terminal tab."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(theme.secondaryText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 6)
+                    Button {
+                        controller.copyToClipboard(#"eval "$(fiche shell-init --wrap)""#, label: "Copied ~/.zshrc snippet")
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(theme.secondaryText)
+                    .help("Copy shell-init line")
+
+                    if !controller.isShellAutoWrapInstalled {
+                        Button("Enable") {
+                            controller.installShellAutoWrap()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(theme.accent)
+                        .controlSize(.small)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+
+                if !installedCLIs.isEmpty {
+                    ForEach(installedCLIs) { agent in
+                        Hairline(inset: 14)
+                        cliAgentRow(agent: agent, isOnline: isOnline, theme: theme)
                     }
                 }
 
-                Text(Fmt.usd(stats.savedUsd))
-                    .font(.caption)
+                if !otherCLIs.isEmpty {
+                    Hairline(inset: 14)
+                    Button {
+                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                            showAllCLIs.toggle()
+                        }
+                    } label: {
+                        HStack {
+                            Text("Other supported CLIs (\(otherCLIs.count))")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(theme.secondaryText)
+                            Spacer()
+                            Image(systemName: showAllCLIs ? "chevron.up" : "chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(theme.tertiaryText)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if showAllCLIs {
+                        ForEach(otherCLIs) { agent in
+                            Hairline(inset: 14)
+                            cliAgentRow(agent: agent, isOnline: isOnline, theme: theme)
+                        }
+                    }
+                }
+            }
+
+            SectionHeader(title: "CLI Help & FAQ")
+
+            Band {
+                let faqs: [(id: String, q: String, a: String, copyCmd: String?)] = [
+                    (
+                        "route",
+                        "How do I route any CLI or custom agent?",
+                        "Run `fiche warp -- <command>` to route HTTPS + API traffic automatically, or pass `--route HOST=http://127.0.0.1:\(controller.daemonPort)`. For direct env routing set `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, or `GEMINI_API_BASE_URL`.",
+                        "fiche warp -- claude"
+                    ),
+                    (
+                        "restart",
+                        "Why isn't an already-running agent showing savings?",
+                        "Apps and shells started before Fiche was enabled keep their old environment and TLS store. Re-launch desktop apps via Agents → Open above, or open a new terminal after enabling Auto-Wrap.",
+                        nil
+                    ),
+                    (
+                        "bypass",
+                        "How do I temporarily bypass Fiche?",
+                        "Prefix any single command with `FICHE_BYPASS=1` or click Pause in the top bar for instant passthrough with zero transformation.",
+                        "FICHE_BYPASS=1 claude"
+                    ),
+                    (
+                        "touched",
+                        "What does Fiche change vs keep untouched?",
+                        "Older history and heavy tool outputs are compacted (optical pages for vision readers; 4-layer deterministic text hygiene for text-tier models). Latest messages, file-read edits, model output, and `@fiche pin` instructions stay verbatim.",
+                        nil
+                    ),
+                ]
+
+                ForEach(Array(faqs.enumerated()), id: \.element.id) { idx, item in
+                    if idx > 0 { Hairline(inset: 14) }
+                    let isOpen = expandedFAQ.contains(item.id)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Button {
+                            withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) {
+                                if isOpen {
+                                    expandedFAQ.remove(item.id)
+                                } else {
+                                    expandedFAQ.insert(item.id)
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Text(item.q)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(theme.primaryText)
+                                    .multilineTextAlignment(.leading)
+                                Spacer()
+                                Image(systemName: isOpen ? "chevron.up" : "chevron.down")
+                                    .font(.caption2)
+                                    .foregroundStyle(theme.tertiaryText)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if isOpen {
+                            Text(item.a)
+                                .font(.caption)
+                                .foregroundStyle(theme.secondaryText)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            if let copyCmd = item.copyCmd {
+                                HStack(spacing: 6) {
+                                    Text(copyCmd)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(theme.primaryText)
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 3)
+                                        .background(theme.controlRail, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                                    Button("Copy") {
+                                        controller.copyToClipboard(copyCmd, label: "Copied: \(copyCmd)")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.mini)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                }
+            }
+        }
+    }
+
+    private func cliAgentRow(agent: DiscoveredCLIAgent, isOnline: Bool, theme: Theme) -> some View {
+        let cmdSnippet = "fiche warp -- \(agent.command)"
+        return HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(agent.name)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(agent.installed ? theme.primaryText : theme.secondaryText)
+                        .lineLimit(1)
+                    if !agent.installed {
+                        Text("not in PATH")
+                            .font(.system(size: 8.5, weight: .medium))
+                            .foregroundStyle(theme.tertiaryText)
+                    }
+                }
+                Text("\(agent.command) · \(agent.provider)")
+                    .font(.caption.monospaced())
                     .foregroundStyle(theme.secondaryText)
-                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            Button {
+                controller.copyToClipboard(cmdSnippet, label: "Copied: \(cmdSnippet)")
+            } label: {
+                Image(systemName: "doc.on.doc")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(theme.secondaryText)
+            .help("Copy `\(cmdSnippet)`")
+
+            if agent.installed {
+                Button("Launch") {
+                    controller.launchCLIAgentInTerminal(agent.command)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!isOnline || controller.isBusy)
             }
         }
         .padding(.horizontal, 14)
@@ -1593,7 +2069,9 @@ struct PopoverView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
 
-                let installedApps = DaemonController.discoverInstalledDesktopApps()
+                let installedApps = controller.discoveredDesktopApps.isEmpty
+                    ? DaemonController.discoverInstalledDesktopApps()
+                    : controller.discoveredDesktopApps
                 if !installedApps.isEmpty {
                     Hairline(inset: 14)
 
@@ -2314,6 +2792,207 @@ private struct HeaderIconButton: View {
         .onHover { isHovered = $0 }
         .help(help)
         .accessibilityLabel(help)
+    }
+}
+
+private struct DailySavingsChartView: View {
+    let points: [DailySavingsPoint]
+    @Binding var metric: DailyChartMetric
+    let theme: Theme
+    @State private var hoveredDate: String? = nil
+
+    var body: some View {
+        let values: [Double] = points.map { max(0, metric == .usd ? $0.savedUsd : $0.savedTokens) }
+        let maxValue = max(metric == .usd ? 0.01 : 1.0, values.max() ?? 0)
+        let totalWtd = points.reduce(0.0) { $0 + $1.savedTokens }
+        let totalRaw = points.reduce(0.0) { $0 + $1.rawSavedTokens }
+        let totalUsd = points.reduce(0.0) { $0 + $1.savedUsd }
+        let hasAnyData = points.contains { $0.savedTokens > 0 || $0.savedUsd > 0 || $0.rawSavedTokens > 0 }
+        let hoveredPoint = hoveredDate.flatMap { d in points.first(where: { $0.date == d }) }
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                if let pt = hoveredPoint {
+                    Text("\(pt.shortDateLabel) · \(Fmt.tokens(pt.savedTokens)) wtd (\(Fmt.tokens(pt.rawSavedTokens)) raw) · \(Fmt.usd(pt.savedUsd))")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(theme.primaryText)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.80)
+                } else if hasAnyData {
+                    Text(
+                        totalRaw > 0
+                            ? "14d: \(Fmt.tokens(totalWtd)) wtd · \(Fmt.tokens(totalRaw)) raw · \(Fmt.usd(totalUsd))"
+                            : "14d: \(Fmt.tokens(totalWtd)) wtd · \(Fmt.usd(totalUsd))"
+                    )
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(theme.secondaryText)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                } else {
+                    Text("Awaiting compressible traffic")
+                        .font(.system(size: 10))
+                        .foregroundStyle(theme.secondaryText)
+                }
+
+                Spacer(minLength: 4)
+
+                HStack(spacing: 2) {
+                    ForEach(DailyChartMetric.allCases) { m in
+                        let active = metric == m
+                        Button {
+                            withAnimation(.spring(response: 0.22, dampingFraction: 0.8)) {
+                                metric = m
+                            }
+                        } label: {
+                            Text(m.rawValue)
+                                .font(.system(size: 9, weight: active ? .semibold : .medium))
+                                .foregroundStyle(active ? theme.primaryText : theme.secondaryText)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background {
+                                    if active {
+                                        RoundedRectangle(cornerRadius: max(2.5, theme.badgeRadius), style: .continuous)
+                                            .fill(theme.controlPill)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: max(2.5, theme.badgeRadius), style: .continuous)
+                                                    .strokeBorder(theme.hairline, lineWidth: 0.5)
+                                            )
+                                    }
+                                }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(1.5)
+                .background(
+                    theme.controlRail,
+                    in: RoundedRectangle(cornerRadius: max(3.5, theme.badgeRadius + 1), style: .continuous)
+                )
+            }
+
+            if points.isEmpty || !hasAnyData {
+                VStack(alignment: .leading, spacing: 4) {
+                    ZStack(alignment: .bottom) {
+                        Rectangle()
+                            .fill(theme.hairline)
+                            .frame(height: 1)
+                        HStack(spacing: 4) {
+                            ForEach(0..<14, id: \.self) { idx in
+                                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                    .fill(idx == 13 ? theme.live.opacity(0.35) : theme.hairline)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 3)
+                            }
+                        }
+                    }
+                    .frame(height: 22)
+
+                    Text("No compressed savings in the past 14 days yet.")
+                        .font(.caption)
+                        .foregroundStyle(theme.tertiaryText)
+                }
+            } else {
+                let plotH: CGFloat = 58
+                HStack(alignment: .bottom, spacing: 6) {
+                    ZStack(alignment: .bottom) {
+                        VStack(spacing: 0) {
+                            DashedHorizontalRule(color: theme.hairline)
+                            Spacer()
+                            DashedHorizontalRule(color: theme.hairline.opacity(0.75))
+                            Spacer()
+                            Rectangle().fill(theme.hairline).frame(height: 0.75)
+                        }
+                        .frame(height: plotH)
+
+                        HStack(alignment: .bottom, spacing: 3) {
+                            ForEach(Array(points.enumerated()), id: \.element.id) { idx, pt in
+                                let v = values[idx]
+                                let barH: CGFloat = v > 0
+                                    ? max(3, CGFloat(v / maxValue) * (plotH - 2))
+                                    : 2
+                                let barCorner: CGFloat = theme.layout == .instrumentation ? 1 : 2.5
+                                let isHovered = hoveredDate == pt.date
+                                let barShape = RoundedRectangle(cornerRadius: barCorner, style: .continuous)
+
+                                VStack(spacing: 0) {
+                                    Spacer(minLength: 0)
+                                    if pt.isToday {
+                                        barShape
+                                            .fill(v > 0 ? theme.live.opacity(0.55) : theme.hairline)
+                                            .overlay(
+                                                barShape.strokeBorder(
+                                                    v > 0 ? theme.live : theme.secondaryText.opacity(0.45),
+                                                    style: StrokeStyle(lineWidth: 1, dash: [2.5, 2])
+                                                )
+                                            )
+                                            .frame(height: barH)
+                                    } else {
+                                        barShape
+                                            .fill(v > 0 ? (isHovered ? theme.accent : theme.live) : theme.hairline)
+                                            .frame(height: barH)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity)
+                                .frame(height: plotH)
+                                .contentShape(Rectangle())
+                                .onHover { entering in
+                                    if entering {
+                                        hoveredDate = pt.date
+                                    } else if hoveredDate == pt.date {
+                                        hoveredDate = nil
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .trailing) {
+                        Text(metric == .usd ? Fmt.usd(maxValue) : Fmt.tokens(maxValue))
+                        Spacer()
+                        Text(metric == .usd ? Fmt.usd(maxValue * 0.5) : Fmt.tokens(maxValue * 0.5))
+                        Spacer()
+                        Text(metric == .usd ? "$0" : "0")
+                    }
+                    .font(.system(size: 8.5, design: .monospaced))
+                    .foregroundStyle(theme.tertiaryText)
+                    .monospacedDigit()
+                    .frame(width: 34, height: plotH, alignment: .trailing)
+                }
+
+                HStack {
+                    Text(points.first?.shortDateLabel ?? "")
+                    Spacer()
+                    HStack(spacing: 4) {
+                        RoundedRectangle(cornerRadius: 1, style: .continuous)
+                            .strokeBorder(theme.live, style: StrokeStyle(lineWidth: 1, dash: [2, 1.5]))
+                            .background(theme.live.opacity(0.45))
+                            .frame(width: 7, height: 7)
+                        Text("Today (live)")
+                    }
+                }
+                .font(.system(size: 9))
+                .foregroundStyle(theme.tertiaryText)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 9)
+    }
+}
+
+private struct DashedHorizontalRule: View {
+    let color: Color
+
+    var body: some View {
+        GeometryReader { geo in
+            Path { path in
+                path.move(to: .zero)
+                path.addLine(to: CGPoint(x: geo.size.width, y: 0))
+            }
+            .stroke(color, style: StrokeStyle(lineWidth: 0.6, dash: [3, 3]))
+        }
+        .frame(height: 1)
     }
 }
 

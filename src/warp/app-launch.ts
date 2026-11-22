@@ -89,14 +89,23 @@ export function buildWarpAppArgs(
   app: ResolvedMacApp,
   proxyUrl: string,
   extraArgs: readonly string[] = [],
+  opts?: { spkiPins?: readonly string[]; proxyBypassList?: string },
 ): string[] {
   if (app.isElectron) {
-    return [app.executablePath, `--proxy-server=${proxyUrl}`, ...extraArgs];
+    const args = [app.executablePath, `--proxy-server=${proxyUrl}`];
+    if (opts?.proxyBypassList) {
+      args.push(`--proxy-bypass-list=${opts.proxyBypassList}`);
+    }
+    if (opts?.spkiPins && opts.spkiPins.length > 0) {
+      args.push(`--ignore-certificate-errors-spki-list=${opts.spkiPins.join(',')}`);
+    }
+    args.push(...extraArgs);
+    return args;
   }
   return [app.executablePath, ...extraArgs];
 }
 
-const CLI_WRAPPERS = ['claude', 'codex', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi'] as const;
+const CLI_WRAPPERS = ['claude', 'codex', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi', 'aider'] as const;
 
 /** Render POSIX zsh/bash shell helpers (or transparent wrappers when `--wrap` is set). */
 export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string } = {}): string {
@@ -105,7 +114,7 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
   const lines: string[] = [
     '# Added by `fiche shell-init` — route coding agent CLIs & macOS apps via local Fiche proxy.',
     `export FICHE_BIN=${safeBin}`,
-    'fiche-app() { "$FICHE_BIN" warp --app "$@"; }',
+    'fiche-app() { if [ "$#" -eq 0 ]; then "$FICHE_BIN" warp --app; else local app="$1"; shift; "$FICHE_BIN" warp --app "$app" -- "$@"; fi; }',
     'fclaude() { "$FICHE_BIN" warp -- claude "$@"; }',
     'fcodex() { "$FICHE_BIN" warp -- codex "$@"; }',
     'fagy() { "$FICHE_BIN" warp -- agy "$@"; }',
@@ -114,6 +123,7 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
     'fcursor() { "$FICHE_BIN" warp -- cursor-agent "$@"; }',
     'famp() { "$FICHE_BIN" warp -- amp "$@"; }',
     'fpi() { "$FICHE_BIN" warp -- pi "$@"; }',
+    'faider() { "$FICHE_BIN" warp -- aider "$@"; }',
   ];
 
   if (opts.wrap) {
