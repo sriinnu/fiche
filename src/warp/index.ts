@@ -26,7 +26,13 @@ import { createWarpHandlers } from './connect.js';
 import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
 import { readBrandEnv } from '../core/env.js';
-import { buildUpstreamRegistry, parseUpstreamHosts } from '../core/upstream-hosts.js';
+import {
+  buildUpstreamRegistry,
+  DEFAULT_UPSTREAM_REGISTRY,
+  getEnabledProviders,
+  parseUpstreamHosts,
+  type ProviderId,
+} from '../core/upstream-hosts.js';
 
 export interface WarpRuntimeOptions {
   /** Port the inkling proxy is already serving on: where matches are sent. */
@@ -37,6 +43,10 @@ export interface WarpRuntimeOptions {
    * than api.anthropic.com (codex, opencode) need one rule each.
    */
   routes?: readonly string[];
+  /** Explicit provider filter for this warp session; defaults to getEnabledProviders(). */
+  providers?: readonly ProviderId[];
+  /** Print every expanded warp route pattern on startup instead of the grouped summary. */
+  verbose?: boolean;
   /** Optional resolved macOS desktop `.app` bundle launched via `fiche warp --app`. */
   app?: ResolvedMacApp;
 }
@@ -47,42 +57,58 @@ export interface WarpRuntime {
 }
 
 /**
- * Only the inference path is diverted. Everything else on the host — OAuth,
- * telemetry, the control plane — is re-originated untouched, which is what
- * keeps the agent's client-side gates satisfied.
+ * Only the inference path is diverted for enabled providers. Everything else on
+ * the host — OAuth, telemetry, the control plane — is re-originated untouched,
+ * which is what keeps the agent's client-side gates satisfied.
  */
-export function defaultRoutes(port: number): Route[] {
-  return [
-    parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`),
-    parseRoute(`api.openai.com/v1/responses*=http://127.0.0.1:${port}`),
-    parseRoute(`api.openai.com/v1/chat/completions*=http://127.0.0.1:${port}`),
-    parseRoute(`chatgpt.com/backend-api/codex/responses*=http://127.0.0.1:${port}`),
-    parseRoute(`cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
-    parseRoute(`generativelanguage.googleapis.com/v1beta/openai/chat/completions*=http://127.0.0.1:${port}`),
-    ...compatRoutes(port),
-  ];
+export function defaultRoutes(
+  port: number,
+  enabledProviders: readonly ProviderId[] = getEnabledProviders(),
+): Route[] {
+  const enabled = new Set<string>(enabledProviders);
+  const out: Route[] = [];
+  if (enabled.has('anthropic')) {
+    out.push(parseRoute(`api.anthropic.com/v1/messages*=http://127.0.0.1:${port}`));
+  }
+  if (enabled.has('openai')) {
+    out.push(
+      parseRoute(`api.openai.com/v1/responses*=http://127.0.0.1:${port}`),
+      parseRoute(`api.openai.com/v1/chat/completions*=http://127.0.0.1:${port}`),
+      parseRoute(`chatgpt.com/backend-api/codex/responses*=http://127.0.0.1:${port}`),
+    );
+  }
+  if (enabled.has('google')) {
+    out.push(
+      parseRoute(`cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`daily-cloudcode-pa.googleapis.com/v1internal:generateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`generativelanguage.googleapis.com/v1beta/models/*:generateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`generativelanguage.googleapis.com/v1/models/*:streamGenerateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`generativelanguage.googleapis.com/v1/models/*:generateContent*=http://127.0.0.1:${port}`),
+      parseRoute(`generativelanguage.googleapis.com/v1beta/openai/chat/completions*=http://127.0.0.1:${port}`),
+    );
+  }
+  out.push(...compatRoutes(port, enabledProviders));
+  return out;
 }
 
 /** Inference endpoints, relative to a provider's API prefix. */
 const COMPAT_INFERENCE_PATHS = ['/v1/messages', '/messages', '/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses'];
 
 /**
- * Third-party providers from the same registry inkling follows, so warp diverts
- * exactly the hosts inkling will forward back to their owner (and refuses the
- * rest). Only inference paths under each registered API prefix are diverted.
+ * Third-party providers from the same registry fiche follows, so warp diverts
+ * only opted-in built-in providers (or all when `enabledProviders` is omitted
+ * for direct callers) plus explicit `FICHE_UPSTREAM_HOSTS` custom entries.
  */
-export function compatRoutes(port: number): Route[] {
+export function compatRoutes(port: number, enabledProviders?: readonly ProviderId[]): Route[] {
   const registry = buildUpstreamRegistry(parseUpstreamHosts(readBrandEnv('UPSTREAM_HOSTS')));
+  const enabled = enabledProviders === undefined ? null : new Set<string>(enabledProviders);
   const specs = new Set<string>();
   for (const entry of registry.values()) {
     if (entry.family !== 'compat') continue;
+    if (enabled !== null && entry.provider !== undefined && !enabled.has(entry.provider)) continue;
     for (const prefix of entry.prefixes) {
       for (const tail of COMPAT_INFERENCE_PATHS) specs.add(`${entry.host}${prefix}${tail}*`);
     }
@@ -92,11 +118,13 @@ export function compatRoutes(port: number): Route[] {
 
 export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
   const { port } = options;
+  const activeProviders = options.providers ?? getEnabledProviders();
+  const explicitRoutes = (options.routes ?? []).map((spec) => parseRoute(spec));
   // Explicit rules first: an operator route for a specific host:port must win
   // over anything built in.
   const routes = [
-    ...(options.routes ?? []).map((spec) => parseRoute(spec)),
-    ...defaultRoutes(port),
+    ...explicitRoutes,
+    ...defaultRoutes(port, activeProviders),
   ];
   const caDir = join(homedir(), '.fiche');
   const legacyCaDir = join(homedir(), '.inkling');
@@ -310,8 +338,27 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     }
     // Startup banner goes to stderr: stdout belongs to the child, so a caller
     // piping the agent's output gets the agent's bytes and nothing of ours.
-    for (const route of routes) {
-      console.error(`[fiche] warp route → ${route.pattern} → ${routeDestination(route)}`);
+    const verboseBanner = Boolean(options.verbose)
+      || /^(?:1|true|yes|on)$/i.test((readBrandEnv('WARP_VERBOSE') ?? '').trim());
+    if (verboseBanner) {
+      for (const route of routes) {
+        console.error(`[fiche] warp route → ${route.pattern} → ${routeDestination(route)}`);
+      }
+    } else {
+      const counts = new Map<string, number>();
+      let customCount = explicitRoutes.length;
+      for (const route of routes.slice(explicitRoutes.length)) {
+        const routeHost = route.pattern.split('/', 1)[0]!.split(':', 1)[0]!.toLowerCase();
+        const provider = DEFAULT_UPSTREAM_REGISTRY.get(routeHost)?.provider;
+        if (provider) counts.set(provider, (counts.get(provider) ?? 0) + 1);
+        else customCount += 1;
+      }
+      const parts = activeProviders
+        .filter((id) => (counts.get(id) ?? 0) > 0)
+        .map((id) => `${id} (${counts.get(id)})`);
+      if (customCount > 0) parts.push(`custom (${customCount})`);
+      const summary = parts.length > 0 ? parts.join(', ') : 'none (direct passthrough)';
+      console.error(`[fiche] warp providers → ${summary} → http://127.0.0.1:${port}`);
     }
     console.error(`[fiche] warp CA → ${ca.certPath}`);
     if (ca.systemRootsPath) {

@@ -104,6 +104,7 @@ final class DaemonController: ObservableObject {
     @Published private(set) var lastTurn: LastTurnResponse?
     @Published private(set) var allowedModels: [String] = []
     @Published private(set) var modelCatalog: [ModelCatalogItem] = ModelCatalogItem.curatedDefaults
+    @Published private(set) var providers: [ProviderDescriptor] = ProviderDescriptor.fallbackDefaults
     @Published private(set) var plugins: [PluginDescriptor] = []
     @Published private(set) var pluginsDir: String?
     @Published private(set) var isLoginAgentInstalled: Bool = false
@@ -174,6 +175,7 @@ final class DaemonController: ObservableObject {
         self.phase = .live
         self.isLoginAgentInstalled = true
         self.allowedModels = ["gemini-4-argon-high", "claude-fable-5", "gpt-6.2-astra", "claude-opus-5-5", "deepseek", "kimi", "glm", "grok"]
+        self.providers = ProviderDescriptor.fallbackDefaults
 
         let decoder = JSONDecoder()
         let healthJSON = """
@@ -496,9 +498,16 @@ final class DaemonController: ObservableObject {
         async let statsFetch: HTTPResult<ProxyStatsResponse> = getJSON(path: "/proxy-stats")
         async let turnFetch: HTTPResult<LastTurnResponse> = getJSON(path: "/api/last-turn.json")
         async let modelsFetch: HTTPResult<ModelsResponse> = getJSON(path: "/api/models")
+        async let providersFetch: HTTPResult<ProvidersResponse> = getJSON(path: "/api/providers")
         async let pluginsFetch: HTTPResult<PluginsResponse> = getJSON(path: "/api/plugins")
 
-        let (statsRes, turnRes, modelsRes, pluginsRes) = await (statsFetch, turnFetch, modelsFetch, pluginsFetch)
+        let (statsRes, turnRes, modelsRes, providersRes, pluginsRes) = await (
+            statsFetch,
+            turnFetch,
+            modelsFetch,
+            providersFetch,
+            pluginsFetch
+        )
         guard gen == pollGeneration, targetPort == daemonPort else { return false }
 
         var anyReachable = health != nil
@@ -530,6 +539,17 @@ final class DaemonController: ObservableObject {
             allowedModels = m.allowedModels
             if !m.catalog.isEmpty {
                 modelCatalog = m.catalog
+            }
+        }
+
+        if case .ok(let p) = providersRes, !p.providers.isEmpty {
+            providers = p.providers
+        } else if let enabledIDs = health?.enabledProviders {
+            let enabledSet = Set(enabledIDs)
+            providers = providers.map { item in
+                var copy = item
+                copy.enabled = enabledSet.contains(item.id)
+                return copy
             }
         }
 
@@ -710,6 +730,75 @@ final class DaemonController: ObservableObject {
         case .unreachable(let reason):
             lastError = "Daemon unreachable: \(reason)"
             phase = .stopped
+        }
+    }
+
+    func toggleProvider(id: String, on: Bool) {
+        guard !isPreview else {
+            providers = providers.map { item in
+                guard item.id == id else { return item }
+                var copy = item
+                copy.enabled = on
+                return copy
+            }
+            return
+        }
+        Task { [weak self] in
+            await self?.setProvider(id: id, on: on)
+        }
+    }
+
+    private func setProvider(id: String, on: Bool) async {
+        pollGeneration &+= 1
+        struct ProviderToggleBody: Encodable {
+            let provider: String
+            let on: Bool
+        }
+        providers = providers.map { item in
+            guard item.id == id else { return item }
+            var copy = item
+            copy.enabled = on
+            return copy
+        }
+        let res: HTTPResult<ProvidersResponse> = await postJSON(
+            path: "/api/providers",
+            body: ProviderToggleBody(provider: id, on: on)
+        )
+        switch res {
+        case .ok(let payload):
+            if !payload.providers.isEmpty {
+                providers = payload.providers
+            }
+            lastError = nil
+            await pollOnce()
+        case .httpError(let status, let msg):
+            lastError = "Provider update failed (\(status)): \(msg)"
+            await pollOnce()
+        case .unreachable(let reason):
+            lastError = "Daemon unreachable: \(reason)"
+        }
+    }
+
+    func setProviders(_ ids: [String]) async {
+        guard !isPreview else { return }
+        pollGeneration &+= 1
+        struct ProvidersListBody: Encodable { let providers: [String] }
+        let res: HTTPResult<ProvidersResponse> = await postJSON(
+            path: "/api/providers",
+            body: ProvidersListBody(providers: ids)
+        )
+        switch res {
+        case .ok(let payload):
+            if !payload.providers.isEmpty {
+                providers = payload.providers
+            }
+            lastError = nil
+            await pollOnce()
+        case .httpError(let status, let msg):
+            lastError = "Provider scope update failed (\(status)): \(msg)"
+            await pollOnce()
+        case .unreachable(let reason):
+            lastError = "Daemon unreachable: \(reason)"
         }
     }
 

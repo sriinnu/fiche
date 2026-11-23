@@ -89,6 +89,14 @@ import {
   setAllowedModelBases,
 } from './core/applicability.js';
 import {
+  getEnabledProviders,
+  listProviderStatuses,
+  normalizeProviderId,
+  parseProvidersSpec,
+  setEnabledProviders,
+  type ProviderId,
+} from './core/upstream-hosts.js';
+import {
   isThirdPartyPlugin,
   mergeStagePlugins,
   type PluginOverrides,
@@ -636,6 +644,7 @@ export interface DashboardHooks {
   readonly setThirdPartyPluginsEnabled?: (
     enabled: boolean,
   ) => { updatedCount: number; enabled: boolean; plugins: StagePluginDescriptor[] };
+  readonly onProvidersPersist?: (providers: readonly ProviderId[]) => void;
   readonly onShutdown?: () => void;
 }
 
@@ -2089,6 +2098,7 @@ export class DashboardState {
       uptime_sec: uptimeSec,
       compression_enabled: this.compressionEnabled,
       allowed_models: getAllowedModelBases(),
+      enabled_providers: getEnabledProviders(),
       by_model: (() => {
         const byModel: Record<string, ModelStatsPayload> = {};
         for (const [model, t] of this.totalsByModel) {
@@ -2229,6 +2239,7 @@ export class DashboardState {
             getAllowedModelBases(),
             getConfiguredModelBases(),
             this.compressionEnabled,
+            listProviderStatuses(),
           ),
         );
       case 'plugins': {
@@ -2361,6 +2372,7 @@ export class DashboardState {
       compression_enabled: this.compressionEnabled,
       price_mode: priceMode(),
       allowed_models: getAllowedModelBases(),
+      enabled_providers: getEnabledProviders(),
       events_file: this.paths?.eventsFile ?? null,
     });
   }
@@ -2406,6 +2418,45 @@ export class DashboardState {
     }
     return jsonResponse(
       { error: 'body must specify { model: string, on: boolean } or { models: string[] }' },
+      400,
+    );
+  }
+
+  /** GET /api/providers — catalog with enabled flags and active provider IDs. */
+  serveProviders(): Response {
+    return jsonResponse({
+      providers: listProviderStatuses(),
+      enabled: getEnabledProviders(),
+    });
+  }
+
+  /** POST /api/providers — toggle one provider (`{ provider, on }`) or set the list (`{ providers: string[] }`). */
+  handleProvidersApiPost(body: unknown): Response {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return jsonResponse({ error: 'request body must be a JSON object' }, 400);
+    }
+    const obj = body as Record<string, unknown>;
+    if ('providers' in obj) {
+      if (!Array.isArray(obj.providers) || !obj.providers.every((p) => typeof p === 'string')) {
+        return jsonResponse({ error: 'providers must be an array of strings' }, 400);
+      }
+      const parsed = parseProvidersSpec(obj.providers as string[]);
+      if (parsed.unknown.length > 0 || parsed.providers === null) {
+        return jsonResponse({ error: `unknown provider(s): ${parsed.unknown.join(', ')}` }, 400);
+      }
+      this.applyEnabledProviders(parsed.providers);
+      return this.serveProviders();
+    }
+    if (typeof obj.provider === 'string' && obj.provider.trim().length > 0 && typeof obj.on === 'boolean') {
+      const id = normalizeProviderId(obj.provider);
+      if (!id) {
+        return jsonResponse({ error: `unknown provider: ${obj.provider.trim()}` }, 400);
+      }
+      this.handleProvidersToggle(id, obj.on);
+      return this.serveProviders();
+    }
+    return jsonResponse(
+      { error: 'body must specify { provider: string, on: boolean } or { providers: string[] }' },
       400,
     );
   }
@@ -2502,6 +2553,23 @@ export class DashboardState {
     }
   }
 
+  /** Toggle one provider in runtime scope and persist when configured. */
+  handleProvidersToggle(provider: ProviderId, on: boolean): void {
+    const next = new Set(getEnabledProviders());
+    if (on) next.add(provider);
+    else next.delete(provider);
+    this.applyEnabledProviders([...next]);
+  }
+
+  private applyEnabledProviders(providers: ProviderId[]): void {
+    setEnabledProviders(providers);
+    try {
+      this.hooks.onProvidersPersist?.(providers);
+    } catch {
+      // Persistence is best-effort; the live flip already took effect.
+    }
+  }
+
   /** GET /favicon.svg, /favicon.ico, /apple-touch-icon*.png */
   serveFavicon(sub: 'svg' | 'empty', headOnly = false): Response {
     return serveFavicon(sub, headOnly);
@@ -2562,6 +2630,7 @@ export type DashboardRoute =
   | { kind: 'api-health' } // /api/health
   | { kind: 'api-compression' } // /api/compression (GET/POST {enabled}) — runtime kill switch
   | { kind: 'api-models' } // /api/models (GET/POST) — runtime model scope control
+  | { kind: 'api-providers' } // /api/providers (GET/POST) — opt-in provider scope control
   | { kind: 'api-plugins' } // /api/plugins (GET/POST) — pipeline stages & skills registry
   | { kind: 'api-shutdown' } // /api/shutdown (POST) — graceful daemon shutdown
   | { kind: 'api-image-source' } // /api/image-source[?id=N] — source text behind a rendered PNG
@@ -2584,6 +2653,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/api/health') return { kind: 'api-health' };
   if (pathname === '/api/compression') return { kind: 'api-compression' };
   if (pathname === '/api/models') return { kind: 'api-models' };
+  if (pathname === '/api/providers') return { kind: 'api-providers' };
   if (pathname === '/api/plugins') return { kind: 'api-plugins' };
   if (pathname === '/api/shutdown') return { kind: 'api-shutdown' };
   if (pathname === '/api/image-source') return { kind: 'api-image-source' };
@@ -2597,6 +2667,7 @@ export function isDashboardMutation(route: DashboardRoute, method: string): bool
   return method === 'POST' && (
     route.kind === 'api-compression'
     || route.kind === 'api-models'
+    || route.kind === 'api-providers'
     || route.kind === 'api-plugins'
     || route.kind === 'api-shutdown'
     || (route.kind === 'fragment' && (route.name === 'toggle' || route.name === 'models' || route.name === 'plugins'))
@@ -2700,6 +2771,13 @@ export async function dispatchDashboard(
       if (!parsed.ok) return parsed.response;
       return dashboard.handleModelsApiPost(parsed.value);
     }
+    case 'api-providers': {
+      if (method === 'GET') return dashboard.serveProviders();
+      if (method !== 'POST') return methodNotAllowed('GET, POST');
+      const parsed = await parseJsonRequestBody(readBody);
+      if (!parsed.ok) return parsed.response;
+      return dashboard.handleProvidersApiPost(parsed.value);
+    }
     case 'api-plugins': {
       if (method === 'GET') return dashboard.servePlugins();
       if (method !== 'POST') return methodNotAllowed('GET, POST');
@@ -2728,25 +2806,32 @@ export async function dispatchDashboard(
       }
       if (route.name === 'models' && method === 'POST') {
         let model = '';
+        let provider = '';
         let on = false;
         let list: string | null = null;
         try {
           const raw = await readBody();
           try {
-            const j = JSON.parse(raw) as { model?: unknown; on?: unknown; list?: unknown };
+            const j = JSON.parse(raw) as { model?: unknown; provider?: unknown; on?: unknown; list?: unknown };
             model = typeof j.model === 'string' ? j.model : '';
+            provider = typeof j.provider === 'string' ? j.provider : '';
             on = j.on === true;
             if (typeof j.list === 'string') list = j.list;
           } catch {
             const p = new URLSearchParams(raw);
             model = p.get('model') ?? '';
+            provider = p.get('provider') ?? '';
             on = p.get('on') === 'true';
             list = p.get('list');
           }
         } catch {
           return new Response('bad request body', { status: 400 });
         }
-        if (list !== null) dashboard.handleModelsSet(list);
+        if (provider) {
+          const id = normalizeProviderId(provider);
+          if (!id) return new Response('unknown provider', { status: 400 });
+          dashboard.handleProvidersToggle(id, on);
+        } else if (list !== null) dashboard.handleModelsSet(list);
         else if (model) dashboard.handleModelsToggle(model, on);
         return dashboard.serveFragment('models', url, port);
       }

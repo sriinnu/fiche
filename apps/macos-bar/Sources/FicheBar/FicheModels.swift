@@ -112,6 +112,7 @@ struct HealthResponse: Decodable, Sendable, Equatable {
     let compressionEnabled: Bool?
     let priceMode: String?
     let allowedModels: [String]?
+    let enabledProviders: [String]?
     let eventsFile: String?
 
     init(from decoder: Decoder) throws {
@@ -126,6 +127,7 @@ struct HealthResponse: Decodable, Sendable, Equatable {
         self.compressionEnabled = c.firstBool("compression_enabled", "compressionEnabled")
         self.priceMode = c.firstString("price_mode", "priceMode")
         self.allowedModels = c.firstStringArray("allowed_models", "allowedModels")
+        self.enabledProviders = c.firstStringArray("enabled_providers", "enabledProviders")
         self.eventsFile = c.firstString("events_file", "eventsFile")
     }
 }
@@ -526,6 +528,41 @@ struct ModelsResponse: Decodable, Sendable {
             ?? (try? c.decodeIfPresent([ModelCatalogItem].self, forKey: DynamicCodingKey("available")))
             ?? []
         self.compressionEnabled = c.firstBool("compression_enabled", "compressionEnabled")
+    }
+}
+
+// MARK: - GET / POST /api/providers
+
+struct ProviderDescriptor: Identifiable, Codable, Sendable, Equatable {
+    let id: String
+    let label: String
+    let tier: String
+    let hosts: [String]
+    var enabled: Bool
+
+    var isFirstParty: Bool {
+        tier == "first-party"
+    }
+
+    var hostsSubtitle: String {
+        hosts.joined(separator: ", ")
+    }
+
+    static let fallbackDefaults: [ProviderDescriptor] = [
+        ProviderDescriptor(id: "anthropic", label: "Anthropic / Claude", tier: "first-party", hosts: ["api.anthropic.com"], enabled: true),
+        ProviderDescriptor(id: "openai", label: "OpenAI / Codex", tier: "first-party", hosts: ["api.openai.com", "chatgpt.com"], enabled: true),
+        ProviderDescriptor(id: "google", label: "Google / Gemini", tier: "first-party", hosts: ["generativelanguage.googleapis.com", "cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"], enabled: true),
+    ]
+}
+
+struct ProvidersResponse: Decodable, Sendable {
+    let providers: [ProviderDescriptor]
+    let enabled: [String]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.providers = (try? c.decodeIfPresent([ProviderDescriptor].self, forKey: DynamicCodingKey("providers"))) ?? []
+        self.enabled = c.firstStringArray("enabled") ?? self.providers.filter(\.enabled).map(\.id)
     }
 }
 

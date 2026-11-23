@@ -23,8 +23,21 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
 import { readBrandEnv } from './core/env.js';
+import { getAllowedModelBases, setAllowedModelBases } from './core/applicability.js';
 import { guardProxyRequest, parseAllowedHosts } from './core/request-guard.js';
-import { buildUpstreamRegistry, parseUpstreamHosts } from './core/upstream-hosts.js';
+import {
+  buildUpstreamRegistry,
+  detectProvidersFromEnv,
+  getEnabledProviders,
+  listProviderStatuses,
+  normalizeProviderId,
+  parseProvidersSpec,
+  parseUpstreamHosts,
+  PROVIDER_CATALOG,
+  setEnabledProviders,
+  type ProviderId,
+} from './core/upstream-hosts.js';
+import { isRunnable } from './warp/resolve.js';
 import {
   isThirdPartyPlugin,
   mergeStagePlugins,
@@ -150,60 +163,73 @@ function fileSessionStateStore(file: string): SessionStateStore {
   };
 }
 
-function normalizeModelsConfig(value: unknown): string | undefined {
+function normalizeCsvConfig(value: unknown, emptyToken: 'off' | 'none' = 'off'): string | undefined {
   if (Array.isArray(value)) {
-    const models = value.map((v) => String(v).trim()).filter(Boolean);
-    return models.length > 0 ? models.join(',') : 'off';
+    const items = value.map((v) => String(v).trim()).filter(Boolean);
+    return items.length > 0 ? items.join(',') : emptyToken;
   }
-  if (typeof value === 'string') return value.trim() || 'off';
+  if (typeof value === 'string') return value.trim() || emptyToken;
   return undefined;
 }
 
-function applyConfigFileDefaults(): void {
+function readConfigObject(): { file: string; cfg: Record<string, unknown> } | null {
   const explicit = readBrandEnv('CONFIG');
   const file = explicit ?? (fs.existsSync(DEFAULT_CONFIG_FILE) || !fs.existsSync(LEGACY_CONFIG_FILE) ? DEFAULT_CONFIG_FILE : LEGACY_CONFIG_FILE);
-  if (!fs.existsSync(file)) return;
+  if (!fs.existsSync(file)) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
   } catch (e) {
     console.warn(`[fiche] ignored invalid config ${file}: ${(e as Error).message}`);
-    return;
+    return null;
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
-  const cfg = parsed as Record<string, unknown>;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  return { file, cfg: parsed as Record<string, unknown> };
+}
+
+function applyConfigFileDefaults(): void {
+  const loaded = readConfigObject();
+  if (!loaded) return;
+  const { cfg } = loaded;
 
   // Env wins over file config. The dashboard can still override the scope at
   // runtime (in-memory) for an emergency live flip.
   if (readBrandEnv('MODELS') === undefined) {
-    const models = normalizeModelsConfig(cfg.models);
+    const models = normalizeCsvConfig(cfg.models, 'off');
     if (models !== undefined) process.env.FICHE_MODELS = models;
+  }
+  if (readBrandEnv('PROVIDERS') === undefined) {
+    const providers = normalizeCsvConfig(cfg.providers, 'none');
+    if (providers !== undefined) process.env.FICHE_PROVIDERS = providers;
+  }
+  if (readBrandEnv('UPSTREAM_HOSTS') === undefined && cfg.custom_hosts !== undefined) {
+    const hosts = Array.isArray(cfg.custom_hosts)
+      ? cfg.custom_hosts.map((v) => String(v).trim()).filter(Boolean).join(',')
+      : typeof cfg.custom_hosts === 'string'
+        ? cfg.custom_hosts.trim()
+        : undefined;
+    if (hosts) process.env.FICHE_UPSTREAM_HOSTS = hosts;
   }
 }
 
-/** Dashboard persistence hook: write the runtime model scope back to the
- *  config file's `models` key so chip toggles survive a restart. Other keys
- *  are preserved; an invalid existing file is left untouched.
- *  NOTE: on the next start an explicit FICHE_MODELS / INKLING_MODELS env still
- *  wins over the persisted value. */
-function persistModelBasesToConfig(bases: readonly string[]): void {
+/** Atomically merge keys into ~/.config/fiche/config.json (preserving unrelated keys). */
+function persistConfigPatch(patch: Record<string, unknown>): boolean {
   const file = readBrandEnv('CONFIG') ?? DEFAULT_CONFIG_FILE;
   let cfg: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      console.warn(`[fiche] could not persist model scope: invalid config object ${file}`);
-      return;
+      console.warn(`[fiche] could not persist config: invalid config object ${file}`);
+      return false;
     }
     cfg = parsed as Record<string, unknown>;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.warn(`[fiche] could not persist model scope: invalid config ${file}: ${(e as Error).message}`);
-      return;
+      console.warn(`[fiche] could not persist config ${file}: ${(e as Error).message}`);
+      return false;
     }
   }
-  // Empty array round-trips as 'off' via normalizeModelsConfig on load.
-  cfg.models = [...bases];
+  Object.assign(cfg, patch);
   const tmp = `${file}.tmp-${process.pid}`;
   try {
     const parentExists = fs.existsSync(path.dirname(file));
@@ -213,14 +239,28 @@ function persistModelBasesToConfig(bases: readonly string[]): void {
     fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
     fs.renameSync(tmp, file);
     fs.chmodSync(file, 0o600);
+    return true;
   } catch (e) {
     try {
       fs.unlinkSync(tmp);
     } catch {
       // The write may have failed before the temporary file was created.
     }
-    console.warn(`[fiche] could not persist model scope to ${file}: ${(e as Error).message}`);
+    console.warn(`[fiche] could not persist config to ${file}: ${(e as Error).message}`);
+    return false;
   }
+}
+
+function persistModelBasesToConfig(bases: readonly string[]): void {
+  persistConfigPatch({ models: [...bases] });
+}
+
+function persistProvidersToConfig(providers: readonly ProviderId[]): void {
+  persistConfigPatch({ providers: [...providers] });
+}
+
+function persistCustomHostsToConfig(hosts: readonly string[]): void {
+  persistConfigPatch({ custom_hosts: [...hosts] });
 }
 
 // ---- Stage plugins & skills discovery + persistence ------------------------
@@ -475,13 +515,16 @@ function printHelp(): void {
 
 Usage:
   fiche                  run the proxy (no flags)
+  fiche providers [...]  list/enable/disable/detect opted-in AI providers
+                         (list | set | enable | disable | detect [--apply] | add-host | remove-host)
+  fiche models [...]     list/enable/disable models eligible for compression
   fiche export [...]     render files/diff to PNG pages + cost report (see fiche export --help)
   fiche mcp [--http P]   MCP server for every agent (stdio, or Streamable HTTP)
-  fiche warp [--app <Name|Path>] [--route PATTERN=TARGET]... -- CMD
+  fiche warp [--app <Name|Path>] [--providers <csv|all|none>] [--all-providers] [--verbose] [--route PATTERN=TARGET]... -- CMD
                         run a CLI or macOS desktop app (Cursor, Antigravity,
-                        OpenCode, Claude, Runic...) behind the proxy without a
+                        Claude, ChatGPT/Codex...) behind the proxy without a
                         custom base URL, so client-side first-party gates keep
-                        working.
+                        working. Only opted-in providers are intercepted.
   fiche shell-init [--wrap]
                         print zsh/bash helper functions (fclaude, fcodex, fagy,
                         fcursor, fiche-app) or transparent wrappers (--wrap).
@@ -519,7 +562,11 @@ Environment (legacy INKLING_* aliases are also accepted):
                           host (warp Host, or base URL .../to/<host>/). On by
                           default; only registered hosts, https:443, the
                           agent's own credential.
-  FICHE_UPSTREAM_HOSTS    extra provider hosts to follow (comma list of
+  FICHE_PROVIDERS         comma-separated built-in providers to intercept & follow
+                          (default anthropic,openai,google; or 'all' / 'none').
+                          Opt in to third-party hosts with \`fiche providers enable <id>\`.
+  FICHE_WARP_VERBOSE      1 to print every expanded warp route line on startup
+  FICHE_UPSTREAM_HOSTS    extra custom provider hosts to follow (comma list of
                           host[/api-prefix], e.g. llm.example.com/anthropic)
   FICHE_UPSTREAM          upstream API base for every API family
   ANTHROPIC_UPSTREAM      Anthropic API base; overrides FICHE_UPSTREAM
@@ -546,7 +593,7 @@ Environment (legacy INKLING_* aliases are also accepted):
   FICHE_FORCE_IMAGES      1 images weak readers too (Claude 5.5, Grok). Does not
                           re-enable prompt_cache_breakpoint on ChatGPT Codex.
   FICHE_CONFIG            JSON config path (default ~/.config/fiche/config.json)
-                          supports {"models": [...]} or {"models": "off"}
+                          supports {"providers": [...], "models": [...], "custom_hosts": [...]}
   FICHE_LOG               JSONL events path (default ~/.fiche/events.jsonl)
   FICHE_SESSION_STATE     where per-session cache pins (freeze-step floor, cache
                           liveness) survive a restart; 0/off disables
@@ -1531,6 +1578,293 @@ Usage:
   );
 }
 
+async function syncDaemonJson(
+  port: number,
+  apiPath: string,
+  payload: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}${apiPath}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(1500),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function detectLocalProviderSignals(): Map<ProviderId, string[]> {
+  const signals = new Map<ProviderId, string[]>();
+  const addSignal = (id: ProviderId, reason: string) => {
+    const list = signals.get(id) ?? [];
+    if (!list.includes(reason)) list.push(reason);
+    signals.set(id, list);
+  };
+  for (const hit of detectProvidersFromEnv(process.env)) {
+    addSignal(hit.id, `env:${hit.matchedEnvKey}`);
+  }
+  const checks: Array<{ id: ProviderId; clis: readonly string[]; apps: readonly string[] }> = [
+    { id: 'anthropic', clis: ['claude'], apps: ['Claude'] },
+    { id: 'openai', clis: ['codex'], apps: ['ChatGPT'] },
+    { id: 'google', clis: ['gemini', 'agy'], apps: ['Antigravity'] },
+  ];
+  for (const c of checks) {
+    for (const cli of c.clis) {
+      if (isRunnable(cli, process.env)) addSignal(c.id, `cli:${cli}`);
+    }
+    if (process.platform === 'darwin') {
+      for (const app of c.apps) {
+        if (resolveMacAppBundle(app)) addSignal(c.id, `app:${app}`);
+      }
+    }
+  }
+  return signals;
+}
+
+function configuredCustomHostSpecs(): string[] {
+  const raw = readBrandEnv('UPSTREAM_HOSTS')?.trim() ?? '';
+  if (!raw) return [];
+  const entries = parseUpstreamHosts(raw);
+  const out: string[] = [];
+  for (const e of entries) {
+    const nonEmpty = e.prefixes.filter((p) => p !== '');
+    if (nonEmpty.length === 0) out.push(e.host);
+    else for (const p of nonEmpty) out.push(`${e.host}${p}`);
+  }
+  return out;
+}
+
+async function runProvidersCommand(argv: readonly string[], port: number): Promise<number> {
+  applyConfigFileDefaults();
+  const jsonFlag = argv.includes('--json');
+  const applyFlag = argv.includes('--apply');
+  const pos = argv.filter((a) => a !== '--json' && a !== '--apply');
+  const sub = (pos[0] ?? 'list').toLowerCase();
+  const rest = pos.slice(1);
+  const availableIds = PROVIDER_CATALOG.map((p) => p.id).join(', ');
+
+  const commitProviders = async (next: readonly ProviderId[], action: string): Promise<number> => {
+    setEnabledProviders(next);
+    const saved = persistConfigPatch({ providers: [...next] });
+    const synced = await syncDaemonJson(port, '/api/providers', { providers: [...next] });
+    if (jsonFlag) {
+      console.log(JSON.stringify({ ok: true, action, enabled: [...next], saved, synced }, null, 2));
+      return 0;
+    }
+    const label = next.length > 0 ? next.join(', ') : 'none';
+    console.log(`[fiche] providers ${action}: ${label} (${synced ? 'updated running daemon + config' : saved ? 'saved to config.json' : 'runtime only'})`);
+    return 0;
+  };
+
+  if (sub === 'list') {
+    const statuses = listProviderStatuses();
+    const enabled = statuses.filter((p) => p.enabled);
+    const optIn = statuses.filter((p) => !p.enabled);
+    const customHosts = configuredCustomHostSpecs();
+    if (jsonFlag) {
+      console.log(JSON.stringify({ enabled: enabled.map((p) => p.id), providers: statuses, custom_hosts: customHosts }, null, 2));
+      return 0;
+    }
+    console.log(`Active providers (${enabled.length}): ${enabled.map((p) => p.id).join(', ') || 'none'}`);
+    for (const p of enabled) {
+      console.log(`  ✓ ${p.id.padEnd(11)} ${p.label} (${p.hosts.join(', ')})`);
+    }
+    if (customHosts.length > 0) {
+      console.log(`Custom hosts (${customHosts.length}): ${customHosts.join(', ')}`);
+    }
+    if (optIn.length > 0) {
+      console.log(`Opt-in third-party (${optIn.length}): ${optIn.map((p) => p.id).join(', ')}`);
+    }
+    console.log('\nExamples:\n  fiche providers detect --apply\n  fiche providers enable openrouter deepseek\n  fiche providers add-host llm.example.com/anthropic');
+    return 0;
+  }
+
+  if (sub === 'detect') {
+    const detectedMap = detectLocalProviderSignals();
+    const detectedIds = [...detectedMap.keys()];
+    const thirdPartyEnabled = getEnabledProviders().filter((id) =>
+      PROVIDER_CATALOG.some((p) => p.id === id && p.tier === 'third-party'),
+    );
+    const recommended = [...new Set([...detectedIds, ...thirdPartyEnabled])];
+    if (applyFlag) {
+      return commitProviders(recommended, 'detected');
+    }
+    if (jsonFlag) {
+      console.log(JSON.stringify({
+        detected: detectedIds.map((id) => ({ id, signals: detectedMap.get(id) ?? [] })),
+        recommended,
+      }, null, 2));
+      return 0;
+    }
+    if (detectedIds.length === 0) {
+      console.log('No local provider CLIs, apps, or API key env vars detected.');
+    } else {
+      console.log('Detected providers on this machine:');
+      for (const id of detectedIds) {
+        console.log(`  • ${id.padEnd(11)} ${(detectedMap.get(id) ?? []).join(', ')}`);
+      }
+      console.log(`\nRun \`fiche providers detect --apply\` or \`fiche providers set ${recommended.join(',')}\` to apply.`);
+    }
+    return 0;
+  }
+
+  if (sub === 'set') {
+    if (rest.length === 0) {
+      console.error('[fiche] providers set needs a provider list, "all", or "none"');
+      return 2;
+    }
+    const { providers, unknown } = parseProvidersSpec(rest.join(','));
+    if (unknown.length > 0 || providers === null) {
+      console.error(`[fiche] unknown provider(s): ${unknown.join(', ')}\nAvailable: ${availableIds}`);
+      return 2;
+    }
+    return commitProviders(providers, 'set');
+  }
+
+  if (sub === 'enable' || sub === 'add') {
+    if (rest.length === 0) {
+      console.error(`[fiche] providers ${sub} needs at least one provider id (${availableIds})`);
+      return 2;
+    }
+    const { providers, unknown } = parseProvidersSpec(rest.join(','));
+    if (unknown.length > 0 || providers === null) {
+      console.error(`[fiche] unknown provider(s): ${unknown.join(', ')}\nAvailable: ${availableIds}`);
+      return 2;
+    }
+    const merged = [...new Set([...getEnabledProviders(), ...providers])];
+    return commitProviders(merged, 'enabled');
+  }
+
+  if (sub === 'disable' || sub === 'remove') {
+    if (rest.length === 0) {
+      console.error('[fiche] providers disable needs at least one provider id');
+      return 2;
+    }
+    const { providers, unknown } = parseProvidersSpec(rest.join(','));
+    if (unknown.length > 0 || providers === null) {
+      console.error(`[fiche] unknown provider(s): ${unknown.join(', ')}\nAvailable: ${availableIds}`);
+      return 2;
+    }
+    const drop = new Set(providers);
+    const next = getEnabledProviders().filter((id) => !drop.has(id));
+    return commitProviders(next, 'disabled');
+  }
+
+  if (sub === 'add-host') {
+    const spec = rest[0]?.trim();
+    if (!spec || parseUpstreamHosts(spec).length === 0) {
+      console.error('[fiche] providers add-host needs a public hostname[/prefix], e.g. llm.example.com/anthropic');
+      return 2;
+    }
+    const normalizedSpec = configuredCustomHostSpecsFromInput([spec])[0];
+    if (!normalizedSpec) {
+      console.error('[fiche] providers add-host: invalid host specification');
+      return 2;
+    }
+    const nextHosts = [...new Set([...configuredCustomHostSpecs(), normalizedSpec])];
+    persistCustomHostsToConfig(nextHosts);
+    if (jsonFlag) {
+      console.log(JSON.stringify({ ok: true, custom_hosts: nextHosts, restart_required: true }, null, 2));
+      return 0;
+    }
+    console.log(`[fiche] custom hosts saved: ${nextHosts.join(', ')} (run \`fiche service restart\` to reload running daemon)`);
+    return 0;
+  }
+
+  if (sub === 'remove-host') {
+    const targetHost = rest[0]?.trim().toLowerCase().replace(/^https?:\/\//, '').split('/')[0]?.replace(/\.$/, '');
+    if (!targetHost) {
+      console.error('[fiche] providers remove-host needs a hostname');
+      return 2;
+    }
+    const nextHosts = configuredCustomHostSpecs().filter((item) => {
+      const hostOnly = item.split('/')[0]?.toLowerCase();
+      return hostOnly !== targetHost;
+    });
+    persistCustomHostsToConfig(nextHosts);
+    if (jsonFlag) {
+      console.log(JSON.stringify({ ok: true, custom_hosts: nextHosts, restart_required: true }, null, 2));
+      return 0;
+    }
+    console.log(`[fiche] custom hosts saved: ${nextHosts.length > 0 ? nextHosts.join(', ') : 'none'} (run \`fiche service restart\` to reload running daemon)`);
+    return 0;
+  }
+
+  console.error(`[fiche] unknown providers subcommand: ${sub} (expected: list | set | enable | disable | detect | add-host | remove-host)`);
+  return 2;
+}
+
+function configuredCustomHostSpecsFromInput(items: readonly string[]): string[] {
+  const entries = parseUpstreamHosts(items.join(','));
+  const out: string[] = [];
+  for (const e of entries) {
+    const nonEmpty = e.prefixes.filter((p) => p !== '');
+    if (nonEmpty.length === 0) out.push(e.host);
+    else for (const p of nonEmpty) out.push(`${e.host}${p}`);
+  }
+  return out;
+}
+
+async function runModelsCommand(argv: readonly string[], port: number): Promise<number> {
+  applyConfigFileDefaults();
+  const jsonFlag = argv.includes('--json');
+  const pos = argv.filter((a) => a !== '--json');
+  const sub = (pos[0] ?? 'list').toLowerCase();
+  const rest = pos.slice(1);
+
+  const commitModels = async (next: readonly string[], action: string): Promise<number> => {
+    setAllowedModelBases(next);
+    const saved = persistConfigPatch({ models: [...next] });
+    const synced = await syncDaemonJson(port, '/api/models', { models: [...next] });
+    if (jsonFlag) {
+      console.log(JSON.stringify({ ok: true, action, models: [...next], saved, synced }, null, 2));
+      return 0;
+    }
+    console.log(`[fiche] models ${action}: ${next.length > 0 ? next.join(', ') : 'off'} (${synced ? 'updated running daemon + config' : saved ? 'saved to config.json' : 'runtime only'})`);
+    return 0;
+  };
+
+  if (sub === 'list') {
+    const models = getAllowedModelBases();
+    if (jsonFlag) {
+      console.log(JSON.stringify({ models }, null, 2));
+      return 0;
+    }
+    console.log(`Enabled model bases (${models.length}): ${models.length > 0 ? models.join(', ') : 'off'}`);
+    return 0;
+  }
+  if (sub === 'set') {
+    const raw = rest.join(',').trim();
+    const next = !raw || /^(?:0|false|no|off|none)$/i.test(raw)
+      ? []
+      : raw.split(',').map((s) => s.trim()).filter(Boolean);
+    return commitModels(next, 'set');
+  }
+  if (sub === 'enable' || sub === 'add') {
+    const items = rest.flatMap((s) => s.split(',')).map((s) => s.trim()).filter(Boolean);
+    if (items.length === 0) {
+      console.error(`[fiche] models ${sub} needs at least one model id`);
+      return 2;
+    }
+    const next = [...new Set([...getAllowedModelBases(), ...items])];
+    return commitModels(next, 'enabled');
+  }
+  if (sub === 'disable' || sub === 'remove') {
+    const drop = new Set(rest.flatMap((s) => s.split(',')).map((s) => s.trim().toLowerCase()).filter(Boolean));
+    if (drop.size === 0) {
+      console.error(`[fiche] models ${sub} needs at least one model id`);
+      return 2;
+    }
+    const next = getAllowedModelBases().filter((m) => !drop.has(m.toLowerCase()));
+    return commitModels(next, 'disabled');
+  }
+  console.error(`[fiche] unknown models subcommand: ${sub} (expected: list | set | enable | disable)`);
+  return 2;
+}
+
 // ---- main ----------------------------------------------------------------
 
 async function main(): Promise<void> {
@@ -1539,6 +1873,16 @@ async function main(): Promise<void> {
     applyConfigFileDefaults();
     await runMcpCommand(argv.slice(1));
     return;
+  }
+  if (argv[0] === 'providers') {
+    const port = Number(process.env.PORT ?? 47821);
+    const code = await runProvidersCommand(argv.slice(1), port);
+    process.exit(code);
+  }
+  if (argv[0] === 'models') {
+    const port = Number(process.env.PORT ?? 47821);
+    const code = await runModelsCommand(argv.slice(1), port);
+    process.exit(code);
   }
   if (argv[0] === 'service') {
     const code = await runServiceCommand(argv.slice(1));
@@ -1580,6 +1924,9 @@ async function main(): Promise<void> {
   // it exits through its own branch below rather than falling through here.
   let warpCommand: string[] | undefined;
   let warpAppSpec: string | undefined;
+  let warpProvidersSpec: string | undefined;
+  let warpAllProviders = false;
+  let warpVerbose = false;
   const warpRoutes: string[] = [];
   let cliArgv = argv;
   if (argv[0] === 'warp') {
@@ -1619,6 +1966,32 @@ async function main(): Promise<void> {
         warpRoutes.push(a.slice('--route='.length));
         continue;
       }
+      if (a === '--providers' || a === '--provider') {
+        const spec = warpArgv[i + 1];
+        if (spec === undefined) {
+          console.error(`[fiche] warp: ${a} needs comma-separated provider ids, "all", or "none"`);
+          process.exit(2);
+        }
+        warpProvidersSpec = spec;
+        i += 1;
+        continue;
+      }
+      if (a.startsWith('--providers=')) {
+        warpProvidersSpec = a.slice('--providers='.length);
+        continue;
+      }
+      if (a.startsWith('--provider=')) {
+        warpProvidersSpec = a.slice('--provider='.length);
+        continue;
+      }
+      if (a === '--all-providers') {
+        warpAllProviders = true;
+        continue;
+      }
+      if (a === '-v' || a === '--verbose') {
+        warpVerbose = true;
+        continue;
+      }
       rest.push(a);
     }
     cliArgv = rest;
@@ -1632,6 +2005,19 @@ async function main(): Promise<void> {
   // does the transforming, the tracking and the dashboard. Everything below —
   // tracker, proxy pipeline, listener — belongs to that instance, not to us.
   if (warpCommand) {
+    let warpProviders: ProviderId[] | undefined;
+    if (warpAllProviders) {
+      warpProviders = PROVIDER_CATALOG.map((p) => p.id);
+    } else if (warpProvidersSpec !== undefined) {
+      const parsed = parseProvidersSpec(warpProvidersSpec);
+      if (parsed.unknown.length > 0 || parsed.providers === null) {
+        console.error(
+          `[fiche] warp: unknown provider(s): ${parsed.unknown.join(', ')} (available: ${PROVIDER_CATALOG.map((p) => p.id).join(', ')})`,
+        );
+        process.exit(2);
+      }
+      warpProviders = parsed.providers;
+    }
     let resolvedWarpApp: ResolvedMacApp | undefined;
     if (warpAppSpec !== undefined) {
       resolvedWarpApp = resolveMacAppBundle(warpAppSpec) ?? undefined;
@@ -1642,7 +2028,13 @@ async function main(): Promise<void> {
         process.exit(2);
       }
     }
-    createWarpRuntime({ port: opts.port, routes: warpRoutes, app: resolvedWarpApp }).launch(warpCommand);
+    createWarpRuntime({
+      port: opts.port,
+      routes: warpRoutes,
+      providers: warpProviders,
+      verbose: warpVerbose,
+      app: resolvedWarpApp,
+    }).launch(warpCommand);
     return;
   }
   // A/B harness passthrough switch (see the `transform` callback below).
@@ -1740,6 +2132,7 @@ async function main(): Promise<void> {
       listPlugins: listNodeStagePlugins,
       setPluginEnabled: setNodePluginEnabled,
       setThirdPartyPluginsEnabled: setNodeThirdPartyPluginsEnabled,
+      onProvidersPersist: persistProvidersToConfig,
       onShutdown: () => shutdownHandler?.('API_SHUTDOWN'),
     },
   );
@@ -1768,6 +2161,7 @@ async function main(): Promise<void> {
     decodeRequestBody,
     followHosts,
     upstreamRegistry,
+    enabledProviders: () => getEnabledProviders(),
     // Per-request transform options:
     //   1. Runtime kill switch — when the dashboard "passthrough" toggle
     //      is off, force compress=false so /v1/messages forwards

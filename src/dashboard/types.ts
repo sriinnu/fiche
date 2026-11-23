@@ -83,6 +83,7 @@ export interface StatsPayload {
   text_hygiene_saved_tokens?: number;
   text_hygiene_saved_chars?: number;
   allowed_models?: string[];
+  enabled_providers?: string[];
   by_model?: Record<string, ModelStatsPayload>;
   today?: DailySavingsPoint;
   daily?: DailySavingsPoint[];
