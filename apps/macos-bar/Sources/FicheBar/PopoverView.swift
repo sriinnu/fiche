@@ -215,6 +215,7 @@ struct PopoverView: View {
     @State private var heroScope: HeroScope = .lifetime
     @State private var dailyMetric: DailyChartMetric = .tokens
     @State private var showAllCLIs: Bool = false
+    @State private var showMoreProviders: Bool = false
     @State private var expandedFAQ: Set<String> = []
     @State private var portDraft: String = ""
     @State private var logoWhisper: String? = nil
@@ -1685,6 +1686,12 @@ struct PopoverView: View {
         let activeSet = Set(controller.allowedModels)
         let catalog = controller.mergedModelsCatalog
         let isOnline = controller.phase != .stopped
+        let allProviders = controller.providers
+        let primaryProviders = allProviders.filter { $0.isFirstParty || $0.enabled }
+        let optionalProviders = allProviders.filter { !$0.isFirstParty && !$0.enabled }
+        let enabledProvidersCount = allProviders.filter(\.enabled).count
+        let thirdPartyProviders = allProviders.filter { !$0.isFirstParty }
+        let thirdPartyEnabledCount = thirdPartyProviders.filter(\.enabled).count
 
         let grouped: [(family: ProviderFamily, items: [ModelCatalogItem])] = ProviderFamily.allCases.compactMap { family in
             let items = catalog.filter { ProviderFamily.classify($0) == family }
@@ -1692,6 +1699,56 @@ struct PopoverView: View {
         }
 
         return VStack(alignment: .leading, spacing: 0) {
+            SectionHeader(
+                title: "My Providers",
+                trailing: "\(enabledProvidersCount)/\(allProviders.count)"
+            )
+
+            Band {
+                ForEach(Array(primaryProviders.enumerated()), id: \.element.id) { idx, provider in
+                    if idx > 0 { Hairline(inset: 14) }
+                    providerToggleRow(provider: provider, isOnline: isOnline, theme: theme)
+                }
+
+                if !optionalProviders.isEmpty {
+                    Hairline(inset: 14)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.16)) {
+                            showMoreProviders.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: showMoreProviders ? "chevron.down" : "chevron.right")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(theme.secondaryText)
+                                .frame(width: 12)
+                            Text("More providers (\(thirdPartyEnabledCount)/\(thirdPartyProviders.count) on)")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(theme.secondaryText)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if showMoreProviders {
+                        ForEach(optionalProviders) { provider in
+                            Hairline(inset: 14)
+                            providerToggleRow(provider: provider, isOnline: isOnline, theme: theme)
+                        }
+                    }
+                }
+            }
+
+            Text("Only enabled providers are routed by `fiche warp` and accepted by the proxy.")
+                .font(.caption2)
+                .foregroundStyle(theme.tertiaryText)
+                .padding(.horizontal, 16)
+                .padding(.top, 5)
+                .padding(.bottom, 2)
+
             if !controller.compressionEnabled && isOnline {
                 Text("Compression is paused — scope changes take effect on resume.")
                     .font(.caption)
@@ -1738,6 +1795,51 @@ struct PopoverView: View {
                 }
             }
         }
+    }
+
+    private func providerToggleRow(
+        provider: ProviderDescriptor,
+        isOnline: Bool,
+        theme: Theme
+    ) -> some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 6) {
+                    Text(provider.label)
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(theme.primaryText)
+                        .lineLimit(1)
+                    if provider.isFirstParty {
+                        Text("CORE")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .foregroundStyle(theme.accent)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(theme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 3))
+                    }
+                }
+                Text(provider.hostsSubtitle)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(theme.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer(minLength: 8)
+
+            Toggle(
+                "",
+                isOn: Binding(
+                    get: { provider.enabled },
+                    set: { next in controller.toggleProvider(id: provider.id, on: next) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(FicheSwitchToggleStyle())
+            .disabled(!isOnline)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
     }
 
     private func modelToggleRow(

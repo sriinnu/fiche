@@ -37,6 +37,7 @@ import {
   isFollowRefusal,
   refuseUnfollowedProviderHost,
   resolveFollowTarget,
+  type ProviderId,
   type UpstreamRegistry,
 } from './upstream-hosts.js';
 import { shouldImageModel } from './reader-tier.js';
@@ -122,6 +123,8 @@ export interface ProxyConfig {
   followHosts?: boolean;
   /** Registry for `followHosts`; defaults to the built-in provider list. */
   upstreamRegistry?: UpstreamRegistry;
+  /** Opted-in built-in providers (`anthropic`, `openai`, `google`, ...). */
+  enabledProviders?: readonly ProviderId[] | (() => readonly ProviderId[]);
   /** Optional Edge Runtime hook (`ctx.waitUntil`) to keep async telemetry alive past response return. */
   waitUntil?: (promise: Promise<unknown>) => void;
 }
@@ -1833,8 +1836,12 @@ let responseContentType: string | undefined;
     const bypassHeader = req.headers.get('x-fiche-bypass') ?? req.headers.get('x-inkling-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
     const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
+    const rawProviders = typeof config.enabledProviders === 'function'
+      ? config.enabledProviders()
+      : config.enabledProviders;
+    const activeProviderSet = rawProviders ? new Set<string>(rawProviders) : undefined;
     const followed = config.followHosts
-      ? resolveFollowTarget(url, req.headers.get('host'), registry)
+      ? resolveFollowTarget(url, req.headers.get('host'), registry, activeProviderSet)
       : refuseUnfollowedProviderHost(req.headers.get('host'), registry);
     const followRefusal = isFollowRefusal(followed) ? followed : null;
     /** Set when this request goes to the agent's own third-party host. */

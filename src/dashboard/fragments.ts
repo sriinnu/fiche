@@ -2,6 +2,7 @@
 
 import { HTMX_JS, ALPINE_JS } from './vendor.js';
 import { CACHE_CREATE_RATE, CACHE_READ_RATE } from '../core/baseline.js';
+import { listProviderStatuses, type ProviderStatus } from '../core/upstream-hosts.js';
 import type {
   StatsPayload,
   RecentPayload,
@@ -112,6 +113,7 @@ export function renderModelsFragment(
   active: string[],
   configured: string[],
   enabled: boolean,
+  providers: readonly ProviderStatus[] = listProviderStatuses(),
 ): string {
   const on = new Set(active);
   const labelOf = new Map(
@@ -135,6 +137,33 @@ export function renderModelsFragment(
       ids.push(id);
     }
   }
+  const providerChipFor = (p: ProviderStatus): string => {
+    const lit = p.enabled;
+    return (
+      `<button class="chip${lit ? ' on' : ''}" type="button" ` +
+      `title="${escapeHtml(p.hosts.join(', '))}" ` +
+      `hx-post="/fragments/models" hx-target="#frag-models" ` +
+      `hx-vals='${escapeHtml(`{"provider":${JSON.stringify(p.id)},"on":${!lit}}`)}'>${escapeHtml(p.label)}${lit ? ' ✓' : ''}</button>`
+    );
+  };
+  const primaryProviders = providers.filter((p) => p.tier === 'first-party' || p.enabled);
+  const disabledThirdPartyProviders = providers.filter((p) => p.tier === 'third-party' && !p.enabled);
+  const enabledThirdPartyCount = providers.filter((p) => p.tier === 'third-party' && p.enabled).length;
+  const totalThirdPartyCount = providers.filter((p) => p.tier === 'third-party').length;
+  const moreProvidersHtml =
+    disabledThirdPartyProviders.length > 0
+      ? `<details class="models-more" style="display:inline-block;margin-left:4px">` +
+        `<summary class="mini-btn" style="cursor:pointer;list-style:none;display:inline-block">More providers (${enabledThirdPartyCount}/${totalThirdPartyCount} on)</summary>` +
+        `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${disabledThirdPartyProviders.map(providerChipFor).join('')}</div>` +
+        `</details>`
+      : '';
+  const providersSection =
+    `<div class="models">` +
+    `<span class="models-label">My Providers (Warp &amp; Proxy)</span>` +
+    primaryProviders.map(providerChipFor).join('') +
+    moreProvidersHtml +
+    `<span class="hint">only enabled providers are intercepted by warp &amp; /to/</span>` +
+    `</div>`;
   const chipFor = (id: string): string => {
     const lit = on.has(id);
     const label = labelOf.get(id) ?? id;
@@ -174,6 +203,7 @@ export function renderModelsFragment(
     : `<div class="models"><span class="hint">compression is off — these settings have no effect right now</span></div>`;
   return (
     moot +
+    providersSection +
     `<div class="models">` +
     `<span class="models-label">Image Claude models</span>` +
     claudeChips +
