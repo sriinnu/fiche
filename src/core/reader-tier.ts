@@ -21,7 +21,7 @@ const GEMINI_READER_RE = /(?:^|\/)gemini(?:-|$|\[)/;
 const IMAGE_READER = [
   GEMINI_READER_RE,
   /claude-fable-5/,
-  /gpt-(?:5\.6|6\.[12])-sol(?:-|$|\[)/,
+  /(?:^|\/)gpt-(?:5\.6|(?:[6-9]|\d{2,})(?:\.\d+)?)-sol(?:-|$|\[)/,
 ];
 
 export function forceImagesEnabled(): boolean {
@@ -48,9 +48,9 @@ const TEXT_ONLY = [
   // Gemini 4 hydrogen, carbon, and neon have no reading measurements yet; the
   // `gemini` image rule would otherwise give them argon's profile blind.
   /gemini-4-(?:hydrogen|carbon|neon)/,
-  // GPT-6 Astra scored 2/15 hex and 26/98 gist on Spleen 5x8 (docs/BENCHMARKS.md);
-  // keep it on 3-stage text hygiene by default unless INKLING_FORCE_IMAGES=1.
-  /gpt-6(?:\.\d+)?-astra(?:-|$|\[)/,
+  // GPT-6+ Astra scored 2/15 hex and 26/98 gist on Spleen 5x8 (docs/BENCHMARKS.md);
+  // keep all 6.x/7+ Astra releases on 4-layer text hygiene by default unless FICHE_FORCE_IMAGES=1.
+  /(?:^|\/)gpt-(?:[6-9]|\d{2,})(?:\.\d+)?-astra(?:-|$|\[)/,
   // Third-party text / unmeasured coding families routed directly via warp or /to/.
   // Prefix-safe text hygiene still compresses tool outputs for these without imaging.
   /deepseek/i,

@@ -218,6 +218,8 @@ describe('CLI wrappers & macOS desktop app launcher', () => {
   it('renders POSIX helpers and optional transparent CLI wrappers with recursion bypass', () => {
     const basic = renderShellInitScript();
     expect(basic).toContain('fclaude()');
+    expect(basic).toContain('fribhu()');
+    expect(basic).toContain('fkimi()');
     expect(basic).toContain('fiche-app()');
     expect(basic).not.toContain('FICHE_BYPASS');
 
@@ -225,6 +227,8 @@ describe('CLI wrappers & macOS desktop app launcher', () => {
     expect(wrapped).toContain(`export FICHE_BIN='/opt/fiche/bin/fiche'`);
     expect(wrapped).toContain('claude() { if [ "${FICHE_BYPASS:-0}" = "1" ]; then command claude "$@"; else "$FICHE_BIN" warp -- claude "$@"; fi; }');
     expect(wrapped).toContain('codex()');
+    expect(wrapped).toContain('ribhu()');
+    expect(wrapped).toContain('kimi()');
     expect(wrapped).toContain('agy()');
   });
 });

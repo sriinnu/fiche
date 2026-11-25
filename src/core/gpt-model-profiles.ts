@@ -308,6 +308,10 @@ const miniNanoProfile = (
   style: BASE_STYLE,
 });
 
+/** True for GPT-5.6 / GPT-6+ Sol optical reader models (incl. gpt-6-sol, gpt-6.1-sol, gpt-6.2-sol, future 6.x/7+). */
+export const isGptSolModel = (m: string): boolean =>
+  /^gpt-(?:5\.6|(?:[6-9]|\d{2,})(?:\.\d+)?)-sol(?:-|$)/.test(m);
+
 /**
  * Built-in profiles, evaluated in order (first match wins). Precedence and
  * numbers reproduce the previous hardcoded `resolveVisionCost` EXACTLY:
@@ -317,14 +321,15 @@ const BUILTIN_RULES: ProfileRule[] = [
   // Exact Sol variant observed on production traffic. Do not match bare 5.6/6.1
   // or sibling variants (for example gpt-5.6-terra): model-specific visual
   // tuning must not leak across variants merely because they share a version
-  // number. Evaluated before the generic gpt-6 family rule so gpt-6.1-sol
-  // inherits Sol's native 14px profile rather than GPT6_PROFILE's 5x8 Spleen.
+  // number. Evaluated before the generic GPT-6+ family rule so gpt-6-sol and
+  // future gpt-6.x-sol / gpt-7+-sol inherit Sol's native 14px profile rather
+  // than GPT6_PROFILE's 5x8 Spleen.
   {
-    test: (m) => /^gpt-(?:5\.6|6\.[12])-sol(?:-|$)/.test(m),
+    test: isGptSolModel,
     profile: GPT56_SOL_PROFILE,
   },
   {
-    test: (m) => /^gpt-6(?:[.-]|$)/.test(m),
+    test: (m) => /^gpt-(?:[6-9]|\d{2,})(?:[.-]|$)/.test(m),
     profile: GPT6_PROFILE,
   },
   // nano patch models: ceil(patches * 2.46), cap 1536
@@ -565,10 +570,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
     // An exact override key may be a prefix of the real model id. Resolve the
     // known family explicitly so `{"gpt-5.6-sol":{...}}` inherits Sol's font
     // and geometry even when a suffixed runtime id is expected.
-    const base =
-      key === 'gpt-5.6-sol' || key === 'gpt-6.1-sol' || key === 'gpt-6.2-sol'
-        ? GPT56_SOL_PROFILE
-        : resolveBuiltin(key);
+    const base = isGptSolModel(key)
+      ? GPT56_SOL_PROFILE
+      : resolveBuiltin(key);
     const p = v as Partial<GptModelProfile>;
     const styleIn = (p as { style?: GptRenderStyle }).style;
     const historyIn = (p as { history?: Partial<GptHistoryProfile> }).history;

@@ -1690,7 +1690,7 @@ export function renderPage(port: number, hostLabel = ''): string {
   <details class="models-collapse">
     <summary class="models-summary">Connect an agent <span class="hint">auto-wrap every CLI or launch any desktop app · instant FICHE_BYPASS=1 · @fiche pin</span></summary>
     <div class="dock-body">
-      <p><strong>Option 1 — One-time automatic shell setup</strong> (recommended; routes <code>claude</code>, <code>codex</code>, <code>agy</code>, <code>gemini</code>, <code>opencode</code>, <code>cursor-agent</code>, <code>amp</code>, <code>pi</code>, <code>aider</code> through Fiche automatically):</p>
+      <p><strong>Option 1 — One-time automatic shell setup</strong> (recommended; routes <code>claude</code>, <code>codex</code>, <code>ribhu</code>, <code>agy</code>, <code>gemini</code>, <code>opencode</code>, <code>cursor-agent</code>, <code>amp</code>, <code>pi</code>, <code>aider</code> through Fiche automatically):</p>
       <pre>eval "$(fiche shell-init --wrap)"   # add to ~/.zshrc or ~/.bashrc</pre>
       <p><strong>Option 2 — Wrap any CLI or Desktop app explicitly</strong> (with zero config edits):</p>
       <pre>fiche warp -- claude

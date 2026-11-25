@@ -137,7 +137,7 @@ export function buildWarpAppArgs(
   return [app.executablePath, ...extraArgs];
 }
 
-const CLI_WRAPPERS = ['claude', 'codex', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi', 'aider'] as const;
+const CLI_WRAPPERS = ['claude', 'codex', 'ribhu', 'kimi', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi', 'aider'] as const;
 
 /** Render POSIX zsh/bash shell helpers (or transparent wrappers when `--wrap` is set). */
 export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string } = {}): string {
@@ -149,6 +149,8 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
     'fiche-app() { if [ "$#" -eq 0 ]; then "$FICHE_BIN" warp --app; else local app="$1"; shift; "$FICHE_BIN" warp --app "$app" -- "$@"; fi; }',
     'fclaude() { "$FICHE_BIN" warp -- claude "$@"; }',
     'fcodex() { "$FICHE_BIN" warp -- codex "$@"; }',
+    'fribhu() { "$FICHE_BIN" warp -- ribhu "$@"; }',
+    'fkimi() { "$FICHE_BIN" warp -- kimi "$@"; }',
     'fagy() { "$FICHE_BIN" warp -- agy "$@"; }',
     'fgemini() { "$FICHE_BIN" warp -- gemini "$@"; }',
     'fopencode() { "$FICHE_BIN" warp -- opencode "$@"; }',

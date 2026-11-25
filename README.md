@@ -45,8 +45,11 @@ Cuts **31.4â€“50.8%** of multi-turn tokens and up to **41.7%** real USD (`34.1â€
 ## 30-Second Quickstart
 
 ```bash
-# 1. Install once (Node >= 20.19) directly from GitHub (builds automatically via prepare)
-npm install -g github:sriinnu/fiche
+# 1. Install once (Homebrew CLI + menubar app, or Node >= 20.19 via npm)
+brew install sriinnu/tap/fiche
+brew install --cask sriinnu/tap/fichebar   # optional macOS 14+ menubar app (upgrade: brew upgrade)
+# Or directly from npm / GitHub:
+npm install -g @sriinnu/fiche@latest     # or github:sriinnu/fiche
 
 # 2. Start daemon (or `fiche service install` on macOS for zero-drop launchd socket activation).
 #    Zero-config applies default `FICHE_MODELS=claude-fable-5,gemini`;

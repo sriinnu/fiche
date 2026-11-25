@@ -610,8 +610,8 @@ Usage:
                         custom base URL, so client-side first-party gates keep
                         working. Only opted-in providers are intercepted.
   fiche shell-init [--wrap]
-                        print zsh/bash helper functions (fclaude, fcodex, fagy,
-                        fcursor, fiche-app) or transparent wrappers (--wrap).
+                        print zsh/bash helper functions (fclaude, fcodex, fribhu,
+                        fagy, fcursor, fiche-app) or transparent wrappers (--wrap).
   fiche stats [--json] [--file <p>]
                         summarize the events log offline (no server needed),
                         incl. measured savings; defaults to $FICHE_LOG

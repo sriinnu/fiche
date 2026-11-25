@@ -1212,6 +1212,8 @@ final class DaemonController: ObservableObject {
     nonisolated static let supportedCLICatalog: [(command: String, name: String, provider: String)] = [
         ("claude", "Claude Code", "Anthropic"),
         ("codex", "OpenAI Codex", "OpenAI"),
+        ("ribhu", "Ribhu", "Multi"),
+        ("kimi", "Kimi Code", "Kimi / Moonshot"),
         ("agy", "Antigravity CLI", "Google / Multi"),
         ("gemini", "Gemini CLI", "Google"),
         ("opencode", "OpenCode", "Multi"),
@@ -1410,6 +1412,7 @@ final class DaemonController: ObservableObject {
         }
         searchDirs.append(contentsOf: [
             "\(home)/.local/bin",
+            "\(home)/.kimi-code/bin",
             "\(home)/.opencode/bin",
             "\(home)/.antigravity/antigravity/bin",
             "\(home)/.volta/bin",

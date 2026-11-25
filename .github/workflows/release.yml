@@ -123,3 +123,36 @@ jobs:
         run: |
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --verify-tag --generate-notes
+
+  release-macos:
+    needs: release
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          persist-credentials: false
+
+      - name: Build, sign, and zip FicheBar.app
+        run: |
+          VERSION="${TAG#v}"
+          CFBundleShortVersionString="${VERSION}" ./apps/macos-bar/bundle.sh --no-install
+          APP_PATH="apps/macos-bar/build.noindex/FicheBar.app"
+          test -x "${APP_PATH}/Contents/MacOS/FicheBar"
+          codesign --verify --deep --strict "${APP_PATH}"
+          ZIP_NAME="FicheBar-${VERSION}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "${ZIP_NAME}"
+          shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload FicheBar zip to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release upload "$TAG" "$ZIP_NAME" "${ZIP_NAME}.sha256" --clobber

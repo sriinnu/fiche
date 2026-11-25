@@ -19,7 +19,15 @@ A pure native macOS 14+ AppKit + SwiftUI (`MenuBarExtra`) companion for **Fiche*
 
 ## Build & Install
 
-Requires **macOS 14+** and **Xcode / Swift 6+** toolchain.
+Install directly via Homebrew (macOS arm64 Sonoma+):
+
+```sh
+brew install --cask sriinnu/tap/fichebar
+# Upgrade later:
+brew upgrade --cask fichebar
+```
+
+Or build from source (requires **macOS 14+** and **Xcode / Swift 6+** toolchain):
 
 ```sh
 # Build debug binary

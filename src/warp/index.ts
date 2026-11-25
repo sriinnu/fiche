@@ -19,7 +19,7 @@ import { existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
 import { buildWarpAppArgs, type ResolvedMacApp } from './app-launch.js';
@@ -36,6 +36,42 @@ import {
 } from '../core/upstream-hosts.js';
 
 const LOOPBACK_NO_PROXY_HOSTS = ['localhost', '127.0.0.1', '::1'] as const;
+const CODEX_NON_SESSION_SUBCOMMANDS = new Set([
+  'app-server',
+  'remote-control',
+  'completion',
+  'update',
+  'help',
+  '--help',
+  '-h',
+  '--version',
+  '-V',
+]);
+
+/**
+ * Augment wrapped child argv when necessary so clients keep HTTP traffic inside
+ * warp's session rather than delegating to an unwrapped background daemon.
+ * For `codex` (>= 0.172), inject `-c features.daemon_auto_start=false` unless
+ * running daemon-management/meta commands, already overridden, or disabled via
+ * `FICHE_CODEX_KEEP_DAEMON=1`.
+ */
+export function augmentWrappedCommand(
+  command: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  if (command.length === 0) return [];
+  const bin = basename(command[0]!).toLowerCase();
+  if (bin !== 'codex' && bin !== 'codex.exe') return [...command];
+  if (/^(1|true|yes|on)$/i.test((env.FICHE_CODEX_KEEP_DAEMON ?? '').trim())) {
+    return [...command];
+  }
+  const rest = command.slice(1);
+  if (rest.some((arg) => arg.includes('daemon_auto_start'))) return [...command];
+  if (rest.length > 0 && CODEX_NON_SESSION_SUBCOMMANDS.has(rest[0]!)) {
+    return [...command];
+  }
+  return [command[0]!, '-c', 'features.daemon_auto_start=false', ...rest];
+}
 
 export function mergeNoProxy(existing: string | undefined): string {
   const entries = (existing ?? '')
@@ -339,7 +375,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
             spkiPins: ca.spkiPins,
             proxyBypassList: 'localhost;127.0.0.1;[::1]',
           })
-        : cmd;
+        : augmentWrappedCommand(cmd, env);
       const child = spawnResolved(execArgv, env);
       wireChildLifecycle(child, execArgv[0]!);
       // A connection dying is not a warp failure. The upstream resets, the proxy
@@ -418,7 +454,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
         : 'native bundle (CA/proxy env — custom base URL still recommended if TLS-pinned)';
       console.error(`[fiche] warp app → ${options.app.appName} [${modeLabel}] → ${options.app.appPath}`);
     } else {
-      console.error(`[fiche] warp exec → ${command.join(' ')}`);
+      console.error(`[fiche] warp exec → ${augmentWrappedCommand(command).join(' ')}`);
     }
 
     proxy.on('error', (err) => {
