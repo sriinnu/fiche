@@ -1,7 +1,7 @@
 {
   "name": "fiche",
   "displayName": "Fiche",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "Fiche MCP tools for coding agents. The HTTP proxy is what reduces provider tokens on live traffic. The MCP tools check a model and transform a request you pass in; they do not remove text already in the conversation.",
   "author": {
     "name": "Srinivas Pendela",

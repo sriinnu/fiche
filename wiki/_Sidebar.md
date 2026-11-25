@@ -7,15 +7,16 @@
 
 ### Core Engine
 * [Architecture](./Architecture.md)
+* [Context-MMU Spec](../docs/CONTEXT_MMU_ARCHITECTURE.md)
 * [Hybrid Optical Engine](./Hybrid-Optical-Engine.md)
-* [4-Layer Text Compiler](./Text-Compiler-Pipeline.md)
+* [Text Compiler (`P0–P3`)](./Text-Compiler-Pipeline.md)
 * [Prefix Cache Safety & Kosha Pricing](./Prefix-Cache-Safety-and-Pricing.md)
 
 ### Ecosystem & Reference
 * [Ecosystem Integration](../docs/ECOSYSTEM_INTEGRATION.md)
 * [Plugins & Skills](../docs/PLUGINS_AND_SKILLS.md)
 * [Latency & Benchmarks](./Latency-and-Benchmarks.md)
-* [Telemetry, Plugins & MCP](./Telemetry-Plugins-and-MCP.md)
+* [Local Stats, Plugins & MCP](./Local-Stats-Plugins-and-MCP.md)
 * [Troubleshooting & FAQ](./Troubleshooting-and-FAQ.md)
 * [Migrating from Inkling](./Migration-from-Inkling.md)
 * [Privacy Policy](../PRIVACY.md)

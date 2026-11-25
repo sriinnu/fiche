@@ -15,8 +15,17 @@ import {
 } from './render.js';
 import { geminiVisionTokens, hasGeminiMeasuredProfile, isGeminiModel, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { bytesToBase64 } from './png.js';
-import { classifyContent, compactSlabWhitespace, sha8, type TransformInfo } from './transform.js';
-import { sessionAnchorText } from './session-state.js';
+import {
+  applyClientSessionIdentity,
+  classifyContent,
+  compactSlabWhitespace,
+  resolveOpticalHistoryPolicy,
+  sha8,
+  type ClientSessionSource,
+  type OpticalMode,
+  type TransformInfo,
+} from './transform.js';
+import { noteHistoryRequest, sessionAnchorText } from './session-state.js';
 import {
   prepareImagedRenderText,
   droppedCodepointsTop,
@@ -33,12 +42,14 @@ import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './facts
 import { stripSchemaDescriptions } from './schema-strip.js';
 import { relocateGooglePins } from './pin.js';
 import { compactPreview, verbatimTaskText } from './history.js';
+import { extractFaultSignalSnippet } from './context-mmu.js';
 import { gateRatesFor, priceMode, resolvePriceRates } from './pricing.js';
 import {
   applyGoogleTextHygiene,
   isTextHygieneActive,
   resolveTextHygieneMode,
   type TextHygieneMode,
+  type WireHygieneStats,
 } from './text-hygiene.js';
 import type { StageToggles } from './stage-plugins.js';
 export interface GooglePart {
@@ -488,6 +499,26 @@ function googleHistoryUnit(content: GoogleContent, index: number): GoogleHistory
   };
 }
 
+/**
+ * File-reading tools whose outputs are commonly quoted verbatim by an immediately
+ * following edit tool (`edit_file`, `Edit`, `replace`, `view_file`). Keeping
+ * them as native text in the live tail avoids OCR/whitespace misses while a file
+ * is actively being edited; once those turns age into collapsed history,
+ * `planGoogleHistory` still compresses them.
+ */
+const EXACT_TEXT_TOOL_NAMES = new Set([
+  'read',
+  'read_file',
+  'view_file',
+  'file_read',
+  'get_file_contents',
+]);
+
+function isExactTextTool(name: string): boolean {
+  const bare = name.includes(':') ? name.slice(name.lastIndexOf(':') + 1) : name;
+  return EXACT_TEXT_TOOL_NAMES.has(bare.toLowerCase());
+}
+
 async function compressGoogleToolResults(
   contents: GoogleContent[],
   modelName: string,
@@ -549,6 +580,10 @@ async function compressGoogleToolResults(
       }
 
       const name = typeof response.name === 'string' ? response.name : 'tool';
+      if (isExactTextTool(name)) {
+        rewrittenParts.push(rawPart);
+        continue;
+      }
       const compact = compactSlabWhitespace(raw);
       const safe = neutralizeSentinel(compact);
       const packed = options.reflow !== false ? reflow(safe) ?? safe : safe;
@@ -987,13 +1022,107 @@ function firstGoogleUserText(contents: readonly GoogleContent[] | undefined): st
   return sessionAnchorText(texts);
 }
 
+function extractGoogleLiveTailTexts(contents: readonly GoogleContent[] | undefined): string[] {
+  if (!Array.isArray(contents) || contents.length === 0) return [];
+  const out: string[] = [];
+  const last = contents[contents.length - 1];
+  if (!last || !Array.isArray(last.parts)) return out;
+
+  const isToolResponseTurn = (last.parts as readonly GooglePart[]).some(
+    (part) => part && typeof part === 'object' && Boolean(part.functionResponse),
+  );
+
+  // Only inspect contents[n - 2] when contents[n - 1] is a tool-response turn,
+  // and ONLY pull functionCall names/args — never Turn t-1's user prompt prose.
+  if (isToolResponseTurn && contents.length >= 2) {
+    const prev = contents[contents.length - 2];
+    if (prev && Array.isArray(prev.parts)) {
+      for (const part of prev.parts) {
+        if (!part || typeof part !== 'object') continue;
+        if (part.functionCall && typeof part.functionCall === 'object') {
+          const fcName = typeof part.functionCall.name === 'string' ? part.functionCall.name : '';
+          const serialized = safeJson(part.functionCall.args);
+          out.push(fcName ? `${fcName} ${serialized}` : serialized);
+        }
+      }
+    }
+  } else if (!isToolResponseTurn && last.role === 'user' && contents.length >= 2) {
+    // If a trailing user prompt immediately follows a functionResponse turn, surface any
+    // active fault/stack snippet from those tool responses (never prior user prompt prose).
+    const prev = contents[contents.length - 2];
+    if (prev && Array.isArray(prev.parts)) {
+      for (const part of prev.parts) {
+        if (!part || typeof part !== 'object' || !part.functionResponse || typeof part.functionResponse !== 'object') continue;
+        const frName = typeof part.functionResponse.name === 'string' ? part.functionResponse.name : '';
+        const frPartsText = Array.isArray(part.functionResponse.parts)
+          ? (part.functionResponse.parts as readonly GooglePart[])
+              .map((sub) => (sub && typeof sub === 'object' && typeof sub.text === 'string' ? sub.text : ''))
+              .filter(Boolean)
+              .join('\n')
+          : '';
+        const rawFr = frPartsText
+          ? `${safeJson(part.functionResponse.response)}\n${frPartsText}`
+          : safeJson(part.functionResponse.response);
+        const faultSnippet = extractFaultSignalSnippet(rawFr);
+        if (faultSnippet) {
+          out.push(frName ? `${frName} ${faultSnippet}` : faultSnippet);
+        }
+      }
+    }
+  }
+
+  const promptTexts: string[] = [];
+  for (const part of last.parts) {
+    if (!part || typeof part !== 'object') continue;
+    if (typeof part.text === 'string' && part.text.trim()) {
+      promptTexts.push(part.text);
+    } else if (part.functionCall && typeof part.functionCall === 'object') {
+      const fcName = typeof part.functionCall.name === 'string' ? part.functionCall.name : '';
+      const serialized = safeJson(part.functionCall.args);
+      out.push(fcName ? `${fcName} ${serialized}` : serialized);
+    } else if (part.functionResponse && typeof part.functionResponse === 'object') {
+      const frName = typeof part.functionResponse.name === 'string' ? part.functionResponse.name : '';
+      const frPartsText = Array.isArray(part.functionResponse.parts)
+        ? (part.functionResponse.parts as readonly GooglePart[])
+            .map((sub) => (sub && typeof sub === 'object' && typeof sub.text === 'string' ? sub.text : ''))
+            .filter(Boolean)
+            .join('\n')
+        : '';
+      const rawFr = frPartsText
+        ? `${safeJson(part.functionResponse.response)}\n${frPartsText}`
+        : safeJson(part.functionResponse.response);
+      const faultSnippet = extractFaultSignalSnippet(rawFr);
+      if (faultSnippet) {
+        out.push(frName ? `${frName} ${faultSnippet}` : faultSnippet);
+      }
+    }
+  }
+  for (const t of promptTexts) out.push(t);
+  return out;
+}
+
+function appendGoogleTailHydration(req: GoogleGenerateContentRequest, hydrationBlock: string): void {
+  if (!hydrationBlock) return;
+  if (!Array.isArray(req.contents)) req.contents = [];
+  // Never scan backwards past model turns into earlier cached user messages.
+  const last = req.contents[req.contents.length - 1];
+  if (last && last.role === 'user') {
+    if (!Array.isArray(last.parts)) last.parts = [];
+    last.parts.push({ text: hydrationBlock });
+    return;
+  }
+  req.contents.push({ role: 'user', parts: [{ text: hydrationBlock }] });
+}
+
 export async function transformGoogleGenerateContent(
   bodyBytes: Uint8Array,
   modelName: string,
   options: {
     compress?: boolean;
     imageCompress?: boolean;
+    opticalMode?: OpticalMode;
     textHygiene?: boolean | TextHygieneMode;
+    cleanUserPayloads?: boolean;
     expectedOutputTokens?: number;
     compressTools?: boolean;
     compressToolResults?: boolean;
@@ -1003,6 +1132,9 @@ export async function transformGoogleGenerateContent(
     cols?: number;
     reflow?: boolean;
     stageToggles?: Partial<StageToggles>;
+    clientSessionId?: string;
+    clientSessionSource?: ClientSessionSource;
+    claudeCodeSessionId?: string;
   } = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo }> {
   const isGemini = isGeminiModel(modelName);
@@ -1031,7 +1163,7 @@ export async function transformGoogleGenerateContent(
   const info = createDefaultInfo(modelName);
   const measuredProfile = isGemini && hasGeminiMeasuredProfile(modelName);
   const firstUser = firstGoogleUserText(req.contents);
-  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+  const resolvedSessionKey = await applyClientSessionIdentity(info, firstUser, options);
 
   const infoMeasured = measuredProfile;
   if (options.compress === false) {
@@ -1040,6 +1172,10 @@ export async function transformGoogleGenerateContent(
       ? withStampedThoughtSignatures(req, bodyBytes, info, isEnvelope ? reqRecord : undefined)
       : { body: bodyBytes, info };
   }
+
+  const sessionState = resolvedSessionKey
+    ? noteHistoryRequest(resolvedSessionKey)
+    : { cold: false, minFreezeStep: 0 };
 
   const pinChars = relocateGooglePins(req);
   if (pinChars > 0) info.pinChars = pinChars;
@@ -1051,42 +1187,64 @@ export async function transformGoogleGenerateContent(
     options.imageCompress !== false &&
     options.stageToggles?.optical !== false;
 
-  const hygieneStats = isTextHygieneActive(options.textHygiene)
-    ? applyGoogleTextHygiene(req, {
-        foldLogs: !opticalEnabled,
-        deepTextCompact: !opticalEnabled,
-        enableTscg: options.stageToggles?.tscg,
-        enableToon: options.stageToggles?.toon,
-        enableAcdc: options.stageToggles?.acdc,
-        enableCasi: options.stageToggles?.casi,
-        aggressiveToon: resolveTextHygieneMode(options.textHygiene) === 'on',
-        model: modelName,
-        expectedOutputTokens: options.expectedOutputTokens,
-        rawBodyBytes: bodyBytes.byteLength,
-        nativeImageBytes,
-      })
-    : undefined;
-  if (hygieneStats?.changed) {
-    info.textHygieneSavedChars = hygieneStats.savedChars;
-    info.textHygieneSavedTokens = hygieneStats.savedTokens;
-    info.textHygieneBlocks = hygieneStats.blocks;
-    info.textHygieneStages = [...hygieneStats.stages];
-    if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
-  }
+  const textHygieneActive = isTextHygieneActive(options.textHygiene);
+  let hygieneStats: WireHygieneStats | undefined;
+  const runGoogleHygiene = (hygieneOpts: {
+    deep: boolean;
+    hasStaticSlabOptical?: boolean;
+  }): void => {
+    if (!textHygieneActive) return;
+    hygieneStats = applyGoogleTextHygiene(req, {
+      foldLogs: hygieneOpts.deep,
+      deepTextCompact: hygieneOpts.deep,
+      cleanUserPayloads: options.cleanUserPayloads === true,
+      enableTscg: hygieneOpts.hasStaticSlabOptical ? false : options.stageToggles?.tscg,
+      enableToon: options.stageToggles?.toon,
+      enableAcdc: options.stageToggles?.acdc,
+      enableCasi: hygieneOpts.deep && options.stageToggles?.casi !== false,
+      enableLsm: options.stageToggles?.lsm,
+      enableMmu: options.stageToggles?.mmu,
+      enableSkillLinker: hygieneOpts.hasStaticSlabOptical ? false : options.stageToggles?.skillLinker,
+      aggressiveToon: resolveTextHygieneMode(options.textHygiene) === 'on',
+      model: modelName,
+      expectedOutputTokens: options.expectedOutputTokens,
+      rawBodyBytes: bodyBytes.byteLength,
+      nativeImageBytes,
+      sessionKey: resolvedSessionKey,
+      firstUserText: firstUser,
+      sessionCacheCold: sessionState.cold,
+      liveTailTexts: hygieneOpts.deep ? extractGoogleLiveTailTexts(req.contents) : undefined,
+      appendTailHydration: hygieneOpts.deep ? (blk) => appendGoogleTailHydration(req, blk) : undefined,
+    });
+    if (hygieneStats.changed || hygieneStats.tailHydrated) {
+      info.textHygieneSavedChars = hygieneStats.savedChars;
+      info.textHygieneSavedTokens = hygieneStats.savedTokens;
+      info.textHygieneBlocks = hygieneStats.blocks;
+      info.textHygieneStages = [...hygieneStats.stages];
+      if (hygieneStats.cliffAvoided) info.cliffAvoided = hygieneStats.cliffAvoided;
+    }
+  };
 
   let cachedPinBody: Uint8Array | undefined;
   const getPinBody = (): Uint8Array => {
     if (cachedPinBody) return cachedPinBody;
-    cachedPinBody = pinChars > 0 || hygieneStats?.changed
+    cachedPinBody = pinChars > 0 || hygieneStats?.changed || hygieneStats?.tailHydrated
       ? new TextEncoder().encode(JSON.stringify(isEnvelope ? { ...reqRecord, request: req } : req))
       : bodyBytes;
     return cachedPinBody;
   };
 
   if (!opticalEnabled) {
+    runGoogleHygiene({ deep: true });
     if (hygieneStats?.changed) {
       info.compressed = true;
       info.reason = 'text_hygiene';
+      return measuredProfile
+        ? withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined)
+        : { body: getPinBody(), info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       return measuredProfile
         ? withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined)
         : { body: getPinBody(), info };
@@ -1104,6 +1262,8 @@ export async function transformGoogleGenerateContent(
     if (hygieneStats?.changed) {
       info.compressed = true;
       info.reason = 'text_hygiene';
+    } else if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
     }
     return { body: getPinBody(), info };
   };
@@ -1112,18 +1272,23 @@ export async function transformGoogleGenerateContent(
   const systemTexts: string[] = [];
   const systemInstruction = record(req.systemInstruction);
   const systemParts = systemInstruction?.parts;
-  if (systemParts !== undefined && !Array.isArray(systemParts)) {
-    return finishEarlyInvalid();
-  }
-  if (Array.isArray(systemParts)) {
+  let invalidSystemParts = systemParts !== undefined && !Array.isArray(systemParts);
+  if (!invalidSystemParts && Array.isArray(systemParts)) {
     for (const rawPart of systemParts) {
       const part = record(rawPart);
-      if (!part) return finishEarlyInvalid();
+      if (!part) {
+        invalidSystemParts = true;
+        break;
+      }
       if (typeof part.text === 'string' && part.text.trim()) {
         systemTexts.push(part.text);
         info.staticChars += part.text.length;
       }
     }
+  }
+  if (invalidSystemParts) {
+    runGoogleHygiene({ deep: false });
+    return finishEarlyInvalid();
   }
 
   const toolRewrite = options.compressTools === false
@@ -1142,10 +1307,28 @@ export async function transformGoogleGenerateContent(
     : 0;
   const estPromptTokens = googleTextTokens(authorityText) + toolRewrite.originalTokens + contentPromptTokens;
 
+  const opticalHistoryPolicy = resolveOpticalHistoryPolicy({
+    opticalMode: options.opticalMode,
+    collapseHistory: options.collapseHistory === true ? true : undefined,
+    model: modelName,
+    estPromptTokens,
+    textHygieneActive,
+  });
+  const hybridTextMmu = opticalHistoryPolicy === 'hybrid';
+
   if (priceMode() === 'kosha' && gateRatesFor(modelName, { promptTokens: estPromptTokens }) === null) {
-    info.reason = hygieneStats?.changed ? 'text_hygiene' : 'unpriced_model';
+    runGoogleHygiene({ deep: hybridTextMmu });
+    info.reason = hygieneStats?.changed
+      ? 'text_hygiene'
+      : hygieneStats?.tailHydrated
+        ? 'mmu_hydrate'
+        : 'unpriced_model';
     if (hygieneStats?.changed) info.compressed = true;
     return withStampedThoughtSignatures(req, getPinBody(), info, isEnvelope ? reqRecord : undefined);
+  }
+
+  if (!hybridTextMmu) {
+    runGoogleHygiene({ deep: false });
   }
 
   let staticImages: RenderedImage[] = [];
@@ -1158,6 +1341,7 @@ export async function transformGoogleGenerateContent(
 
   if (combinedRaw) {
     const combined = compactSlabWhitespace(combinedRaw).trimEnd();
+    info.systemSha8 = await sha8(combined);
     const reflowNote = options.reflow !== false
       ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
       : '';
@@ -1197,9 +1381,14 @@ export async function transformGoogleGenerateContent(
   }
 
   // Build static image parts if static slab is profitable
-  const imageParts: GooglePart[] = staticProfitable ? staticImages.map(imagePart) : [];
-  if (staticProfitable && fsText) {
+  const hasStaticCompression = staticProfitable && staticImages.length > 0;
+  const imageParts: GooglePart[] = hasStaticCompression ? staticImages.map(imagePart) : [];
+  if (hasStaticCompression && fsText) {
     imageParts.push({ text: fsText });
+  }
+
+  if (hybridTextMmu) {
+    runGoogleHygiene({ deep: true, hasStaticSlabOptical: hasStaticCompression });
   }
 
   // Prepare transformed request. Plan history against the ORIGINAL contents;
@@ -1214,7 +1403,7 @@ export async function transformGoogleGenerateContent(
     }
   }
 
-  const historyPlan = options.collapseHistory === false
+  const historyPlan = options.collapseHistory === false || hybridTextMmu
     ? null
     : await planGoogleHistory(
         originalContents,
@@ -1233,9 +1422,6 @@ export async function transformGoogleGenerateContent(
       if (seg.factSheet) historyParts.push({ text: seg.factSheet });
       historyParts.push({ text: outro });
     }
-    if (historyPlan.pinnedUserText) {
-      historyParts.push({ text: historyPlan.pinnedUserText });
-    }
     if (historyPlan.start > 0 && contents[historyPlan.start - 1]?.role === 'user') {
       // Keep Gemini's alternating role shape: append the synthetic prior-context
       // parts to the preceding live user turn rather than emitting user→user.
@@ -1252,12 +1438,36 @@ export async function transformGoogleGenerateContent(
         ...contents.slice(historyPlan.endExclusive),
       ];
     }
+    if (historyPlan.pinnedUserText) {
+      // Keep mutable active/prior user framing OUT of contents[0] so sealed
+      // optical segments remain byte-identical across turns and never bust KV cache.
+      const last = contents[contents.length - 1];
+      if (last && last.role === 'user') {
+        contents[contents.length - 1] = {
+          ...last,
+          parts: [{ text: historyPlan.pinnedUserText }, ...(last.parts ?? [])],
+        };
+      } else {
+        contents.push({ role: 'user', parts: [{ text: historyPlan.pinnedUserText }] });
+      }
+    }
   }
 
-  const toolResultPlan = await compressGoogleToolResults(contents, modelName, options);
+  const toolResultPlan = hybridTextMmu
+    ? {
+        contents,
+        images: [] as RenderedImage[],
+        imageSources: [] as string[],
+        baselineTokens: 0,
+        nativeTokens: 0,
+        compressedChars: 0,
+        bucketChars: {} as Record<string, number>,
+        droppedChars: 0,
+        droppedCodepoints: new Map<number, number>(),
+      }
+    : await compressGoogleToolResults(contents, modelName, options);
   contents = toolResultPlan.contents;
 
-  const hasStaticCompression = staticProfitable && staticImages.length > 0;
   const hasHistoryCompression = !!historyPlan && historyPlan.images.length > 0;
   const hasToolCompression = toolResultPlan.images.length > 0;
 
@@ -1265,6 +1475,8 @@ export async function transformGoogleGenerateContent(
     if (hygieneStats?.changed) {
       info.compressed = true;
       info.reason = 'text_hygiene';
+    } else if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
     } else if (!combinedRaw) {
       info.reason = 'no_static_context';
     } else if (!staticProfitable) {
@@ -1357,7 +1569,7 @@ export async function transformGoogleGenerateContent(
       for (const [codepoint, count] of historyPlan.droppedCodepoints) {
         mergedDroppedCodepoints.set(codepoint, (mergedDroppedCodepoints.get(codepoint) ?? 0) + count);
       }
-  } else if (options.collapseHistory !== false) {
+  } else if (options.collapseHistory !== false && !hybridTextMmu) {
     info.historyReason = originalContents.length > profile.history.keepTail
       ? 'not_profitable'
       : 'no_history';
@@ -1386,6 +1598,12 @@ export async function transformGoogleGenerateContent(
   }
   info.droppedChars = (info.droppedChars ?? 0) + totalDroppedChars;
   info.droppedCodepointsTop = droppedCodepointsTop(mergedDroppedCodepoints) ?? {};
+  if (hybridTextMmu && hasStaticCompression) {
+    info.reason = 'hybrid_slab_optical';
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_slab_optical')) stages.push('hybrid_slab_optical');
+    info.textHygieneStages = stages;
+  }
 
   const outPayload = isEnvelope ? { ...reqRecord, request: transformedReq } : transformedReq;
   const transformedBytes = new TextEncoder().encode(JSON.stringify(outPayload));

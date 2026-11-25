@@ -7,7 +7,9 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { ensureLaunchdSocketShim, resolveInheritedListenFd } from './launchd-socket.js';
 import { createWarpRuntime } from './warp/index.js';
+import { createNodeUpstreamFetch } from './node-fetch.js';
 import {
   renderShellInitScript,
   resolveMacAppBundle,
@@ -18,10 +20,16 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { isIP } from 'node:net';
+import { isIP, Server as NetServer, type Socket } from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { createProxy, parseGatewayHeaders, resolveUpstreams, type ProxyConfig } from './core/proxy.js';
+import {
+  createProxy,
+  parseGatewayHeaders,
+  resolveTrustAdjacentToolRoundsEnv,
+  resolveUpstreams,
+  type ProxyConfig,
+} from './core/proxy.js';
 import { readBrandEnv } from './core/env.js';
 import { getAllowedModelBases, setAllowedModelBases } from './core/applicability.js';
 import { guardProxyRequest, parseAllowedHosts } from './core/request-guard.js';
@@ -66,6 +74,7 @@ import {
   type TrackEvent,
 } from './core/tracker.js';
 import {
+  configureMaxSessions,
   configureSessionStateStore,
   flushSessionState,
   type SessionStateStore,
@@ -78,6 +87,24 @@ import {
 } from './dashboard.js';
 import { runStats } from './stats.js';
 import { defaultEventsFilePath, runTurnReportCli } from './turn-report.js';
+import {
+  defaultCalibratedProfilesPath,
+  loadCalibratedProfilesFile,
+  runCalibrationCli,
+} from './calibrate.js';
+import {
+  configureMmuLimits,
+  configureMmuPersistence,
+  flushMmuPersistence,
+  getGlobalMmuStore,
+} from './core/context-mmu.js';
+import { fileMmuPersistenceStore, MMU_CLI_USAGE, parseMmuCliArgs } from './mmu-store.js';
+import {
+  extractKoshaModelBases,
+  loadKoshaSnapshot,
+  mergeModelBases,
+  type KoshaRegistrySnapshot,
+} from './kosha-sync.js';
 
 /** Runtime config. The core transform tuning comes from DEFAULTS in
  *  transform.ts; startup knobs cover deployment plus emergency GPT scope
@@ -187,6 +214,24 @@ function readConfigObject(): { file: string; cfg: Record<string, unknown> } | nu
   return { file, cfg: parsed as Record<string, unknown> };
 }
 
+function normalizePositiveIntConfig(raw: unknown): string | undefined {
+  const n = typeof raw === 'number'
+    ? raw
+    : typeof raw === 'string' && raw.trim() !== ''
+      ? Number(raw.trim())
+      : NaN;
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return String(Math.floor(n));
+}
+
+function parseOptionalPositiveIntEnv(name: string): number | undefined {
+  const raw = readBrandEnv(name)?.trim();
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
+}
+
 function applyConfigFileDefaults(): void {
   const loaded = readConfigObject();
   if (!loaded) return;
@@ -209,6 +254,18 @@ function applyConfigFileDefaults(): void {
         ? cfg.custom_hosts.trim()
         : undefined;
     if (hosts) process.env.FICHE_UPSTREAM_HOSTS = hosts;
+  }
+  if (readBrandEnv('MMU_MAX_PAGES') === undefined) {
+    const v = normalizePositiveIntConfig(cfg.mmu_max_pages);
+    if (v !== undefined) process.env.FICHE_MMU_MAX_PAGES = v;
+  }
+  if (readBrandEnv('MMU_MAX_MB') === undefined) {
+    const v = normalizePositiveIntConfig(cfg.mmu_max_mb);
+    if (v !== undefined) process.env.FICHE_MMU_MAX_MB = v;
+  }
+  if (readBrandEnv('MAX_SESSIONS') === undefined) {
+    const v = normalizePositiveIntConfig(cfg.max_sessions);
+    if (v !== undefined) process.env.FICHE_MAX_SESSIONS = v;
   }
 }
 
@@ -390,6 +447,10 @@ function listNodeStagePlugins(): StagePluginDescriptor[] {
   discoverCustomPlugins(customDir, discovered);
   discoverSkillsDir(path.join(home, '.agents', 'skills'), discovered);
   discoverSkillsDir(
+    path.join(home, '.gemini', 'config', 'plugins', 'fiche-companion', 'skills'),
+    discovered,
+  );
+  discoverSkillsDir(
     path.join(home, '.gemini', 'config', 'plugins', 'fiche-telemetry', 'skills'),
     discovered,
   );
@@ -433,6 +494,24 @@ function setNodeThirdPartyPluginsEnabled(
   return { updatedCount, enabled, plugins: listNodeStagePlugins() };
 }
 
+function parseEnvPort(raw: string | undefined): number {
+  if (raw === undefined || !raw.trim()) return 47821;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n >= 1 && n <= 65535 ? n : 47821;
+}
+
+const DEFAULT_SHUTDOWN_DRAIN_MS = 60_000;
+const MAX_SHUTDOWN_DRAIN_MS = 600_000;
+
+function parseShutdownDrainMs(raw: string | undefined): number {
+  const trimmed = raw?.trim();
+  if (!trimmed) return DEFAULT_SHUTDOWN_DRAIN_MS;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) && n >= 0 && n <= MAX_SHUTDOWN_DRAIN_MS
+    ? n
+    : DEFAULT_SHUTDOWN_DRAIN_MS;
+}
+
 function parseCli(argv: string[]): RuntimeConfig {
   // Only flags accepted are --help and --version. Anything else is an
   // error — there is exactly ONE way to run fiche and the dashboard
@@ -464,7 +543,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
     : undefined;
   return {
-    port: Number(process.env.PORT ?? 47821),
+    port: parseEnvPort(process.env.PORT),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
@@ -517,7 +596,12 @@ Usage:
   fiche                  run the proxy (no flags)
   fiche providers [...]  list/enable/disable/detect opted-in AI providers
                          (list | set | enable | disable | detect [--apply] | add-host | remove-host)
-  fiche models [...]     list/enable/disable models eligible for compression
+  fiche models [...]     list/enable/disable/sync-kosha models eligible for compression
+                         (list | set | enable | disable | sync-kosha [--apply] [--all-providers] [--providers <csv>] [--file <path>] [--replace])
+  fiche calibrate [...]  run synthetic Auto-Canary optical calibration for a model
+                         (<model> [--provider ...] [--band auto|...] [--dry-run] [--list] [--clear <m>] [--json])
+  fiche mmu [...]        inspect Context-MMU virtual memory stats and paged blocks
+                         ([stats | pages | page <id>] [--query <text>] [--session <key>] [--port P] [--json])
   fiche export [...]     render files/diff to PNG pages + cost report (see fiche export --help)
   fiche mcp [--http P]   MCP server for every agent (stdio, or Streamable HTTP)
   fiche warp [--app <Name|Path>] [--providers <csv|all|none>] [--all-providers] [--verbose] [--route PATTERN=TARGET]... -- CMD
@@ -593,12 +677,21 @@ Environment (legacy INKLING_* aliases are also accepted):
   FICHE_FORCE_IMAGES      1 images weak readers too (Claude 5.5, Grok). Does not
                           re-enable prompt_cache_breakpoint on ChatGPT Codex.
   FICHE_CONFIG            JSON config path (default ~/.config/fiche/config.json)
-                          supports {"providers": [...], "models": [...], "custom_hosts": [...]}
+                          supports {"providers": [...], "models": [...],
+                          "custom_hosts": [...], "mmu_max_pages": N,
+                          "mmu_max_mb": N, "max_sessions": N}
   FICHE_LOG               JSONL events path (default ~/.fiche/events.jsonl)
   FICHE_SESSION_STATE     where per-session cache pins (freeze-step floor, cache
                           liveness) survive a restart; 0/off disables
                           (default ~/.fiche/session-state.json). Without it a
                           restart drops every live session's floor.
+  FICHE_MAX_SESSIONS      max tracked sessions in RAM (default 512, [64, 8192])
+  FICHE_MMU_MAX_PAGES     max Context-MMU virtual pages in RAM (default 512, [64, 16384])
+  FICHE_MMU_MAX_MB        max Context-MMU RAM budget in MiB (default 16, [4, 256])
+  FICHE_MMU_PERSIST       1/true/on to persist non-secret Context-MMU pages
+                          (24h idle TTL) alongside events.jsonl; default off
+                          (daemon memory-only). Honored only when
+                          FICHE_SESSION_STATE is not disabled.
   FICHE_DUMP_DIR          debug: write every rendered PNG here (what the model
                           sees); off unless set. Compress arm only.
   FICHE_RENDER_CACHE_BYTES  max bytes of rendered pages to keep in memory
@@ -610,6 +703,12 @@ Environment (legacy INKLING_* aliases are also accepted):
   FICHE_DEBUG_CAPTURE_4XX debug: set to 1 to persist full 4xx request and
                           upstream error bodies (prompts + any secrets in
                           context) to disk. Off by default.
+  FICHE_SHUTDOWN_DRAIN_MS ms to wait for active proxy/SSE streams to finish
+                          after SIGINT/SIGTERM before force-closing sockets
+                          (default 60000 when active requests > 0, else 1500).
+  FICHE_TRUST_ADJACENT_TOOL_ROUNDS  1 = let history collapse split adjacent tool
+                          call/result pairs for every client; 0 = never. Unset:
+                          on only for Claude Code (claude-cli/ UA + x-app: cli).
 
 Use with Claude Code:
   ANTHROPIC_BASE_URL=http://127.0.0.1:47821 claude
@@ -635,7 +734,7 @@ function resolvedCliVersion(): string {
       : typeof __INKLING_VERSION__ === 'string'
         ? __INKLING_VERSION__
         : undefined;
-  return injected ?? process.env.npm_package_version ?? '0.18.0';
+  return injected ?? process.env.npm_package_version ?? '0.19.0';
 }
 
 function printVersion(): void {
@@ -644,7 +743,7 @@ function printVersion(): void {
 
 // ---- node:http <-> Web Request/Response bridge ---------------------------
 
-function toWebRequest(req: IncomingMessage): Request {
+function toWebRequest(req: IncomingMessage, signal?: AbortSignal): Request {
   const rawProto = typeof req.headers['x-forwarded-proto'] === 'string'
     ? req.headers['x-forwarded-proto'].split(',')[0]!.trim().toLowerCase()
     : '';
@@ -662,77 +761,95 @@ function toWebRequest(req: IncomingMessage): Request {
   const method = req.method ?? 'GET';
   const hasBody = method !== 'GET' && method !== 'HEAD';
 
-  // Stream the body with explicit listener cleanup and abort/cancel guards so
-  // cancelling mid-stream (e.g. >16 MiB cap) never enqueues onto a closed stream.
+  // Stream with pull-based backpressure so large passthrough uploads stay
+  // bounded and early rejections (e.g. declared Content-Length over limit)
+  // pull zero bytes off the socket while leaving TCP alive to flush 413.
   let body: BodyInit | undefined;
   if (hasBody) {
     let closed = false;
+    let controllerRef: ReadableStreamDefaultController<Uint8Array> | undefined;
     let onData: ((chunk: Buffer) => void) | undefined;
     let onEnd: (() => void) | undefined;
     let onError: ((err: Error) => void) | undefined;
-    let onClose: (() => void) | undefined;
+    let onAborted: (() => void) | undefined;
     const detach = () => {
       if (onData) req.off('data', onData);
       if (onEnd) req.off('end', onEnd);
       if (onError) req.off('error', onError);
-      if (onClose) req.off('close', onClose);
+      if (onAborted) req.off('aborted', onAborted);
     };
-    body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        onData = (chunk: Buffer) => {
-          if (closed) return;
-          try {
-            controller.enqueue(chunk);
-          } catch {
+    body = new ReadableStream<Uint8Array>(
+      {
+        start(controller) {
+          controllerRef = controller;
+          onData = (chunk: Buffer) => {
+            if (closed) return;
+            try {
+              controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+              if ((controller.desiredSize ?? 0) <= 0) req.pause();
+            } catch {
+              closed = true;
+              detach();
+              req.pause();
+            }
+          };
+          onEnd = () => {
+            if (closed) return;
             closed = true;
             detach();
-            req.destroy();
-          }
-        };
-        onEnd = () => {
+            try {
+              controller.close();
+            } catch {
+              /* stream already closed */
+            }
+          };
+          onError = (e: Error) => {
+            if (closed) return;
+            closed = true;
+            detach();
+            try {
+              controller.error(e);
+            } catch {
+              /* stream already closed */
+            }
+          };
+          onAborted = () => {
+            if (closed) return;
+            closed = true;
+            detach();
+            try {
+              controller.error(new Error('client request aborted'));
+            } catch {
+              /* stream already closed */
+            }
+          };
+          req.on('data', onData);
+          req.on('end', onEnd);
+          req.on('error', onError);
+          req.on('aborted', onAborted);
+          req.pause();
+        },
+        pull() {
+          if (!closed && controllerRef) req.resume();
+        },
+        cancel() {
           if (closed) return;
           closed = true;
           detach();
-          try {
-            controller.close();
-          } catch {
-            /* stream already closed */
-          }
-        };
-        onError = (e: Error) => {
-          if (closed) return;
-          closed = true;
-          detach();
-          try {
-            controller.error(e);
-          } catch {
-            /* stream already closed */
-          }
-        };
-        onClose = () => {
-          if (closed) return;
-          if (!req.complete) {
-            onError?.(new Error('client request aborted'));
-          }
-        };
-        req.on('data', onData);
-        req.on('end', onEnd);
-        req.on('error', onError);
-        req.on('close', onClose);
+          // Pause rather than destroy: req shares its TCP socket with res, so
+          // destroying req here would abort a 413 response before it flushes.
+          req.pause();
+        },
       },
-      cancel() {
-        if (closed) return;
-        closed = true;
-        detach();
-        req.destroy();
-      },
-    });
+      { highWaterMark: 0 },
+    );
   }
 
   return new Request(url, {
     method,
     headers,
     body,
+    ...(signal ? { signal } : {}),
     // @ts-expect-error — duplex is required for streamed request bodies in Node 18+
     duplex: hasBody ? 'half' : undefined,
   });
@@ -798,6 +915,10 @@ function waitForDrain(out: ServerResponse): Promise<void> {
 }
 
 async function writeWebResponse(res: Response, out: ServerResponse): Promise<void> {
+  if (out.destroyed || out.writableEnded) {
+    await res.body?.cancel().catch(() => undefined);
+    return;
+  }
   out.statusCode = res.status;
   const cookies = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
   res.headers.forEach((v, k) => {
@@ -818,6 +939,7 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
   out.flushHeaders();
   const reader = res.body.getReader();
   let finished = false;
+  let completed = false;
   const cancelBody = () => {
     if (!finished) void reader.cancel().catch(() => undefined);
   };
@@ -825,7 +947,10 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
   try {
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        completed = true;
+        break;
+      }
       if (value && !out.write(value)) await waitForDrain(out);
     }
     if (!out.writableEnded) out.end();
@@ -838,6 +963,7 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
   } finally {
     finished = true;
     out.off('close', cancelBody);
+    if (!completed) await reader.cancel().catch(() => undefined);
     reader.releaseLock();
   }
 }
@@ -1255,7 +1381,30 @@ async function runExport(argv: string[]): Promise<void> {
 
 // ---- macOS launchd daemon service -----------------------------------------
 
-const SERVICE_LABEL = 'com.sriinnu.fiche';
+const DEFAULT_SERVICE_LABEL = 'com.sriinnu.fiche';
+const SERVICE_LABEL_PATTERN = /^[A-Za-z0-9._-]+$/;
+const SERVICE_PASSTHROUGH_ENV_KEYS = [
+  'FICHE_LOG',
+  'FICHE_CONFIG',
+  'FICHE_SESSION_STATE',
+  'FICHE_SHUTDOWN_DRAIN_MS',
+  'FICHE_MMU_MAX_PAGES',
+  'FICHE_MMU_MAX_MB',
+  'FICHE_MAX_SESSIONS',
+  'ANTHROPIC_UPSTREAM',
+  'FICHE_MODELS',
+] as const;
+
+function resolveServiceLabel(): string {
+  const override = process.env.FICHE_SERVICE_LABEL?.trim();
+  if (override) {
+    if (!SERVICE_LABEL_PATTERN.test(override)) {
+      throw new Error(`Invalid FICHE_SERVICE_LABEL "${override}" (expected [A-Za-z0-9._-]+)`);
+    }
+    return override;
+  }
+  return DEFAULT_SERVICE_LABEL;
+}
 
 function escapeXml(value: string): string {
   return value
@@ -1281,43 +1430,111 @@ function resolveServiceEntryPath(): string {
   return currentFile;
 }
 
-function resolvePlistPath(): string {
+function resolvePlistPath(label = resolveServiceLabel()): string {
   const override = process.env.FICHE_PLIST_PATH?.trim();
   if (override) return override;
-  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`);
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+}
+
+function collectServiceExtraEnv(): Record<string, string> {
+  const extra: Record<string, string> = {};
+  for (const key of SERVICE_PASSTHROUGH_ENV_KEYS) {
+    const val = process.env[key]?.trim();
+    if (val) extra[key] = val;
+  }
+  return extra;
 }
 
 function renderLaunchdPlist(opts: {
+  label?: string;
   execPath?: string;
   entryPath?: string;
+  shimPath?: string | null;
   ficheDir?: string;
+  port?: number;
+  host?: string;
+  extraEnv?: Record<string, string>;
 }): string {
+  const label = opts.label ?? resolveServiceLabel();
   const execPath = opts.execPath ?? process.execPath;
   const entryPath = opts.entryPath ?? resolveServiceEntryPath();
+  const shimPath = opts.shimPath ?? null;
   const ficheDir = opts.ficheDir ?? path.join(os.homedir(), '.fiche');
+  const port = opts.port ?? 47821;
+  const host = opts.host ?? '127.0.0.1';
   const outLog = path.join(ficheDir, 'daemon.out.log');
   const errLog = path.join(ficheDir, 'daemon.err.log');
+
+  const envMap = new Map<string, string>([
+    ['PATH', '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'],
+    ['FICHE_PRICES', 'kosha'],
+    ['FICHE_TEXT_HYGIENE', 'on'],
+  ]);
+  if (port !== 47821 || process.env.PORT?.trim()) {
+    envMap.set('PORT', String(port));
+  }
+  if (host !== '127.0.0.1' || process.env.HOST?.trim()) {
+    envMap.set('HOST', host);
+  }
+  for (const [k, v] of Object.entries(opts.extraEnv ?? {})) {
+    if (v) envMap.set(k, v);
+  }
+
+  const programArgs = shimPath ? [shimPath, execPath, entryPath] : [execPath, entryPath];
+  const socketLines: string[] = [];
+  if (shimPath) {
+    socketLines.push(
+      '  <key>Sockets</key>',
+      '  <dict>',
+      '    <key>Listeners</key>',
+      '    <dict>',
+    );
+    const family =
+      isIP(host) === 4 || host === 'localhost'
+        ? 'IPv4'
+        : isIP(host) === 6
+          ? 'IPv6'
+          : null;
+    if (family) {
+      socketLines.push('      <key>SockFamily</key>', `      <string>${family}</string>`);
+    }
+    if (host !== '0.0.0.0' && host !== '::') {
+      socketLines.push(
+        '      <key>SockNodeName</key>',
+        `      <string>${escapeXml(host === 'localhost' ? '127.0.0.1' : host)}</string>`,
+      );
+    }
+    socketLines.push(
+      '      <key>SockServiceName</key>',
+      `      <string>${escapeXml(String(port))}</string>`,
+      '      <key>SockType</key>',
+      '      <string>stream</string>',
+      '      <key>SockPassive</key>',
+      '      <true/>',
+      '    </dict>',
+      '  </dict>',
+    );
+  }
+
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
     '<plist version="1.0">',
     '<dict>',
     '  <key>Label</key>',
-    `  <string>${escapeXml(SERVICE_LABEL)}</string>`,
+    `  <string>${escapeXml(label)}</string>`,
     '  <key>ProgramArguments</key>',
     '  <array>',
-    `    <string>${escapeXml(execPath)}</string>`,
-    `    <string>${escapeXml(entryPath)}</string>`,
+    ...programArgs.map((arg) => `    <string>${escapeXml(arg)}</string>`),
     '  </array>',
     '  <key>EnvironmentVariables</key>',
     '  <dict>',
-    '    <key>PATH</key>',
-    '    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>',
-    '    <key>FICHE_PRICES</key>',
-    '    <string>kosha</string>',
-    '    <key>FICHE_TEXT_HYGIENE</key>',
-    '    <string>on</string>',
+    ...[...envMap.entries()].flatMap(([k, v]) => [
+      `    <key>${escapeXml(k)}</key>`,
+      `    <string>${escapeXml(v)}</string>`,
+    ]),
     '  </dict>',
+    ...socketLines,
     '  <key>RunAtLoad</key>',
     '  <true/>',
     '  <key>KeepAlive</key>',
@@ -1326,7 +1543,9 @@ function renderLaunchdPlist(opts: {
     '    <false/>',
     '  </dict>',
     '  <key>ThrottleInterval</key>',
-    '  <integer>10</integer>',
+    '  <integer>1</integer>',
+    '  <key>ExitTimeOut</key>',
+    '  <integer>65</integer>',
     '  <key>ProcessType</key>',
     '  <string>Standard</string>',
     '  <key>StandardOutPath</key>',
@@ -1352,25 +1571,37 @@ function runLaunchctl(args: string[], dryRun: boolean): { status: number; stdout
 }
 
 async function fetchHealth(port: number, timeoutMs = 350): Promise<Record<string, unknown> | null> {
+  let res: Response | undefined;
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+    res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+      headers: { connection: 'close' },
       signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      return null;
+    }
     const parsed = (await res.json()) as unknown;
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
       ? (parsed as Record<string, unknown>)
       : null;
   } catch {
+    await res?.body?.cancel().catch(() => undefined);
     return null;
   }
 }
 
-async function pollHealth(port: number, budgetMs = 2000): Promise<Record<string, unknown> | null> {
+async function pollHealth(
+  port: number,
+  budgetMs = 2000,
+  excludePid?: number,
+): Promise<Record<string, unknown> | null> {
   const deadline = Date.now() + budgetMs;
   while (Date.now() < deadline) {
-    const health = await fetchHealth(port, 250);
-    if (health) return health;
+    const health = await fetchHealth(port, 750);
+    if (health && (excludePid === undefined || health.pid !== excludePid)) {
+      return health;
+    }
     await new Promise((r) => setTimeout(r, 100));
   }
   return null;
@@ -1380,11 +1611,12 @@ async function runServiceCommand(argv: string[]): Promise<number> {
   const jsonFlag = argv.includes('--json');
   const dryRun = argv.includes('--dry-run');
   const action = argv.find((a) => !a.startsWith('-')) ?? 'status';
+  const serviceLabel = resolveServiceLabel();
   if (argv.includes('--help') || argv.includes('-h')) {
     console.log(`fiche service — manage the macOS launchd background daemon
 
 Usage:
-  fiche service install [--json]     install & start ~/Library/LaunchAgents/${SERVICE_LABEL}.plist
+  fiche service install [--json]     install & start ~/Library/LaunchAgents/${serviceLabel}.plist
   fiche service uninstall [--json]   stop & remove the LaunchAgent plist
   fiche service start [--json]       start the daemon via launchd
   fiche service stop [--json]        stop the daemon cleanly
@@ -1400,17 +1632,31 @@ Usage:
     return 2;
   }
 
-  const port = Number(process.env.PORT ?? 47821);
-  const plistPath = resolvePlistPath();
+  const port = parseEnvPort(process.env.PORT);
+  const host = process.env.HOST?.trim() || '127.0.0.1';
+  const plistPath = resolvePlistPath(serviceLabel);
   const ficheDir = path.join(os.homedir(), '.fiche');
   const uid = typeof process.getuid === 'function' ? process.getuid() : 501;
   const domainTarget = `gui/${uid}`;
-  const serviceTarget = `${domainTarget}/${SERVICE_LABEL}`;
+  const serviceTarget = `${domainTarget}/${serviceLabel}`;
 
   const emitResult = (payload: Record<string, unknown>, humanLine: string, code = 0): number => {
     if (jsonFlag) process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
     else console.log(humanLine);
     return code;
+  };
+
+  const buildServicePlist = () => {
+    const shim = ensureLaunchdSocketShim(ficheDir, dryRun);
+    const plistXml = renderLaunchdPlist({
+      label: serviceLabel,
+      ficheDir,
+      port,
+      host,
+      shimPath: shim.supported ? shim.shimPath : null,
+      extraEnv: collectServiceExtraEnv(),
+    });
+    return { plistXml, shim };
   };
 
   if (action === 'status') {
@@ -1419,15 +1665,17 @@ Usage:
     const payload = {
       running: Boolean(health),
       pid: typeof health?.pid === 'number' ? health.pid : null,
+      label: serviceLabel,
       plist_installed: plistInstalled,
       plist_path: plistPath,
       port,
       compression_enabled: typeof health?.compression_enabled === 'boolean' ? health.compression_enabled : null,
+      active_requests: typeof health?.active_requests === 'number' ? health.active_requests : null,
       price_mode: typeof health?.price_mode === 'string' ? health.price_mode : (readBrandEnv('PRICES') || 'default'),
       ...(typeof health?.version === 'string' ? { version: health.version } : {}),
     };
     const msg = health
-      ? `[fiche service] running (pid=${payload.pid}, port=${port}, compression=${payload.compression_enabled ? 'on' : 'off'}, prices=${payload.price_mode})`
+      ? `[fiche service] running (pid=${payload.pid}, port=${port}, active=${payload.active_requests ?? 0}, compression=${payload.compression_enabled ? 'on' : 'off'}, prices=${payload.price_mode})`
       : `[fiche service] stopped (plist=${plistInstalled ? 'installed' : 'not installed'}, port=${port})`;
     return emitResult(payload, msg);
   }
@@ -1444,7 +1692,10 @@ Usage:
   };
 
   if (action === 'install') {
-    const plistXml = renderLaunchdPlist({ ficheDir });
+    const prevHealth = dryRun ? null : await fetchHealth(port, 350);
+    const prevPid = typeof prevHealth?.pid === 'number' ? prevHealth.pid : undefined;
+    const { plistXml, shim } = buildServicePlist();
+    const socketActivated = Boolean(shim.supported && shim.shimPath);
     if (!dryRun) {
       fs.mkdirSync(ficheDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(path.dirname(plistPath), { recursive: true });
@@ -1454,17 +1705,19 @@ Usage:
     const boot = await bootstrapWithRetry(dryRun);
     if (boot.status !== 0 && !dryRun) {
       return emitResult(
-        { ok: false, action: 'install', error: boot.stderr.trim() || `launchctl bootstrap exited ${boot.status}`, plist_path: plistPath },
+        { ok: false, action: 'install', error: boot.stderr.trim() || `launchctl bootstrap exited ${boot.status}`, plist_path: plistPath, label: serviceLabel },
         `[fiche service] install failed: ${boot.stderr.trim() || `exit ${boot.status}`}`,
         1,
       );
     }
-    const health = dryRun ? null : await pollHealth(port);
+    const health = dryRun ? null : await pollHealth(port, 10_000, prevPid);
     return emitResult(
       {
         ok: true,
         action: 'install',
         dry_run: dryRun,
+        label: serviceLabel,
+        socket_activated: socketActivated,
         plist_installed: dryRun ? fs.existsSync(plistPath) : true,
         plist_path: plistPath,
         ...(dryRun ? { plist_xml: plistXml } : {}),
@@ -1479,10 +1732,11 @@ Usage:
   if (action === 'uninstall') {
     if (!dryRun) {
       try {
-        await fetch(`http://127.0.0.1:${port}/api/shutdown`, {
+        const res = await fetch(`http://127.0.0.1:${port}/api/shutdown`, {
           method: 'POST',
           signal: AbortSignal.timeout(500),
         });
+        await res.body?.cancel().catch(() => undefined);
       } catch {
         // Not running
       }
@@ -1498,7 +1752,7 @@ Usage:
       }
     }
     return emitResult(
-      { ok: true, action: 'uninstall', dry_run: dryRun, removed, plist_path: plistPath },
+      { ok: true, action: 'uninstall', dry_run: dryRun, removed, plist_path: plistPath, label: serviceLabel },
       `[fiche service] ${dryRun ? 'would uninstall' : `uninstalled (${removed ? `removed ${plistPath}` : 'plist was absent'})`}`,
     );
   }
@@ -1506,26 +1760,28 @@ Usage:
   if (action === 'stop') {
     if (!dryRun) {
       try {
-        await fetch(`http://127.0.0.1:${port}/api/shutdown`, {
+        const res = await fetch(`http://127.0.0.1:${port}/api/shutdown`, {
           method: 'POST',
           signal: AbortSignal.timeout(500),
         });
+        await res.body?.cancel().catch(() => undefined);
       } catch {
         // Not running
       }
     }
     runLaunchctl(['bootout', serviceTarget], dryRun);
     return emitResult(
-      { ok: true, action: 'stop', dry_run: dryRun, running: false, plist_path: plistPath },
+      { ok: true, action: 'stop', dry_run: dryRun, running: false, plist_path: plistPath, label: serviceLabel },
       `[fiche service] ${dryRun ? 'would stop' : 'stopped'}`,
     );
   }
 
   if (action === 'start') {
     if (!dryRun && !fs.existsSync(plistPath)) {
+      const { plistXml } = buildServicePlist();
       fs.mkdirSync(ficheDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-      fs.writeFileSync(plistPath, renderLaunchdPlist({ ficheDir }), { mode: 0o600 });
+      fs.writeFileSync(plistPath, plistXml, { mode: 0o600 });
     }
     let boot = runLaunchctl(['kickstart', '-k', serviceTarget], dryRun);
     if (boot.status !== 0) {
@@ -1533,31 +1789,35 @@ Usage:
     }
     if (boot.status !== 0 && !dryRun) {
       return emitResult(
-        { ok: false, action: 'start', error: boot.stderr.trim() || `launchctl exited ${boot.status}`, plist_path: plistPath },
+        { ok: false, action: 'start', error: boot.stderr.trim() || `launchctl exited ${boot.status}`, plist_path: plistPath, label: serviceLabel },
         `[fiche service] start failed: ${boot.stderr.trim() || `exit ${boot.status}`}`,
         1,
       );
     }
-    const health = dryRun ? null : await pollHealth(port);
+    const health = dryRun ? null : await pollHealth(port, 10_000);
     return emitResult(
-      { ok: true, action: 'start', dry_run: dryRun, running: Boolean(health), pid: health?.pid ?? null, port, plist_path: plistPath },
+      { ok: true, action: 'start', dry_run: dryRun, label: serviceLabel, running: Boolean(health), pid: health?.pid ?? null, port, plist_path: plistPath },
       `[fiche service] ${dryRun ? 'would start' : `started${health ? ` (pid=${health.pid})` : ''}`}`,
     );
   }
 
   // restart: kickstart atomically when already loaded; fall back to bootout + retry bootstrap
+  const prevHealth = dryRun ? null : await fetchHealth(port, 350);
+  const prevPid = typeof prevHealth?.pid === 'number' ? prevHealth.pid : undefined;
   if (!dryRun && !fs.existsSync(plistPath)) {
+    const { plistXml } = buildServicePlist();
     fs.mkdirSync(ficheDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-    fs.writeFileSync(plistPath, renderLaunchdPlist({ ficheDir }), { mode: 0o600 });
+    fs.writeFileSync(plistPath, plistXml, { mode: 0o600 });
   }
   let boot = runLaunchctl(['kickstart', '-k', serviceTarget], dryRun);
   if (boot.status !== 0 && !dryRun) {
     try {
-      await fetch(`http://127.0.0.1:${port}/api/shutdown`, {
+      const res = await fetch(`http://127.0.0.1:${port}/api/shutdown`, {
         method: 'POST',
         signal: AbortSignal.timeout(500),
       });
+      await res.body?.cancel().catch(() => undefined);
     } catch {
       // Not running
     }
@@ -1566,14 +1826,14 @@ Usage:
   }
   if (boot.status !== 0 && !dryRun) {
     return emitResult(
-      { ok: false, action: 'restart', error: boot.stderr.trim() || `launchctl exited ${boot.status}`, plist_path: plistPath },
+      { ok: false, action: 'restart', error: boot.stderr.trim() || `launchctl exited ${boot.status}`, plist_path: plistPath, label: serviceLabel },
       `[fiche service] restart failed: ${boot.stderr.trim() || `exit ${boot.status}`}`,
       1,
     );
   }
-  const health = dryRun ? null : await pollHealth(port);
+  const health = dryRun ? null : await pollHealth(port, 10_000, prevPid);
   return emitResult(
-    { ok: true, action: 'restart', dry_run: dryRun, running: Boolean(health), pid: health?.pid ?? null, port, plist_path: plistPath },
+    { ok: true, action: 'restart', dry_run: dryRun, label: serviceLabel, running: Boolean(health), pid: health?.pid ?? null, port, plist_path: plistPath },
     `[fiche service] ${dryRun ? 'would restart' : `restarted${health ? ` (pid=${health.pid})` : ''}`}`,
   );
 }
@@ -1590,6 +1850,7 @@ async function syncDaemonJson(
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(1500),
     });
+    await res.body?.cancel().catch(() => undefined);
     return res.ok;
   } catch {
     return false;
@@ -1861,8 +2122,154 @@ async function runModelsCommand(argv: readonly string[], port: number): Promise<
     const next = getAllowedModelBases().filter((m) => !drop.has(m.toLowerCase()));
     return commitModels(next, 'disabled');
   }
-  console.error(`[fiche] unknown models subcommand: ${sub} (expected: list | set | enable | disable)`);
+  if (sub === 'sync-kosha' || sub === 'sync') {
+    let apply = false;
+    let allProviders = false;
+    let replace = false;
+    let explicitFile: string | undefined;
+    let providersArg: string | undefined;
+    for (let i = 0; i < rest.length; i += 1) {
+      const arg = rest[i]!;
+      if (arg === '--apply') {
+        apply = true;
+      } else if (arg === '--all-providers') {
+        allProviders = true;
+      } else if (arg === '--replace') {
+        replace = true;
+      } else if (arg === '--file') {
+        const val = rest[i + 1];
+        if (!val || val.startsWith('-')) {
+          console.error('[fiche] models sync-kosha: --file needs a path');
+          return 2;
+        }
+        explicitFile = val;
+        i += 1;
+      } else if (arg.startsWith('--file=')) {
+        explicitFile = arg.slice('--file='.length);
+      } else if (arg === '--providers') {
+        const val = rest[i + 1];
+        if (!val || val.startsWith('-')) {
+          console.error('[fiche] models sync-kosha: --providers needs a comma-separated list');
+          return 2;
+        }
+        providersArg = val;
+        i += 1;
+      } else if (arg.startsWith('--providers=')) {
+        providersArg = arg.slice('--providers='.length);
+      } else {
+        console.error(`[fiche] models sync-kosha: unknown option: ${arg}`);
+        return 2;
+      }
+    }
+    if (allProviders && providersArg !== undefined) {
+      console.error('[fiche] models sync-kosha: --all-providers and --providers are mutually exclusive');
+      return 2;
+    }
+
+    let targetProviders: ProviderId[];
+    if (allProviders) {
+      targetProviders = PROVIDER_CATALOG.map((p) => p.id);
+    } else if (providersArg !== undefined) {
+      const { providers, unknown } = parseProvidersSpec(providersArg);
+      if (unknown.length > 0 || !providers || providers.length === 0) {
+        const available = PROVIDER_CATALOG.map((p) => p.id).join(', ');
+        console.error(
+          `[fiche] unknown or empty provider(s): ${unknown.join(', ') || '(empty)'}\nAvailable: ${available}`,
+        );
+        return 2;
+      }
+      targetProviders = [...providers];
+    } else {
+      targetProviders = getEnabledProviders();
+    }
+
+    let loaded: { snapshot: KoshaRegistrySnapshot; source: string };
+    try {
+      loaded = loadKoshaSnapshot(explicitFile);
+    } catch (e) {
+      console.error(`[fiche] models sync-kosha failed: ${(e as Error).message}`);
+      return 1;
+    }
+
+    const extracted = extractKoshaModelBases(loaded.snapshot, { providers: targetProviders });
+    const existing = getAllowedModelBases();
+    const { merged, added } = mergeModelBases(existing, extracted.bases, replace);
+
+    let saved = false;
+    let synced = false;
+    if (apply) {
+      setAllowedModelBases(merged);
+      saved = persistConfigPatch({ models: merged });
+      synced = await syncDaemonJson(port, '/api/models', { models: merged });
+    }
+
+    if (jsonFlag) {
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            action: 'sync-kosha',
+            applied: apply,
+            replace,
+            source: loaded.source,
+            providers: targetProviders,
+            providersMatched: extracted.providersMatched,
+            scannedModels: extracted.scannedModels,
+            matchedModels: extracted.matchedModels,
+            discoveredCount: extracted.bases.length,
+            added,
+            models: merged,
+            saved,
+            synced,
+          },
+          null,
+          2,
+        ),
+      );
+      return 0;
+    }
+
+    if (!apply) {
+      console.log(
+        `[fiche] models sync-kosha (dry-run, ${loaded.source}): ` +
+          `${extracted.matchedModels}/${extracted.scannedModels} chat models -> ` +
+          `${extracted.bases.length} normalized bases (+${added.length} new over current ${existing.length})`,
+      );
+      if (added.length > 0) {
+        console.log(`  would add (${added.length}): ${added.join(', ')}`);
+      } else {
+        console.log('  no new model bases to add');
+      }
+      console.log('Run again with --apply to write config.json and update the running daemon.');
+      return 0;
+    }
+
+    console.log(
+      `[fiche] models sync-kosha applied (${loaded.source}): ` +
+        `${merged.length} total model bases (+${added.length} new; ` +
+        `${synced ? 'updated running daemon + config' : saved ? 'saved to config.json' : 'runtime only'})`,
+    );
+    return 0;
+  }
+  console.error(`[fiche] unknown models subcommand: ${sub} (expected: list | set | enable | disable | sync-kosha)`);
   return 2;
+}
+
+function applyMmuLimitsFromEnv(): { maxPages: number; maxBytes: number } {
+  const mmuMaxPagesEnv = parseOptionalPositiveIntEnv('MMU_MAX_PAGES');
+  const mmuMaxMbEnv = parseOptionalPositiveIntEnv('MMU_MAX_MB');
+  if (mmuMaxPagesEnv !== undefined || mmuMaxMbEnv !== undefined) {
+    return configureMmuLimits({
+      ...(mmuMaxPagesEnv !== undefined ? { maxPages: mmuMaxPagesEnv } : {}),
+      ...(mmuMaxMbEnv !== undefined ? { maxBytes: mmuMaxMbEnv * 1024 * 1024 } : {}),
+    });
+  }
+  const store = getGlobalMmuStore();
+  return { maxPages: store.maxPages, maxBytes: store.maxBytes };
+}
+
+function scaledMmuFileMaxBytes(maxBytes: number): number {
+  return Math.min(512 * 1024 * 1024, Math.max(32 * 1024 * 1024, maxBytes * 2));
 }
 
 // ---- main ----------------------------------------------------------------
@@ -1875,12 +2282,12 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] === 'providers') {
-    const port = Number(process.env.PORT ?? 47821);
+    const port = parseEnvPort(process.env.PORT);
     const code = await runProvidersCommand(argv.slice(1), port);
     process.exit(code);
   }
   if (argv[0] === 'models') {
-    const port = Number(process.env.PORT ?? 47821);
+    const port = parseEnvPort(process.env.PORT);
     const code = await runModelsCommand(argv.slice(1), port);
     process.exit(code);
   }
@@ -1918,6 +2325,152 @@ async function main(): Promise<void> {
     if (out) process.stdout.write(out + '\n');
     if (err) process.stderr.write(err + '\n');
     process.exit(code); // server never starts
+  }
+  if (argv[0] === 'calibrate') {
+    const code = await runCalibrationCli(argv.slice(1));
+    process.exit(code); // server never starts
+  }
+  if (argv[0] === 'mmu') {
+    const parsed = parseMmuCliArgs(argv.slice(1), process.env.PORT);
+    if (!parsed.ok) {
+      console.error(parsed.error);
+      process.exit(parsed.exitCode);
+    }
+    if (parsed.help) {
+      console.log(MMU_CLI_USAGE);
+      process.exit(0);
+    }
+
+    const { sub, asJson, port, query: queryArg, pageId: pageIdArg, sessionKey } = parsed;
+    const eventsPath = defaultEventsFilePath();
+    const mmuPath = path.join(path.dirname(eventsPath), 'mmu-pages.json');
+    if (sub === 'page') {
+      const qs = new URLSearchParams();
+      if (pageIdArg) qs.set('id', pageIdArg);
+      if (queryArg) qs.set('query', queryArg);
+      if (sessionKey) qs.set('sessionKey', sessionKey);
+      let payload: unknown;
+      let daemonHttpError: string | undefined;
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/mmu/page?${qs.toString()}`, {
+          signal: AbortSignal.timeout(400),
+        });
+        if (res.ok) {
+          payload = await res.json();
+        } else {
+          const errJson = (await res.json().catch(() => null)) as { error?: string } | null;
+          daemonHttpError = errJson?.error ?? `HTTP ${res.status}`;
+        }
+      } catch {
+        // Daemon unreachable — fallback to offline mmu-pages.json below if present
+      }
+      if (daemonHttpError) {
+        console.error(`[fiche] ${daemonHttpError}`);
+        process.exit(1);
+      }
+      if (!payload) {
+        applyConfigFileDefaults();
+        const effectiveMmu = applyMmuLimitsFromEnv();
+        configureMmuPersistence(
+          fileMmuPersistenceStore(mmuPath, { maxFileBytes: scaledMmuFileMaxBytes(effectiveMmu.maxBytes) }),
+        );
+        const store = getGlobalMmuStore();
+        if (pageIdArg) {
+          const hit = store.derefPage(pageIdArg, { sessionKey, query: queryArg, maxLines: 120 });
+          if (!hit) {
+            console.error(`[fiche] MMU page not found: ${pageIdArg}`);
+            process.exit(1);
+          }
+          payload = {
+            pageId: hit.page.id,
+            refId: hit.page.refId,
+            sessionKey: hit.page.sessionKey,
+            filePath: hit.page.filePath,
+            startLine: hit.startLine,
+            endLine: hit.endLine,
+            text: hit.text,
+          };
+        } else {
+          const matches = store.searchPages(queryArg!, sessionKey);
+          if (matches.length === 0) {
+            console.error(`[fiche] no MMU pages matching query: ${queryArg}`);
+            process.exit(1);
+          }
+          const top = matches[0]!;
+          const hit = store.derefPage(top.page.id, { sessionKey: top.page.sessionKey, query: queryArg, maxLines: 120 });
+          payload = {
+            pageId: top.page.id,
+            refId: top.page.refId,
+            sessionKey: top.page.sessionKey,
+            filePath: top.page.filePath,
+            startLine: hit?.startLine ?? 1,
+            endLine: hit?.endLine ?? 0,
+            text: hit?.text ?? '',
+          };
+        }
+      }
+      if (asJson) {
+        console.log(JSON.stringify(payload, null, 2));
+      } else {
+        const p = payload as { pageId: string; refId?: string; filePath?: string; startLine: number; endLine: number; text: string };
+        console.log(`[fiche mmu] ${p.pageId} (${p.filePath ?? p.refId ?? 'block'} L${p.startLine}-${p.endLine})\n${p.text}`);
+      }
+      process.exit(0);
+    }
+
+    let statsPayload: unknown;
+    let statsHttpError: string | undefined;
+    const statsQs = sessionKey ? `?sessionKey=${encodeURIComponent(sessionKey)}` : '';
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/mmu/stats${statsQs}`, {
+        signal: AbortSignal.timeout(400),
+      });
+      if (res.ok) {
+        statsPayload = await res.json();
+      } else {
+        const errJson = (await res.json().catch(() => null)) as { error?: string } | null;
+        statsHttpError = errJson?.error ?? `HTTP ${res.status}`;
+      }
+    } catch {
+      // Daemon unreachable — fallback to offline mmu-pages.json below if present
+    }
+    if (statsHttpError) {
+      console.error(`[fiche] ${statsHttpError}`);
+      process.exit(1);
+    }
+    if (!statsPayload) {
+      applyConfigFileDefaults();
+      const effectiveMmu = applyMmuLimitsFromEnv();
+      configureMmuPersistence(
+        fileMmuPersistenceStore(mmuPath, { maxFileBytes: scaledMmuFileMaxBytes(effectiveMmu.maxBytes) }),
+      );
+      const store = getGlobalMmuStore();
+      const pages = store.listPages(sessionKey);
+      const safePages = pages.slice(0, 50).map((p) => {
+        if (sessionKey) return p;
+        const { factTokens: _omitted, ...rest } = p;
+        return rest;
+      });
+      statsPayload = { stats: store.getStats(), pageCount: pages.length, pages: safePages };
+    }
+    if (asJson) {
+      console.log(JSON.stringify(statsPayload, null, 2));
+    } else {
+      const data = statsPayload as {
+        stats: { activePages: number; pagesStored: number; tailHydrations: number; markovFolds: number; skillsStubbed: number; densityPrunedBlocks: number };
+        pages?: Array<{ id: string; refId: string; filePath?: string; lineCount: number }>;
+      };
+      const st = data.stats;
+      console.log(
+        `[fiche mmu] activePages=${st.activePages} stored=${st.pagesStored} hydrations=${st.tailHydrations} markovFolds=${st.markovFolds} skillStubs=${st.skillsStubbed} densityPruned=${st.densityPrunedBlocks}`,
+      );
+      if (sub === 'pages' && data.pages) {
+        for (const p of data.pages) {
+          console.log(`  ${p.id}  ${String(p.lineCount).padStart(4)}L  ${p.filePath ?? p.refId}`);
+        }
+      }
+    }
+    process.exit(0);
   }
   // `warp` runs an agent behind a CONNECT proxy and redirects its inference
   // traffic into the fiche instance already running. It starts no proxy of its own, so
@@ -2037,8 +2590,16 @@ async function main(): Promise<void> {
     }).launch(warpCommand);
     return;
   }
+  // Capture systemd / fiche-launchd-exec socket activation state early and strip
+  // LISTEN_FDS / LISTEN_PID so child processes do not re-inherit fd 3.
+  const inheritedListenFd = resolveInheritedListenFd(process.env, process.pid);
+  delete process.env.LISTEN_FDS;
+  delete process.env.LISTEN_PID;
   // A/B harness passthrough switch (see the `transform` callback below).
   const forcePassthrough = /^(1|true|yes|on)$/i.test(readBrandEnv('DISABLE') ?? '');
+  const trustAdjacent = resolveTrustAdjacentToolRoundsEnv(readBrandEnv('TRUST_ADJACENT_TOOL_ROUNDS'));
+  const trustAdjacentToolRounds = trustAdjacent.value;
+  if (trustAdjacent.warning) console.warn(trustAdjacent.warning);
   if (forcePassthrough) {
     console.log('[fiche] FICHE_DISABLE set — passthrough mode (compress=false), still logging usage + baselines');
   }
@@ -2094,56 +2655,424 @@ async function main(): Promise<void> {
   // runs on static DEFAULTS — charsPerToken=4, priorWarm*=0 — which leaves
   // the warm-baseline and anti-flapping burn terms inert. That is
   // deliberate, NOT an oversight: there is no live-α feedback loop from
-  // the dashboard. Telemetry (2026-06, 897 sessions / 21,347 measured
+  // Local event logs (2026-06, 897 sessions / 21,347 measured
   // rows) showed 5 mode flips ever and losses at 0.8% of wins — all
   // one-time cache-create amortization — so closing the loop would not
   // change decisions. Re-run that reconciliation before wiring one in.
-  if (opts.sessionStateFile) {
-    const restored = configureSessionStateStore(fileSessionStateStore(opts.sessionStateFile));
-    console.log(`[fiche] session state: ${restored} session(s) restored from ${opts.sessionStateFile}`);
-  } else {
-    console.log('[fiche] session state: persistence off (FICHE_SESSION_STATE)');
-  }
-
+  const isLoopbackHost = isLoopbackHostname(opts.host);
+  // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
+  const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
   const tracker: Tracker = new FileTracker(opts.eventsFile);
-
   // Sidecar dir for oversized 4xx request-body samples. Lives next to the
   // events.jsonl so a single `rm -rf` cleans up both. Lazy-mkdir'd on first
   // sidecar write (see maybeWriteBodySidecar).
   const bodySidecarDir = path.join(path.dirname(opts.eventsFile), '4xx-bodies');
+  const upstreamFetch = createNodeUpstreamFetch();
+  const allowedHosts = parseAllowedHosts(readBrandEnv('ALLOWED_HOSTS'));
+  const allowPrivateDashboard = /^(1|true|yes|on)$/i.test(
+    (readBrandEnv('DASHBOARD_ALLOW_PRIVATE') ?? '').trim(),
+  );
 
   let shutdownHandler: ((sig: string) => void) | undefined;
+  let activeProxyRequests = 0;
+  let shuttingDown = false;
+  const shutdownDrainMs = parseShutdownDrainMs(readBrandEnv('SHUTDOWN_DRAIN_MS'));
   const pendingOnRequests = new Set<Promise<void>>();
 
-  // Live dashboard state — populated on every request via onRequest below,
-  // served via the route interception in front of the proxy handler. The
-  // SessionsPaths handle lets the dashboard surface session/disk/stats data
-  // without reaching back into module-scope globals.
-  const dashboard = new DashboardState(
-    {
-      eventsFile: opts.eventsFile,
-      sidecarDir: bodySidecarDir,
-    },
-    undefined,
-    persistModelBasesToConfig,
-    {
-      version: resolvedCliVersion(),
-      host: opts.host,
-      listPlugins: listNodeStagePlugins,
-      setPluginEnabled: setNodePluginEnabled,
-      setThirdPartyPluginsEnabled: setNodeThirdPartyPluginsEnabled,
-      onProvidersPersist: persistProvidersToConfig,
-      onShutdown: () => shutdownHandler?.('API_SHUTDOWN'),
-    },
-  );
-  // Seed the "recent requests" table from the JSONL log so a process restart
-  // doesn't reset what you can see in the UI. Best-effort; ignored on error.
-  await dashboard.replay(opts.eventsFile).catch(() => {});
+  let markReady!: () => void;
+  let markFailed!: (err: unknown) => void;
+  const readyPromise = new Promise<void>((resolve, reject) => {
+    markReady = resolve;
+    markFailed = reject;
+  });
+  readyPromise.catch(() => {});
 
-  // Follow the agent to its own third-party host (warp Host, or /to/<host>/).
-  const upstreamRegistry = buildUpstreamRegistry(parseUpstreamHosts(readBrandEnv('UPSTREAM_HOSTS')));
-  const followHosts = !/^(?:0|false|off|no)$/i.test((readBrandEnv('FOLLOW_HOSTS') ?? '').trim());
-  const config: ProxyConfig = {
+  let dashboard!: DashboardState;
+  let upstreamRegistry!: ReturnType<typeof buildUpstreamRegistry>;
+  let config!: ProxyConfig;
+  let handle!: ReturnType<typeof createProxy>;
+
+  type ConnTrack = { active: number; completed: number };
+  const connTrack = new Map<Socket, ConnTrack>();
+  const closeIdleSockets = (includeFreshUnstarted: boolean) => {
+    for (const [sock, state] of connTrack) {
+      if (state.active > 0) continue;
+      if (!includeFreshUnstarted && state.completed === 0) continue;
+      if (includeFreshUnstarted && state.completed === 0 && sock.bytesRead > 0) continue;
+      if (!sock.destroyed && !sock.writableEnded) sock.end();
+    }
+  };
+
+  let server!: ReturnType<typeof createServer>;
+  const boundPort = (): number => {
+    const addr = server.address();
+    return addr && typeof addr === 'object' ? addr.port : opts.port;
+  };
+
+  server = createServer((req, res) => {
+    const reqSocket = req.socket;
+    reqSocket?.setNoDelay?.(true);
+    const connState = reqSocket ? connTrack.get(reqSocket) : undefined;
+    if (connState) connState.active++;
+    if (shuttingDown && !res.headersSent) res.setHeader('connection', 'close');
+    res.once('close', () => {
+      if (!connState) return;
+      connState.active = Math.max(0, connState.active - 1);
+      connState.completed++;
+      if (shuttingDown && connState.active === 0 && !reqSocket.destroyed && !reqSocket.writableEnded) {
+        setImmediate(() => {
+          if (connState.active === 0 && !reqSocket.destroyed && !reqSocket.writableEnded) {
+            reqSocket.end();
+          }
+        });
+      }
+    });
+    Promise.resolve()
+      .then(async () => {
+        await readyPromise;
+        // Local dashboard routes — handled BEFORE the proxy so they never hit
+        // api.anthropic.com (which would 404 them).
+        const rawReqUrl = req.url ?? '/';
+        const rawHost = req.headers.host ?? 'localhost';
+        const rawHostHostname = extractHostHeaderHostname(rawHost);
+        const nonOriginForm =
+          rawReqUrl.startsWith('//') || !rawReqUrl.startsWith('/') || rawReqUrl.startsWith('/\\');
+        if (nonOriginForm) {
+          await writeWebResponse(new Response('invalid request target', { status: 400 }), res);
+          return;
+        }
+        let url: URL;
+        try {
+          url = new URL(rawReqUrl, `http://${rawHost}`);
+        } catch {
+          await writeWebResponse(new Response('invalid request target', { status: 400 }), res);
+          return;
+        }
+        const route = dashboardPath(url.pathname);
+        if (route) {
+          const remoteAllowed =
+            isLoopbackAddress(req.socket.remoteAddress) ||
+            (allowPrivateDashboard && isPrivateAddress(req.socket.remoteAddress));
+          if (
+            !remoteAllowed
+            || !isLoopbackHostname(rawHostHostname)
+            || !isLoopbackHostname(url.hostname)
+            || req.headers['sec-fetch-site'] === 'cross-site'
+          ) {
+            await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
+            return;
+          }
+          if (
+            (isDashboardMutation(route, req.method ?? 'GET') || req.headers.origin !== undefined)
+            && !isSameOriginDashboardRequest(req, url)
+          ) {
+            await writeWebResponse(new Response('cross-origin dashboard request denied', { status: 403 }), res);
+            return;
+          }
+          const webRes = await dispatchDashboard(
+            dashboard,
+            route,
+            req.method ?? 'GET',
+            url,
+            boundPort(),
+            () => readRequestBody(req),
+          );
+          if (webRes) {
+            await writeWebResponse(webRes, res);
+            return;
+          }
+        }
+        // Proxy API: refuse browser cross-site requests and rebound Hosts, which
+        // would otherwise spend the configured keys (see core/request-guard.ts).
+        const denial = guardProxyRequest(
+          {
+            host: req.headers.host,
+            origin: req.headers.origin,
+            secFetchSite: typeof req.headers['sec-fetch-site'] === 'string'
+              ? req.headers['sec-fetch-site']
+              : undefined,
+          },
+          { allowedHosts, providerHosts: new Set(upstreamRegistry.keys()) },
+        );
+        if (denial) {
+          await writeWebResponse(new Response(JSON.stringify({ error: denial.reason, message: denial.message }), {
+            status: denial.status,
+            headers: { 'content-type': 'application/json' },
+          }), res);
+          return;
+        }
+        activeProxyRequests++;
+        const clientAbort = new AbortController();
+        const onReqAborted = () => {
+          if (!clientAbort.signal.aborted) clientAbort.abort(new Error('client request aborted'));
+        };
+        const onReqClose = () => {
+          if (!req.complete && !clientAbort.signal.aborted) {
+            clientAbort.abort(new Error('client request closed prematurely'));
+          }
+        };
+        const onResClose = () => {
+          if (!res.writableFinished && !clientAbort.signal.aborted) {
+            clientAbort.abort(new Error('client disconnected'));
+          }
+        };
+        req.once('aborted', onReqAborted);
+        req.once('close', onReqClose);
+        res.once('close', onResClose);
+        try {
+          const webReq = toWebRequest(req, clientAbort.signal);
+          const webRes = await handle(webReq);
+          if (clientAbort.signal.aborted || res.destroyed || res.writableEnded) {
+            await webRes.body?.cancel().catch(() => undefined);
+            return;
+          }
+          // If the handler answered without draining the request body (e.g. an
+          // early 413), close the keep-alive socket after flushing the response
+          // so unread body bytes cannot desync the next pipelined request.
+          if (!req.complete && !res.headersSent) res.setHeader('connection', 'close');
+          await writeWebResponse(webRes, res);
+        } finally {
+          req.off('aborted', onReqAborted);
+          req.off('close', onReqClose);
+          res.off('close', onResClose);
+          activeProxyRequests = Math.max(0, activeProxyRequests - 1);
+          if (shuttingDown && activeProxyRequests === 0) {
+            closeIdleSockets(false);
+          }
+        }
+      })
+      .catch((err) => {
+        if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
+        console.error('[fiche] handler error:', err);
+        if (!res.headersSent) res.statusCode = 500;
+        if (!res.writableEnded) res.end();
+      });
+  });
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+    connTrack.set(socket, { active: 0, completed: 0 });
+    socket.once('close', () => {
+      connTrack.delete(socket);
+    });
+  });
+
+  let listeningStarted = false;
+  server.on('error', (err) => {
+    console.error('[fiche] server error:', err);
+    if (!listeningStarted) {
+      markFailed(err);
+      process.exit(1);
+    }
+  });
+
+  // server.close() only stops accepting new connections and waits for open
+  // ones to drain — it does NOT end idle keep-alive sockets. The dashboard tab
+  // (htmx polls every 2s) and coding agent clients hold keep-alive sockets
+  // open, so we drop idle sockets immediately, allow active SSE streams to
+  // drain up to `shutdownDrainMs` (default 60s when activeProxyRequests > 0,
+  // 1.5s when idle), and let a second signal exit immediately.
+  let flushedOnExit = false;
+  const flushAndExit = async (exitCode: number): Promise<void> => {
+    if (!flushedOnExit) {
+      flushedOnExit = true;
+      if (pendingOnRequests.size > 0) {
+        await Promise.race([
+          Promise.allSettled([...pendingOnRequests]),
+          new Promise<void>((r) => setTimeout(r, 300)),
+        ]);
+      }
+      // Pins first: losing a freeze-step floor re-keys a whole prefix.
+      upstreamFetch.destroy();
+      flushSessionState();
+      flushMmuPersistence();
+      // Flush+close the tracker so we don't drop the last few events on exit.
+      if (tracker instanceof FileTracker) tracker.close();
+    }
+    process.exit(exitCode);
+  };
+  let firstShutdownSignal: string | undefined;
+  let apiShutdownTermIgnored = false;
+  const shutdown = (sig: string) => {
+    if (shuttingDown) {
+      if (firstShutdownSignal === 'API_SHUTDOWN' && sig === 'SIGTERM' && !apiShutdownTermIgnored) {
+        apiShutdownTermIgnored = true;
+        console.log('[fiche] SIGTERM received during API_SHUTDOWN drain — continuing graceful drain');
+        return;
+      }
+      console.log(`[fiche] ${sig} again — forcing exit`);
+      if (!flushedOnExit) {
+        flushedOnExit = true;
+        upstreamFetch.destroy();
+        flushSessionState();
+        flushMmuPersistence();
+        if (tracker instanceof FileTracker) tracker.close();
+      }
+      process.exit(130);
+    }
+    shuttingDown = true;
+    firstShutdownSignal = sig;
+    const drainMs = activeProxyRequests > 0 ? shutdownDrainMs : 1500;
+    if (activeProxyRequests > 0) {
+      console.log(
+        `[fiche] ${sig} — draining ${activeProxyRequests} active request(s) ` +
+          `(up to ${Math.round(drainMs / 1000)}s); send ${sig} again to force exit`,
+      );
+    } else {
+      console.log(`[fiche] ${sig} — shutting down`);
+    }
+    // Drain in-flight connections first so late finishing requests don't lose
+    // session state or write to an already-closed tracker.
+    const idleSweep = setTimeout(() => {
+      closeIdleSockets(true);
+    }, 500);
+    idleSweep.unref();
+    const deadline = setTimeout(() => {
+      clearTimeout(idleSweep);
+      server.closeAllConnections?.();
+      void flushAndExit(0);
+    }, drainMs);
+    deadline.unref();
+    // Use net.Server.prototype.close directly so Node 19+ httpServerPreClose()
+    // does not call closeIdleConnections() and destroy() freshly accepted
+    // sockets whose HTTP request bytes are still pre-parse (TCP RST / ECONNRESET).
+    // Idle keep-alive sockets are gracefully ended via connTrack below.
+    NetServer.prototype.close.call(server, () => {
+      clearTimeout(idleSweep);
+      clearTimeout(deadline);
+      void flushAndExit(0);
+    });
+    // Drop idle keep-alive sockets immediately while giving freshly accepted
+    // sockets a brief window to deliver their first request bytes cleanly.
+    closeIdleSockets(false);
+  };
+  shutdownHandler = shutdown;
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  const announce = () => {
+    const routes = resolveUpstreams(config);
+    console.log(`[fiche] anthropic upstream → ${routes.anthropic}`);
+    console.log(`[fiche] openai upstream → ${routes.openai}`);
+    if (opts.cloudflareUpstream !== undefined) {
+      console.log(
+        `[fiche] cloudflare upstream → ${chatCompletionsUrl(opts.cloudflareUpstream)} ` +
+          `(models: ${opts.cloudflareModels?.join(', ') || 'none'})`,
+      );
+    }
+    console.log(`[fiche] tracking events → ${opts.eventsFile}`);
+    if (opts.captureErrorReqBody) {
+      console.warn(
+        `[fiche] FICHE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request and ` +
+          `upstream error bodies (prompts + any secrets in context) to ${bodySidecarDir}. ` +
+          `Debugging only.`,
+      );
+    }
+  };
+
+  // Bind BEFORE slow store/replay restoration so socket-activated restarts and
+  // cold boots start accepting TCP connections into the backlog immediately.
+  const onListening = () => {
+    listeningStarted = true;
+    const listenPort = boundPort();
+    const mode = inheritedListenFd !== null ? ` (socket-activated fd=${inheritedListenFd})` : '';
+    console.log(`[fiche] listening on http://${displayHost}:${listenPort}${mode}`);
+    if (!isLoopbackHost) {
+      console.warn(
+        `[fiche] bound to ${opts.host}; proxy API is reachable off-host, ` +
+          `but dashboard routes remain loopback-only.`,
+      );
+    }
+    void readyPromise.then(() => {
+      announce();
+      console.log(`[fiche] dashboard → http://127.0.0.1:${listenPort}/`);
+    }).catch(() => {});
+  };
+  if (inheritedListenFd !== null) {
+    server.listen({ fd: inheritedListenFd }, onListening);
+  } else {
+    server.listen(opts.port, opts.host, onListening);
+  }
+
+  try {
+    const maxSessionsEnv = parseOptionalPositiveIntEnv('MAX_SESSIONS');
+    if (maxSessionsEnv !== undefined) {
+      const effectiveSessions = configureMaxSessions(maxSessionsEnv);
+      console.log(`[fiche] session state limit: max ${effectiveSessions} sessions`);
+    }
+    const mmuMaxPagesEnv = parseOptionalPositiveIntEnv('MMU_MAX_PAGES');
+    const mmuMaxMbEnv = parseOptionalPositiveIntEnv('MMU_MAX_MB');
+    const effectiveMmu = applyMmuLimitsFromEnv();
+    if (mmuMaxPagesEnv !== undefined || mmuMaxMbEnv !== undefined) {
+      console.log(
+        `[fiche] context-mmu limits: max ${effectiveMmu.maxPages} pages, ` +
+          `${Math.round(effectiveMmu.maxBytes / (1024 * 1024))} MiB`,
+      );
+    }
+    if (opts.sessionStateFile) {
+      const restored = configureSessionStateStore(fileSessionStateStore(opts.sessionStateFile));
+      console.log(`[fiche] session state: ${restored} session(s) restored from ${opts.sessionStateFile}`);
+    } else {
+      console.log('[fiche] session state: persistence off (FICHE_SESSION_STATE)');
+    }
+    try {
+      const calPath = defaultCalibratedProfilesPath();
+      const calCount = loadCalibratedProfilesFile(calPath);
+      if (calCount > 0) {
+        console.log(`[fiche] calibration: ${calCount} calibrated model profile(s) loaded from ${calPath}`);
+      }
+    } catch {
+      // Best-effort calibration restore
+    }
+    const mmuPersistEnabled =
+      Boolean(opts.sessionStateFile) && /^(1|true|yes|on)$/i.test(readBrandEnv('MMU_PERSIST') ?? '');
+    if (mmuPersistEnabled) {
+      try {
+        const mmuPath = path.join(path.dirname(opts.eventsFile), 'mmu-pages.json');
+        const mmuPages = configureMmuPersistence(
+          fileMmuPersistenceStore(mmuPath, { maxFileBytes: scaledMmuFileMaxBytes(effectiveMmu.maxBytes) }),
+        );
+        if (mmuPages > 0) {
+          console.log(`[fiche] context-mmu: ${mmuPages} virtual page(s) restored from ${mmuPath}`);
+        }
+      } catch {
+        // Best-effort MMU restore
+      }
+    } else {
+      console.log('[fiche] context-mmu: memory-only (set FICHE_MMU_PERSIST=1 to enable disk persistence)');
+    }
+
+    // Live dashboard state — populated on every request via onRequest below,
+    // served via the route interception in front of the proxy handler. The
+    // SessionsPaths handle lets the dashboard surface session/disk/stats data
+    // without reaching back into module-scope globals.
+    dashboard = new DashboardState(
+      {
+        eventsFile: opts.eventsFile,
+        sidecarDir: bodySidecarDir,
+      },
+      undefined,
+      persistModelBasesToConfig,
+      {
+        version: resolvedCliVersion(),
+        host: opts.host,
+        listPlugins: listNodeStagePlugins,
+        setPluginEnabled: setNodePluginEnabled,
+        setThirdPartyPluginsEnabled: setNodeThirdPartyPluginsEnabled,
+        onProvidersPersist: persistProvidersToConfig,
+        onShutdown: () => shutdownHandler?.('API_SHUTDOWN'),
+        getActiveRequests: () => activeProxyRequests,
+      },
+    );
+    // Seed the "recent requests" table from the JSONL log so a process restart
+    // doesn't reset what you can see in the UI. Best-effort; ignored on error.
+    await dashboard.replay(opts.eventsFile).catch(() => {});
+
+    // Follow the agent to its own third-party host (warp Host, or /to/<host>/).
+    upstreamRegistry = buildUpstreamRegistry(parseUpstreamHosts(readBrandEnv('UPSTREAM_HOSTS')));
+    const followHosts = !/^(?:0|false|off|no)$/i.test((readBrandEnv('FOLLOW_HOSTS') ?? '').trim());
+    const DEFAULT_NODE_MAX_REQUEST_BYTES = 64 << 20;
+    config = {
+    fetch: upstreamFetch.fetch,
     authToken: anthropicAuthToken,
     provider: opts.provider,
     gatewayBaseUrl: opts.gatewayBaseUrl,
@@ -2157,7 +3086,8 @@ async function main(): Promise<void> {
     openAIModels: opts.openAIModels,
     cloudflareModels: opts.cloudflareModels,
     captureErrorReqBody: opts.captureErrorReqBody,
-    maxRequestBytes: opts.maxRequestBytes,
+    maxRequestBytes: opts.maxRequestBytes ?? (isLoopbackHost ? DEFAULT_NODE_MAX_REQUEST_BYTES : undefined),
+    oversizedBodyPolicy: isLoopbackHost ? 'passthrough' : 'reject',
     decodeRequestBody,
     followHosts,
     upstreamRegistry,
@@ -2176,17 +3106,25 @@ async function main(): Promise<void> {
       if (forcePassthrough || !dashboard.getCompressionEnabled()) return { compress: false };
       const toggles = stageTogglesFromOverrides(getActivePluginOverrides());
       const hasDisabledStage =
-        !toggles.optical || !toggles.tscg || !toggles.toon || !toggles.acdc || !toggles.casi;
+        !toggles.optical ||
+        !toggles.tscg ||
+        !toggles.toon ||
+        !toggles.acdc ||
+        !toggles.casi ||
+        !toggles.lsm ||
+        !toggles.mmu ||
+        !toggles.skillLinker;
       const rawHorizon = (readBrandEnv('HISTORY_AMORTIZATION_HORIZON') ?? '').trim();
       const parsedHorizon = rawHorizon ? Number.parseInt(rawHorizon, 10) : NaN;
-      if (Number.isFinite(parsedHorizon) && parsedHorizon >= 1 && parsedHorizon <= 100) {
-        return {
-          historyAmortizationHorizon: parsedHorizon,
-          ...(hasDisabledStage ? { stageToggles: toggles } : {}),
-        };
-      }
-      // Active path: use DEFAULTS in transform.ts for break-even gating.
-      return hasDisabledStage ? { stageToggles: toggles } : {};
+      const horizonOpt =
+        Number.isFinite(parsedHorizon) && parsedHorizon >= 1 && parsedHorizon <= 100
+          ? { historyAmortizationHorizon: parsedHorizon }
+          : {};
+      return {
+        ...horizonOpt,
+        ...(hasDisabledStage ? { stageToggles: toggles } : {}),
+        ...(trustAdjacentToolRounds !== undefined ? { separateAdjacentToolPairs: trustAdjacentToolRounds } : {}),
+      };
     },
     onRequest: (e) => {
       const task = (async () => {
@@ -2301,187 +3239,12 @@ async function main(): Promise<void> {
       return task;
     },
   };
-  const handle = createProxy(config);
-  const allowedHosts = parseAllowedHosts(readBrandEnv('ALLOWED_HOSTS'));
-
-  const allowPrivateDashboard = /^(1|true|yes|on)$/i.test(
-    (readBrandEnv('DASHBOARD_ALLOW_PRIVATE') ?? '').trim(),
-  );
-
-  const server = createServer((req, res) => {
-    req.socket?.setNoDelay?.(true);
-    Promise.resolve()
-      .then(async () => {
-        // Local dashboard routes — handled BEFORE the proxy so they never hit
-        // api.anthropic.com (which would 404 them).
-        const rawReqUrl = req.url ?? '/';
-        const rawHost = req.headers.host ?? 'localhost';
-        const rawHostHostname = extractHostHeaderHostname(rawHost);
-        const nonOriginForm =
-          rawReqUrl.startsWith('//') || !rawReqUrl.startsWith('/') || rawReqUrl.startsWith('/\\');
-        if (nonOriginForm) {
-          await writeWebResponse(new Response('invalid request target', { status: 400 }), res);
-          return;
-        }
-        let url: URL;
-        try {
-          url = new URL(rawReqUrl, `http://${rawHost}`);
-        } catch {
-          await writeWebResponse(new Response('invalid request target', { status: 400 }), res);
-          return;
-        }
-        const route = dashboardPath(url.pathname);
-        if (route) {
-          const remoteAllowed =
-            isLoopbackAddress(req.socket.remoteAddress) ||
-            (allowPrivateDashboard && isPrivateAddress(req.socket.remoteAddress));
-          if (
-            !remoteAllowed
-            || !isLoopbackHostname(rawHostHostname)
-            || !isLoopbackHostname(url.hostname)
-            || req.headers['sec-fetch-site'] === 'cross-site'
-          ) {
-            await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
-            return;
-          }
-          if (isDashboardMutation(route, req.method ?? 'GET')
-            && !isSameOriginDashboardRequest(req, url)) {
-            await writeWebResponse(new Response('cross-origin dashboard mutation denied', { status: 403 }), res);
-            return;
-          }
-          const webRes = await dispatchDashboard(
-            dashboard,
-            route,
-            req.method ?? 'GET',
-            url,
-            opts.port,
-            () => readRequestBody(req),
-          );
-          if (webRes) {
-            await writeWebResponse(webRes, res);
-            return;
-          }
-        }
-        // Proxy API: refuse browser cross-site requests and rebound Hosts, which
-        // would otherwise spend the configured keys (see core/request-guard.ts).
-        const denial = guardProxyRequest(
-          {
-            host: req.headers.host,
-            origin: req.headers.origin,
-            secFetchSite: typeof req.headers['sec-fetch-site'] === 'string'
-              ? req.headers['sec-fetch-site']
-              : undefined,
-          },
-          { allowedHosts, providerHosts: new Set(upstreamRegistry.keys()) },
-        );
-        if (denial) {
-          await writeWebResponse(new Response(JSON.stringify({ error: denial.reason, message: denial.message }), {
-            status: denial.status,
-            headers: { 'content-type': 'application/json' },
-          }), res);
-          return;
-        }
-        const webReq = toWebRequest(req);
-        const webRes = await handle(webReq);
-        await writeWebResponse(webRes, res);
-      })
-      .catch((err) => {
-        if (isConnectionAbort(err) && (req.aborted || res.destroyed)) return;
-        console.error('[fiche] handler error:', err);
-        if (!res.headersSent) res.statusCode = 500;
-        if (!res.writableEnded) res.end();
-      });
-  });
-  server.on('connection', (socket) => socket.setNoDelay(true));
-  // IPv6 literals need bracket notation to form a valid URL (http://[::1]:47821).
-  const displayHost = opts.host.includes(':') ? `[${opts.host}]` : opts.host;
-  const isLoopbackHost =
-    opts.host === '127.0.0.1' || opts.host === 'localhost' || opts.host === '::1';
-  const announce = () => {
-    const routes = resolveUpstreams(config);
-    console.log(`[fiche] anthropic upstream → ${routes.anthropic}`);
-    console.log(`[fiche] openai upstream → ${routes.openai}`);
-    if (opts.cloudflareUpstream !== undefined) {
-      console.log(
-        `[fiche] cloudflare upstream → ${chatCompletionsUrl(opts.cloudflareUpstream)} ` +
-          `(models: ${opts.cloudflareModels?.join(', ') || 'none'})`,
-      );
-    }
-    console.log(`[fiche] tracking events → ${opts.eventsFile}`);
-    if (opts.captureErrorReqBody) {
-      console.warn(
-        `[fiche] FICHE_DEBUG_CAPTURE_4XX=1 — persisting full 4xx request and ` +
-          `upstream error bodies (prompts + any secrets in context) to ${bodySidecarDir}. ` +
-          `Debugging only.`,
-      );
-    }
-  };
-
-  server.listen(opts.port, opts.host, () => {
-    console.log(`[fiche] listening on http://${displayHost}:${opts.port}`);
-    if (!isLoopbackHost) {
-      console.warn(
-        `[fiche] bound to ${opts.host}; proxy API is reachable off-host, ` +
-          `but dashboard routes remain loopback-only.`,
-      );
-    }
-    announce();
-    console.log(`[fiche] dashboard → http://127.0.0.1:${opts.port}/`);
-  });
-
-  // server.close() only stops accepting new connections and waits for open
-  // ones to drain — it does NOT end idle keep-alive sockets. The dashboard tab
-  // (htmx polls every 2s) and the Claude Code client both hold keep-alive
-  // sockets open, so a naive close() never fires its callback and the first
-  // Ctrl+C appears to hang. We drop idle sockets immediately, force-close any
-  // in-flight ones after a short grace period, and let a second signal exit now.
-  let shuttingDown = false;
-  let flushedOnExit = false;
-  const flushAndExit = async (exitCode: number): Promise<void> => {
-    if (!flushedOnExit) {
-      flushedOnExit = true;
-      if (pendingOnRequests.size > 0) {
-        await Promise.race([
-          Promise.allSettled([...pendingOnRequests]),
-          new Promise<void>((r) => setTimeout(r, 300)),
-        ]);
-      }
-      // Pins first: losing a freeze-step floor re-keys a whole prefix.
-      flushSessionState();
-      // Flush+close the tracker so we don't drop the last few events on exit.
-      if (tracker instanceof FileTracker) tracker.close();
-    }
-    process.exit(exitCode);
-  };
-  const shutdown = (sig: string) => {
-    if (shuttingDown) {
-      console.log(`[fiche] ${sig} again — forcing exit`);
-      if (!flushedOnExit) {
-        flushedOnExit = true;
-        flushSessionState();
-        if (tracker instanceof FileTracker) tracker.close();
-      }
-      process.exit(130);
-    }
-    shuttingDown = true;
-    console.log(`[fiche] ${sig} — shutting down`);
-    // Drain in-flight connections first so late finishing requests don't lose
-    // session state or write to an already-closed tracker.
-    const deadline = setTimeout(() => {
-      server.closeAllConnections?.();
-      void flushAndExit(0);
-    }, 1500);
-    deadline.unref();
-    server.close(() => {
-      clearTimeout(deadline);
-      void flushAndExit(0);
-    });
-    // Drop idle keep-alive sockets so close()'s callback can actually fire.
-    server.closeIdleConnections?.();
-  };
-  shutdownHandler = shutdown;
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+    handle = createProxy(config);
+    markReady();
+  } catch (err) {
+    markFailed(err);
+    throw err;
+  }
 }
 
 main().catch((err) => {

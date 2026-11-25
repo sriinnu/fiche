@@ -7,16 +7,18 @@ description: Inspect live token & dollar savings from the fiche context compiler
 
 Use this skill when the user wants to inspect **live token/dollar savings**, check **model routing tiers**, test **`fiche` transforms**, wrap coding agents through **`fiche warp`**, or export repositories/diffs via **`fiche export`**.
 
-## Zero-Token Live Telemetry & Stats
+## Zero-Token Local Stats & Turn Receipts
 
 The plugin's `PostInvocation` hook (`hooks.json` -> `scripts/post-invocation.mjs`) and `scripts/claude-statusline.mjs` read `$FICHE_LOG` (`~/.fiche/events.jsonl`) in `<5 ms` and report per-turn/session savings with `systemMessage: ""` (zero extra LLM tokens). Prefer `fiche-mcp` tools or fast CLI commands before reading raw logs:
 
 - **MCP tools** (server `fiche-mcp`):
+  - `page_in` — retrieves verbatim `±15`-line or ranged slices from `Context-MMU` pages (`pg_*`) or symbol/text queries.
+  - `mmu_stats` — inspects `Context-MMU` counters and resident page metadata.
   - `stats` — live `lastTurn`, cumulative `session` token/USD savings from `$FICHE_LOG`, plus MCP call counts.
   - `check_model` — checks whether a model id is in `FICHE_MODELS` scope, its `readerTier` (`image` vs `text`), and active engine pipeline.
   - `transform_request` — previews how `fiche` compiles a payload on `anthropic`, `responses`, `chat`, or `google` wire formats.
   - `health` — server version and Codex `prompt_cache_breakpoint` stripping status.
-- **Fast CLI telemetry (`<5 ms`)**:
+- **Fast CLI turn receipts (`<5 ms`)**:
   ```bash
   fiche turn-report --color
   fiche stats

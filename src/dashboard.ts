@@ -12,7 +12,7 @@
  *   GET  /proxy-recent               → JSON ring buffer of recent requests
  *   GET  /proxy-latest-png[?crop=N]  → raw PNG of the latest rendered image
  *
- * Session endpoints (read-only telemetry — no destructive operations):
+ * Session endpoints (read-only local metrics — no destructive operations):
  *
  *   GET  /api/sessions.json          → grouped sessions (sha8 + project + counts)
  *   GET  /api/stats.json             → full-history aggregate (formerly `inkling stats`)
@@ -82,6 +82,9 @@ import {
 } from './dashboard/fragments.js';
 export { FICHE_ICON_SVG };
 import { readBrandEnv } from './core/env.js';
+import { listCalibratedProfiles } from './core/calibration.js';
+import { getGlobalMmuStore } from './core/context-mmu.js';
+import { getGlobalPrefixTape } from './core/prefix-tape.js';
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
@@ -389,7 +392,7 @@ interface Totals {
   /** Kosha mode: exact per-row USD across compressed vs passthrough paths. */
   compressedActualUsdKosha: number;
   passthroughActualUsdKosha: number;
-  /** Prefix-safe text-hygiene token/char savings and cliff avoidance telemetry. */
+  /** Prefix-safe text-hygiene token/char savings and cliff avoidance metrics. */
   textHygieneSavedTokens: number;
   textHygieneSavedChars: number;
   cliffAvoidedEvents: number;
@@ -630,7 +633,7 @@ function gptEff(args: {
 declare const __FICHE_VERSION__: string | undefined;
 
 function defaultDashboardVersion(): string {
-  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.18.0';
+  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.19.0';
 }
 
 export interface DashboardHooks {
@@ -646,6 +649,7 @@ export interface DashboardHooks {
   ) => { updatedCount: number; enabled: boolean; plugins: StagePluginDescriptor[] };
   readonly onProvidersPersist?: (providers: readonly ProviderId[]) => void;
   readonly onShutdown?: () => void;
+  readonly getActiveRequests?: () => number;
 }
 
 export class DashboardState {
@@ -2369,6 +2373,7 @@ export class DashboardState {
       host: this.hooks.host ?? '127.0.0.1',
       port,
       uptime_sec: round1(Math.max(0, Date.now() / 1000 - this.startedAt)),
+      active_requests: Math.max(0, this.hooks.getActiveRequests?.() ?? 0),
       compression_enabled: this.compressionEnabled,
       price_mode: priceMode(),
       allowed_models: getAllowedModelBases(),
@@ -2520,6 +2525,110 @@ export class DashboardState {
     return jsonResponse({ shutting_down: true });
   }
 
+  /** GET /api/mmu/stats — Context-MMU counters & bounded page summaries. */
+  serveMmuStats(sessionKey?: string): Response {
+    if (sessionKey !== undefined && !sessionKey.trim()) {
+      return mmuJsonResponse({ error: 'sessionKey must be a non-empty string' }, 400);
+    }
+    const store = getGlobalMmuStore();
+    const sk = sessionKey?.trim();
+    const pages = store.listPages(sk);
+    const safePages = pages.slice(0, 50).map((p) => {
+      if (sk) return p;
+      const { factTokens: _omitted, ...rest } = p;
+      return rest;
+    });
+    return mmuJsonResponse({
+      stats: store.getStats(),
+      pageCount: pages.length,
+      pages: safePages,
+      limits: store.getLimits(),
+      prefixTape: getGlobalPrefixTape().getStats(),
+    });
+  }
+
+  /** GET /api/mmu/page — retrieve exact slice by `id`/`pageId` or search by `query`. */
+  serveMmuPage(params: URLSearchParams): Response {
+    const pageId = (params.get('id') ?? params.get('pageId'))?.trim() || undefined;
+    const query = params.get('query')?.trim() || undefined;
+    if (params.has('sessionKey') && !params.get('sessionKey')!.trim()) {
+      return mmuJsonResponse({ error: 'sessionKey must be a non-empty string' }, 400);
+    }
+    const sessionKey = params.get('sessionKey')?.trim() || undefined;
+    if (!pageId && !query) {
+      return mmuJsonResponse({ error: 'id/pageId or query parameter is required' }, 400);
+    }
+    if (query && query.length > 512) {
+      return mmuJsonResponse({ error: 'query must be <= 512 chars' }, 400);
+    }
+    const parseOptPosInt = (name: string): number | undefined => {
+      const raw = params.get(name);
+      if (raw === null || raw.trim() === '') return undefined;
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n >= 1 ? n : NaN;
+    };
+    const startLine = parseOptPosInt('startLine');
+    const endLine = parseOptPosInt('endLine');
+    const maxLinesRaw = parseOptPosInt('maxLines');
+    if (Number.isNaN(startLine) || Number.isNaN(endLine) || Number.isNaN(maxLinesRaw)) {
+      return mmuJsonResponse({ error: 'startLine, endLine, and maxLines must be positive integers' }, 400);
+    }
+    const maxLines = maxLinesRaw !== undefined ? Math.min(500, maxLinesRaw) : 120;
+    const store = getGlobalMmuStore();
+
+    if (pageId) {
+      const hit = store.derefPage(pageId, { sessionKey, startLine, endLine, query, maxLines });
+      if (!hit) return mmuJsonResponse({ error: `MMU page not found: ${pageId}` }, 404);
+      return mmuJsonResponse({
+        pageId: hit.page.id,
+        refId: hit.page.refId,
+        sessionKey: hit.page.sessionKey,
+        filePath: hit.page.filePath,
+        lineCount: hit.page.lineCount,
+        startLine: hit.startLine,
+        endLine: hit.endLine,
+        text: hit.text,
+        symbols: hit.page.symbols,
+      });
+    }
+
+    const matches = store.searchPages(query!, sessionKey);
+    if (matches.length === 0) {
+      return mmuJsonResponse({ error: `no MMU pages matching query: ${query}`, matches: [] }, 404);
+    }
+    const top = matches[0]!;
+    const hit = store.derefPage(top.page.id, {
+      sessionKey: top.page.sessionKey,
+      startLine,
+      endLine,
+      query,
+      maxLines,
+    });
+    return mmuJsonResponse({
+      pageId: top.page.id,
+      refId: top.page.refId,
+      sessionKey: top.page.sessionKey,
+      filePath: top.page.filePath,
+      lineCount: top.page.lineCount,
+      startLine: hit?.startLine ?? 1,
+      endLine: hit?.endLine ?? 0,
+      text: hit?.text ?? '',
+      symbols: top.page.symbols,
+      matches: matches.slice(0, 5).map((m) => ({
+        pageId: m.page.id,
+        refId: m.page.refId,
+        filePath: m.page.filePath,
+        score: m.score,
+        matchedLine: m.matchedLine,
+      })),
+    });
+  }
+
+  /** GET /api/calibration — Auto-Canary calibrated visual model profiles. */
+  serveCalibration(): Response {
+    return mmuJsonResponse({ profiles: listCalibratedProfiles() });
+  }
+
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
    *  runtime compress scope. The model checks read this live. Persisted via
    *  the host's `persistModelBases` hook when provided (Node writes the
@@ -2598,6 +2707,17 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function mmuJsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    },
+  });
+}
+
 function notConfigured(what: string): Response {
   // The dashboard was constructed without SessionsPaths (e.g. a legacy host
   // that doesn't track to disk). Return 503 so the client can surface a
@@ -2634,6 +2754,9 @@ export type DashboardRoute =
   | { kind: 'api-plugins' } // /api/plugins (GET/POST) — pipeline stages & skills registry
   | { kind: 'api-shutdown' } // /api/shutdown (POST) — graceful daemon shutdown
   | { kind: 'api-image-source' } // /api/image-source[?id=N] — source text behind a rendered PNG
+  | { kind: 'api-mmu-stats' } // /api/mmu/stats — Context-MMU counters & page index
+  | { kind: 'api-mmu-page' } // /api/mmu/page — Context-MMU page deref/search
+  | { kind: 'api-calibration' } // /api/calibration — calibrated visual model profiles
   | { kind: 'fragment'; name: string }; // /fragments/<name> — server-rendered htmx panels
 
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
@@ -2657,6 +2780,9 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/api/plugins') return { kind: 'api-plugins' };
   if (pathname === '/api/shutdown') return { kind: 'api-shutdown' };
   if (pathname === '/api/image-source') return { kind: 'api-image-source' };
+  if (pathname === '/api/mmu/stats') return { kind: 'api-mmu-stats' };
+  if (pathname === '/api/mmu/page') return { kind: 'api-mmu-page' };
+  if (pathname === '/api/calibration') return { kind: 'api-calibration' };
   if (pathname.startsWith('/fragments/')) {
     return { kind: 'fragment', name: pathname.slice('/fragments/'.length) };
   }
@@ -2788,6 +2914,15 @@ export async function dispatchDashboard(
     case 'api-shutdown':
       if (method !== 'POST') return methodNotAllowed('POST');
       return dashboard.handleShutdown();
+    case 'api-mmu-stats':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveMmuStats(url.searchParams.has('sessionKey') ? url.searchParams.get('sessionKey')! : undefined);
+    case 'api-mmu-page':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveMmuPage(url.searchParams);
+    case 'api-calibration':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveCalibration();
     case 'fragment': {
       if (route.name === 'toggle' && method === 'POST') {
         let enabled = false;

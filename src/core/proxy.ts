@@ -16,6 +16,7 @@ import {
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  isThreadContinuation,
 } from './measurement.js';
 import type { Usage } from './types.js';
 import {
@@ -28,6 +29,7 @@ import {
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
+import { withClientToolRoundShape } from './client-tool-round.js';
 import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -42,6 +44,12 @@ import {
 } from './upstream-hosts.js';
 import { shouldImageModel } from './reader-tier.js';
 import { resolveTextHygieneMode } from './text-hygiene.js';
+
+export {
+  parseTrustAdjacentToolRounds,
+  resolveTrustAdjacentToolRoundsEnv,
+  withClientToolRoundShape,
+} from './client-tool-round.js';
 
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
@@ -104,6 +112,12 @@ export interface ProxyConfig {
    *  negative value is ignored in favour of that default: an unusable limit must
    *  not silently become no limit. */
   maxRequestBytes?: number;
+  /** How transformable routes handle an inbound body larger than {@link maxRequestBytes}:
+   *  - `'reject'` (default): return provider-shaped 413 without calling upstream (Workers / non-loopback).
+   *  - `'passthrough'`: stop buffering at the ceiling and stream buffered chunks + remainder
+   *    straight to upstream, logging `body_too_large`. Fails closed with 413 on `/v1/messages`
+   *    when `openAIModels` / `cloudflareModels` bridging is configured. */
+  oversizedBodyPolicy?: 'reject' | 'passthrough';
   /** Undo a request `Content-Encoding` on transformable routes so the body can
    *  be read. Codex's built-in provider zstd-compresses its Responses POST; left
    *  encoded, the transform silently skips it. Return `undefined` when the coding
@@ -125,6 +139,9 @@ export interface ProxyConfig {
   upstreamRegistry?: UpstreamRegistry;
   /** Opted-in built-in providers (`anthropic`, `openai`, `google`, ...). */
   enabledProviders?: readonly ProviderId[] | (() => readonly ProviderId[]);
+  /** Custom `fetch` implementation for upstream requests and token probes (defaults to `globalThis.fetch`).
+   *  Node callers pass a keep-alive HTTP/1.1 transport to avoid Node 26 undici HTTP/2 idle-reaper crashes. */
+  fetch?: typeof globalThis.fetch;
   /** Optional Edge Runtime hook (`ctx.waitUntil`) to keep async telemetry alive past response return. */
   waitUntil?: (promise: Promise<unknown>) => void;
 }
@@ -198,6 +215,27 @@ const INFLIGHT_SWEEP_SIZE = 256;
 /** Floor between size-triggered sweeps so genuine high concurrency stays O(1)/request. */
 const INFLIGHT_SWEEP_MIN_INTERVAL_MS = 1_000;
 
+function combineAbortSignals(timeoutMs: number, parent?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!parent) return timeoutSignal;
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([timeoutSignal, parent]);
+  }
+  if (parent.aborted) return parent;
+  const ac = new AbortController();
+  const onParent = () => {
+    timeoutSignal.removeEventListener('abort', onTimeout);
+    ac.abort(parent.reason);
+  };
+  const onTimeout = () => {
+    parent.removeEventListener('abort', onParent);
+    ac.abort(timeoutSignal.reason);
+  };
+  parent.addEventListener('abort', onParent, { once: true });
+  timeoutSignal.addEventListener('abort', onTimeout, { once: true });
+  return ac.signal;
+}
+
 /**
  * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
  * the watchdog sees real network activity rather than post-transform output.
@@ -251,7 +289,29 @@ function withIdleTimeout(
       },
     }),
   );
-  return new Response(watched, {
+  // Wrap readable so consumer cancel() clears any pending idle watchdog immediately.
+  const watchedReader = watched.getReader();
+  const guardedBody = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await watchedReader.read();
+        if (done) {
+          clear();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        clear();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      clear();
+      return watchedReader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return new Response(guardedBody, {
     status: res.status,
     statusText: res.statusText,
     headers: res.headers,
@@ -323,27 +383,37 @@ function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array<
 
 type BoundedBody =
   | { ok: true; bytes: Uint8Array<ArrayBuffer> }
-  | { ok: false; observedBytes: number; declaredBytes?: number };
+  | { ok: false; observedBytes: number; declaredBytes?: number; restoredBody?: BodyInit | null };
 
 /**
- * Read a whole request body, refusing anything over `limit`.
+ * Read a whole request body, stopping once it exceeds `limit`.
  *
- * The declared `content-length` is used only as a shortcut to reject without
+ * The declared `content-length` is used only as a shortcut to act without
  * reading a byte. It is never the authority: chunked senders omit it, and a
  * wrong value costs the sender nothing. The streaming loop is what enforces the
  * cap, so a body that lies about its size is bounded by the same number as one
  * that declares nothing.
  *
- * Peak memory is the limit plus at most one chunk: the loop stops pulling the
- * moment the running total crosses the line and cancels the stream instead of
- * draining a body it has already refused.
+ * When `restoreOnOverflow` is true, the buffered chunks are replayed lazily ahead
+ * of the untouched remainder as a ReadableStream (dropping each chunk reference
+ * as handed off upstream), or `req.body` is returned untouched when `content-length`
+ * already proved overflow.
  */
-async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody> {
+async function readBodyBounded(
+  req: Request,
+  limit: number,
+  restoreOnOverflow = false,
+): Promise<BoundedBody> {
   const declaredRaw = req.headers.get('content-length');
   const declared = declaredRaw === null ? NaN : Number(declaredRaw);
   const declaredBytes = Number.isFinite(declared) && declared >= 0 ? declared : undefined;
   if (declaredBytes !== undefined && declaredBytes > limit) {
-    return { ok: false, observedBytes: 0, declaredBytes };
+    return {
+      ok: false,
+      observedBytes: 0,
+      declaredBytes,
+      ...(restoreOnOverflow ? { restoredBody: req.body } : {}),
+    };
   }
 
   const body = req.body;
@@ -359,8 +429,48 @@ async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody
       if (!value || value.byteLength === 0) continue;
       total += value.byteLength;
       if (total > limit) {
-        await reader.cancel().catch(() => {});
-        return { ok: false, observedBytes: total, ...(declaredBytes !== undefined ? { declaredBytes } : {}) };
+        if (!restoreOnOverflow) {
+          await reader.cancel().catch(() => {});
+          return { ok: false, observedBytes: total, ...(declaredBytes !== undefined ? { declaredBytes } : {}) };
+        }
+        chunks.push(value);
+        let index = 0;
+        const restored = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (index < chunks.length) {
+              const chunk = chunks[index]!;
+              chunks[index] = undefined as unknown as Uint8Array;
+              index++;
+              controller.enqueue(chunk);
+              return;
+            }
+            try {
+              for (;;) {
+                const { done: nextDone, value: nextValue } = await reader.read();
+                if (nextDone) {
+                  controller.close();
+                  return;
+                }
+                if (nextValue && nextValue.byteLength > 0) {
+                  controller.enqueue(nextValue);
+                  return;
+                }
+              }
+            } catch (err) {
+              controller.error(err);
+            }
+          },
+          cancel(reason) {
+            chunks.length = 0;
+            return reader.cancel(reason);
+          },
+        });
+        return {
+          ok: false,
+          observedBytes: total,
+          ...(declaredBytes !== undefined ? { declaredBytes } : {}),
+          restoredBody: restored,
+        };
       }
       chunks.push(value);
     }
@@ -1044,20 +1154,30 @@ function teeForUsage(
       const reader = forUs.getReader();
       const decoder = new TextDecoder();
       let out = '';
+      let drained = false;
       try {
         while (out.length < ERROR_BODY_MAX) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            drained = true;
+            break;
+          }
           out += decoder.decode(value, { stream: true });
         }
         out += decoder.decode();
         // Drain the rest so the tee buffer doesn't hold the stream open.
-        while (true) {
+        while (!drained) {
           const { done } = await reader.read();
-          if (done) break;
+          if (done) {
+            drained = true;
+            break;
+          }
         }
       } catch {
         /* client may have aborted */
+      } finally {
+        if (!drained) await reader.cancel().catch(() => undefined);
+        try { reader.releaseLock(); } catch { /* already released */ }
       }
       return out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out;
     })();
@@ -1095,6 +1215,7 @@ function teeForUsage(
     const reader = forUs.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    let drained = false;
     let streamedMeasurement: OutputMeasurement | undefined;
     const state: { usage: Usage | undefined; stopReason: string | undefined } = {
       usage: undefined,
@@ -1117,7 +1238,10 @@ function teeForUsage(
         const sseBoundaryRe = /\r\n\r\n|\n\n|\r\r/g;
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            drained = true;
+            break;
+          }
           const prevLen = buf.length;
           buf += decoder.decode(value, { stream: true });
           // SSE events are terminated by a blank line; start scanning at prevLen - 3 so
@@ -1136,8 +1260,11 @@ function teeForUsage(
           // smaller; fail closed and drain if no delimiter arrives within 4 MiB.
           if (buf.length > 4 * 1024 * 1024) {
             while (true) {
-              const { done: drained } = await reader.read();
-              if (drained) break;
+              const { done: eof } = await reader.read();
+              if (eof) {
+                drained = true;
+                break;
+              }
             }
             return { usage: undefined, measurement: undefined, stopReason: undefined };
           }
@@ -1154,7 +1281,10 @@ function teeForUsage(
         let overflow = false;
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            drained = true;
+            break;
+          }
           if (!overflow) {
             buf += decoder.decode(value, { stream: true });
             if (buf.length > MAX) {
@@ -1195,6 +1325,14 @@ function teeForUsage(
           return { usage: undefined, measurement: undefined, stopReason: undefined };
         }
       }
+      // Unknown content-type: drain to release the tee buffer.
+      while (true) {
+        const { done } = await reader.read();
+        if (done) {
+          drained = true;
+          break;
+        }
+      }
     } catch {
       if (retainStreamReceipt) {
         return {
@@ -1203,15 +1341,9 @@ function teeForUsage(
           stopReason: state.stopReason ?? 'stream_error',
         };
       }
-    }
-    // Unknown content-type: drain to release the tee buffer.
-    try {
-      while (true) {
-        const { done } = await reader.read();
-        if (done) break;
-      }
-    } catch {
-      /* ignore */
+    } finally {
+      if (!drained) await reader.cancel().catch(() => undefined);
+      try { reader.releaseLock(); } catch { /* already released */ }
     }
     return { usage: undefined, measurement: undefined, stopReason: undefined };
   })();
@@ -1245,6 +1377,8 @@ const STRIP_REQ_HEADERS = new Set([
   'accept-encoding', // let upstream choose
   'x-fiche-bypass', // fiche-only opt-out signal; never forwarded upstream
   'x-inkling-bypass', // legacy opt-out alias; never forwarded upstream
+  'x-fiche-session-id', // fiche-only swarm/session isolation key; never forwarded upstream
+  'x-inkling-session-id', // legacy session isolation alias; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -1434,6 +1568,38 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
     || (isModelsPath && looksOpenAIAuth);
 }
 
+/** anthropic-beta values count_tokens has rejected in this process. Clients
+ *  (e.g. Claude Code) may send betas that /v1/messages accepts but
+ *  /v1/messages/count_tokens does not; we learn them from the 400 and drop them. */
+const COUNT_TOKENS_REJECTED_BETAS_MAX = 64;
+const countTokensRejectedBetas = new Set<string>();
+const REJECTED_BETA_RE = /Unexpected value\(s\) (.+?) for the `anthropic-beta` header/;
+
+/** Extract beta names a count_tokens 400 complained about (backtick-quoted). */
+export function parseRejectedBetas(errorBody: string): string[] {
+  let msg = errorBody;
+  try {
+    const j = JSON.parse(errorBody) as { error?: { message?: unknown } };
+    if (typeof j?.error?.message === 'string') msg = j.error.message;
+  } catch { /* not JSON — scan raw text */ }
+  const m = REJECTED_BETA_RE.exec(msg);
+  if (!m) return [];
+  return [...(m[1] ?? '').matchAll(/`([^`]+)`/g)].map((x) => (x[1] ?? '').trim()).filter(Boolean);
+}
+
+function dropRejectedBetas(headers: Headers): void {
+  const raw = headers.get('anthropic-beta');
+  if (!raw || countTokensRejectedBetas.size === 0) return;
+  const kept = raw.split(',').map((b) => b.trim()).filter((b) => b && !countTokensRejectedBetas.has(b));
+  if (kept.length) headers.set('anthropic-beta', kept.join(','));
+  else headers.delete('anthropic-beta');
+}
+
+/** Test hook. */
+export function resetCountTokensRejectedBetasForTests(): void {
+  countTokensRejectedBetas.clear();
+}
+
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
  *  `input_tokens` number or null on any failure. count_tokens is documented
  *  as a free endpoint (no input-token billing) — we use it once per request
@@ -1444,22 +1610,53 @@ async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
+  onError?: (reason: string) => void,
+  retried = false,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  parentSignal?: AbortSignal,
 ): Promise<number | null> {
+  let res: Response | undefined;
   try {
-    const res = await fetch(countTokensUrl, {
+    if (parentSignal?.aborted) return null;
+    const reqHeaders = new Headers(headers);
+    dropRejectedBetas(reqHeaders);
+    res = await fetchImpl(countTokensUrl, {
       method: 'POST',
-      headers,
+      headers: reqHeaders,
       body: body as unknown as BodyInit,
       redirect: 'manual',
-      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
+      signal: combineAbortSignals(COUNT_TOKENS_TIMEOUT_MS, parentSignal),
     });
+    if (res.status === 400 && !retried) {
+      const text = await res.text().catch(() => '');
+      const rejected = parseRejectedBetas(text);
+      if (rejected.length > 0 && rejected.some((b) => !countTokensRejectedBetas.has(b))) {
+        for (const b of rejected) {
+          if (countTokensRejectedBetas.size >= COUNT_TOKENS_REJECTED_BETAS_MAX) break;
+          countTokensRejectedBetas.add(b);
+        }
+        return countTokensUpstream(countTokensUrl, body, reqHeaders, onError, true, fetchImpl, parentSignal);
+      }
+      onError?.(`http_400${text ? ` ${text.slice(0, 300)}` : ''}`);
+      return null;
+    }
     if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
+      let detail = '';
+      try {
+        detail = (await res.text()).slice(0, 300);
+      } catch {
+        await res.body?.cancel().catch(() => undefined);
+      }
+      onError?.(`http_${res.status}${detail ? ` ${detail}` : ''}`);
       return null;
     }
     const json = (await res.json()) as { input_tokens?: unknown };
-    return typeof json.input_tokens === 'number' ? json.input_tokens : null;
-  } catch {
+    if (typeof json.input_tokens === 'number') return json.input_tokens;
+    onError?.('no_input_tokens_in_response');
+    return null;
+  } catch (e) {
+    await res?.body?.cancel().catch(() => undefined);
+    onError?.(`fetch_error ${(e as Error)?.name ?? ''}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
     return null;
   }
 }
@@ -1475,6 +1672,8 @@ async function countGoogleTokensUpstream(
   body: Uint8Array,
   headers: Headers,
   model: string,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  parentSignal?: AbortSignal,
 ): Promise<number | null> {
   try {
     const rawParsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
@@ -1494,15 +1693,17 @@ async function countGoogleTokensUpstream(
     const deadline = Date.now() + COUNT_TOKENS_TIMEOUT_MS;
     const perShapeTimeout = Math.floor(COUNT_TOKENS_TIMEOUT_MS / orderedShapes.length);
     for (const countBody of orderedShapes) {
+      if (parentSignal?.aborted) break;
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
+      let res: Response | undefined;
       try {
-        const res = await fetch(countTokensUrl, {
+        res = await fetchImpl(countTokensUrl, {
           method: 'POST',
           headers,
           body: countBody,
           redirect: 'manual',
-          signal: AbortSignal.timeout(Math.min(remainingMs, perShapeTimeout)),
+          signal: combineAbortSignals(Math.min(remainingMs, perShapeTimeout), parentSignal),
         });
         if (res.ok) {
           const json = (await res.json()) as { totalTokens?: unknown };
@@ -1514,6 +1715,7 @@ async function countGoogleTokensUpstream(
           await res.body?.cancel().catch(() => {});
         }
       } catch {
+        await res?.body?.cancel().catch(() => {});
         // try next payload shape
       }
     }
@@ -1650,6 +1852,7 @@ export function createProxy(config: ProxyConfig = {}) {
   const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
   const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
   const maxRequestBytes = resolveMaxRequestBytes(config.maxRequestBytes);
+  const oversizedBodyPolicy = config.oversizedBodyPolicy ?? 'reject';
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -1724,6 +1927,28 @@ let responseContentType: string | undefined;
     let reqBodySha256: string | undefined;
     // Set once the transform returns; read by fire() at event time.
     let transformMs: number | undefined;
+    // Why the baseline count_tokens probe failed (status + upstream error), if it did.
+    let baselineProbeError: string | undefined;
+    const fetchImpl = config.fetch ?? globalThis.fetch;
+    const upstreamAbort = new AbortController();
+    const clientSignal = req.signal;
+    let clientAbortWired = false;
+    const onClientAbort = (): void => {
+      if (!upstreamAbort.signal.aborted) {
+        upstreamAbort.abort(clientSignal?.reason ?? new Error('fiche: client disconnected'));
+      }
+    };
+    const ensureClientAbortWired = (): void => {
+      if (clientAbortWired || !clientSignal) return;
+      clientAbortWired = true;
+      if (clientSignal.aborted) onClientAbort();
+      else clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    };
+    const detachClientAbort = (): void => {
+      if (!clientAbortWired || !clientSignal) return;
+      clientAbortWired = false;
+      clientSignal.removeEventListener('abort', onClientAbort);
+    };
 
     const fire = (
       status: number,
@@ -1773,11 +1998,16 @@ let responseContentType: string | undefined;
           }
           if (baselineResolved === null) {
             info.baselineProbeStatus = 'failed';
+            if (baselineProbeError) info.baselineProbeError = baselineProbeError;
           } else if (cacheableExpected && cacheableResolved === null) {
             info.baselineProbeStatus = 'partial'; // dashboard excludes row; must not treat as cacheable=0
+          } else if (threadContinue) {
+            // Delta-only baseline vs full-thread usage: rollups must exclude the row.
+            info.baselineProbeStatus = 'partial';
           } else {
             info.baselineProbeStatus = 'ok';
           }
+          if (threadContinue) info.threadContinue = true;
         }
         // The Messages compatibility response exposes Anthropic's disjoint
         // usage buckets to the client. Dashboard accounting still needs the
@@ -1835,6 +2065,23 @@ let responseContentType: string | undefined;
     // to have its traffic forwarded byte-for-byte untouched.
     const bypassHeader = req.headers.get('x-fiche-bypass') ?? req.headers.get('x-inkling-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
+    const ficheSessionRaw = (req.headers.get('x-fiche-session-id') ?? req.headers.get('x-inkling-session-id'))?.trim() ?? null;
+    const ccSessionRaw = req.headers.get('x-claude-code-session-id')?.trim() ?? null;
+    const validatedFicheSessionId =
+      ficheSessionRaw !== null && /^[A-Za-z0-9._:-]{4,128}$/.test(ficheSessionRaw)
+        ? ficheSessionRaw
+        : undefined;
+    const validatedCcSessionId =
+      ccSessionRaw !== null && /^[A-Za-z0-9_-]{8,128}$/.test(ccSessionRaw)
+        ? ccSessionRaw
+        : undefined;
+    const validatedClientSessionId = validatedFicheSessionId ?? validatedCcSessionId;
+    const validatedClientSessionSource: 'fiche-header' | 'claude-code-header' | undefined =
+      validatedFicheSessionId
+        ? 'fiche-header'
+        : validatedCcSessionId
+          ? 'claude-code-header'
+          : undefined;
     const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
     const rawProviders = typeof config.enabledProviders === 'function'
       ? config.enabledProviders()
@@ -1896,6 +2143,8 @@ let responseContentType: string | undefined;
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    // Server-side thread continuation: probe sees only delta while provider bills full thread.
+    let threadContinue = false;
     let responsesStreaming = false;
     let isAnthropicMessagesRoute = false;
 
@@ -1929,329 +2178,375 @@ let responseContentType: string | undefined;
     }
 
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
-      // Transformable routes have to hold the whole body, so this is the one
-      // place a client could otherwise choose how much the proxy allocates.
-      // Refuse past the ceiling before any allocation the caller controls, and
-      // before any upstream call: a 413 the provider would have sent anyway is
-      // cheaper for everyone than an out-of-memory host.
-      const bounded = await readBodyBounded(req, maxRequestBytes);
+      // Transformable routes have to hold the whole body to rewrite it, so this
+      // is the one place a caller could otherwise choose how much memory fiche
+      // allocates. Bound the read before allocating past `maxRequestBytes`.
+      //
+      // Under `'passthrough'` (loopback Node), a body past the ceiling streams
+      // straight upstream untouched so multimodal payloads are never broken by
+      // a local cap — except when `/v1/messages` model-bridging is configured,
+      // where forwarding unparsed Anthropic JSON could cross provider boundaries.
+      const canStreamOversized =
+        oversizedBodyPolicy === 'passthrough' && !(isMessages && modelRoutes.size > 0);
+      const bounded = await readBodyBounded(req, maxRequestBytes, canStreamOversized);
       if (!bounded.ok) {
-        const message =
-          `request body exceeds the ${maxRequestBytes}-byte fiche limit ` +
-          `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
-          `read ${bounded.observedBytes})`;
-        const error = isMessages
-          ? { type: 'error', error: { type: 'request_too_large', message } }
-          : { error: { type: 'request_too_large', message } };
-        // Emit like the serialized-size 413 below: a rejected request is still a
-        // dashboard row, otherwise over-limit clients are invisible.
-        fireWait(413, undefined, message);
-        return new Response(JSON.stringify(error), {
-          status: 413,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      let bodyIn = bounded.bytes;
-      const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
-      if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
-        const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
-        if (decoded) {
-          bodyIn = decoded;
-          requestBodyDecoded = true;
+        if (canStreamOversized) {
+          bodyOut = bounded.restoredBody ?? null;
+          info = {
+            compressed: false,
+            reason: 'body_too_large',
+            origChars: 0,
+            compressedChars: 0,
+            imageCount: 0,
+            imageBytes: 0,
+            staticChars: 0,
+            dynamicChars: 0,
+            dynamicBlockCount: 0,
+          };
+        } else {
+          const message =
+            `request body exceeds the ${maxRequestBytes}-byte fiche limit ` +
+            `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
+            `read ${bounded.observedBytes})`;
+          const error = isMessages
+            ? { type: 'error', error: { type: 'request_too_large', message } }
+            : { error: { type: 'request_too_large', message } };
+          // Emit like the serialized-size 413 below: a rejected request is still a
+          // dashboard row, otherwise over-limit clients are invisible.
+          fireWait(413, undefined, message);
+          return new Response(JSON.stringify(error), {
+            status: 413,
+            headers: { 'content-type': 'application/json' },
+          });
         }
-      }
-      const encodedUndecoded =
-        contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
-      try {
-        const baseTransformOpts =
-          typeof config.transform === 'function' ? config.transform() : config.transform;
-        // Bytes still under a coding we did not undo must not be rewritten: the
-        // header would go out unchanged and the upstream would try to decompress
-        // whatever the transform produced. Forward them as they came.
-        const transformOpts = encodedUndecoded
-          ? { ...baseTransformOpts, compress: false }
-          : baseTransformOpts;
-        // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = googleModelFromPath ?? readModelField(bodyIn);
-        if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
-        requestModel = model ?? undefined;
-        // A turn whose only content is `@inkling pin` / `@inkling unpin` is
-        // configuration, not a question. Answer it here unless compression is
-        // paused/disabled: passthrough mode must forward `@fiche pin` untouched.
-        if (transformOpts?.compress !== false && (isMessages || isOpenAIChat || isOpenAIResponses)) {
-          try {
-            const pinReply = isMessages
-              ? pinCommandResponse(bodyIn)
-              : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
-            if (pinReply) {
-              return new Response(pinReply.body, {
-                status: 200,
-                headers: {
-                  'content-type': pinReply.contentType,
-                  'cache-control': 'no-cache',
-                },
-              });
-            }
-          } catch {
-            // Fail open: malformed pin parsing must never abort a live agent request.
+      } else {
+        let bodyIn = bounded.bytes;
+        const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
+        if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
+          const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
+          if (decoded) {
+            bodyIn = decoded;
+            requestBodyDecoded = true;
           }
         }
-        // /v1/messages is only a wire schema: Claude Code can target a non-
-        // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
-        // renderer or Anthropic count_tokens merely because the route is
-        // Messages-shaped. Enabled GPT models take the standalone
-        // Messages→Responses bridge; unsupported models still fail closed.
-        // Claude Code model aliases decode back to exact Cloudflare model IDs.
-        const decodedByAlias = [...modelRoutes.keys()]
-          .find((candidate) => claudeGatewayModelId(candidate) === model);
-        const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
-        const routedModel = decodedChatModel ?? model;
-        // A followed host answers for its own models; never bridge them elsewhere.
-        const modelRoute = routedModel && !follow ? modelRoutes.get(routedModel) : undefined;
-        modelRouteForRequest = modelRoute;
-        const forceChat = isMessages && modelRoute === 'cloudflare';
-        const messagesAnthropic = isMessages
-          && modelRoute === undefined && !forceChat && (Boolean(follow) || isClaudeModel(model));
-        isAnthropicMessagesRoute = messagesAnthropic;
-        // Provider routing is explicit. Unlisted Messages models use the
-        // default Anthropic route, regardless of how their id is shaped.
-        bridgedGptMessages =
-          isMessages && !messagesAnthropic && !forceChat
-          && modelRoute === 'openai';
-        // Messages → Chat Completions bridge toward Cloudflare Workers AI.
-        bridgedChatMessages = forceChat;
-        const chatStamp = bridgedChatMessages ? routedModel : undefined;
-        const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
-        // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
-        // allowlist gates it so INKLING_MODELS / the chip can opt out.
-        const modelOk = isGoogle
-          ? (isGeminiModel(model) && isInklingSupportedModel(model))
-          : isMessages
-            ? (messagesAnthropic && isInklingSupportedModel(model))
-              || (bridgedGptMessages && isInklingSupportedGptModel(effectiveModel))
-              || (bridgedChatMessages && isInklingSupportedGptModel(effectiveModel))
-            : isInklingSupportedGptModel(model);
-        // Compression eligibility and telemetry follow the model that actually
-        // receives the request, not Claude Code's local gateway alias.
-        if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
-          requestModel = effectiveModel;
-        }
-        const bridgeBody = bridgedGptMessages
-          ? (() => {
-              const bridged = JSON.parse(new TextDecoder().decode(
-                anthropicMessagesToOpenAIResponses(bodyIn),
-              )) as Record<string, unknown>;
-              bridged.model = effectiveModel;
-              return new TextEncoder().encode(JSON.stringify(bridged));
-            })()
-          : bridgedChatMessages
-            ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
-            : bodyIn;
-        const routeModel = effectiveModel ?? model ?? undefined;
-        // Third-party hosts never get the OpenAI-only breakpoint field.
-        const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
-          pathname: url.pathname,
-          upstream: openAIUpstream,
-        });
-        // Allowlisted models image, except weak or unmeasured readers (Claude
-        // 5.5, Grok, Gemini 4 hydrogen/carbon, DeepSeek, Kimi, GLM, MiniMax),
-        // which stay text unless INKLING_FORCE_IMAGES=1. When compression is not
-        // switched off, weak/text-only/third-party models still receive
-        // prefix-safe deterministic text hygiene (`imageCompress: false`).
-        const imageThisRequest =
-          transformOpts?.stageToggles?.optical !== false &&
-          shouldImageModel(routeModel, modelOk);
-        const hygieneForcedOn = resolveTextHygieneMode(transformOpts?.textHygiene) === 'on';
-        const familyInScope = modelOk || isInConfiguredModelBases(routeModel);
-        const killSwitchOff = transformOpts?.compress === false || (!familyInScope && !hygieneForcedOn);
-        const effectiveOpts = killSwitchOff
-          ? { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints }
-          : imageThisRequest
-            ? { ...transformOpts, imageCompress: true, explicitPromptCacheBreakpoints: allowBreakpoints }
-            : { ...transformOpts, imageCompress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
-        // Local render+encode cost only. The Google branch below issues upstream
-        // count_tokens probes, so the timer closes here rather than after them —
-        // otherwise network latency would be charged to our own CPU.
-        const tTransform = Date.now();
-        // Fail open: a renderer or transform bug must never cost the user a
-        // turn. The request goes out as it arrived (after any wire bridge, which
-        // the upstream needs), and the event row records why.
-        let r: { body: Uint8Array; info: TransformInfo };
+        const encodedUndecoded =
+          contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
         try {
-          r = isGoogle
-            ? await transformGoogleGenerateContent(bridgeBody, model!, effectiveOpts)
-            : isMessages
-              ? bridgedGptMessages
-                ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
-                : bridgedChatMessages
-                  ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                  : await transformRequest(bridgeBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
-              : isOpenAIChat
-                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformOpenAIResponses(bridgeBody, effectiveOpts);
-        } catch (e) {
-          r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
-        }
-        if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
-          try {
-            r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
-          } catch {
-            // Fail open if response/body scrubbing encounters an unexpected shape.
+          const baseTransformOpts = withClientToolRoundShape(
+            typeof config.transform === 'function' ? config.transform() : config.transform,
+            req.headers,
+          );
+          // Bytes still under a coding we did not undo must not be rewritten: the
+          // header would go out unchanged and the upstream would try to decompress
+          // whatever the transform produced. Forward them as they came.
+          const transformOpts = encodedUndecoded
+            ? { ...baseTransformOpts, compress: false }
+            : baseTransformOpts;
+          // Fail-closed: unreadable model → no compression, not a risky guess.
+          const model = googleModelFromPath ?? readModelField(bodyIn);
+          if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
+          requestModel = model ?? undefined;
+          // A turn whose only content is `@inkling pin` / `@inkling unpin` is
+          // configuration, not a question. Answer it here unless compression is
+          // paused/disabled: passthrough mode must forward `@fiche pin` untouched.
+          if (transformOpts?.compress !== false && (isMessages || isOpenAIChat || isOpenAIResponses)) {
+            try {
+              const pinReply = isMessages
+                ? pinCommandResponse(bodyIn)
+                : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
+              if (pinReply) {
+                return new Response(pinReply.body, {
+                  status: 200,
+                  headers: {
+                    'content-type': pinReply.contentType,
+                    'cache-control': 'no-cache',
+                  },
+                });
+              }
+            } catch {
+              // Fail open: malformed pin parsing must never abort a live agent request.
+            }
           }
-        }
-        transformMs = Date.now() - tTransform;
-        // CloudCode PA (`/v1internal:*`) has no `:countTokens` endpoint, and
-        // text-hygiene-only turns already have exact local token deltas.
-        if (
-          isGoogle &&
-          r.info.compressed &&
-          (r.info.imageCount ?? 0) > 0 &&
-          !url.pathname.startsWith('/v1internal:')
-        ) {
+          // /v1/messages is only a wire schema: Claude Code can target a non-
+          // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
+          // renderer or Anthropic count_tokens merely because the route is
+          // Messages-shaped. Enabled GPT models take the standalone
+          // Messages→Responses bridge; unsupported models still fail closed.
+          // Claude Code model aliases decode back to exact Cloudflare model IDs.
+          const decodedByAlias = [...modelRoutes.keys()]
+            .find((candidate) => claudeGatewayModelId(candidate) === model);
+          const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
+          const routedModel = decodedChatModel ?? model;
+          // A followed host answers for its own models; never bridge them elsewhere.
+          const modelRoute = routedModel && !follow ? modelRoutes.get(routedModel) : undefined;
+          modelRouteForRequest = modelRoute;
+          const forceChat = isMessages && modelRoute === 'cloudflare';
+          const messagesAnthropic = isMessages
+            && modelRoute === undefined && !forceChat && (Boolean(follow) || isClaudeModel(model));
+          isAnthropicMessagesRoute = messagesAnthropic;
+          // Provider routing is explicit. Unlisted Messages models use the
+          // default Anthropic route, regardless of how their id is shaped.
+          bridgedGptMessages =
+            isMessages && !messagesAnthropic && !forceChat
+            && modelRoute === 'openai';
+          // Messages → Chat Completions bridge toward Cloudflare Workers AI.
+          bridgedChatMessages = forceChat;
+          const chatStamp = bridgedChatMessages ? routedModel : undefined;
+          const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
+          // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
+          // allowlist gates it so INKLING_MODELS / the chip can opt out.
+          const modelOk = isGoogle
+            ? (isGeminiModel(model) && isInklingSupportedModel(model))
+            : isMessages
+              ? (messagesAnthropic && isInklingSupportedModel(model))
+                || (bridgedGptMessages && isInklingSupportedGptModel(effectiveModel))
+                || (bridgedChatMessages && isInklingSupportedGptModel(effectiveModel))
+              : isInklingSupportedGptModel(model);
+          // Compression eligibility and telemetry follow the model that actually
+          // receives the request, not Claude Code's local gateway alias.
+          if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
+            requestModel = effectiveModel;
+          }
+          const bridgeBody = bridgedGptMessages
+            ? (() => {
+                const bridged = JSON.parse(new TextDecoder().decode(
+                  anthropicMessagesToOpenAIResponses(bodyIn),
+                )) as Record<string, unknown>;
+                bridged.model = effectiveModel;
+                return new TextEncoder().encode(JSON.stringify(bridged));
+              })()
+            : bridgedChatMessages
+              ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
+              : bodyIn;
+          const routeModel = effectiveModel ?? model ?? undefined;
+          // Third-party hosts never get the OpenAI-only breakpoint field.
+          const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
+            pathname: url.pathname,
+            upstream: openAIUpstream,
+          });
+          // Allowlisted models image, except weak or unmeasured readers (Claude
+          // 5.5, Grok, Gemini 4 hydrogen/carbon, DeepSeek, Kimi, GLM, MiniMax),
+          // which stay text unless INKLING_FORCE_IMAGES=1. When compression is not
+          // switched off, weak/text-only/third-party models still receive
+          // prefix-safe deterministic text hygiene (`imageCompress: false`).
+          const imageThisRequest =
+            transformOpts?.stageToggles?.optical !== false &&
+            shouldImageModel(routeModel, modelOk);
+          const hygieneForcedOn = resolveTextHygieneMode(transformOpts?.textHygiene) === 'on';
+          const familyInScope = modelOk || isInConfiguredModelBases(routeModel);
+          const killSwitchOff = transformOpts?.compress === false || (!familyInScope && !hygieneForcedOn);
+          const effectiveOpts = killSwitchOff
+            ? { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints }
+            : imageThisRequest
+              ? { ...transformOpts, imageCompress: true, explicitPromptCacheBreakpoints: allowBreakpoints }
+              : { ...transformOpts, imageCompress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
+          // Local render+encode cost only. The Google branch below issues upstream
+          // count_tokens probes, so the timer closes here rather than after them —
+          // otherwise network latency would be charged to our own CPU.
+          const tTransform = Date.now();
+          // Fail open: a renderer or transform bug must never cost the user a
+          // turn. The request goes out as it arrived (after any wire bridge, which
+          // the upstream needs), and the event row records why.
+          const sessionTransformOpts = validatedClientSessionId && validatedClientSessionSource
+            ? {
+                clientSessionId: validatedClientSessionId,
+                clientSessionSource: validatedClientSessionSource,
+              }
+            : undefined;
+          const optsWithSession = sessionTransformOpts
+            ? { ...effectiveOpts, ...sessionTransformOpts }
+            : effectiveOpts;
+          let r: { body: Uint8Array; info: TransformInfo };
           try {
-            const countUrl = new URL(
-              (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
-                /:(?:generateContent|streamGenerateContent)$/,
-                ':countTokens',
-              ),
-            );
-            for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
-            countUrl.searchParams.delete('alt');
-            const countHeaders = applyGatewayHeadersIfTargeted(
-              filterHeaders(req.headers, STRIP_REQ_HEADERS),
-              countUrl.toString(),
-            );
-            stripAnthropicCredentials(countHeaders);
-            countHeaders.delete('content-encoding');
-            countHeaders.set('content-type', 'application/json');
-            const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
-            const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
-            if (googleSyncProbe) {
-              const [baseline, transformed] = await Promise.all([
-                countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
-                countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
-              ]);
-              if (baseline !== null && transformed !== null) {
-                if (transformed >= baseline) {
-                  r = {
-                    body: bodyIn,
-                    info: revertedGoogleInfo(
-                      r.info,
-                      `not_profitable (${transformed} >= ${baseline} tokens)`,
-                      'ok',
-                    ),
-                  };
+            r = isGoogle
+              ? await transformGoogleGenerateContent(bridgeBody, model!, optsWithSession)
+              : isMessages
+                ? bridgedGptMessages
+                  ? await transformOpenAIResponses(bridgeBody, optsWithSession)
+                  : bridgedChatMessages
+                    ? await transformOpenAIChatCompletions(bridgeBody, optsWithSession)
+                    : await transformRequest(bridgeBody, {
+                        ...optsWithSession,
+                        model: effectiveModel ?? undefined,
+                      })
+                : isOpenAIChat
+                  ? await transformOpenAIChatCompletions(bridgeBody, optsWithSession)
+                  : await transformOpenAIResponses(bridgeBody, optsWithSession);
+          } catch (e) {
+            r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
+          }
+          if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
+            try {
+              r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
+            } catch {
+              // Fail open if response/body scrubbing encounters an unexpected shape.
+            }
+          }
+          transformMs = Date.now() - tTransform;
+          // CloudCode PA (`/v1internal:*`) has no `:countTokens` endpoint, and
+          // text-hygiene-only turns already have exact local token deltas.
+          if (
+            isGoogle &&
+            r.info.compressed &&
+            (r.info.imageCount ?? 0) > 0 &&
+            !url.pathname.startsWith('/v1internal:')
+          ) {
+            try {
+              const countUrl = new URL(
+                (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
+                  /:(?:generateContent|streamGenerateContent)$/,
+                  ':countTokens',
+                ),
+              );
+              for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
+              countUrl.searchParams.delete('alt');
+              const countHeaders = applyGatewayHeadersIfTargeted(
+                filterHeaders(req.headers, STRIP_REQ_HEADERS),
+                countUrl.toString(),
+              );
+              stripAnthropicCredentials(countHeaders);
+              countHeaders.delete('content-encoding');
+              countHeaders.set('content-type', 'application/json');
+              const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
+              const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
+              ensureClientAbortWired();
+              if (googleSyncProbe) {
+                const [baseline, transformed] = await Promise.all([
+                  countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!, fetchImpl, upstreamAbort.signal),
+                  countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!, fetchImpl, upstreamAbort.signal),
+                ]);
+                if (baseline !== null && transformed !== null) {
+                  if (transformed >= baseline) {
+                    r = {
+                      body: bodyIn,
+                      info: revertedGoogleInfo(
+                        r.info,
+                        `not_profitable (${transformed} >= ${baseline} tokens)`,
+                        'ok',
+                      ),
+                    };
+                  } else {
+                    r.info.baselineTokens = baseline;
+                    r.info.baselineProbeStatus = 'ok';
+                  }
                 } else {
-                  r.info.baselineTokens = baseline;
-                  r.info.baselineProbeStatus = 'ok';
+                  // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
+                  // Retain local profitability decision computed by transformGoogleGenerateContent.
+                  r.info.baselineProbeStatus = 'failed';
                 }
               } else {
-                // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
-                // Retain local profitability decision computed by transformGoogleGenerateContent.
-                r.info.baselineProbeStatus = 'failed';
+                baselineStatusApplies = true;
+                baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!, fetchImpl, upstreamAbort.signal);
               }
-            } else {
-              baselineStatusApplies = true;
-              baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!);
+            } catch {
+              r.info.baselineProbeStatus = 'failed';
             }
-          } catch {
-            r.info.baselineProbeStatus = 'failed';
           }
-        }
-        if (!modelOk && !r.info.compressed) r.info.reason = 'unsupported_model';
-        bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
-        info = r.info;
-        reqBodyBytes = r.body;
-        r.info.serializedRequestBytes = r.body.byteLength;
-        if (r.body.byteLength > 0) {
-          reqBodySha256 = await sha256Bytes(r.body);
-          reqBodySha8 = reqBodySha256.slice(0, 8);
-        }
-        let requestByteLimit: number | undefined;
-        try {
-          requestByteLimit = requestModel
-            ? resolveGptProfile(requestModel).maxSerializedRequestBytes
-            : undefined;
-        } catch {
-          requestByteLimit = undefined;
-        }
-        if (r.info.compressed && requestByteLimit !== undefined) {
-          if (r.body.byteLength > requestByteLimit) {
-            r.info.sizeLimitOutcome = 'rejected';
-            const message = `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
-            fireWait(413, r.info, message);
-            const error = isMessages
-              ? { type: 'error', error: { type: 'request_too_large', message } }
-              : { error: { type: 'request_too_large', message } };
-            return new Response(JSON.stringify(error), {
-              status: 413,
-              headers: { 'content-type': 'application/json' },
-            });
-          } else {
-            r.info.sizeLimitOutcome = 'within_limit';
+          if (!modelOk && !r.info.compressed && r.info.reason !== 'mmu_hydrate') r.info.reason = 'unsupported_model';
+          bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
+          info = r.info;
+          reqBodyBytes = r.body;
+          r.info.serializedRequestBytes = r.body.byteLength;
+          if (r.body.byteLength > 0) {
+            reqBodySha256 = await sha256Bytes(r.body);
+            reqBodySha8 = reqBodySha256.slice(0, 8);
           }
-        }
-
-        // Probes go to the configured Anthropic upstream with the host's keys; a
-        // followed request's prompt must not be copied there.
-        if (isMessages && messagesAnthropic && !follow) {
+          let requestByteLimit: number | undefined;
           try {
-            baselineStatusApplies = true;
-            // Probes fire on the ORIGINAL body before the main forward so all three overlap.
-            // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
-            const ctBody = buildBaselineCountTokensBody(bodyIn);
-            if (ctBody) {
-              // Mirror the actual outbound request base+path: count_tokens lives at
-              // `<messages-path>/count_tokens`, so provider-prefixed routes like
-              // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
-              // joined like the main forward so a `…/anthropic` base isn't doubled.
-              const ctUrl = providerPrefixed
-                ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
-                : upstream + url.pathname + '/count_tokens';
-              const ctHeaders = applyGatewayHeadersIfTargeted(
-                filterHeaders(req.headers, STRIP_REQ_HEADERS),
-                ctUrl,
-              );
-              ctHeaders.delete('content-encoding');
-              ctHeaders.set('content-type', 'application/json');
-              const ctAuth = resolveAuthToken(config);
-              if (config.apiKey) ctHeaders.delete('authorization');
-              if (ctAuth) ctHeaders.delete('x-api-key');
-              if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-              // The probe carries the client's frozen bearer otherwise, so it 401s
-              // exactly when the main forward starts succeeding on the fresh one.
-              if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
-              baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
-              // Null = no markers → cacheable=0 by definition, no probe needed.
-              const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
-              if (ctCacheableBody) {
-                baselineCacheablePromise = countTokensUpstream(
-                  ctUrl,
-                  ctCacheableBody,
-                  new Headers(ctHeaders),
-                );
-              }
-            }
+            requestByteLimit = requestModel
+              ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+              : undefined;
           } catch {
-            // Telemetry-only count_tokens probes must never abort the live request.
+            requestByteLimit = undefined;
           }
+          if ((r.info.compressed || r.body !== bridgeBody) && requestByteLimit !== undefined) {
+            if (r.body.byteLength > requestByteLimit) {
+              r.info.sizeLimitOutcome = 'rejected';
+              const message = `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+              fireWait(413, r.info, message);
+              const error = isMessages
+                ? { type: 'error', error: { type: 'request_too_large', message } }
+                : { error: { type: 'request_too_large', message } };
+              detachClientAbort();
+              return new Response(JSON.stringify(error), {
+                status: 413,
+                headers: { 'content-type': 'application/json' },
+              });
+            } else {
+              r.info.sizeLimitOutcome = 'within_limit';
+            }
+          }
+
+          // Probes go to the configured Anthropic upstream with the host's keys; a
+          // followed request's prompt must not be copied there.
+          if (isMessages && messagesAnthropic && !follow) {
+            try {
+              baselineStatusApplies = true;
+              threadContinue = isThreadContinuation(bodyIn);
+              // Probes fire on the ORIGINAL body before the main forward so all three overlap.
+              // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
+              const ctBody = buildBaselineCountTokensBody(bodyIn);
+              if (ctBody) {
+                // Mirror the actual outbound request base+path: count_tokens lives at
+                // `<messages-path>/count_tokens`, so provider-prefixed routes like
+                // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
+                // joined like the main forward so a `…/anthropic` base isn't doubled.
+                const ctUrl = providerPrefixed
+                  ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
+                  : upstream + url.pathname + '/count_tokens';
+                const ctHeaders = applyGatewayHeadersIfTargeted(
+                  filterHeaders(req.headers, STRIP_REQ_HEADERS),
+                  ctUrl,
+                );
+                ctHeaders.delete('content-encoding');
+                ctHeaders.set('content-type', 'application/json');
+                const ctAuth = resolveAuthToken(config);
+                if (config.apiKey) ctHeaders.delete('authorization');
+                if (ctAuth) ctHeaders.delete('x-api-key');
+                if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+                // The probe carries the client's frozen bearer otherwise, so it 401s
+                // exactly when the main forward starts succeeding on the fresh one.
+                if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
+                ensureClientAbortWired();
+                baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders, (reason) => {
+                  baselineProbeError = reason;
+                }, false, fetchImpl, upstreamAbort.signal);
+                // Null = no markers → cacheable=0 by definition, no probe needed.
+                const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
+                if (ctCacheableBody) {
+                  baselineCacheablePromise = countTokensUpstream(
+                    ctUrl,
+                    ctCacheableBody,
+                    new Headers(ctHeaders),
+                    undefined,
+                    false,
+                    fetchImpl,
+                    upstreamAbort.signal,
+                  );
+                }
+              }
+            } catch {
+              // Telemetry-only count_tokens probes must never abort the live request.
+            }
+          }
+        } catch (e) {
+          if (
+            (bridgedGptMessages || bridgedChatMessages) &&
+            ((e as Error).name === 'MessagesBridgeInvalidRequest' || e instanceof SyntaxError)
+          ) {
+            fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
+            return new Response(JSON.stringify({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: (e as Error).message },
+            }), { status: 400, headers: { 'content-type': 'application/json' } });
+          }
+          detachClientAbort();
+          fireWait(502, undefined, `transform_error: ${(e as Error).message}`);
+          return new Response(JSON.stringify({ error: 'fiche transform failed' }), {
+            status: 502,
+            headers: { 'content-type': 'application/json' },
+          });
         }
-      } catch (e) {
-        if (
-          (bridgedGptMessages || bridgedChatMessages) &&
-          ((e as Error).name === 'MessagesBridgeInvalidRequest' || e instanceof SyntaxError)
-        ) {
-          fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
-          return new Response(JSON.stringify({
-            type: 'error',
-            error: { type: 'invalid_request_error', message: (e as Error).message },
-          }), { status: 400, headers: { 'content-type': 'application/json' } });
-        }
-        fireWait(502, undefined, `transform_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'fiche transform failed' }), {
-          status: 502,
-          headers: { 'content-type': 'application/json' },
-        });
       }
     } else if (req.method === 'POST') {
       // The model lives in the body, not the path, so read it here too or the
@@ -2406,6 +2701,7 @@ let responseContentType: string | undefined;
         upstreamUrl,
         headers,
         reqBodySha256,
+        validatedClientSessionId ?? '',
       ]));
       const now = Date.now();
       // Time trigger keeps steady state clean; size trigger reclaims promptly if entries
@@ -2424,6 +2720,10 @@ let responseContentType: string | undefined;
       // Fail open once the holder is older than the window: a retry that arrives this
       // late is the client recovering from a stall, not an accidental double-send.
       if (existing && now - existing.startedAt < duplicateHoldMs) {
+        detachClientAbort();
+        if (!upstreamAbort.signal.aborted) {
+          upstreamAbort.abort(new Error('fiche: duplicate request rejected'));
+        }
         const message = 'An identical request is already in progress';
         fireWait(409, undefined, 'duplicate_request_in_flight');
         const error = isMessages
@@ -2442,7 +2742,7 @@ let responseContentType: string | undefined;
     }
     // One controller for the whole exchange: headers timeout, stall watchdog and client
     // disconnect all abort through it, so nothing can hold the socket open indefinitely.
-    const upstreamAbort = new AbortController();
+    ensureClientAbortWired();
     let timeoutKind: 'headers' | 'idle' | undefined;
     let headersTimer: ReturnType<typeof setTimeout> | undefined;
     // Raced explicitly rather than trusting the fetch implementation to reject on
@@ -2464,9 +2764,9 @@ let responseContentType: string | undefined;
       }
     };
 
-    let upstreamRes: Response;
+    let upstreamRes: Response | undefined;
     try {
-      const upstreamFetch = fetch(upstreamUrl, {
+      const upstreamFetch = fetchImpl(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
         // Never auto-follow 3xx redirects upstream: cross-origin redirects could
@@ -2481,8 +2781,11 @@ let responseContentType: string | undefined;
         headersTimeoutMs > 0 ? await Promise.race([upstreamFetch, headersDeadline]) : await upstreamFetch;
       clearHeadersTimer();
       if (raced === HEADERS_TIMEOUT) {
-        // Abandoned: keep its eventual rejection from surfacing as unhandled.
-        void upstreamFetch.catch(() => undefined);
+        // Abandoned: cancel any late response body so streams never linger unconsumed.
+        void upstreamFetch.then(
+          (lateRes) => lateRes.body?.cancel().catch(() => undefined),
+          () => undefined,
+        );
         throw new Error('fiche: upstream headers timeout');
       }
       upstreamRes = raced;
@@ -2498,6 +2801,13 @@ let responseContentType: string | undefined;
       }
     } catch (e) {
       clearHeadersTimer();
+      if (upstreamRes?.body && !upstreamRes.body.locked) {
+        void upstreamRes.body.cancel().catch(() => undefined);
+      }
+      if (!upstreamAbort.signal.aborted) {
+        upstreamAbort.abort(e instanceof Error ? e : new Error(String(e)));
+      }
+      detachClientAbort();
       releaseInFlight();
       if (timeoutKind) {
         const detail = timeoutKind === 'headers'
@@ -2516,12 +2826,13 @@ let responseContentType: string | undefined;
       });
     }
 
+    const finalUpstreamRes = upstreamRes;
     const firstByteMs = Date.now() - t0;
-    responseContentType = upstreamRes.headers.get('content-type') ?? undefined;
-    responseContentEncoding = upstreamRes.headers.get('content-encoding') ?? undefined;
+    responseContentType = finalUpstreamRes.headers.get('content-type') ?? undefined;
+    responseContentEncoding = finalUpstreamRes.headers.get('content-encoding') ?? undefined;
 
     // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-let teed: Response;
+    let teed: Response;
     let usagePromise: Promise<Usage | undefined>;
     let errorBodyPromise: Promise<string | undefined>;
     let measurementPromise: Promise<OutputMeasurement | undefined>;
@@ -2529,12 +2840,19 @@ let teed: Response;
     try {
       ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
         teeForUsage(
-          upstreamRes,
+          finalUpstreamRes,
           isOpenAIResponsesWire && responsesStreaming,
           isOpenAIResponsesWire && !responsesStreaming,
           isMessages || isGoogle || isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages,
         ));
     } catch (e) {
+      if (finalUpstreamRes.body && !finalUpstreamRes.body.locked) {
+        void finalUpstreamRes.body.cancel().catch(() => undefined);
+      }
+      if (!upstreamAbort.signal.aborted) {
+        upstreamAbort.abort(e instanceof Error ? e : new Error(String(e)));
+      }
+      detachClientAbort();
       releaseInFlight();
       throw e;
     }
@@ -2549,22 +2867,24 @@ let teed: Response;
       // A rejected request never populated a prefix cache, so the append-only
       // freeze this session was protecting protects nothing: let the next turn
       // re-cut the grid for density instead of preserving dead bytes.
-      if (responseLeftNoCache(upstreamRes.status, errorBody)) {
-        markCacheDead(info?.firstUserSha8);
+      const sessionKey = info?.sessionKey ?? info?.firstUserSha8;
+      if (responseLeftNoCache(finalUpstreamRes.status, errorBody)) {
+        markCacheDead(sessionKey);
       }
       // Feed the provider's own cache accounting back into the session store. A
       // read proves the prefix was live; a create proves one was just written.
-      // Either way the next turn must not re-cut the grid — which the wall clock
-      // alone could not tell, and got wrong on most gaps that mattered.
-      if (upstreamRes.ok && usage !== undefined && isAnthropicMessagesRoute) {
+      // Either way the next turn must not re-cut the grid or assume cold cache.
+      if (finalUpstreamRes.ok && usage !== undefined && (isAnthropicMessagesRoute || isGoogle || isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages)) {
         noteCacheOutcome(
-          info?.firstUserSha8,
-          usage.cache_read_input_tokens,
-          usage.cache_creation_input_tokens,
+          sessionKey,
+          usage.cache_read_input_tokens ?? usage.cached_tokens,
+          bridgedGptMessages || bridgedChatMessages
+            ? undefined
+            : (usage.cache_creation_input_tokens ?? usage.cache_write_tokens),
         );
       }
       return fire(
-        upstreamRes.status,
+        finalUpstreamRes.status,
         info,
         timeoutKind === 'idle' ? `upstream_timeout: no upstream bytes for ${idleTimeoutMs}ms` : undefined,
         firstByteMs,
@@ -2575,6 +2895,7 @@ let teed: Response;
       );
     }).finally(() => {
       clearHeadersTimer();
+      detachClientAbort();
       releaseInFlight();
     });
     config.waitUntil?.(bgTask);
@@ -2584,6 +2905,7 @@ let teed: Response;
     const clientBody = teed.body
       ? withClientDisconnect(teed.body, () => {
           clearHeadersTimer();
+          detachClientAbort();
           releaseInFlight();
           if (!upstreamAbort.signal.aborted) {
             upstreamAbort.abort(new Error('fiche: client disconnected'));
@@ -2591,8 +2913,8 @@ let teed: Response;
         })
       : null;
 
-    const resHeaders = filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS);
-    if (info && (info.compressed || (info.textHygieneSavedTokens ?? 0) > 0)) {
+    const resHeaders = filterHeaders(finalUpstreamRes.headers, STRIP_RES_HEADERS);
+    if (info && (info.compressed || (info.textHygieneSavedTokens ?? 0) > 0 || (info.textHygieneStages?.length ?? 0) > 0)) {
       const imagedSaved = info.compressed
         ? Math.max(
             0,
@@ -2612,9 +2934,10 @@ let teed: Response;
       }
     }
 
+    if (!clientBody) detachClientAbort();
     return new Response(clientBody, {
-      status: upstreamRes.status,
-      statusText: upstreamRes.statusText,
+      status: finalUpstreamRes.status,
+      statusText: finalUpstreamRes.statusText,
       headers: resHeaders,
     });
   };

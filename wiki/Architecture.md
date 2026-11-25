@@ -1,137 +1,52 @@
 # Architecture
 
-![fiche architecture](../docs/architecture/fiche-architecture.svg)
+`fiche` separates a runtime-agnostic compiler core (`src/core/`, zero `node:` imports and zero runtime `Buffer` references) from thin host adapters for Node.js, Cloudflare Workers, TLS Warp, MCP, CLI utilities, and the macOS menu bar app.
 
-![fiche request flow](../docs/architecture/request-flow.svg)
-
-`fiche` intercepts inference traffic (or transforms payloads offline via library / MCP / `fiche export`) using a clean split between a **pure runtime-agnostic core** (`src/core/`, zero `node:` imports) and **host adapters** (`src/node.ts`, `src/worker.ts`, `src/warp/`, `src/mcp/`, `apps/macos-bar/`).
-
----
-
-## 1. End-to-End Topology
+## Topology
 
 ```mermaid
 flowchart LR
-  subgraph CLIENTS["Coding CLIs & Desktop Apps"]
-    CLIS["claude · codex · gemini · opencode · agy"]
-    APPS["Desktop Apps via 'fiche warp --app'"]
-    SHELL["'fiche shell-init [--wrap]' (fclaude / fcodex / fiche-app)"]
-    BAR["FicheBar.app (5 Apple HIG Themes + Control)"]
-  end
+  Clients["CLIs & Apps\n(claude · codex · gemini · opencode · agy · GUI)"]
+  Warp["Local HTTP Proxy :47821\n+ TLS Warp (--app / shell-init --wrap)"]
+  Core["Pure Core (src/core/)\nP0–P3 Text · Context-MMU · Optical"]
+  State["Local State (0600)\nsession-state.json\ncalibrated-models.json\noptional mmu-pages.json"]
+  MCP["fiche-mcp (:47823 / stdio)\ncheck_model · transform_request\npage_in · mmu_stats"]
+  Upstream["29 Built-In Upstream Hosts\nacross 21 Providers (6 1P + 23 COMPAT)"]
 
-  subgraph LOCAL["Local Loopback Stack (127.0.0.1:47821)"]
-    WARP["CONNECT MITM + Loopback Guard"]
-    PROXY["fiche Hybrid Context Proxy + Dashboard"]
-    MCP["fiche-mcp (Stdio / :47823 HTTP)"]
-    STATE["~/.fiche/ (events.jsonl · session-state.json · plugins/)"]
-  end
-
-  subgraph UPSTREAM["First-Party + 23 COMPAT Hosts"]
-    ANT["api.anthropic.com"]
-    OAI["api.openai.com · chatgpt.com/backend-api/codex"]
-    GOOG["generativelanguage / cloudcode-pa (/v1internal:*)"]
-    COMPAT["DeepSeek · Moonshot · Kimi · Z.AI · xAI · OpenRouter · Groq · +16"]
-  end
-
-  CLIS --> WARP
-  APPS --> WARP
-  SHELL --> WARP
-  WARP --> PROXY
-  BAR <-->|"Poll & POST /api/*"| PROXY
-  MCP -->|"check_model / transform_request"| PROXY
-  PROXY <--> STATE
-  PROXY --> ANT
-  PROXY --> OAI
-  PROXY --> GOOG
-  PROXY --> COMPAT
+  Clients -->|"OpenAI / Anthropic / Gemini wires"| Warp
+  Warp --> Core
+  Core <-->|"Prefix seals & calibrated bands"| State
+  Core -->|"Prompt-cache-safe payloads"| Upstream
+  Clients <-->|"In-process inspect / compile;\nHTTP proxy fallback on page_in / mmu_stats miss"| MCP
+  MCP -.->|"page_in / mmu_stats fallback"| Warp
 ```
 
----
+## Module Layout
 
-## 2. Hybrid Context Compiler Router
+| Layer | Key Files | Responsibilities |
+| --- | --- | --- |
+| **Pure Core** | `src/core/proxy.ts`, `prefix-tape.ts`, `schema-compiler.ts`, `text-hygiene.ts`, `casi-delta.ts`, `calibration.ts`, `text-history.ts`, `context-mmu.ts`, `session-state.ts`, `reader-tier.ts` | P0 XML-Island TSCG, Merkle Schema DAG (`$defs._fN`) & `PrefixMemoTape`, P1 `CASI` (`PREPARED_LINES_CACHE`, Recursive Histogram Diff, FastCDC) & 4-axis calibration, P2 `LSM-Context` (`L1/L0/L2`, `computeHorizonPaybackLimit`), P3 `Context-MMU` (`pg_<12hex>`, Per-Session Context-TLB, Markovian folding, Turn-1 skill linking, Minoux Submodular IDF pruning), append-only prefix sealing |
+| **Wire Adapters** | `src/core/google.ts`, `transform.ts`, `openai.ts` | Provider wire translation, `OpticalMode` (`hybrid` Turn-1 optical slab + dynamic Text-MMU vs `full` optical), Google `pinnedUserText` live-tail split, active-turn-only tail extractors, `!opticalEnabled` guard disabling `CASI` in Full Optical |
+| **Daemon & CLI** | `src/node.ts`, `src/node-fetch.ts`, `src/launchd-socket.ts`, `mmu-store.ts`, `calibrate.ts`, `turn-report.ts` | `:47821` daemon with HTTP/1.1 keep-alive upstream fetch (`#33`), `launchd`/`systemd` socket activation + bind-before-restore + `connTrack` `60s` SSE drain (`#34`), `fiche calibrate`, `fiche mmu`, `fiche turn-report`, `fiche export`, optional `FICHE_MMU_PERSIST=1` `0600` persistence |
+| **UI & Extensions** | `src/dashboard.ts`, `src/mcp/server.ts`, `src/warp/`, `apps/macos-bar/` | Warm Paper dashboard + `no-store`/`nosniff` `/api/mmu/*` & `/api/calibration`, MCP server (`6` tools), HTTPS `CONNECT` warp (`isLocalDaemonReachable`, `failOpenOnDivertRefused`, loopback `NO_PROXY`), native SwiftUI `FicheBar.app` |
 
-```mermaid
-flowchart TD
-  REQ["Inbound Wire Request"] --> GUARD{"Origin / Host & Bypass Guard"}
-  GUARD -->|"x-fiche-bypass: 1"| PASS["Forward Verbatim"]
-  GUARD -->|"Loopback / Trusted"| WIRE["Normalize Wire Format"]
+## Request & Prefix-Cache Invariants
 
-  WIRE --> WTYPE{"Wire Family"}
-  WTYPE --> ANT_W["Anthropic Messages (/v1/messages)"]
-  WTYPE --> OAI_W["OpenAI Responses & Chat (/v1/responses, /v1/chat/completions)"]
-  WTYPE --> GOOG_W["Google Gemini & /v1internal:* (:generateContent, :streamGenerateContent)"]
+1. **RAM-First MMU Default**: `ContextPageStore` runs purely in daemon memory by default; persistence to `~/.fiche/mmu-pages.json` requires explicit opt-in (`FICHE_MMU_PERSIST=1` with `FICHE_SESSION_STATE` enabled) and skips pages matching high-confidence secret patterns with a 24-hour idle TTL.
+2. **Edit & Read Protection**: `FILE_READ_TOOL_RE` and `isCodeOrDiffProtected` bypass destructive pruning (`pruneLowDensityBlob`) and aggressive compaction, keeping edits and code reads verbatim in the live tail.
+3. **Append-Only Sealed Prefix, Context-TLB & PrefixMemoTape**: `PrefixMemoTape` (`src/core/prefix-tape.ts`) accelerates warm turns via Stage-2 LRU memoization, `sessionKey`-scoped Unified Prefix Seals (`L1`/`L0`/Markov), and Merkle prefix-state CASI memos with chronological `deferredBases` seeding. Turn-1 skill catalogs are pinned (`PINNED_SKILLS_MAX = 32` across `512` LRU sessions) in `session-state.ts`, while `computeTailHydration` filters queries to active trailing turns and suppresses redundant re-hydrations via per-session Context-TLB (`TLB_DEFAULT_COOLDOWN_TURNS = 3`) across `±15`-line slices in the uncached live tail.
+4. **Hybrid Slab-Optical + Text-MMU & Live-Tail Read Safety**: `resolveOpticalHistoryPolicy` (`transform.ts`) selects `opticalMode: 'hybrid'` under low read-discount `kosha` pricing (`rates.read <= 0.10`, `estPromptTokens < 160_000`), freezing Turn-1 instructions/schemas optically once while running Text + `Context-MMU` on dynamic history (`39.5%` weighted / `46.9%` raw saved at `89.9%` cache hit across `60` images on `gemini-4-argon`, vs. `36.8%` weighted / `44.0%` raw on 0-image Text+MMU and `3.0%` weighted / `49.0%` raw across `153` PNGs in Full Optical—all with `editSafe = true` and `tailRecallVerified = true`). Full Optical disables `CASI` (`!opticalEnabled`), keeps live-tail reads verbatim until sealed, and places mutable `pinnedUserText` in the trailing live turn (`79.7%` cache hit vs `11.9%`).
+5. **Cold-Cache & Online Horizon Triggers**: `L2` cold repack runs only when upstream `usage` confirms cache expiry (`everCacheAlive && !lastCacheAlive`, `1h + 30s` idle, or `413` backstop) with `justRepacked` hysteresis across all `5` provider cache-read JSON `usage` fields; mid-prefix compaction passes through `computeHorizonPaybackLimit`.
+6. **Zero-Drop Transport, Socket Activation & Warp Fail-Open**: `src/node-fetch.ts` uses dedicated HTTP/1.1 keep-alive agents with persistent socket `'error'` listeners and `AbortController` teardown (preventing Node 26 / `undici` idle-reaper `ClientHttp2Stream` crashes, `#33`). `src/launchd-socket.ts` + `src/node.ts` adopt `launchd` (`<key>Sockets</key>` `<launch.h>` trampoline) or `systemd` (`LISTEN_FDS`/`LISTEN_PID`) fds before store/replay restoration (`#34`) while protecting freshly accepted sockets across `SIGTERM`, and `src/warp/` bypasses dead daemons (`FICHE_BYPASS=1`), merges loopback `NO_PROXY`, and fails open direct on mid-session `ECONNREFUSED`.
 
-  ANT_W --> SCOPE{"readerTier(model) & FICHE_MODELS"}
-  OAI_W --> SCOPE
-  GOOG_W --> SCOPE
+## Benchmark Snapshot (`bench/context-mmu-eval.mts`, 30 Turns, `gemini-4-argon`, `kosha` pricing)
 
-  SCOPE -->|"OPTICAL Tier (Fable 5, Gemini Vision, Opt-in Sol)"| OPT["Optical Microfiche + Text Hygiene + FactSheet"]
-  SCOPE -->|"TEXT Tier (Astra, Opus 5.5, Neon/Carbon, DeepSeek, Kimi, GLM, Grok)"| TXT["4-Layer Text Compiler (0 images)"]
+| Arm | Raw Save | Weighted Save (`kosha`) | Cache Hit | p50 / p95 ms | EditSafe | Tail Recall |
+| --- | ---: | ---: | ---: | ---: | :---: | :---: |
+| Baseline (uncompressed) | 0.0% | 0.0% | 91.8% | 0.00 / 0.01 | `true` | `true` |
+| v0.18 Text (`lsm/mmu/skillLinker` off) | 32.5% | 34.0% | 92.1% | 11.94 / 16.33 | `true` | `true` |
+| P0–P3 Text + Context-MMU (0 images) | 44.0% | 36.8% | 90.1% | 10.24 / 35.53 | `true` | `true` |
+| P0–P3 + Optical (`spleen-5x8`, 153 imgs) | 49.0% | 3.0% | 79.7% | 4.71 / 54.07 | `true` | `true` |
+| **P0–P3 Hybrid Slab-Optical + Text-MMU** (`60` imgs) | **46.9%** | **39.5%** | **89.9%** | **9.62 / 32.41** | `true` | `true` |
 
-  subgraph TEXT4["Deterministic Text Pipeline (src/core/)"]
-    S1["Stage 1: TSCG (Schema & Static Compiler)"]
-    S2["Stage 2: Terminal ANSI/CR + @toon + Drain Log Fold"]
-    S3["Stage 3: ACDC (Frozen Epoch Digestion)"]
-    S4["Stage 4: CASI-Delta (Cross-Turn Line Hash Dedupe)"]
-    S1 --> S2 --> S3 --> S4
-  end
-
-  TXT --> S1
-  OPT --> EDIT{"editSafe Guard (isCodeOrDiffProtected)"}
-  S4 --> EDIT
-  EDIT -->|"Numbered Reads & Diffs Exact"| SEAL["Append-Only Prefix Cache Boundary + @fiche pin Tail"]
-```
-
----
-
-## 3. Prefix-Cache Seal & Zero-Token Telemetry Sequence
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant Agent as Coding Agent / IDE
-  participant Proxy as fiche Proxy (src/core/proxy.ts)
-  participant State as Session State (~/.fiche/session-state.json)
-  participant Upstream as Provider API (Prompt Cache)
-  participant UI as FicheBar.app / Dashboard / Hook
-
-  Agent->>Proxy: Turn N messages + tool results
-  Proxy->>State: Lookup sealed chunks / optical history grid
-  State-->>Proxy: Immutable bytes for Turns 1..K (prefix-stable)
-  Proxy->>Proxy: Compile new chunk K+1 (preserving live tail & @fiche pin)
-  Proxy->>Upstream: Forward compiled payload + original credentials
-  Upstream-->>Proxy: SSE / JSON response + cache_read_input_tokens
-  Proxy-->>Agent: Response + x-fiche-saved-tokens / x-fiche-stages / x-fiche-cliff-saved-usd
-  Proxy->>State: Append TrackEvent to ~/.fiche/events.jsonl (<5 ms tail write)
-  UI-->>State: Poll /api/health, /proxy-stats, /api/last-turn.json, PostInvocation hook (0 LLM tokens)
-```
-
----
-
-## 4. Module Map (`src/` & `apps/`)
-
-| Module | Path | Responsibility |
-| :--- | :--- | :--- |
-| **Pure Core Engine** | `src/core/` | Zero `node:` imports: wire transforms (`transform.ts`, `openai.ts`, `google.ts`), 4-layer text pipeline (`schema-compiler.ts`, `text-hygiene.ts`, `toon.ts`, `text-history.ts`, `casi-delta.ts`), optical PNG renderer (`render.ts`, `atlas*.ts`, `png.ts`, `factsheet.ts`), cache state (`session-state.ts`, `codex-cache.ts`), 23-host COMPAT registry (`upstream-hosts.ts`), `kosha` pricing & baselines (`pricing.ts`, `baseline.ts`, `measurement.ts`), and plugins (`stage-plugins.ts`) |
-| **Loopback Proxy & CLI** | `src/node.ts`, `src/worker.ts` | Local HTTP daemon (`127.0.0.1:47821`), Cloudflare Workers adapter, `fiche export`, `fiche turn-report`, `fiche stats`, `fiche service` (`launchd`) |
-| **TLS Warp & App Launch** | `src/warp/` | Local HTTPS `CONNECT` interceptor (`connect.ts`, `ca.ts`, `resolve.ts`, `route.ts`) + macOS GUI launcher & shell helpers (`app-launch.ts`) for `fiche warp --app` and `fiche shell-init [--wrap]` |
-| **Local Dashboard** | `src/dashboard.ts`, `src/dashboard/` | Editorial Warm Paper live telemetry dashboard, PNG crop inspector, `/fragments/plugins`, and `/api/models` / `/api/plugins` controls |
-| **MCP Server** | `src/mcp/` | Stdio & stateless Streamable HTTP MCP server (`fiche-mcp` / `:47823`) exposing `check_model`, `transform_request`, `health`, `stats` |
-| **Fast Telemetry Tail** | `src/turn-report.ts`, `src/sessions.ts`, `src/stats.ts` | Bounded reverse-tail buffer scanner (`<5 ms`) powering CLI rollups, Antigravity `PostInvocation`, and Claude `statusLine` |
-| **macOS Companion** | `apps/macos-bar/` | Native Swift 6 / SwiftUI `FicheBar.app` with 5 Apple HIG themes (`Editorial`, `Native`, `Slate`, `Terminal`, `Midnight`), weighted-vs-raw savings readout, 1-click third-party toggles, and About/Sponsor window |
-
----
-
-## 5. Model Routing & Font Bands (`src/core/reader-tier.ts`)
-
-1. **Dense 5×8 bitmap (`spleen-5x8`, 5×8 cell + `Unifont` 8px fallback)**: `claude-fable-5`, measured `gemini` vision tiers (`gemini-3.6-flash`, `3.7-flash`, `3.8-flash`, `gemini-4-argon`), `gpt-6` (non-Sol), and default GPT fallback (`312` cols on Claude/Gemini, `152` cols on GPT).
-2. **Spaced 5×8 bitmap (`spleen-5x8` + `2px` row spacing → 5×10 cell)**: `claude-fable-5-1`, `claude-fable-5-2`, and other opt-in Claude models (`312` cols, `1568×728` max). Intermediate `jetbrains-mono-10` (`6×11`) and `jetbrains-mono-12` (`8×13`) atlases are also compiled for `FICHE_GPT_PROFILES`.
-3. **Native 14px (`jetbrains-mono-14`, 9×16 cell + `Unifont` 14px fallback)**: opt-in `gpt-5.6-sol` / `gpt-6.1-sol` / `gpt-6.2-sol` (`84` cols, `764×1954`), opt-in `grok-*` (`84` cols, `764×512`), and opt-in `qwen3.8-27b` (`84` cols, `764×512`, `providerImageCap: 32`).
-4. **Text-only deterministic hygiene (zero images)**: `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-*`, `gpt-6*-astra`, `gemini-4-neon`, `gemini-4-carbon`, `gemini-4-hydrogen`, `deepseek`, `kimi`, `glm`, `minimax`, and `grok` (unless `FICHE_FORCE_IMAGES=1`). Includes Google `/v1internal:*` `functionResponse.parts[].text` compression for non-Gemini models routed through Antigravity.
-
-## Further Reading
-
-- [Detailed Architecture Reference](../docs/ARCHITECTURE.md)
-- [Hybrid Optical Engine](./Hybrid-Optical-Engine.md) · [4-Layer Text Compiler](./Text-Compiler-Pipeline.md)
-- [Prefix Cache Safety & Kosha Pricing](./Prefix-Cache-Safety-and-Pricing.md)
-- [Security Model](../docs/SECURITY_MODEL.md) · [Privacy Policy](../PRIVACY.md)
+Cross-wire 30-turn verification (`kosha` pricing): Anthropic (`claude-opus-5-5`) achieves `48.8%` raw / `39.8%` weighted saved (`89.6%` cache hit, `18.50 ms` avg, `42.65 ms` p95); OpenAI Responses (`gpt-6-astra`) achieves `44.6%` raw / `33.2%` weighted saved (`88.3%` cache hit, `11.66 ms` avg, `15.50 ms` p95); both `editSafe = true` and `tailRecallVerified = true`.

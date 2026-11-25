@@ -599,7 +599,7 @@ function stripLines(text: string, source: 'file' | 'session' = 'session'): strin
  * The block appended at the tail. Sits after every existing `cache_control`
  * breakpoint, so its bytes are re-read each turn by construction and it can never
  * cost a cache miss — which is also why formatting drift in the user's source
- * lines is free here, and why we normalize purely for tidy telemetry.
+ * lines is free here, and why we normalize purely for tidy counters.
  */
 /** Neutralize closing `</system-reminder>` tags inside user/file pin text so
  *  relocated pins cannot break out of the outer `<system-reminder>` envelope. */

@@ -308,7 +308,7 @@ export interface RenderedImage {
   height: number;
   /** Input codepoints rendered (wide chars count as 1, not 2). */
   charsRendered: number;
-  /** Codepoints absent from atlas, rendered as blank cells. Surface as telemetry. */
+  /** Codepoints absent from atlas, rendered as blank cells. Surface in counters. */
   droppedChars: number;
   /** Per-codepoint drop histogram. Empty when droppedChars === 0; never undefined. */
   droppedCodepoints: Map<number, number>;
@@ -526,7 +526,7 @@ export function dereflow(reflowed: string): string {
 // --- atlas-miss escaping -----------------------------------------------------
 //
 // Codepoints absent from the atlas used to render as blank cells (droppedChars
-// telemetry). Emoji and other astral glyphs can't be DRAWN at 5×8 px, but they
+// metrics). Emoji and other astral glyphs can't be DRAWN at 5×8 px, but they
 // can be PRESERVED: substitute a deterministic textual escape (`[U+HEX]`) before
 // wrap, so the model reads the codepoint instead of a gap. Applied at the same layer
 // as tab expansion (wrapLines + measureContentCols), so wrap math and canvas

@@ -52,6 +52,34 @@ private final class TaskCancellationBox: @unchecked Sendable {
     }
 }
 
+private final class LockedDataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func set(_ next: Data) {
+        lock.lock()
+        data = next
+        lock.unlock()
+    }
+
+    func appendBounded(_ chunk: Data, maxBytes: Int) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        if data.count > maxBytes {
+            data = Data(data.suffix(maxBytes))
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        let copy = data
+        lock.unlock()
+        return copy
+    }
+}
+
 // MARK: - DaemonController
 
 @MainActor
@@ -102,6 +130,8 @@ final class DaemonController: ObservableObject {
     @Published private(set) var health: HealthResponse?
     @Published private(set) var stats: ProxyStatsResponse?
     @Published private(set) var lastTurn: LastTurnResponse?
+    @Published private(set) var mmuStats: MmuStatsResponse?
+    @Published private(set) var calibratedProfiles: [CalibratedModelProfile] = []
     @Published private(set) var allowedModels: [String] = []
     @Published private(set) var modelCatalog: [ModelCatalogItem] = ModelCatalogItem.curatedDefaults
     @Published private(set) var providers: [ProviderDescriptor] = ProviderDescriptor.fallbackDefaults
@@ -113,6 +143,12 @@ final class DaemonController: ObservableObject {
     @Published private(set) var discoveredDesktopApps: [DiscoveredDesktopApp] = []
     @Published private(set) var discoveredCLIAgents: [DiscoveredCLIAgent] = []
     @Published private(set) var hasCompletedAgentDiscovery: Bool = false
+    @Published private(set) var hasKoshaCLI: Bool = false
+    @Published private(set) var hasKoshaRegistry: Bool = false
+    @Published private(set) var koshaRegistryUpdatedAt: Date? = nil
+    @Published private(set) var isSyncingKosha: Bool = false
+    @Published private(set) var koshaSyncStage: String? = nil
+    @Published private(set) var lastKoshaSyncSummary: String? = nil
     @Published private(set) var transientNotice: String? = nil
     @Published private(set) var isBusy: Bool = false
     @Published private(set) var lastError: String?
@@ -127,6 +163,7 @@ final class DaemonController: ObservableObject {
     private var noticeGeneration: Int = 0
     private var pollGeneration: Int = 0
     private var discoveryGeneration: Int = 0
+    private var koshaGeneration: Int = 0
     private var isUpdatingShellAutoWrap: Bool = false
 
     var isPreviewMode: Bool { isPreview }
@@ -163,6 +200,7 @@ final class DaemonController: ObservableObject {
 
         startPolling()
         refreshAgentDiscovery()
+        refreshKoshaStatus()
     }
 
     private init(previewTheme: ThemeID) {
@@ -182,7 +220,7 @@ final class DaemonController: ObservableObject {
         {
           "ok": true,
           "name": "fiche",
-          "version": "0.18.0",
+          "version": "0.19.0",
           "pid": 17130,
           "host": "127.0.0.1",
           "port": 47821,
@@ -325,6 +363,9 @@ final class DaemonController: ObservableObject {
             PluginDescriptor(id: "toon-structured", name: "TOON Structured Encoder", description: "Lossless tabular TOON encoding for repetitive JSON payloads.", kind: .stage, source: "builtin", enabled: true, mutable: false),
             PluginDescriptor(id: "acdc-epochs", name: "ACDC Epoch Collapse", description: "Amortized cache-safe collapsing of older text history turns.", kind: .stage, source: "builtin", enabled: true, mutable: false),
             PluginDescriptor(id: "casi-delta", name: "CASI Delta Deduplicator", description: "Content-addressed duplicate and delta referencing.", kind: .stage, source: "builtin", enabled: true, mutable: false),
+            PluginDescriptor(id: "lsm-context", name: "LSM-Context Hierarchy", description: "Multi-level LSM history compaction tiers for long-running sessions.", kind: .stage, source: "builtin", enabled: true, mutable: false),
+            PluginDescriptor(id: "context-mmu", name: "Context-MMU Virtual Memory", description: "Virtual context paging, Markovian episode folding, and live-tail hydration.", kind: .stage, source: "builtin", enabled: true, mutable: false),
+            PluginDescriptor(id: "skill-linker", name: "Session Skill Linker", description: "Turn-1 pinned skill catalog stubbing with Turn-N auto-hydration.", kind: .stage, source: "builtin", enabled: true, mutable: false),
             PluginDescriptor(id: "skill:fiche", name: "fiche", description: "Inspect token & dollar savings from the fiche context compiler.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:azure-ai", name: "azure-ai", description: "External Azure AI skill extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:baton-handover", name: "baton-handover", description: "External session baton handover extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
@@ -346,6 +387,58 @@ final class DaemonController: ObservableObject {
             DiscoveredCLIAgent(id: "opencode", name: "OpenCode", command: "opencode", provider: "Multi", installed: true, binaryPath: "/Users/demo/.opencode/bin/opencode", attachedCount: 0, directCount: 0),
             DiscoveredCLIAgent(id: "aider", name: "Aider", command: "aider", provider: "Multi", installed: false, binaryPath: nil, attachedCount: 0, directCount: 0),
         ]
+        self.hasKoshaCLI = true
+        self.hasKoshaRegistry = true
+        self.koshaRegistryUpdatedAt = Date().addingTimeInterval(-1_800)
+        self.lastKoshaSyncSummary = "Up to date · 8 active bases"
+        self.mmuStats = MmuStatsResponse(
+            stats: MmuStatsSnapshot(
+                pagesStored: 16,
+                pagesEvicted: 0,
+                activePages: 16,
+                activeBytes: 428_032,
+                tailHydrations: 4,
+                tailHydrationTokens: 1_552,
+                markovFolds: 1,
+                skillsStubbed: 12,
+                densityPrunedBlocks: 1
+            ),
+            pageCount: 16,
+            limits: MmuLimitsSnapshot(maxPages: 512, maxBytes: 16 * 1024 * 1024, persisted: false),
+            prefixTape: PrefixTapeSnapshot(
+                stage2Entries: 24,
+                stage2Hits: 82,
+                stage2Misses: 12,
+                sealSessions: 2,
+                totalSeals: 14,
+                sealHits: 28,
+                casiEntries: 18,
+                casiHits: 31,
+                casiMisses: 6
+            )
+        )
+        self.calibratedProfiles = [
+            CalibratedModelProfile(
+                model: "gemini-4-argon",
+                band: "spleen-5x8",
+                cols: 312,
+                maxHeightPx: 768,
+                calibratedAtIso: "2026-11-25T10:00:00Z",
+                source: "probe",
+                overallScore: 0.99,
+                passed: true
+            ),
+            CalibratedModelProfile(
+                model: "gpt-6.2-sol",
+                band: "jetbrains-mono-14",
+                cols: 95,
+                maxHeightPx: 512,
+                calibratedAtIso: "2026-11-25T10:00:00Z",
+                source: "probe",
+                overallScore: 0.96,
+                passed: true
+            ),
+        ]
     }
 
     static func previewSample(theme: ThemeID) -> DaemonController {
@@ -357,6 +450,23 @@ final class DaemonController: ObservableObject {
     }
 
     // MARK: - Computed Properties
+
+    func calibratedProfile(for modelId: String) -> CalibratedModelProfile? {
+        let stripped = modelId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\[[^\]]*\]"#, with: "", options: .regularExpression)
+        guard !stripped.isEmpty else { return nil }
+        if let exact = calibratedProfiles.first(where: { $0.model.lowercased() == stripped }) {
+            return exact
+        }
+        let base = stripped.split(separator: "/").last.map(String.init) ?? stripped
+        return calibratedProfiles.first(where: {
+            let p = $0.model.lowercased()
+            let pBase = p.split(separator: "/").last.map(String.init) ?? p
+            return pBase == base
+        })
+    }
 
     var baseURL: URL {
         URL(string: "http://127.0.0.1:\(daemonPort)")!
@@ -480,6 +590,7 @@ final class DaemonController: ObservableObject {
         case .httpError(let status, let body):
             health = nil
             lastTurn = nil
+            mmuStats = nil
             if phase != .starting {
                 phase = .stopped
             }
@@ -489,6 +600,7 @@ final class DaemonController: ObservableObject {
             health = nil
             stats = nil
             lastTurn = nil
+            mmuStats = nil
             if phase != .starting {
                 phase = .stopped
             }
@@ -500,13 +612,17 @@ final class DaemonController: ObservableObject {
         async let modelsFetch: HTTPResult<ModelsResponse> = getJSON(path: "/api/models")
         async let providersFetch: HTTPResult<ProvidersResponse> = getJSON(path: "/api/providers")
         async let pluginsFetch: HTTPResult<PluginsResponse> = getJSON(path: "/api/plugins")
+        async let mmuFetch: HTTPResult<MmuStatsResponse> = getJSON(path: "/api/mmu/stats")
+        async let calibrationFetch: HTTPResult<CalibrationResponse> = getJSON(path: "/api/calibration")
 
-        let (statsRes, turnRes, modelsRes, providersRes, pluginsRes) = await (
+        let (statsRes, turnRes, modelsRes, providersRes, pluginsRes, mmuRes, calibrationRes) = await (
             statsFetch,
             turnFetch,
             modelsFetch,
             providersFetch,
-            pluginsFetch
+            pluginsFetch,
+            mmuFetch,
+            calibrationFetch
         )
         guard gen == pollGeneration, targetPort == daemonPort else { return false }
 
@@ -525,6 +641,7 @@ final class DaemonController: ObservableObject {
 
         if !anyReachable {
             lastTurn = nil
+            mmuStats = nil
             if phase != .starting {
                 phase = .stopped
             }
@@ -562,6 +679,18 @@ final class DaemonController: ObservableObject {
             pluginsEndpointSupported = false
         case .httpError, .unreachable:
             break
+        }
+
+        if case .ok(let mmu) = mmuRes {
+            mmuStats = mmu
+        } else if case .httpError(let status, _) = mmuRes, status == 404 {
+            mmuStats = nil
+        }
+
+        if case .ok(let cal) = calibrationRes {
+            calibratedProfiles = cal.profiles
+        } else if case .httpError(let status, _) = calibrationRes, status == 404 {
+            calibratedProfiles = []
         }
 
         let enabled = health?.compressionEnabled ?? stats?.compressionEnabled ?? true
@@ -860,6 +989,111 @@ final class DaemonController: ObservableObject {
         }
     }
 
+    func refreshKoshaStatus() {
+        guard !isPreview else { return }
+        koshaGeneration &+= 1
+        let gen = koshaGeneration
+        Task.detached(priority: .utility) { [weak self] in
+            let snapshot = Self.inspectKoshaEnvironment()
+            await MainActor.run { [weak self] in
+                guard let self, self.koshaGeneration == gen else { return }
+                self.hasKoshaCLI = snapshot.hasCLI
+                self.hasKoshaRegistry = snapshot.hasRegistry
+                self.koshaRegistryUpdatedAt = snapshot.updatedAt
+            }
+        }
+    }
+
+    func syncModelsFromKosha(updateFirst: Bool, allProviders: Bool) async {
+        guard !isPreview, !isSyncingKosha else { return }
+        isSyncingKosha = true
+        lastError = nil
+        defer {
+            isSyncingKosha = false
+            koshaSyncStage = nil
+        }
+
+        if updateFirst {
+            koshaSyncStage = "Running kosha update…"
+            let updateRes = await Task.detached(priority: .userInitiated) { () -> CommandOutput in
+                guard let koshaPath = Self.resolveKoshaBinary() else {
+                    return CommandOutput(
+                        exitCode: 127,
+                        stdout: "",
+                        stderr: "Could not locate `kosha` binary on PATH or Homebrew."
+                    )
+                }
+                let extraPrefix = (koshaPath as NSString).deletingLastPathComponent
+                return Self.runProcessSync(
+                    executable: koshaPath,
+                    arguments: ["update"],
+                    extraPathPrefix: extraPrefix,
+                    timeoutSeconds: 30
+                )
+            }.value
+
+            if updateRes.exitCode != 0 {
+                let err = updateRes.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let out = updateRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                lastError = !err.isEmpty
+                    ? "kosha update failed: \(err)"
+                    : (!out.isEmpty ? "kosha update failed: \(out)" : "`kosha update` exited with code \(updateRes.exitCode)")
+                return
+            }
+        }
+
+        koshaSyncStage = allProviders ? "Syncing all 21 providers…" : "Syncing enabled providers…"
+        let port = daemonPort
+        var args = ["models", "sync-kosha", "--apply", "--json"]
+        if allProviders {
+            args.append("--all-providers")
+        }
+        let syncArgs = args
+
+        let syncRes = await Task.detached(priority: .userInitiated) {
+            Self.runFicheCommand(arguments: syncArgs, port: port, timeoutSeconds: 20)
+        }.value
+
+        let snap = await Task.detached(priority: .utility) {
+            Self.inspectKoshaEnvironment()
+        }.value
+        hasKoshaCLI = snap.hasCLI
+        hasKoshaRegistry = snap.hasRegistry
+        koshaRegistryUpdatedAt = snap.updatedAt
+
+        guard syncRes.exitCode == 0 else {
+            let err = syncRes.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let out = syncRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            lastError = !err.isEmpty
+                ? err
+                : (!out.isEmpty ? out : "`fiche models sync-kosha` exited with code \(syncRes.exitCode)")
+            return
+        }
+
+        guard let data = syncRes.stdout.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(KoshaSyncResponse.self, from: data),
+              decoded.ok
+        else {
+            lastError = "Unexpected output from `fiche models sync-kosha --json`."
+            return
+        }
+
+        pollGeneration &+= 1
+        allowedModels = decoded.models
+        let delivery = decoded.synced ? " (live + config)" : (decoded.saved ? " (saved to config)" : "")
+        let summary: String
+        if decoded.added.isEmpty {
+            summary = "Up to date · \(decoded.models.count) active bases"
+        } else {
+            summary = "+\(decoded.added.count) added · \(decoded.models.count) bases\(delivery)"
+        }
+        lastKoshaSyncSummary = summary
+        showTransientNotice(summary)
+        if phase != .stopped {
+            await pollOnce()
+        }
+    }
+
     static func isThirdPartyModel(_ id: String) -> Bool {
         let cleaned = id
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -921,6 +1155,9 @@ final class DaemonController: ObservableObject {
         "toon-structured",
         "acdc-epochs",
         "casi-delta",
+        "lsm-context",
+        "context-mmu",
+        "skill-linker",
         "skill:fiche",
     ]
 
@@ -1530,12 +1767,27 @@ final class DaemonController: ObservableObject {
             process.standardOutput = FileHandle.nullDevice
             let stderrPipe = Pipe()
             process.standardError = stderrPipe
+            let errBox = LockedDataBox()
+            let stderrHandle = stderrPipe.fileHandleForReading
+            stderrHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    errBox.appendBounded(chunk, maxBytes: 16_384)
+                }
+            }
             let launchedAt = Date()
 
             process.terminationHandler = { [weak self] proc in
                 let status = proc.terminationStatus
                 let elapsed = Date().timeIntervalSince(launchedAt)
-                let errData = (try? stderrPipe.fileHandleForReading.readToEnd()) ?? Data()
+                stderrHandle.readabilityHandler = nil
+                let remainder = stderrHandle.readDataToEndOfFile()
+                if !remainder.isEmpty {
+                    errBox.appendBounded(remainder, maxBytes: 16_384)
+                }
+                let errData = errBox.snapshot()
                 let errText = String(data: errData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if status != 0 && elapsed < 5.0 {
@@ -2036,7 +2288,61 @@ final class DaemonController: ObservableObject {
         }
     }
 
-    nonisolated private static func runFicheCommand(arguments: [String]) -> CommandOutput {
+    private struct KoshaEnvSnapshot: Sendable {
+        let hasCLI: Bool
+        let hasRegistry: Bool
+        let updatedAt: Date?
+    }
+
+    nonisolated private static func resolveKoshaBinary() -> String? {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "\(home)/.local/bin/kosha",
+            "/opt/homebrew/bin/kosha",
+            "/usr/local/bin/kosha",
+            "\(home)/.bun/bin/kosha",
+            "\(home)/.volta/bin/kosha",
+        ]
+        for path in candidates where isExecutableRegularFile(path) {
+            return path
+        }
+        let whichRes = runProcessSync(
+            executable: "/usr/bin/which",
+            arguments: ["kosha"],
+            extraPathPrefix: "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:\(home)/.volta/bin:\(home)/.bun/bin"
+        )
+        let found = whichRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if whichRes.exitCode == 0, !found.isEmpty, isExecutableRegularFile(found) {
+            return found
+        }
+        return nil
+    }
+
+    nonisolated private static func inspectKoshaEnvironment() -> KoshaEnvSnapshot {
+        let fm = FileManager.default
+        let envReg = ProcessInfo.processInfo.environment["KOSHA_REGISTRY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultReg = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".kosha/registry.json")
+            .path
+        let candidatePaths = [envReg, defaultReg].compactMap { $0 }.filter { !$0.isEmpty }
+        let foundPath = candidatePaths.first { fm.fileExists(atPath: $0) }
+        let updatedAt: Date? = foundPath.flatMap { path in
+            try? fm.attributesOfItem(atPath: path)[.modificationDate] as? Date
+        }
+        return KoshaEnvSnapshot(
+            hasCLI: resolveKoshaBinary() != nil,
+            hasRegistry: foundPath != nil,
+            updatedAt: updatedAt
+        )
+    }
+
+    nonisolated private static func runFicheCommand(
+        arguments: [String],
+        port: Int? = nil,
+        timeoutSeconds: TimeInterval = 15
+    ) -> CommandOutput {
         let nodePath = resolveNodeBinary()
         guard let entry = resolveFicheExecutable(nodePath: nodePath) else {
             return CommandOutput(
@@ -2045,19 +2351,24 @@ final class DaemonController: ObservableObject {
                 stderr: "Could not locate `fiche` or `node` executable."
             )
         }
+        let extraEnv = port.map { ["PORT": String($0)] } ?? [:]
 
         switch entry {
         case .binary(let binPath):
             return runProcessSync(
                 executable: binPath,
                 arguments: arguments,
-                extraPathPrefix: nodePath.map { ($0 as NSString).deletingLastPathComponent }
+                extraPathPrefix: nodePath.map { ($0 as NSString).deletingLastPathComponent },
+                extraEnv: extraEnv,
+                timeoutSeconds: timeoutSeconds
             )
         case .nodeScript(let node, let script):
             return runProcessSync(
                 executable: node,
                 arguments: [script] + arguments,
-                extraPathPrefix: (node as NSString).deletingLastPathComponent
+                extraPathPrefix: (node as NSString).deletingLastPathComponent,
+                extraEnv: extraEnv,
+                timeoutSeconds: timeoutSeconds
             )
         }
     }
@@ -2075,13 +2386,18 @@ final class DaemonController: ObservableObject {
     nonisolated private static func runProcessSync(
         executable: String,
         arguments: [String],
-        extraPathPrefix: String? = nil
+        extraPathPrefix: String? = nil,
+        extraEnv: [String: String] = [:],
+        timeoutSeconds: TimeInterval = 15
     ) -> CommandOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
 
         var env = ProcessInfo.processInfo.environment
+        for (k, v) in extraEnv {
+            env[k] = v
+        }
         env["PATH"] = buildAugmentedPath(existing: env["PATH"], extraPrefix: extraPathPrefix)
         process.environment = env
 
@@ -2098,31 +2414,40 @@ final class DaemonController: ObservableObject {
         }
 
         let group = DispatchGroup()
-        nonisolated(unsafe) var outData = Data()
-        nonisolated(unsafe) var errData = Data()
+        let outBox = LockedDataBox()
+        let errBox = LockedDataBox()
 
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            outBox.set(outPipe.fileHandleForReading.readDataToEndOfFile())
             group.leave()
         }
 
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            errBox.set(errPipe.fileHandleForReading.readDataToEndOfFile())
             group.leave()
         }
 
-        let timedOut = group.wait(timeout: .now() + 15) == .timedOut
+        let clampedTimeout = max(1, timeoutSeconds)
+        let timedOut = group.wait(timeout: .now() + clampedTimeout) == .timedOut
         if timedOut {
             if process.isRunning {
                 process.terminate()
             }
-            _ = group.wait(timeout: .now() + 1)
+            if group.wait(timeout: .now() + 0.5) == .timedOut {
+                if process.isRunning && process.processIdentifier > 0 {
+                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                }
+                process.waitUntilExit()
+                _ = group.wait(timeout: .now() + 0.5)
+            } else {
+                process.waitUntilExit()
+            }
             return CommandOutput(
                 exitCode: 124,
-                stdout: String(data: outData, encoding: .utf8) ?? "",
-                stderr: "Subprocess timed out after 15s."
+                stdout: String(data: outBox.snapshot(), encoding: .utf8) ?? "",
+                stderr: "Subprocess timed out after \(Int(clampedTimeout))s."
             )
         }
 
@@ -2130,8 +2455,8 @@ final class DaemonController: ObservableObject {
 
         return CommandOutput(
             exitCode: process.terminationStatus,
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? ""
+            stdout: String(data: outBox.snapshot(), encoding: .utf8) ?? "",
+            stderr: String(data: errBox.snapshot(), encoding: .utf8) ?? ""
         )
     }
 

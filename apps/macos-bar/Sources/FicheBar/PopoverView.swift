@@ -29,6 +29,7 @@ private enum DailyChartMetric: String, CaseIterable, Identifiable {
 
 private enum EngineMode: String {
     case optical = "OPTICAL"
+    case hybrid = "HYBRID"
     case text = "TEXT"
 }
 
@@ -63,6 +64,9 @@ private enum ModelClassification {
         "toon-structured",
         "acdc-epochs",
         "casi-delta",
+        "lsm-context",
+        "context-mmu",
+        "skill-linker",
     ]
 
     /// Validated or explicitly measured Gemini IDs matching `src/core/gemini-model-profiles.ts`.
@@ -133,6 +137,33 @@ private enum ModelClassification {
             enabled: true,
             mutable: false
         ),
+        PluginDescriptor(
+            id: "lsm-context",
+            name: "LSM-Context Hierarchy",
+            description: "Multi-level LSM history compaction tiers for long-running sessions.",
+            kind: .stage,
+            source: "history",
+            enabled: true,
+            mutable: false
+        ),
+        PluginDescriptor(
+            id: "context-mmu",
+            name: "Context-MMU Virtual Memory",
+            description: "Virtual context paging, Markovian causal episode folding, and live-tail hydration.",
+            kind: .stage,
+            source: "history",
+            enabled: true,
+            mutable: false
+        ),
+        PluginDescriptor(
+            id: "skill-linker",
+            name: "Session Skill Linker",
+            description: "Turn-1 pinned skill catalog stubbing with speculative Turn-N auto-hydration.",
+            kind: .stage,
+            source: "pre-hygiene",
+            enabled: true,
+            mutable: false
+        ),
     ]
 
     static func isBuiltInStage(_ plugin: PluginDescriptor) -> Bool {
@@ -161,6 +192,25 @@ private enum ModelClassification {
             || base == "glm"
             || base.hasPrefix("glm-")
             || base.contains("minimax")
+            || base.contains("qwen")
+            || base.contains("llama")
+            || base.hasPrefix("mistral")
+            || base.hasPrefix("mixtral")
+            || base.hasPrefix("codestral")
+            || base.hasPrefix("devstral")
+            || base.hasPrefix("ministral")
+            || base.hasPrefix("magistral")
+            || base.hasPrefix("pixtral")
+            || base.hasPrefix("command-")
+            || base.hasPrefix("c4ai-aya")
+            || base.hasPrefix("gemma")
+            || base.hasPrefix("gpt-oss")
+            || base.hasPrefix("sonar")
+            || base.hasPrefix("nova")
+            || base.hasPrefix("jamba")
+            || base.hasPrefix("mercury")
+            || base.hasPrefix("solar")
+            || base.range(of: #"^step-\d"#, options: .regularExpression) != nil
         {
             return .text
         }
@@ -216,6 +266,8 @@ struct PopoverView: View {
     @State private var dailyMetric: DailyChartMetric = .tokens
     @State private var showAllCLIs: Bool = false
     @State private var showMoreProviders: Bool = false
+    @State private var koshaSyncAllProviders: Bool = false
+    @State private var expandedModelFamilies: Set<ProviderFamily> = []
     @State private var expandedFAQ: Set<String> = []
     @State private var portDraft: String = ""
     @State private var logoWhisper: String? = nil
@@ -282,6 +334,7 @@ struct PopoverView: View {
             portDraft = String(controller.daemonPort)
             controller.refreshNow()
             controller.refreshAgentDiscovery()
+            controller.refreshKoshaStatus()
             if !controller.isPreviewMode {
                 withAnimation(.easeInOut(duration: 2.0).repeatForever(autoreverses: true)) {
                     livePulseActive = true
@@ -333,7 +386,7 @@ struct PopoverView: View {
                 .fontWidth(theme.fontWidth)
                 .foregroundStyle(theme.primaryText)
 
-            Text("v\(controller.health?.version ?? "0.18.0")")
+            Text("v\(controller.health?.version ?? "0.19.0")")
                 .font(.footnote)
                 .foregroundStyle(theme.tertiaryText)
 
@@ -544,7 +597,7 @@ struct PopoverView: View {
 
         return Band(isHero: true) {
             if theme.layout == .instrumentation {
-                // Terminal live prompt telemetry header bar
+                // Terminal live prompt metrics header bar
                 HStack(spacing: 4) {
                     Text("fiche@\(String(controller.daemonPort))")
                         .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
@@ -1169,6 +1222,54 @@ struct PopoverView: View {
                     }
                 }
             }
+
+            if controller.phase != .stopped, let mmu = controller.mmuStats {
+                SectionHeader(
+                    title: "Context-MMU",
+                    trailing: mmu.limits?.persisted == true ? "0600 file" : "RAM-only"
+                )
+                Band {
+                    VStack(spacing: 0) {
+                        HStack(spacing: 0) {
+                            lifetimeStatCell(
+                                label: "Virtual Pages",
+                                value: "\(mmu.stats.activePages)/\(mmu.limits?.maxPages ?? 512)",
+                                theme: theme
+                            )
+                            .help(
+                                "Resident Context-MMU pages: \(Fmt.compactBytes(mmu.stats.activeBytes)) / \(Fmt.compactBytes(mmu.limits?.maxBytes ?? Int64(16 * 1024 * 1024))) · \(mmu.stats.pagesStored) stored, \(mmu.stats.pagesEvicted) evicted."
+                            )
+                            VerticalHairline()
+                            lifetimeStatCell(
+                                label: "Prefix Tape",
+                                value: prefixTapeLabel(mmu.prefixTape),
+                                theme: theme
+                            )
+                            .help(prefixTapeTooltip(mmu.prefixTape))
+                        }
+                        Hairline()
+                        HStack(spacing: 0) {
+                            lifetimeStatCell(
+                                label: "Tail Recalls",
+                                value: "\(mmu.stats.tailHydrations)",
+                                theme: theme
+                            )
+                            .help(
+                                "Speculative ±15-line Context-TLB hydrations injected into the uncached live tail (\(Fmt.tokens(mmu.stats.tailHydrationTokens)) tokens)."
+                            )
+                            VerticalHairline()
+                            lifetimeStatCell(
+                                label: "Folds · Prunes",
+                                value: "\(mmu.stats.markovFolds) · \(mmu.stats.densityPrunedBlocks)",
+                                theme: theme
+                            )
+                            .help(
+                                "Markovian FAIL→PASS episode folds (\(mmu.stats.markovFolds)), Minoux IDF density prunes (\(mmu.stats.densityPrunedBlocks)), and Turn-1 skill stubs (\(mmu.stats.skillsStubbed))."
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1179,8 +1280,9 @@ struct PopoverView: View {
         theme: Theme
     ) -> some View {
         let engine: EngineMode = {
-            if stats.imagedRequests > 0 && stats.textCompressedRequests == 0 { return .optical }
-            if stats.textCompressedRequests > 0 && stats.imagedRequests == 0 { return .text }
+            if stats.imagedRequests > 0 && stats.textCompressedRequests > 0 { return .hybrid }
+            if stats.imagedRequests > 0 { return .optical }
+            if stats.textCompressedRequests > 0 { return .text }
             return ModelClassification.engineMode(for: model)
         }()
         let ratio = stats.savedInputTokens > 0
@@ -1255,7 +1357,7 @@ struct PopoverView: View {
                         RoundedRectangle(cornerRadius: 2, style: .continuous)
                             .fill(theme.controlRail)
                         RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(engine == .optical ? theme.accent : theme.live)
+                            .fill((engine == .optical || engine == .hybrid) ? theme.accent : theme.live)
                             .frame(width: max(4, geo.size.width * ratio))
                     }
                 }
@@ -1749,6 +1851,12 @@ struct PopoverView: View {
                 .padding(.top, 5)
                 .padding(.bottom, 2)
 
+            koshaSyncSection(theme: theme)
+
+            if !controller.calibratedProfiles.isEmpty {
+                calibratedVisionSection(theme: theme)
+            }
+
             if !controller.compressionEnabled && isOnline {
                 Text("Compression is paused — scope changes take effect on resume.")
                     .font(.caption)
@@ -1760,6 +1868,10 @@ struct PopoverView: View {
 
             ForEach(grouped, id: \.family) { group in
                 let activeCount = group.items.filter { activeSet.contains($0.id) }.count
+                let isExpanded = expandedModelFamilies.contains(group.family)
+                let visibleItems = (group.items.count > 8 && !isExpanded)
+                    ? Array(group.items.prefix(8))
+                    : group.items
 
                 if group.family == .compat {
                     SectionHeader(
@@ -1783,7 +1895,7 @@ struct PopoverView: View {
                 }
 
                 Band {
-                    ForEach(Array(group.items.enumerated()), id: \.element.id) { idx, item in
+                    ForEach(Array(visibleItems.enumerated()), id: \.element.id) { idx, item in
                         if idx > 0 { Hairline(inset: 14) }
                         modelToggleRow(
                             item: item,
@@ -1792,9 +1904,197 @@ struct PopoverView: View {
                             theme: theme
                         )
                     }
+
+                    if group.items.count > 8 {
+                        Hairline(inset: 14)
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.16)) {
+                                if isExpanded {
+                                    expandedModelFamilies.remove(group.family)
+                                } else {
+                                    expandedModelFamilies.insert(group.family)
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(theme.secondaryText)
+                                    .frame(width: 12)
+                                Text(
+                                    isExpanded
+                                        ? "Show fewer"
+                                        : "Show \(group.items.count - 8) more (\(group.items.count) total)"
+                                )
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(theme.secondaryText)
+                                Spacer()
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
         }
+    }
+
+    private func relativeAgeLabel(from date: Date?) -> String {
+        guard let date else { return "No local cache" }
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "Just now" }
+        if seconds < 3_600 { return "\(seconds / 60)m ago" }
+        if seconds < 86_400 { return "\(seconds / 3_600)h ago" }
+        return "\(seconds / 86_400)d ago"
+    }
+
+    private func koshaSyncSection(theme: Theme) -> some View {
+        let subtitle = controller.koshaSyncStage
+            ?? controller.lastKoshaSyncSummary
+            ?? (koshaSyncAllProviders
+                ? "All 21 built-in providers"
+                : "Enabled providers in ~/.kosha/registry.json")
+
+        return VStack(alignment: .leading, spacing: 0) {
+            SectionHeader(
+                title: "Kosha Registry",
+                trailing: relativeAgeLabel(from: controller.koshaRegistryUpdatedAt)
+            )
+
+            Band {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Sync models from Kosha")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(theme.primaryText)
+                            .lineLimit(1)
+                        Text(subtitle)
+                            .font(.caption2)
+                            .foregroundStyle(theme.secondaryText)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if controller.isSyncingKosha {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button("Sync") {
+                            Task {
+                                await controller.syncModelsFromKosha(
+                                    updateFirst: false,
+                                    allProviders: koshaSyncAllProviders
+                                )
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .tint(theme.accent)
+                        .disabled(!controller.hasKoshaRegistry && !controller.hasKoshaCLI)
+                        .help("Run `fiche models sync-kosha --apply` to merge active chat model bases from Kosha.")
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+
+                Hairline(inset: 14)
+
+                HStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        Text("All 21 providers")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(theme.secondaryText)
+                        Toggle("", isOn: $koshaSyncAllProviders)
+                            .labelsHidden()
+                            .toggleStyle(FicheSwitchToggleStyle())
+                            .disabled(controller.isSyncingKosha)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if controller.hasKoshaCLI {
+                        Button("Update & Sync") {
+                            Task {
+                                await controller.syncModelsFromKosha(
+                                    updateFirst: true,
+                                    allProviders: koshaSyncAllProviders
+                                )
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(controller.isSyncingKosha)
+                        .help("Run `kosha update` then `fiche models sync-kosha --apply`.")
+                    } else {
+                        Text("kosha CLI not found")
+                            .font(.caption2)
+                            .foregroundStyle(theme.tertiaryText)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+            }
+        }
+    }
+
+    private func calibratedVisionSection(theme: Theme) -> some View {
+        let profiles = controller.calibratedProfiles
+        return VStack(alignment: .leading, spacing: 0) {
+            SectionHeader(
+                title: "Calibrated Vision",
+                trailing: "\(profiles.filter(\.passed).count)/\(profiles.count) passed"
+            )
+
+            Band {
+                ForEach(Array(profiles.enumerated()), id: \.element.id) { idx, profile in
+                    if idx > 0 { Hairline(inset: 14) }
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(profile.model)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(theme.primaryText)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                calibratedBandBadge(profile, theme: theme)
+                            }
+                            Text("\(profile.cols) cols · \(profile.maxHeightPx)px max · score \(Int((profile.overallScore * 100).rounded()))%")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(theme.secondaryText)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 8)
+                        Text(profile.passed ? "PASS" : "FAIL")
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(profile.passed ? theme.live : theme.danger)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 6)
+                }
+            }
+        }
+    }
+
+    private func calibratedBandBadge(_ profile: CalibratedModelProfile, theme: Theme) -> some View {
+        let color: Color = profile.passed ? theme.accent : theme.warn
+        return Text(profile.shortBandLabel)
+            .font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+            .foregroundStyle(color)
+            .padding(.horizontal, 4.5)
+            .padding(.vertical, 1)
+            .background(
+                color.opacity(0.11),
+                in: RoundedRectangle(cornerRadius: theme.badgeRadius, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: theme.badgeRadius, style: .continuous)
+                    .strokeBorder(color.opacity(0.28), lineWidth: 0.5)
+            )
+            .help("Calibrated via `fiche calibrate`: band=\(profile.band), \(profile.cols) cols × \(profile.maxHeightPx)px, score=\(Int((profile.overallScore * 100).rounded()))%.")
     }
 
     private func providerToggleRow(
@@ -1848,7 +2148,24 @@ struct PopoverView: View {
         isOnline: Bool,
         theme: Theme
     ) -> some View {
-        let engine = ModelClassification.engineMode(for: item.id, hint: item.hint)
+        let calProfile = controller.calibratedProfile(for: item.id)
+        let baseEngine = ModelClassification.engineMode(for: item.id, hint: item.hint)
+        let engine: EngineMode = {
+            let lower = item.id.lowercased()
+            if let calProfile, calProfile.passed {
+                if calProfile.band == "text-only" { return .text }
+                if controller.priceMode == "kosha",
+                   lower.contains("gemini-4-argon") || lower.contains("gemini-3.8-flash")
+                {
+                    return .hybrid
+                }
+                return .optical
+            }
+            if baseEngine == .optical, controller.priceMode == "kosha", lower.contains("gemini-4-argon") {
+                return .hybrid
+            }
+            return baseEngine
+        }()
 
         return HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
@@ -1858,6 +2175,9 @@ struct PopoverView: View {
                         .foregroundStyle(theme.primaryText)
                         .lineLimit(1)
                     engineBadge(engine, theme: theme)
+                    if let calProfile, calProfile.passed, calProfile.band != "text-only" {
+                        calibratedBandBadge(calProfile, theme: theme)
+                    }
                 }
 
                 Text(item.id)
@@ -2347,7 +2667,7 @@ struct PopoverView: View {
 
     private func footerRow(theme: Theme) -> some View {
         HStack(spacing: 2) {
-            Text(footerTelemetry(theme: theme))
+            Text(footerMetrics(theme: theme))
                 .font(.footnote)
                 .foregroundStyle(theme.secondaryText)
                 .monospacedDigit()
@@ -2404,7 +2724,7 @@ struct PopoverView: View {
         .padding(.vertical, 6)
     }
 
-    private func footerTelemetry(theme: Theme) -> String {
+    private func footerMetrics(theme: Theme) -> String {
         var parts = [":\(controller.daemonPort)"]
         if controller.phase == .stopped {
             parts.append("offline")
@@ -2421,11 +2741,37 @@ struct PopoverView: View {
 
     // MARK: - Shared Helpers
 
+    private func prefixTapeLabel(_ tape: PrefixTapeSnapshot?) -> String {
+        guard let tape else { return "—" }
+        if let pct = tape.hitPct {
+            return "\(Int(pct.rounded()))% hit"
+        }
+        return "\(tape.totalSeals) seals"
+    }
+
+    private func prefixTapeTooltip(_ tape: PrefixTapeSnapshot?) -> String {
+        guard let tape else { return "PrefixMemoTape warm-turn reuse ledger." }
+        return "PrefixMemoTape: \(tape.stage2Hits) Stage-2 hits (\(tape.stage2Entries) cached), \(tape.sealHits) prefix seal hits (\(tape.totalSeals) seals / \(tape.sealSessions) sessions), \(tape.casiHits) Merkle CASI hits."
+    }
+
     private func engineBadge(_ mode: EngineMode, theme: Theme) -> some View {
-        let color: Color = mode == .optical ? theme.accent : theme.secondaryText
-        let tooltip = mode == .optical
-            ? "Optical Microfiche + 4-layer text hygiene active for this validated reader."
-            : "4-layer prefix-safe text hygiene only (no rasterized images sent)."
+        let color: Color = {
+            switch mode {
+            case .optical: return theme.accent
+            case .hybrid: return theme.live
+            case .text: return theme.secondaryText
+            }
+        }()
+        let tooltip: String = {
+            switch mode {
+            case .optical:
+                return "Optical Microfiche + 4-layer text hygiene active for this validated reader."
+            case .hybrid:
+                return "Hybrid Slab-Optical (Turn-1 static PNG slab) + Text-MMU dynamic history."
+            case .text:
+                return "4-layer prefix-safe text hygiene only (no rasterized images sent)."
+            }
+        }()
 
         return Text(mode.rawValue)
             .font(.system(size: 8.5, weight: .semibold, design: .monospaced))

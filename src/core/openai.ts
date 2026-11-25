@@ -26,15 +26,20 @@ import {
 } from './gpt-model-profiles.js';
 import { bytesToBase64 } from './png.js';
 import {
+  applyClientSessionIdentity,
   compactSlabWhitespace,
   countVisualRows,
   estimateImageCount,
+  resolveOpticalHistoryPolicy,
   sha8,
+  type ClientSessionSource,
+  type OpticalMode,
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
 import { visionTokens } from './vision-cost.js';
 import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
+import { extractFaultSignalSnippet } from './context-mmu.js';
 import { evaluateCliffAvoidance, gateRatesFor, priceMode } from './pricing.js';
 import {
   applyOpenAIChatTextHygiene,
@@ -59,6 +64,7 @@ import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
 import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
+import { noteHistoryRequest, sessionAnchorText } from './session-state.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -310,6 +316,7 @@ interface ResponsesFlatTool {
 interface OpenAIResolvedOptions {
   compress: boolean;
   imageCompress: boolean;
+  opticalMode: OpticalMode;
   textHygiene: boolean | TextHygieneMode;
   expectedOutputTokens: number;
   compressTools: boolean;
@@ -323,28 +330,35 @@ interface OpenAIResolvedOptions {
   /** See TransformOptions.explicitPromptCacheBreakpoints. Default on. */
   explicitPromptCacheBreakpoints: boolean;
   stageToggles?: Partial<StageToggles>;
+  cleanUserPayloads: boolean;
+  clientSessionId?: string;
+  clientSessionSource?: ClientSessionSource;
+  claudeCodeSessionId?: string;
 }
 
 const DEFAULTS: OpenAIResolvedOptions = {
   compress: true,
   imageCompress: true,
+  opticalMode: 'auto',
   textHygiene: 'auto',
   expectedOutputTokens: 1000,
   compressTools: true,
   minCompressChars: 2000,
   cols: undefined,
-  charsPerToken: 4, // conservative OpenAI default; override after telemetry
+  charsPerToken: 4, // conservative OpenAI default; override after calibration
   explicitCharsPerToken: false,
   reflow: true,
   collapseHistory: true,
   explicitPromptCacheBreakpoints: true,
   stageToggles: {},
+  cleanUserPayloads: false,
 };
 
 function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
   return {
     compress: opts.compress ?? DEFAULTS.compress,
     imageCompress: opts.imageCompress ?? DEFAULTS.imageCompress,
+    opticalMode: opts.opticalMode ?? DEFAULTS.opticalMode,
     textHygiene: opts.textHygiene ?? DEFAULTS.textHygiene,
     expectedOutputTokens: opts.expectedOutputTokens ?? DEFAULTS.expectedOutputTokens,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
@@ -357,6 +371,10 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     gptHistory: opts.gptHistory,
     explicitPromptCacheBreakpoints: opts.explicitPromptCacheBreakpoints !== false,
     stageToggles: opts.stageToggles ?? {},
+    cleanUserPayloads: opts.cleanUserPayloads === true,
+    clientSessionId: opts.clientSessionId,
+    clientSessionSource: opts.clientSessionSource,
+    claudeCodeSessionId: opts.claudeCodeSessionId,
   };
 }
 
@@ -475,10 +493,18 @@ function setTextContent(msg: OpenAIChatMessage, text: string): void {
 }
 
 function firstUserText(req: OpenAIChatRequest): string {
+  const texts: string[] = [];
   for (const msg of req.messages) {
-    if (msg.role === 'user') return contentText(msg.content).slice(0, 4096);
+    if (!msg || typeof msg !== 'object') continue;
+    if (msg.role === 'system' || msg.role === 'developer') {
+      if (texts.length > 0) break;
+      continue;
+    }
+    if (msg.role !== 'user') break;
+    const t = contentText(msg.content);
+    if (t.trim()) texts.push(t);
   }
-  return '';
+  return sessionAnchorText(texts).slice(0, 4096);
 }
 
 function responsesContentText(content: ResponsesInputItem['content']): string {
@@ -488,7 +514,7 @@ function responsesContentText(content: ResponsesInputItem['content']): string {
     .filter((p): p is ResponsesInputTextPart =>
       typeof p === 'object'
       && p !== null
-      && (p as { type?: unknown }).type === 'input_text'
+      && ((p as { type?: unknown }).type === 'input_text' || (p as { type?: unknown }).type === 'text')
       && typeof (p as { text?: unknown }).text === 'string')
     .map((p) => p.text)
     .join('\n\n');
@@ -499,12 +525,212 @@ function firstResponsesUserText(
   originalInput: string | undefined,
   inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
 ): string {
-  if (inputWasString) return (originalInput ?? '').slice(0, 4096);
-  for (const item of inputItems) {
-    if ((item as ResponsesInputItem).role !== 'user') continue;
-    return responsesContentText((item as ResponsesInputItem).content).slice(0, 4096);
+  if (inputWasString) {
+    return originalInput ? sessionAnchorText([originalInput]).slice(0, 4096) : '';
   }
-  return '';
+  const texts: string[] = [];
+  for (const item of inputItems) {
+    if (!item || typeof item !== 'object') continue;
+    const role = (item as ResponsesInputItem).role;
+    const type = (item as { type?: unknown }).type;
+    if (role === 'system' || role === 'developer') {
+      if (texts.length > 0) break;
+      continue;
+    }
+    if (role !== 'user') {
+      if (role || type === 'function_call' || type === 'function_call_output' || type === 'custom_tool_call') break;
+      continue;
+    }
+    const t = responsesContentText((item as ResponsesInputItem).content);
+    if (t.trim()) texts.push(t);
+  }
+  return sessionAnchorText(texts).slice(0, 4096);
+}
+
+function extractChatLiveTailTexts(messages: readonly OpenAIChatMessage[]): string[] {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const out: string[] = [];
+  const last = messages[messages.length - 1];
+  if (!last || typeof last !== 'object') return out;
+
+  if (last.role === 'tool') {
+    let toolStart = messages.length - 1;
+    while (toolStart > 0 && messages[toolStart - 1]?.role === 'tool') {
+      toolStart--;
+    }
+    const prev = toolStart > 0 ? messages[toolStart - 1] : undefined;
+    // Only pull tool_calls names/arguments from the preceding assistant message —
+    // never Turn t-1's user prompt prose or assistant prose.
+    if (prev && prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+      for (const tc of prev.tool_calls) {
+        const fn = tc && typeof tc === 'object' ? (tc as { function?: { name?: unknown; arguments?: unknown } }).function : undefined;
+        if (fn && typeof fn.arguments === 'string' && fn.arguments.trim()) {
+          out.push(typeof fn.name === 'string' ? `${fn.name} ${fn.arguments}` : fn.arguments);
+        }
+      }
+    }
+    for (let i = toolStart; i < messages.length; i++) {
+      const msg = messages[i];
+      if (!msg || typeof msg !== 'object') continue;
+      const t = contentText(msg.content);
+      const faultSnippet = extractFaultSignalSnippet(t) ?? (t.length <= 1024 && t.trim() ? t : undefined);
+      if (faultSnippet) out.push(faultSnippet);
+    }
+    return out;
+  }
+
+  if (last.role === 'user') {
+    let toolEnd = messages.length - 1;
+    let toolStart = toolEnd;
+    while (toolStart > 0 && messages[toolStart - 1]?.role === 'tool') {
+      toolStart--;
+    }
+    for (let i = toolStart; i < toolEnd; i++) {
+      const msg = messages[i];
+      if (!msg || typeof msg !== 'object') continue;
+      const faultSnippet = extractFaultSignalSnippet(contentText(msg.content));
+      if (faultSnippet) out.push(faultSnippet);
+    }
+  }
+
+  const t = contentText(last.content);
+  if (t.trim()) out.push(t);
+  if (Array.isArray(last.tool_calls)) {
+    for (const tc of last.tool_calls) {
+      const fn = tc && typeof tc === 'object' ? (tc as { function?: { name?: unknown; arguments?: unknown } }).function : undefined;
+      if (fn && typeof fn.arguments === 'string' && fn.arguments.trim()) {
+        out.push(typeof fn.name === 'string' ? `${fn.name} ${fn.arguments}` : fn.arguments);
+      }
+    }
+  }
+  return out;
+}
+
+function appendChatTailHydration(req: OpenAIChatRequest, hydrationBlock: string): void {
+  if (!hydrationBlock) return;
+  if (!Array.isArray(req.messages) || req.messages.length === 0) return;
+  // Never walk backwards past an assistant/tool sequence into Turn-1 messages.
+  // Only append to the trailing live user or trailing tool-result message.
+  const last = req.messages[req.messages.length - 1];
+  if (!last || (last.role !== 'user' && last.role !== 'tool')) return;
+  if (typeof last.content === 'string') {
+    last.content = last.content ? `${last.content}\n\n${hydrationBlock}` : hydrationBlock;
+    return;
+  }
+  if (Array.isArray(last.content)) {
+    last.content.push({ type: 'text', text: hydrationBlock });
+  }
+}
+
+function extractResponsesLiveTailTexts(
+  inputWasString: boolean,
+  originalInput: string | undefined,
+  inputItems: ReadonlyArray<ResponsesInputItem | Record<string, unknown>>,
+): string[] {
+  if (inputWasString) return originalInput ? [originalInput] : [];
+  if (!Array.isArray(inputItems) || inputItems.length === 0) return [];
+  const out: string[] = [];
+  const isToolOutputItem = (item: unknown): boolean => {
+    if (!item || typeof item !== 'object') return false;
+    const t = (item as { type?: unknown }).type;
+    return t === 'function_call_output' || t === 'custom_tool_call_output';
+  };
+  const isToolCallItem = (item: unknown): boolean => {
+    if (!item || typeof item !== 'object') return false;
+    const t = (item as { type?: unknown }).type;
+    return t === 'function_call' || t === 'custom_tool_call';
+  };
+  const pushCallItem = (item: unknown) => {
+    if (!item || typeof item !== 'object') return;
+    const rec = item as { name?: unknown; arguments?: unknown; input?: unknown };
+    if (typeof rec.arguments === 'string' && rec.arguments.trim()) {
+      out.push(typeof rec.name === 'string' ? `${rec.name} ${rec.arguments}` : rec.arguments);
+    } else if (typeof rec.input === 'string' && rec.input.trim()) {
+      out.push(typeof rec.name === 'string' ? `${rec.name} ${rec.input}` : rec.input);
+    }
+  };
+
+  const last = inputItems[inputItems.length - 1];
+  if (!last || typeof last !== 'object') return out;
+
+  if (isToolOutputItem(last)) {
+    let tailStart = inputItems.length - 1;
+    while (tailStart > 0 && isToolOutputItem(inputItems[tailStart - 1])) {
+      tailStart--;
+    }
+    // Pull ONLY preceding tool call names/arguments — never Turn t-1's user prompt prose.
+    let callStart = tailStart;
+    while (callStart > 0 && isToolCallItem(inputItems[callStart - 1])) {
+      callStart--;
+    }
+    for (let i = callStart; i < tailStart; i++) {
+      pushCallItem(inputItems[i]);
+    }
+    for (let i = tailStart; i < inputItems.length; i++) {
+      const rec = inputItems[i] as { output?: unknown };
+      if (rec.output !== undefined) {
+        const rawOut = typeof rec.output === 'string' ? rec.output : JSON.stringify(rec.output);
+        const faultSnippet =
+          extractFaultSignalSnippet(rawOut) ?? (rawOut.length <= 1024 && rawOut.trim() ? rawOut : undefined);
+        if (faultSnippet) out.push(faultSnippet);
+      }
+    }
+    return out;
+  }
+
+  const rec = last as {
+    role?: unknown;
+    content?: unknown;
+    name?: unknown;
+    arguments?: unknown;
+    input?: unknown;
+  };
+  if (rec.role === 'user') {
+    let toolEnd = inputItems.length - 1;
+    let toolStart = toolEnd;
+    while (toolStart > 0 && isToolOutputItem(inputItems[toolStart - 1])) {
+      toolStart--;
+    }
+    for (let i = toolStart; i < toolEnd; i++) {
+      const prevOut = inputItems[i] as { output?: unknown };
+      if (prevOut.output !== undefined) {
+        const faultSnippet = extractFaultSignalSnippet(
+          typeof prevOut.output === 'string' ? prevOut.output : JSON.stringify(prevOut.output),
+        );
+        if (faultSnippet) out.push(faultSnippet);
+      }
+    }
+  }
+  pushCallItem(rec);
+  if (typeof rec.content === 'string' && rec.content.trim()) {
+    out.push(rec.content);
+  } else if (Array.isArray(rec.content)) {
+    const txt = responsesContentText(rec.content as ResponsesContentPart[]);
+    if (txt.trim()) out.push(txt);
+  }
+  return out;
+}
+
+function appendResponsesTailHydration(req: ResponsesRequest, hydrationBlock: string): void {
+  if (!hydrationBlock) return;
+  if (typeof req.input === 'string') {
+    req.input = req.input ? `${req.input}\n\n${hydrationBlock}` : hydrationBlock;
+    return;
+  }
+  if (!Array.isArray(req.input)) req.input = [];
+  const items = req.input;
+  const last = items[items.length - 1] as ResponsesInputItem | undefined;
+  if (last && last.role === 'user') {
+    if (typeof last.content === 'string') {
+      last.content = last.content ? `${last.content}\n\n${hydrationBlock}` : hydrationBlock;
+      return;
+    }
+    if (Array.isArray(last.content)) {
+      last.content.push({ type: 'input_text', text: hydrationBlock });
+      return;
+    }
+  }
+  items.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: hydrationBlock }] });
 }
 
 function isFunctionTool(tool: unknown): tool is OpenAIFunctionTool {
@@ -946,7 +1172,7 @@ function gptBaselineImagedTokens(
  *  vision tokens (added to imageTokens) and stand in for the o200k text tokens
  *  the collapsed transcript would have cost unproxied (added to baselineImagedTokens).
  *  openai-savings.ts then credits (baseline − image) × cache-weight with no
- *  further change. Also merges image bytes/pixels/dropped + collapse telemetry. */
+ *  further change. Also merges image bytes/pixels/dropped + collapse stats. */
 function foldGptHistory(
   info: TransformInfo,
   model: string,
@@ -1053,7 +1279,7 @@ function recordOpenAICliffSticky(key: string, cliffAt: number): void {
   openaiCliffSticky.set(key, cliffAt);
 }
 
-function clearImageTelemetryForLimit(info: TransformInfo): void {
+function clearImageStatsForLimit(info: TransformInfo): void {
   info.imageCount = 0;
   info.imageTokens = 0;
   info.baselineImagedTokens = 0;
@@ -1115,7 +1341,7 @@ async function applyResponsesHistoryCollapse(
     if (collapsedTokens >= gate.textTokens) return false;
     let accepted = maxReads === undefined
       || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
-    const cliffStickyKey = `${req.model}\0${info.firstUserSha8 ?? ''}\0${sourceText.length}:${sourceText.slice(0, 128)}`;
+    const cliffStickyKey = `${req.model}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0${sourceText.length}:${sourceText.slice(0, 128)}`;
     if (!accepted && remainingPromptTokens > gate.textTokens) {
       const stickyCliffAt = priceMode() === 'kosha' ? openaiCliffSticky.get(cliffStickyKey) : undefined;
       if (stickyCliffAt !== undefined && remainingPromptTokens > stickyCliffAt) {
@@ -1322,22 +1548,50 @@ export async function transformOpenAIChatCompletions(
   const chatNativeImageBytes = countOpenAINativeImageBytes(req.messages);
 
   const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
-  const hygieneStats = isTextHygieneActive(o.textHygiene)
+  const textHygieneActive = isTextHygieneActive(o.textHygiene);
+  const estTextPromptTokensChat = Math.ceil(
+    Math.max(0, body.byteLength - chatNativeImageBytes) / Math.max(1, o.charsPerToken),
+  );
+  const opticalHistoryPolicy = effectiveImageCompress
+    ? resolveOpticalHistoryPolicy({
+        opticalMode: o.opticalMode,
+        collapseHistory: opts.collapseHistory === true ? true : undefined,
+        model: req.model,
+        estPromptTokens: estTextPromptTokensChat,
+        textHygieneActive,
+      })
+    : 'full';
+  const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
+  const earlyFirstUser = firstUserText(req);
+  const chatSessionKey = await applyClientSessionIdentity(info, earlyFirstUser, o);
+  const sessionState = chatSessionKey
+    ? noteHistoryRequest(chatSessionKey)
+    : { cold: false, minFreezeStep: 0 };
+  const hygieneStats = textHygieneActive
     ? applyOpenAIChatTextHygiene(req, {
-        foldLogs: !effectiveImageCompress,
-        deepTextCompact: !effectiveImageCompress,
-        enableTscg: o.stageToggles?.tscg,
+        foldLogs: !effectiveImageCompress || hybridTextMmu,
+        deepTextCompact: !effectiveImageCompress || hybridTextMmu,
+        cleanUserPayloads: o.cleanUserPayloads,
+        enableTscg: hybridTextMmu ? false : o.stageToggles?.tscg,
         enableToon: o.stageToggles?.toon,
         enableAcdc: o.stageToggles?.acdc,
-        enableCasi: o.stageToggles?.casi,
+        enableCasi: (!effectiveImageCompress || hybridTextMmu) && o.stageToggles?.casi !== false,
+        enableLsm: o.stageToggles?.lsm,
+        enableMmu: o.stageToggles?.mmu,
+        enableSkillLinker: hybridTextMmu ? false : o.stageToggles?.skillLinker,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: req.model,
         expectedOutputTokens: o.expectedOutputTokens,
         rawBodyBytes: body.byteLength,
         nativeImageBytes: chatNativeImageBytes,
+        sessionKey: chatSessionKey,
+        firstUserText: earlyFirstUser,
+        sessionCacheCold: sessionState.cold,
+        liveTailTexts: (!effectiveImageCompress || hybridTextMmu) ? extractChatLiveTailTexts(req.messages) : undefined,
+        appendTailHydration: (!effectiveImageCompress || hybridTextMmu) ? (blk) => appendChatTailHydration(req, blk) : undefined,
       })
     : undefined;
-  if (hygieneStats?.changed) {
+  if (hygieneStats?.changed || hygieneStats?.tailHydrated) {
     info.textHygieneSavedChars = hygieneStats.savedChars;
     info.textHygieneSavedTokens = hygieneStats.savedTokens;
     info.textHygieneBlocks = hygieneStats.blocks;
@@ -1348,7 +1602,7 @@ export async function transformOpenAIChatCompletions(
   let cachedPinOutgoingChat: number | undefined;
   const getPinBody = (): Uint8Array => {
     if (cachedPinBodyChat) return cachedPinBodyChat;
-    if (pinChars > 0 || hygieneStats?.changed) {
+    if (pinChars > 0 || hygieneStats?.changed || hygieneStats?.tailHydrated) {
       cachedPinOutgoingChat = countOutgoingTextChars(req);
       cachedPinBodyChat = new TextEncoder().encode(JSON.stringify(req));
     } else {
@@ -1356,15 +1610,18 @@ export async function transformOpenAIChatCompletions(
     }
     return cachedPinBodyChat;
   };
-  if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed)) {
+  if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed || hygieneStats?.tailHydrated)) {
     getPinBody();
   }
   if (!effectiveImageCompress) {
     if (hygieneStats?.changed) {
-      const firstUser = firstUserText(req);
-      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
       info.compressed = true;
       info.reason = 'text_hygiene';
+      info.outgoingTextChars = countOutgoingTextChars(req);
+      return { body: getPinBody(), info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       info.outgoingTextChars = countOutgoingTextChars(req);
       return { body: getPinBody(), info };
     }
@@ -1389,8 +1646,9 @@ export async function transformOpenAIChatCompletions(
   if (priceMode() === 'kosha' && gateRatesFor(req.model, { promptTokens: estPromptTokensChat }) === null) {
     info.reason = hygieneStats?.changed ? 'text_hygiene' : 'unpriced_model';
     if (hygieneStats?.changed) {
-      const firstUser = firstUserText(req);
-      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      if (!info.firstUserSha8 || !info.sessionKey) {
+        await applyClientSessionIdentity(info, firstUserText(req), o);
+      }
       info.compressed = true;
       info.outgoingTextChars = countOutgoingTextChars(req);
     }
@@ -1419,7 +1677,7 @@ export async function transformOpenAIChatCompletions(
     const encoded = new TextEncoder().encode(JSON.stringify(req));
     const serializedByteLimit = profile.maxSerializedRequestBytes;
     if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
-      clearImageTelemetryForLimit(info);
+      clearImageStatsForLimit(info);
       info.reason = 'serialized_request_limit';
       if (body.byteLength > serializedByteLimit) {
         info.compressed = true;
@@ -1443,7 +1701,7 @@ export async function transformOpenAIChatCompletions(
   };
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
-    if (o.collapseHistory && await applyChatHistoryCollapse(
+    if (o.collapseHistory && !hybridTextMmu && await applyChatHistoryCollapse(
       req, info, o, profile, firstUserIdx + 1,
     )) {
       info.reason = undefined;
@@ -1453,6 +1711,9 @@ export async function transformOpenAIChatCompletions(
       info.compressed = true;
       info.reason = 'text_hygiene';
       info.outgoingTextChars = countOutgoingTextChars(req);
+    } else if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
+      info.outgoingTextChars = countOutgoingTextChars(req);
     }
     return { body: getPinBody(), info };
   };
@@ -1460,8 +1721,9 @@ export async function transformOpenAIChatCompletions(
     return finishHistoryOnly('no_static_context');
   }
 
-  const firstUser = firstUserText(req);
-  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+  if (!info.firstUserSha8 || !info.sessionKey) {
+    await applyClientSessionIdentity(info, firstUserText(req), o);
+  }
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const minCompressTokens = profile.minCompressTokens;
@@ -1522,7 +1784,7 @@ export async function transformOpenAIChatCompletions(
   // chats: the repeated system slab consumes slots that could replace much more
   // history. Plan against the full cap first and keep static text native when the
   // two image sets cannot coexist.
-  if (o.collapseHistory && profile.providerImageCap !== undefined) {
+  if (o.collapseHistory && !hybridTextMmu && profile.providerImageCap !== undefined) {
     const historyReq = structuredClone(req);
     const historyInfo = structuredClone(info);
     if (await applyChatHistoryCollapse(
@@ -1591,11 +1853,17 @@ export async function transformOpenAIChatCompletions(
   // Collapse the OLD conversation prefix into history image(s). The inserted slab
   // item carries static images and is protected; the original opening user prompt
   // remains collapsible history instead of looking like the live request.
-  if (o.collapseHistory) {
+  if (o.collapseHistory && !hybridTextMmu) {
     await applyChatHistoryCollapse(req, info, o, profile, firstUserIdx + 1);
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
+  if (hybridTextMmu && info.imageCount > 0) {
+    info.reason = 'hybrid_slab_optical';
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_slab_optical')) stages.push('hybrid_slab_optical');
+    info.textHygieneStages = stages;
+  }
   return finishSerializedChat();
 }
 
@@ -1617,28 +1885,73 @@ export async function transformOpenAIResponses(
     info.reason = `parse_error: ${(e as Error).message}`;
     return { body, info };
   }
+  const inputWasString = typeof req.input === 'string';
+  const originalInputString = inputWasString ? (req.input as string) : undefined;
+  let inputItems: Array<ResponsesInputItem | Record<string, unknown>>;
+  if (inputWasString) {
+    inputItems = [];
+  } else if (Array.isArray(req.input)) {
+    inputItems = req.input as Array<ResponsesInputItem | Record<string, unknown>>;
+  } else {
+    info.reason = 'parse_error: input must be a string or array';
+    return { body, info };
+  }
+  if (inputItems.some((item) => !item || typeof item !== 'object')) {
+    info.reason = 'invalid_input';
+    return { body, info };
+  }
   const profile = resolveGptProfile(req.model);
   const pinChars = relocateOpenAIPins(req);
   if (pinChars > 0) info.pinChars = pinChars;
   const respNativeImageBytes = countOpenAINativeImageBytes(req.input);
 
   const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
-  const hygieneStats = isTextHygieneActive(o.textHygiene)
+  const textHygieneActive = isTextHygieneActive(o.textHygiene);
+  const estTextPromptTokensResp = Math.ceil(
+    Math.max(0, body.byteLength - respNativeImageBytes) / Math.max(1, o.charsPerToken),
+  );
+  const opticalHistoryPolicy = effectiveImageCompress
+    ? resolveOpticalHistoryPolicy({
+        opticalMode: o.opticalMode,
+        collapseHistory: opts.collapseHistory === true ? true : undefined,
+        model: req.model,
+        estPromptTokens: estTextPromptTokensResp,
+        textHygieneActive,
+      })
+    : 'full';
+  const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
+  const earlyRespFirstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
+  const respSessionKey = await applyClientSessionIdentity(info, earlyRespFirstUser, o);
+  const sessionState = respSessionKey
+    ? noteHistoryRequest(respSessionKey)
+    : { cold: false, minFreezeStep: 0 };
+  const hygieneStats = textHygieneActive
     ? applyOpenAIResponsesTextHygiene(req, {
-        foldLogs: !effectiveImageCompress,
-        deepTextCompact: !effectiveImageCompress,
-        enableTscg: o.stageToggles?.tscg,
+        foldLogs: !effectiveImageCompress || hybridTextMmu,
+        deepTextCompact: !effectiveImageCompress || hybridTextMmu,
+        cleanUserPayloads: o.cleanUserPayloads,
+        enableTscg: hybridTextMmu ? false : o.stageToggles?.tscg,
         enableToon: o.stageToggles?.toon,
         enableAcdc: o.stageToggles?.acdc,
-        enableCasi: o.stageToggles?.casi,
+        enableCasi: (!effectiveImageCompress || hybridTextMmu) && o.stageToggles?.casi !== false,
+        enableLsm: o.stageToggles?.lsm,
+        enableMmu: o.stageToggles?.mmu,
+        enableSkillLinker: hybridTextMmu ? false : o.stageToggles?.skillLinker,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: req.model,
         expectedOutputTokens: o.expectedOutputTokens,
         rawBodyBytes: body.byteLength,
         nativeImageBytes: respNativeImageBytes,
+        sessionKey: respSessionKey,
+        firstUserText: earlyRespFirstUser,
+        sessionCacheCold: sessionState.cold,
+        liveTailTexts: (!effectiveImageCompress || hybridTextMmu)
+          ? extractResponsesLiveTailTexts(inputWasString, originalInputString, inputItems)
+          : undefined,
+        appendTailHydration: (!effectiveImageCompress || hybridTextMmu) ? (blk) => appendResponsesTailHydration(req, blk) : undefined,
       })
     : undefined;
-  if (hygieneStats?.changed) {
+  if (hygieneStats?.changed || hygieneStats?.tailHydrated) {
     info.textHygieneSavedChars = hygieneStats.savedChars;
     info.textHygieneSavedTokens = hygieneStats.savedTokens;
     info.textHygieneBlocks = hygieneStats.blocks;
@@ -1649,7 +1962,7 @@ export async function transformOpenAIResponses(
   let cachedPinOutgoingResp: number | undefined;
   const getPinBodyResp = (): Uint8Array => {
     if (cachedPinBodyResp) return cachedPinBodyResp;
-    if (pinChars > 0 || hygieneStats?.changed) {
+    if (pinChars > 0 || hygieneStats?.changed || hygieneStats?.tailHydrated) {
       cachedPinOutgoingResp = countResponsesOutgoingTextChars(req);
       cachedPinBodyResp = new TextEncoder().encode(JSON.stringify(req));
     } else {
@@ -1657,16 +1970,18 @@ export async function transformOpenAIResponses(
     }
     return cachedPinBodyResp;
   };
-  if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed)) {
+  if (profile.maxSerializedRequestBytes !== undefined && (pinChars > 0 || hygieneStats?.changed || hygieneStats?.tailHydrated)) {
     getPinBodyResp();
   }
   if (!effectiveImageCompress) {
     if (hygieneStats?.changed) {
-      const inputArr = Array.isArray(req.input) ? req.input as Array<ResponsesInputItem | Record<string, unknown>> : [];
-      const firstUser = firstResponsesUserText(typeof req.input === 'string', typeof req.input === 'string' ? req.input : undefined, inputArr);
-      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
       info.compressed = true;
       info.reason = 'text_hygiene';
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+      return { body: getPinBodyResp(), info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       info.outgoingTextChars = countResponsesOutgoingTextChars(req);
       return { body: getPinBodyResp(), info };
     }
@@ -1675,23 +1990,8 @@ export async function transformOpenAIResponses(
     return { body: getPinBodyResp(), info };
   }
 
-  // Normalize input to an array; preserve original string for wrap-back if needed.
-  const inputWasString = typeof req.input === 'string';
-  const originalInputString = inputWasString ? (req.input as string) : undefined;
-  let inputItems: Array<ResponsesInputItem | Record<string, unknown>>;
-  if (inputWasString) {
-    inputItems = [];
-  } else if (Array.isArray(req.input)) {
+  if (Array.isArray(req.input)) {
     inputItems = req.input as Array<ResponsesInputItem | Record<string, unknown>>;
-  } else {
-    info.reason = 'parse_error: input must be a string or array';
-    return { body: getPinBodyResp(), info };
-  }
-  // As on the chat path: every stage below reads `.role` / `.content` off each
-  // item, so a non-object item threw out of the transform and became a 502.
-  if (inputItems.some((item) => !item || typeof item !== 'object')) {
-    info.reason = 'invalid_input';
-    return { body: getPinBodyResp(), info };
   }
 
   // Find first user item index (skip non-message items like function_call_output, reasoning).
@@ -1717,8 +2017,13 @@ export async function transformOpenAIResponses(
   if (priceMode() === 'kosha' && gateRatesFor(req.model, { promptTokens: info.responsesComposition.totalLocal }) === null) {
     info.reason = hygieneStats?.changed ? 'text_hygiene' : 'unpriced_model';
     if (hygieneStats?.changed) {
-      const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
-      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+      if (!info.firstUserSha8 || !info.sessionKey) {
+        await applyClientSessionIdentity(
+          info,
+          firstResponsesUserText(inputWasString, originalInputString, inputItems),
+          o,
+        );
+      }
       info.compressed = true;
       info.outgoingTextChars = countResponsesOutgoingTextChars(req);
     }
@@ -1766,7 +2071,7 @@ export async function transformOpenAIResponses(
     // the original here turns a hard 413 into a plain uncompressed request.
     const serializedByteLimit = profile.maxSerializedRequestBytes;
     if (serializedByteLimit !== undefined && encoded.byteLength > serializedByteLimit) {
-      clearImageTelemetryForLimit(info);
+      clearImageStatsForLimit(info);
       info.reason = 'serialized_request_limit';
       if (body.byteLength > serializedByteLimit) {
         info.compressed = true;
@@ -1790,7 +2095,7 @@ export async function transformOpenAIResponses(
   };
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
-    if (o.collapseHistory && !inputWasString && await applyResponsesHistoryCollapse(
+    if (o.collapseHistory && !hybridTextMmu && !inputWasString && await applyResponsesHistoryCollapse(
       req, inputItems, info, o, profile,
     )) {
       info.reason = undefined;
@@ -1800,6 +2105,9 @@ export async function transformOpenAIResponses(
       info.compressed = true;
       info.reason = 'text_hygiene';
       info.outgoingTextChars = countResponsesOutgoingTextChars(req);
+    } else if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
+      info.outgoingTextChars = countResponsesOutgoingTextChars(req);
     }
     return { body: getPinBodyResp(), info };
   };
@@ -1807,8 +2115,13 @@ export async function transformOpenAIResponses(
     return finishHistoryOnly('no_static_context');
   }
 
-  const firstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
-  if (firstUser) info.firstUserSha8 = await sha8(firstUser);
+  if (!info.firstUserSha8 || !info.sessionKey) {
+    await applyClientSessionIdentity(
+      info,
+      firstResponsesUserText(inputWasString, originalInputString, inputItems),
+      o,
+    );
+  }
 
   const combined = compactSlabWhitespace(combinedRaw).trimEnd();
   const minCompressTokens = profile.minCompressTokens;
@@ -1917,7 +2230,7 @@ export async function transformOpenAIResponses(
         ...imagePartsResp,
         ...slabFactSheetPart,
         endMarker,
-        { type: 'input_text', text: originalInputString! },
+        { type: 'input_text', text: typeof req.input === 'string' ? req.input : originalInputString! },
       ],
     }];
   } else {
@@ -1963,11 +2276,17 @@ export async function transformOpenAIResponses(
   // Responses protocol state is not an ordinary contiguous conversation prefix.
   // The profile selects pair-only legacy coverage or mixed safe-message coverage;
   // both preserve recent/open/malformed calls and opaque protocol barriers.
-  if (o.collapseHistory && !inputWasString) {
+  if (o.collapseHistory && !hybridTextMmu && !inputWasString) {
     await applyResponsesHistoryCollapse(req, inputItems, info, o, profile);
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
+  if (hybridTextMmu && info.imageCount > 0) {
+    info.reason = 'hybrid_slab_optical';
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_slab_optical')) stages.push('hybrid_slab_optical');
+    info.textHygieneStages = stages;
+  }
 
   // Regression denominator, same as the Chat path — Responses was the only
   // transform that never recorded it.

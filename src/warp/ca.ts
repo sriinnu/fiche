@@ -454,6 +454,21 @@ export class CertificateAuthority {
   }
 
   /**
+   * Mint PEM `{ key, cert }` credentials for `host` (root included for full chain validation).
+   * Useful both for SNI contexts and TLS servers bound to IP literals where clients omit SNI.
+   */
+  leafCredentialsFor(host: string): { key: string; cert: string } {
+    const stripped = host.replace(/\.$/, '');
+    const name = isIP(stripped) ? stripped : stripped.toLowerCase();
+    return {
+      key: this.leafKeyPem,
+      // Ship the root alongside the leaf so the child validates the whole chain
+      // from NODE_EXTRA_CA_CERTS without a separate fetch.
+      cert: this.mintLeafCertPem(name) + this.certPem,
+    };
+  }
+
+  /**
    * Cached-or-minted TLS context for an SNI host. One leaf key is reused across
    * every host: these certs never leave the machine and are only trusted by the
    * child we spawned, so per-host keygen would buy nothing but latency on the
@@ -469,13 +484,7 @@ export class CertificateAuthority {
       return cached;
     }
 
-    const leafPem = this.mintLeafCertPem(name);
-    const context = createSecureContext({
-      key: this.leafKeyPem,
-      // Ship the root alongside the leaf so the child validates the whole chain
-      // from NODE_EXTRA_CA_CERTS without a separate fetch.
-      cert: leafPem + this.certPem,
-    });
+    const context = createSecureContext(this.leafCredentialsFor(name));
     if (this.leaves.size >= MAX_LEAF_CONTEXTS) {
       const oldest = this.leaves.keys().next().value;
       if (oldest !== undefined) this.leaves.delete(oldest);

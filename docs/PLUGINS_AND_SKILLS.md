@@ -53,13 +53,13 @@ The Node host scans `$FICHE_PLUGINS_DIR` (default: `~/.fiche/plugins/`) for subd
 The Node host automatically discovers agent skills from:
 
 1. `~/.agents/skills/<skill-name>/SKILL.md`
-2. `~/.gemini/config/plugins/fiche-telemetry/skills/<skill-name>/SKILL.md`
+2. `~/.gemini/config/plugins/fiche-companion/skills/<skill-name>/SKILL.md`
 
 *(Skills stored under `~/.claude/skills/<skill-name>/` can be symlinked into `~/.agents/skills/` to share one canonical copy across Claude Code, Codex, and Antigravity.)*
 
 `parseSkillManifest()` parses YAML frontmatter (`name`, `description`) and registers each skill with ID `skill:<directory-name>` and `stage: "skill"`.
 
-`fiche` ships its built-in skill at [`plugins/fiche-telemetry/skills/fiche/SKILL.md`](../plugins/fiche-telemetry/skills/fiche/SKILL.md), covering `fiche-mcp` tools (`stats`, `check_model`, `transform_request`, `health`), `fiche warp`, `fiche turn-report`, and `fiche export`.
+`fiche` ships its built-in skill at [`plugins/fiche-companion/skills/fiche/SKILL.md`](../plugins/fiche-companion/skills/fiche/SKILL.md), covering `fiche-mcp` tools (`stats`, `check_model`, `transform_request`, `health`), `fiche warp`, `fiche turn-report`, and `fiche export`.
 
 ---
 

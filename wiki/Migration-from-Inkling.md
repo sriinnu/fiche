@@ -8,7 +8,7 @@ The package was renamed from `@sriinnu/inkling` to **`@sriinnu/fiche`** (`fiche`
 | :--- | :--- | :--- |
 | npm package | `@sriinnu/inkling` | `@sriinnu/fiche` |
 | CLI binaries | `inkling`, `inkling-mcp` | `fiche`, `fiche-mcp` |
-| Telemetry plugin | `plugins/inkling-telemetry/` | `plugins/fiche-telemetry/` |
+| Companion plugin | `plugins/inkling-telemetry/` | `plugins/fiche-companion/` |
 | Env vars | `INKLING_*` | `FICHE_*` (`INKLING_*` fallback built in) |
 | Data directory | `~/.inkling/` | `~/.fiche/` (auto-falls back to `~/.inkling/` if present) |
 | Config file | `~/.config/inkling/config.json` | `~/.config/fiche/config.json` (legacy read fallback) |

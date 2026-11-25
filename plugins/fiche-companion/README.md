@@ -1,9 +1,9 @@
-# Fiche Telemetry Plugin
+# Fiche Companion Plugin
 
-Zero-token-overhead per-turn & session token/dollar savings reporting for coding agents running through the `fiche` proxy (`node dist/node.js`).
+Zero-token-overhead per-turn & session local token/dollar savings reporting for coding agents running through the `fiche` proxy (`node dist/node.js`).
 
 ## 1. Antigravity (Inline Per-Turn UI Banner, 0 LLM Tokens)
-Register or copy `plugins/fiche-telemetry/` into your Antigravity customizations directory (`.agents/plugins/fiche-telemetry/` or `~/.gemini/config/plugins/fiche-telemetry/`).
+Register or copy `plugins/fiche-companion/` into your Antigravity customizations directory (`.agents/plugins/fiche-companion/` or `~/.gemini/config/plugins/fiche-companion/`).
 Every `PostInvocation` reads `~/.fiche/events.jsonl` (`$FICHE_LOG`, with legacy `$INKLING_LOG` / `~/.inkling/events.jsonl` fallback) in `<5ms` and injects `metadata.user_markdown` with `systemMessage: ""`, showing per-turn and session savings inline without billing any LLM tokens.
 
 ## 2. Claude Code `statusLine`
@@ -12,7 +12,7 @@ In `~/.claude/settings.json`:
 {
   "statusLine": {
     "type": "command",
-    "command": "node /path/to/fiche/plugins/fiche-telemetry/scripts/claude-statusline.mjs"
+    "command": "node /path/to/fiche/plugins/fiche-companion/scripts/claude-statusline.mjs"
   }
 }
 ```
@@ -28,6 +28,8 @@ curl -s http://127.0.0.1:47821/api/last-turn.json
 
 Configured via `mcp_config.json` (`npx --yes --package @sriinnu/fiche fiche-mcp`) and documented in `skills/fiche/SKILL.md`:
 
+- `page_in` — retrieve verbatim lines from `Context-MMU` virtual memory by `pg_<12hex>` ID or symbol/text query (scoped by optional `sessionKey`), falling back to the running loopback daemon.
+- `mmu_stats` — inspect `Context-MMU` virtual memory counters and resident page summaries (no raw page bodies).
 - `check_model` — check `FICHE_MODELS` scope, `readerTier` (`image` vs `text`), and active engine pipeline.
 - `transform_request` — preview how `fiche` compiles an `anthropic`, `responses`, `chat`, or `google` request payload.
 - `stats` — live `lastTurn` and cumulative `session` token/USD savings from `$FICHE_LOG`, plus MCP call counters.

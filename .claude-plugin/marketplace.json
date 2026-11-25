@@ -9,7 +9,7 @@
     {
       "name": "fiche",
       "source": "./",
-      "description": "Stdio MCP server for check_model, transform_request, health, and stats. Calling a tool does not shrink the turn that called it.",
+      "description": "Stdio MCP server for page_in, mmu_stats, check_model, transform_request, health, and stats. Calling a tool does not shrink the turn that called it.",
       "category": "development"
     }
   ]

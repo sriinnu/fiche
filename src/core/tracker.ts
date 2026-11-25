@@ -101,6 +101,9 @@ export interface TrackEvent {
    *  was therefore allowed to repack for density. Pair with cache_read_tokens:
    *  a repack that lands on a live cache would show as a cache_create spike. */
   history_pack_fill?: boolean;
+  /** History collapse treated each closed tool call/result pair as its own round
+   *  (Claude Code detection or FICHE_TRUST_ADJACENT_TOOL_ROUNDS=1). */
+  history_split_adjacent_pairs?: boolean;
   /** Codepoints not in the glyph atlas. A spike means users type glyphs we don't ship — widen ATLAS_PROFILE. */
   dropped_chars?: number;
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
@@ -155,6 +158,8 @@ export interface TrackEvent {
   // Fingerprints:
   system_sha8?: string;
   first_user_sha8?: string;
+  session_key?: string;
+  session_key_source?: 'fiche-header' | 'claude-code-header' | 'anchor';
 
   // From Anthropic/OpenAI Usage:
   input_tokens?: number;
@@ -196,6 +201,11 @@ export interface TrackEvent {
   baseline_cacheable_tokens?: number;
   /** Probe outcome. Dashboards must only attribute "$ saved" to rows where status === 'ok'. */
   baseline_probe_status?: 'ok' | 'partial' | 'failed';
+  /** Why the baseline probe failed (HTTP status + upstream error snippet). Present only on failure. */
+  baseline_probe_error?: string;
+  /** Server-side thread continuation: the body (and so baseline_tokens) is the delta only,
+   *  while provider usage includes the server-held thread. Probe status is 'partial'. */
+  thread_continue?: boolean;
 
   // Errors:
   error?: string;
@@ -330,6 +340,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.historyFreezeStep !== undefined) out.history_freeze_step = info.historyFreezeStep;
     if (info.historyBudgetTrimmed) out.history_budget_trimmed = true;
     if (info.historyPackFill) out.history_pack_fill = true;
+    if (info.historySplitAdjacentPairs) out.history_split_adjacent_pairs = true;
     if (info.droppedChars !== undefined && info.droppedChars > 0) {
       out.dropped_chars = info.droppedChars;
     }
@@ -367,6 +378,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.churning_static_tags = info.churningStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;
+    if (info.sessionKey) out.session_key = info.sessionKey;
+    if (info.sessionKeySource) out.session_key_source = info.sessionKeySource;
     if (info.baselineTokens !== undefined && info.baselineTokens > 0) {
       out.baseline_tokens = info.baselineTokens;
     }
@@ -379,6 +392,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.baselineProbeStatus !== undefined) {
       out.baseline_probe_status = info.baselineProbeStatus;
     }
+    if (info.baselineProbeError !== undefined) {
+      out.baseline_probe_error = info.baselineProbeError;
+    }
+    if (info.threadContinue) out.thread_continue = true;
   }
   if (env) {
     if (env.cwd) out.cwd = env.cwd;

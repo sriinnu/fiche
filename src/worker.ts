@@ -12,13 +12,16 @@
  */
 
 import type { ExecutionContext } from '@cloudflare/workers-types';
-import { createProxy, type ProxyConfig } from './core/proxy.js';
+import { createProxy, resolveTrustAdjacentToolRoundsEnv, type ProxyConfig } from './core/proxy.js';
 import type { TransformOptions } from './core/transform.js';
 import { toTrackEvent, JsonLogTracker, noopTracker, type Tracker } from './core/tracker.js';
 import { setAllowedModelBases } from './core/applicability.js';
 import { setRenderCacheMaxBytes } from './core/render.js';
 
 import { readBrandEnv } from './core/env.js';
+
+/** Invalid TRUST_ADJACENT_TOOL_ROUNDS values already warned about in this isolate. */
+const warnedTrustAdjacentRaw = new Set<string>();
 
 export interface Env {
   /** Optional single upstream base for every API family. Family-specific env vars override it. */
@@ -68,6 +71,10 @@ export interface Env {
    *  Set with: npx wrangler secret put FICHE_WORKER_SECRET */
   FICHE_WORKER_SECRET?: string;
   INKLING_WORKER_SECRET?: string;
+  /** "1" lets history collapse split adjacent tool call/result pairs for every
+   *  client; "0" never. Unset decides per request from client headers. */
+  FICHE_TRUST_ADJACENT_TOOL_ROUNDS?: string;
+  INKLING_TRUST_ADJACENT_TOOL_ROUNDS?: string;
 }
 
 /** Compare SHA-256 digests instead of the raw strings so the comparison
@@ -166,6 +173,13 @@ export default {
       ? Number(env.COLS)
       : NaN;
 
+    const rawTrustAdjacent = env.FICHE_TRUST_ADJACENT_TOOL_ROUNDS ?? env.INKLING_TRUST_ADJACENT_TOOL_ROUNDS;
+    const trustAdjacent = resolveTrustAdjacentToolRoundsEnv(rawTrustAdjacent);
+    if (trustAdjacent.warning && rawTrustAdjacent !== undefined && !warnedTrustAdjacentRaw.has(rawTrustAdjacent)) {
+      if (warnedTrustAdjacentRaw.size < 32) warnedTrustAdjacentRaw.add(rawTrustAdjacent);
+      console.warn(trustAdjacent.warning);
+    }
+
     const transform: TransformOptions = {
       compress: truthy(env.COMPRESS, true),
       compressTools: truthy(env.COMPRESS_TOOLS, true),
@@ -179,6 +193,7 @@ export default {
       // Omit by default so OpenAI-shaped requests use their exact model profile;
       // COLS remains an explicit operator override for every family.
       ...(Number.isFinite(parsedCols) && parsedCols > 0 ? { cols: Math.floor(parsedCols) } : {}),
+      ...(trustAdjacent.value !== undefined ? { separateAdjacentToolPairs: trustAdjacent.value } : {}),
     };
     const trackingOn = truthy(env.FICHE_TRACK ?? env.INKLING_TRACK, true);
     // Workers Logs ingests stdout as separate log lines. Emit one JSON line

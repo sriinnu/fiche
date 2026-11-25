@@ -44,6 +44,7 @@ import {
   stripPinCommandsFromSystem, type Pin,
 } from './pin.js';
 import { factSheetText } from './factsheet.js';
+import { extractFaultSignalSnippet } from './context-mmu.js';
 import { stripSchemaDescriptions, schemaHasStructure } from './schema-strip.js';
 import { bytesToBase64 } from './png.js';
 import {
@@ -53,13 +54,15 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
-import { noteHistoryRequest, recordFreezeStep, sessionAnchorText } from './session-state.js';
+import { noteHistoryRequest, recordFreezeStep, sessionAnchorText, type HistorySessionState } from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
+import { readBrandEnv } from './env.js';
 import {
   ANTHROPIC_GATE_RATES,
   evaluateCliffAvoidance,
   gateRatesFor,
   priceMode,
+  resolvePriceRates,
   type PriceRates,
 } from './pricing.js';
 import {
@@ -131,6 +134,16 @@ export interface RecoverableBlock {
   readonly imageCount: number;
 }
 
+export type OpticalMode = 'auto' | 'hybrid' | 'full';
+
+export type ClientSessionSource = 'fiche-header' | 'claude-code-header';
+
+export interface ClientSessionIdentityInput {
+  clientSessionId?: string;
+  clientSessionSource?: ClientSessionSource;
+  claudeCodeSessionId?: string;
+}
+
 export interface TransformOptions {
   /** Resolved model id. Its profile supplies font, columns, height, and history defaults. */
   model?: string;
@@ -139,6 +152,9 @@ export interface TransformOptions {
   /** Enable image rendering passes (slab, history, tool_result PNGs). Set false for
    *  weak/text-only readers while leaving prefix-safe deterministic text hygiene active. */
   imageCompress?: boolean;
+  /** Optical history policy: 'auto' (kosha + cheap read <= 0.10x & < 160k -> hybrid),
+   *  'hybrid' (Turn-1 static slab optical + dynamic Text-MMU), or 'full' (all-optical). */
+  opticalMode?: OpticalMode;
   /** Prefix-safe deterministic tool-output hygiene (`auto` | `on` | `off` | boolean). */
   textHygiene?: boolean | TextHygieneMode;
   /** Optional expected output tokens for long-context output-cliff calculations. */
@@ -205,11 +221,23 @@ export interface TransformOptions {
   explicitPromptCacheBreakpoints?: boolean;
   /** Per-stage enable flags synced from `~/.config/fiche/plugins.json`. */
   stageToggles?: Partial<StageToggles>;
+  /** Opt-in Stage 2 lossless cleaning on bulky non-code user payloads (>=1500 chars). Default false. */
+  cleanUserPayloads?: boolean;
+  /** History collapse: treat each closed tool call/result pair as its own round.
+   *  Set by proxy for Claude Code (`claude-cli/` UA + `x-app: cli|cli-bg`). Default false. */
+  separateAdjacentToolPairs?: boolean;
+  /** Validated client session ID (`x-fiche-session-id`, `x-inkling-session-id`, or `x-claude-code-session-id`) for swarm/session isolation. */
+  clientSessionId?: string;
+  /** Header family that supplied `clientSessionId`. */
+  clientSessionSource?: ClientSessionSource;
+  /** Validated Claude Code session UUID (`x-claude-code-session-id` header) for session isolation. */
+  claudeCodeSessionId?: string;
 }
 
 const DEFAULTS: Required<TransformOptions> = {
   compress: true,
   imageCompress: true,
+  opticalMode: 'auto',
   textHygiene: 'auto',
   expectedOutputTokens: 1000,
   compressTools: true,
@@ -237,6 +265,11 @@ const DEFAULTS: Required<TransformOptions> = {
   model: '',
   explicitPromptCacheBreakpoints: true,
   stageToggles: {},
+  cleanUserPayloads: false,
+  separateAdjacentToolPairs: false,
+  clientSessionId: '',
+  clientSessionSource: 'fiche-header',
+  claudeCodeSessionId: '',
 };
 
 /**
@@ -765,6 +798,9 @@ export interface TransformInfo {
   systemSha8?: string;
   /** sha8 of first user message text (first 4 KiB). Rough thread/session id. */
   firstUserSha8?: string;
+  /** Isolated session key (`sha8('fs:' + id)`, `sha8('cc:' + id)`, or `firstUserSha8`). */
+  sessionKey?: string;
+  sessionKeySource?: ClientSessionSource | 'anchor';
   /** Raw bytes of the first rendered image. Dashboard preview only; NOT persisted to JSONL. */
   firstImagePng?: Uint8Array;
   firstImageWidth?: number;
@@ -784,7 +820,7 @@ export interface TransformInfo {
    *  whose own images already fill the cap must not get a single one from us.
    *  Counted once, before any rewrite. See {@link imageHeadroom}. */
   nativeImages?: number;
-  /** Imaging steps skipped because the cap was exhausted (telemetry for tuning). */
+  /** Imaging steps skipped because the cap was exhausted (metrics for tuning). */
   imageBudgetSkips?: number;
   /** Decoded bytes of the CLIENT's own image blocks, counted once before any
    *  rewrite. They occupy the same weight budget ours do, and they are never
@@ -849,6 +885,8 @@ export interface TransformInfo {
   historyPackFill?: boolean;
   /** The image budget could not hold the whole closed prefix; the tail stayed live text. */
   historyBudgetTrimmed?: boolean;
+  /** History collapse ran with separateAdjacentToolPairs enabled. */
+  historySplitAdjacentPairs?: boolean;
   /** sha8 of the ACTUAL cacheable prefix sent this turn (tools + system +
    *  message blocks through the imaged history/slab boundary; the live tail is
    *  excluded). Read-only measurement. A change turn-over-turn within a session
@@ -899,9 +937,14 @@ export interface TransformInfo {
    *  Absent when the original body has no cache_control markers (cacheable=0 exactly). */
   baselineCacheableTokens?: number;
   /** 'ok': both probes resolved. 'partial': full-body resolved but cacheable-prefix
-   *  didn't (exclude from rollup — cacheable=0 fallback is dishonest). 'failed': no
-   *  baseline. undefined: no probe attempted. */
+   *  didn't, or body is a server-side thread continuation whose probe covers only
+   *  the delta (exclude from rollup either way). 'failed': no baseline.
+   *  undefined: no probe attempted. */
   baselineProbeStatus?: 'ok' | 'partial' | 'failed';
+  /** When baselineProbeStatus is 'failed': why (e.g. `http_400 ...`, `fetch_error ...`). */
+  baselineProbeError?: string;
+  /** Request was a server-side thread continuation (`thread.type === "continue"`). */
+  threadContinue?: boolean;
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -1467,16 +1510,48 @@ async function cachePrefixDigest(
 export function firstUserText(req: MessagesRequest): string {
   const texts: string[] = [];
   for (const m of req.messages ?? []) {
+    if (!m || typeof m !== 'object') continue;
     if (m.role !== 'user') break;
     if (typeof m.content === 'string') {
       texts.push(m.content);
     } else if (Array.isArray(m.content)) {
       for (const block of m.content) {
-        if (block?.type === 'text' && typeof block.text === 'string') texts.push(block.text);
+        if (block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') texts.push(block.text);
       }
     }
   }
   return sessionAnchorText(texts);
+}
+
+/**
+ * Resolve and record session isolation identity on `info` from explicit client
+ * session headers (`x-fiche-session-id` -> `fs:`, `x-claude-code-session-id` -> `cc:`)
+ * or fall back to the SHA-8 anchor of the first user turn (`anchor`).
+ */
+export async function applyClientSessionIdentity(
+  info: TransformInfo,
+  firstUser: string,
+  opts?: ClientSessionIdentityInput,
+): Promise<string | undefined> {
+  if (firstUser && !info.firstUserSha8) {
+    info.firstUserSha8 = await sha8(firstUser);
+  }
+  const explicitId = opts?.clientSessionId?.trim();
+  const resolvedId = explicitId || opts?.claudeCodeSessionId?.trim() || '';
+  if (resolvedId) {
+    const source: ClientSessionSource = explicitId
+      ? (opts?.clientSessionSource ?? 'fiche-header')
+      : 'claude-code-header';
+    const prefix = source === 'fiche-header' ? 'fs:' : 'cc:';
+    if (!info.sessionKey || info.sessionKeySource !== source) {
+      info.sessionKey = await sha8(`${prefix}${resolvedId}`);
+      info.sessionKeySource = source;
+    }
+  } else if (info.firstUserSha8 && !info.sessionKey) {
+    info.sessionKey = info.firstUserSha8;
+    info.sessionKeySource = 'anchor';
+  }
+  return info.sessionKey ?? info.firstUserSha8;
 }
 
 /**
@@ -2062,10 +2137,11 @@ export function countNativeImages(messages: readonly Message[] | undefined): num
  */
 function historyGridTuning(
   info: TransformInfo,
+  preSession?: HistorySessionState,
 ): { imageBudget: number; packFill: boolean; minFreezeStep: number } {
   const headroom = imageHeadroom(info);
   const imageBudget = Math.max(1, Math.min(ANTHROPIC_HISTORY_IMAGE_BUDGET, headroom));
-  const session = noteHistoryRequest(info.firstUserSha8);
+  const session = preSession ?? noteHistoryRequest(info.sessionKey ?? info.firstUserSha8);
   return { imageBudget, packFill: session.cold, minFreezeStep: session.minFreezeStep };
 }
 
@@ -2354,6 +2430,44 @@ function estimateTailMsgTokens(messages: readonly Message[] | undefined, charsPe
   }
 }
 
+/** Resolve whether optical compression covers only the static Turn-1 slab ('hybrid',
+ *  with dynamic turns handled by prefix-monotonic Text-MMU) or also history/tool_results ('full'). */
+export function resolveOpticalHistoryPolicy(opts: {
+  readonly opticalMode?: OpticalMode;
+  readonly collapseHistory?: boolean;
+  readonly model?: string;
+  readonly estPromptTokens?: number;
+  readonly textHygieneActive: boolean;
+}): 'hybrid' | 'full' {
+  const rawEnv = readBrandEnv('OPTICAL_MODE');
+  const normEnv = rawEnv ? rawEnv.trim().toLowerCase() : undefined;
+  const envMode: OpticalMode | undefined =
+    normEnv === 'full' || normEnv === 'hybrid' || normEnv === 'auto'
+      ? normEnv
+      : undefined;
+
+  if (
+    opts.opticalMode === 'full' ||
+    envMode === 'full' ||
+    opts.collapseHistory === true ||
+    !opts.textHygieneActive
+  ) {
+    return 'full';
+  }
+  if (opts.opticalMode === 'hybrid' || envMode === 'hybrid') {
+    return 'hybrid';
+  }
+  if (priceMode() !== 'kosha') {
+    return 'full';
+  }
+  const promptTokens = opts.estPromptTokens ?? 0;
+  if (promptTokens >= 160_000) {
+    return 'full';
+  }
+  const rates = resolvePriceRates(opts.model, { promptTokens: opts.estPromptTokens });
+  return rates.read <= 0.10 ? 'hybrid' : 'full';
+}
+
 async function runHistoryCollapseAndFinalize(
   req: MessagesRequest,
   info: TransformInfo,
@@ -2363,13 +2477,17 @@ async function runHistoryCollapseAndFinalize(
   pins: Pin[],
   reqPromptTokensEst?: number,
   reqTtlSec?: number,
+  sessionState?: HistorySessionState,
+  hybridTextMmu = false,
 ): Promise<{ body: Uint8Array; info: TransformInfo; changed: boolean }> {
   let collapsedFlag = false;
   // Same wire cap as every other imaging path: the collapse buys tokens with
   // image blocks, and a request whose client images already fill the cap has
   // none left to spend. `historyGridTuning` floors the budget at 1, so without
   // this guard a full wire would still emit exactly one image — and 400.
-  if (imageHeadroom(info) <= 0) {
+  if (hybridTextMmu) {
+    // Dynamic turns are handled by Text-MMU in hybrid mode.
+  } else if (imageHeadroom(info) <= 0) {
     bumpPassthrough(info, 'image_budget');
     info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
     info.historyReason ??= 'too_many_images';
@@ -2397,7 +2515,7 @@ async function runHistoryCollapseAndFinalize(
         const textTok = text.length / Math.max(1e-6, historyCpt);
         const imgTok = imageTokensCost(text, historyGeometry.cols, undefined, true, historyGeometry.maxChars, historyGeometry);
         if (imgTok < textTok) {
-          const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.firstUserSha8 ?? ''}\0history`;
+          const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0history`;
           const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(histCliffKey) : undefined;
           if (stickyCliffAt !== undefined && reqPromptTokensEst > stickyCliffAt) return true;
           const upstreamSysTok = Math.ceil((info.origChars ?? 0) / Math.max(1, o.charsPerToken));
@@ -2430,7 +2548,7 @@ async function runHistoryCollapseAndFinalize(
     // message carrying them is protected from collapse the same way the
     // non-collapse path already keeps <system-reminder> as text below.
     const protectedPrefix = firstMessageHasSystemReminder(req.messages) ? 1 : 0;
-    const tuning = historyGridTuning(info);
+    const tuning = historyGridTuning(info, sessionState);
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
@@ -2441,6 +2559,7 @@ async function runHistoryCollapseAndFinalize(
         style: historyGeometry.style,
         maxHeightPx: historyGeometry.maxHeightPx,
         pageChars: historyGeometry.maxChars,
+        separateAdjacentToolPairs: o.separateAdjacentToolPairs,
         imageBudget: tuning.imageBudget,
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
@@ -2460,10 +2579,11 @@ async function runHistoryCollapseAndFinalize(
       info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
       info.historyReason = 'image_bytes';
     } else if (histInfo.collapsedTurns > 0) {
-      recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+      recordFreezeStep(info.sessionKey ?? info.firstUserSha8, histInfo.freezeStep);
       if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
       if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
       if (tuning.packFill) info.historyPackFill = true;
+      if (o.separateAdjacentToolPairs) info.historySplitAdjacentPairs = true;
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -2497,7 +2617,7 @@ async function runHistoryCollapseAndFinalize(
   // tool_results are imaged on their own merits, not only when the slab is: a
   // tiny system with a large tool_result (e.g. a server-side thread continuation)
   // is exactly the request that needs it. After the collapse, per the invariant.
-  const toolResultsImaged = o.compressToolResults
+  const toolResultsImaged = !hybridTextMmu && o.compressToolResults
     ? await compressToolResultsInPlace(req, info, o, denseGateGeometry(o), droppedCodepoints)
     : false;
   applyPins(req, info, pins);
@@ -2524,6 +2644,120 @@ async function runHistoryCollapseAndFinalize(
  * bytes) plus diagnostic info. On any error, returns the original bytes
  * unchanged.
  */
+function extractAnthropicLiveTailTexts(messages: readonly Message[] | undefined): string[] {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const out: string[] = [];
+  const last = messages[messages.length - 1];
+  if (!last || typeof last !== 'object') return out;
+
+  const isToolResultTurn =
+    Array.isArray(last.content) &&
+    (last.content as readonly ContentBlock[]).some(
+      (blk) => blk && typeof blk === 'object' && (blk as { type?: unknown }).type === 'tool_result',
+    );
+
+  // Only inspect messages[n - 2] when messages[n - 1] is a tool-response turn,
+  // and ONLY pull tool_use names/arguments — never Turn t-1's user prompt prose.
+  if (isToolResultTurn && messages.length >= 2) {
+    const prev = messages[messages.length - 2];
+    if (prev && typeof prev === 'object' && Array.isArray(prev.content)) {
+      for (const blk of prev.content) {
+        if (!blk || typeof blk !== 'object') continue;
+        const b = blk as { type?: unknown; name?: unknown; input?: unknown };
+        if (b.type === 'tool_use' && b.input !== undefined) {
+          const s = typeof b.input === 'string' ? b.input : JSON.stringify(b.input);
+          if (s) out.push(typeof b.name === 'string' ? `${b.name} ${s}` : s);
+        }
+      }
+    }
+  } else if (!isToolResultTurn && last.role === 'user' && messages.length >= 2) {
+    // If a trailing user prompt immediately follows a tool_result message, surface any
+    // active fault/stack snippet from that tool_result (never prior user prompt prose).
+    const prev = messages[messages.length - 2];
+    if (prev && typeof prev === 'object' && Array.isArray(prev.content)) {
+      for (const blk of prev.content) {
+        if (!blk || typeof blk !== 'object') continue;
+        const b = blk as { type?: unknown; content?: unknown };
+        if (b.type === 'tool_result' && b.content !== undefined) {
+          let s = '';
+          if (typeof b.content === 'string') {
+            s = b.content;
+          } else if (Array.isArray(b.content)) {
+            const parts: string[] = [];
+            for (const sub of b.content) {
+              if (sub && typeof sub === 'object' && typeof (sub as { text?: unknown }).text === 'string') {
+                parts.push((sub as { text: string }).text);
+              }
+            }
+            s = parts.join('\n');
+          }
+          const faultSnippet = extractFaultSignalSnippet(s);
+          if (faultSnippet) out.push(faultSnippet);
+        }
+      }
+    }
+  }
+
+  if (typeof last.content === 'string') {
+    if (last.content.trim()) out.push(last.content);
+    return out;
+  }
+  if (!Array.isArray(last.content)) return out;
+
+  const promptTexts: string[] = [];
+  for (const blk of last.content) {
+    if (!blk || typeof blk !== 'object') continue;
+    const b = blk as {
+      type?: unknown;
+      text?: unknown;
+      thinking?: unknown;
+      name?: unknown;
+      input?: unknown;
+      content?: unknown;
+    };
+    if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+      promptTexts.push(b.text);
+    } else if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim()) {
+      promptTexts.push(b.thinking);
+    } else if (b.type === 'tool_use' && b.input !== undefined) {
+      const s = typeof b.input === 'string' ? b.input : JSON.stringify(b.input);
+      if (s) out.push(typeof b.name === 'string' ? `${b.name} ${s}` : s);
+    } else if (b.type === 'tool_result' && b.content !== undefined) {
+      let s = '';
+      if (typeof b.content === 'string') {
+        s = b.content;
+      } else if (Array.isArray(b.content)) {
+        const parts: string[] = [];
+        for (const sub of b.content) {
+          if (sub && typeof sub === 'object' && typeof (sub as { text?: unknown }).text === 'string') {
+            parts.push((sub as { text: string }).text);
+          }
+        }
+        s = parts.join('\n');
+      }
+      const faultSnippet = extractFaultSignalSnippet(s);
+      if (faultSnippet) out.push(faultSnippet);
+    }
+  }
+  for (const t of promptTexts) out.push(t);
+  return out;
+}
+
+function appendAnthropicTailHydration(req: MessagesRequest, hydrationBlock: string): void {
+  if (!hydrationBlock) return;
+  if (!Array.isArray(req.messages) || req.messages.length === 0) return;
+  // Never walk backwards past an assistant/prefill turn into earlier cached user messages.
+  const last = req.messages[req.messages.length - 1];
+  if (!last || last.role !== 'user') return;
+  if (typeof last.content === 'string') {
+    last.content = last.content ? `${last.content}\n\n${hydrationBlock}` : hydrationBlock;
+    return;
+  }
+  if (Array.isArray(last.content)) {
+    last.content.push({ type: 'text', text: hydrationBlock });
+  }
+}
+
 export async function transformRequest(
   body: Uint8Array,
   opts: TransformOptions = {},
@@ -2634,23 +2868,51 @@ export async function transformRequest(
   }
 
   const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
-  const hygieneStats = isTextHygieneActive(o.textHygiene)
+  const textHygieneActive = isTextHygieneActive(o.textHygiene);
+  const opticalHistoryPolicy: 'hybrid' | 'full' = effectiveImageCompress
+    ? resolveOpticalHistoryPolicy({
+        opticalMode: o.opticalMode,
+        collapseHistory: opts.collapseHistory === true ? true : undefined,
+        model: o.model,
+        estPromptTokens: Math.ceil(
+          Math.max(0, body.byteLength - Math.ceil((info.nativeImageBytes ?? 0) * 4 / 3)) /
+            Math.max(1, o.charsPerToken),
+        ),
+        textHygieneActive,
+      })
+    : 'full';
+  const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
+  const earlyFirstUser = firstUserText(req);
+  const resolvedSessionKey = await applyClientSessionIdentity(info, earlyFirstUser, o);
+  const sessionState = resolvedSessionKey
+    ? noteHistoryRequest(resolvedSessionKey)
+    : { cold: false, minFreezeStep: 0 };
+  const hygieneStats = textHygieneActive
     ? applyAnthropicTextHygiene(req, {
-        foldLogs: !effectiveImageCompress,
-        deepTextCompact: !effectiveImageCompress,
-        enableTscg: o.stageToggles?.tscg,
+        foldLogs: !effectiveImageCompress || hybridTextMmu,
+        deepTextCompact: !effectiveImageCompress || hybridTextMmu,
+        cleanUserPayloads: o.cleanUserPayloads === true,
+        enableTscg: hybridTextMmu ? false : o.stageToggles?.tscg,
         enableToon: o.stageToggles?.toon,
         enableAcdc: o.stageToggles?.acdc,
-        enableCasi: o.stageToggles?.casi !== false && typeof opts.keepSharp !== 'function',
+        enableCasi: (!effectiveImageCompress || hybridTextMmu) && o.stageToggles?.casi !== false && typeof opts.keepSharp !== 'function',
+        enableLsm: o.stageToggles?.lsm,
+        enableMmu: o.stageToggles?.mmu,
+        enableSkillLinker: hybridTextMmu ? false : o.stageToggles?.skillLinker,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: o.model,
         expectedOutputTokens: o.expectedOutputTokens,
         rawBodyBytes: body.byteLength,
         nativeImageBytes: Math.ceil((info.nativeImageBytes ?? 0) * 4 / 3),
         ttlSec: reqTtlSec,
+        sessionKey: resolvedSessionKey,
+        firstUserText: earlyFirstUser,
+        sessionCacheCold: sessionState.cold,
+        liveTailTexts: (!effectiveImageCompress || hybridTextMmu) ? extractAnthropicLiveTailTexts(req.messages) : undefined,
+        appendTailHydration: (!effectiveImageCompress || hybridTextMmu) ? (blk) => appendAnthropicTailHydration(req, blk) : undefined,
       })
     : undefined;
-  if (hygieneStats?.changed) {
+  if (hygieneStats?.changed || hygieneStats?.tailHydrated) {
     info.textHygieneSavedChars = hygieneStats.savedChars;
     info.textHygieneSavedTokens = hygieneStats.savedTokens;
     info.textHygieneBlocks = hygieneStats.blocks;
@@ -2660,10 +2922,13 @@ export async function transformRequest(
   if (!effectiveImageCompress) {
     if (pinsRewrote) applyPins(req, info, pins);
     if (hygieneStats?.changed) {
-      const firstUser = firstUserText(req);
-      if (firstUser) info.firstUserSha8 = await sha8(firstUser);
       info.compressed = true;
       info.reason = 'text_hygiene';
+      info.outgoingTextChars = countOutgoingTextChars(req);
+      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       info.outgoingTextChars = countOutgoingTextChars(req);
       return { body: new TextEncoder().encode(JSON.stringify(req)), info };
     }
@@ -2729,16 +2994,17 @@ export async function transformRequest(
 
   // Privacy-safe fingerprints that don't depend on tool docs (computed
   // here so they're available even if we below_min_chars out below).
-  // systemSha8 is set later, after we know the combined image-bound text.
-  const firstUser = firstUserText(req);
-  const firstUserSha = firstUser ? await sha8(firstUser) : undefined;
-  if (firstUserSha) info.firstUserSha8 = firstUserSha;
+  // Keep canonical pre-hygiene firstUserSha8 so cleanUserPayloads never splits
+  // session state between noteHistoryRequest/MMU and noteCacheOutcome/freezeStep.
+  if (!info.firstUserSha8 || !info.sessionKey) {
+    await applyClientSessionIdentity(info, firstUserText(req), o);
+  }
 
   // Canary: slab tags whose content churns within a session bust the image
   // cache every turn — report them regardless of the hardcoded lists.
   if (staticTagContents.size > 0) {
     const churning = observeStaticTagChurn(
-      firstUserSha ?? 'global',
+      info.sessionKey ?? info.firstUserSha8 ?? 'global',
       staticTagContents,
     );
     if (churning.length > 0) info.churningStaticTags = churning;
@@ -2846,10 +3112,14 @@ export async function transformRequest(
     // If history collapses, we flip `info.compressed = true` and let the
     // library wrapper return reason='applied'; otherwise this still
     // populates `outgoingTextChars` for the regression denominator.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec, sessionState, hybridTextMmu);
     if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
       if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
+      return { body: finalized.body, info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       return { body: finalized.body, info };
     }
     // `body` is the original bytes. If the pin pass edited `req`, those bytes
@@ -2875,13 +3145,15 @@ export async function transformRequest(
       req.system = preservedSys.length > 0 ? preservedSys : undefined;
     }
     info.reason = 'no_user_message';
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec, sessionState, hybridTextMmu);
     if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
       if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
+    } else if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
     }
     return {
-      body: finalized.changed || pinsRewrote || hygieneStats?.changed || billingLine !== null ? finalized.body : body,
+      body: finalized.changed || pinsRewrote || hygieneStats?.changed || hygieneStats?.tailHydrated || billingLine !== null ? finalized.body : body,
       info,
     };
   }
@@ -2894,12 +3166,14 @@ export async function transformRequest(
     info.reason = 'image_budget';
     bumpPassthrough(info, 'image_budget');
     info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec, sessionState, hybridTextMmu);
     if (hygieneStats?.changed && !finalized.changed) {
       info.compressed = true;
       info.reason = 'text_hygiene';
+    } else if (hygieneStats?.tailHydrated && !finalized.changed) {
+      info.reason = 'mmu_hydrate';
     }
-    return { body: pinsRewrote || finalized.changed || hygieneStats?.changed ? finalized.body : body, info };
+    return { body: pinsRewrote || finalized.changed || hygieneStats?.changed || hygieneStats?.tailHydrated ? finalized.body : body, info };
   }
 
   // Break-even check guards even the slab (rare edge: tiny tool docs + tiny slab < 10k chars).
@@ -2944,7 +3218,7 @@ export async function transformRequest(
   let slabProfitable = slabGateEval?.profitable ?? false;
   if (slabGateEval && !slabProfitable && slabRates !== null) {
     const promptBefore = Math.max(slabGateEval.textTokens, reqPromptTokensEst);
-    const slabCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.firstUserSha8 ?? ''}\0${info.systemSha8 ?? ''}`;
+    const slabCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0${info.systemSha8 ?? ''}`;
     const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(slabCliffKey) : undefined;
     if (stickyCliffAt !== undefined && promptBefore > stickyCliffAt) {
       slabProfitable = true;
@@ -2986,10 +3260,14 @@ export async function transformRequest(
     info.reason = `not_profitable (slab=${combined.length} chars)`;
     bumpPassthrough(info, 'not_profitable');
     // Slab not profitable but history may still be collapsable — try before returning.
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec, sessionState, hybridTextMmu);
     if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
       if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
+      return { body: finalized.body, info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       return { body: finalized.body, info };
     }
     // `body` is the original bytes. If the pin pass edited `req`, those bytes
@@ -3026,10 +3304,14 @@ export async function transformRequest(
     bumpPassthrough(info, 'image_budget');
     if (slabOverBytes && !slabOverCount) info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
     else info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
-    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec);
+    const finalized = await runHistoryCollapseAndFinalize(req, info, o, opts, droppedCodepoints, pins, reqPromptTokensEst, reqTtlSec, sessionState, hybridTextMmu);
     if (finalized.changed || hygieneStats?.changed) {
       info.compressed = true;
       if (!finalized.changed && hygieneStats?.changed) info.reason = 'text_hygiene';
+      return { body: finalized.body, info };
+    }
+    if (hygieneStats?.tailHydrated) {
+      info.reason = 'mmu_hydrate';
       return { body: finalized.body, info };
     }
     return { body: pinsRewrote ? finalized.body : body, info };
@@ -3134,7 +3416,9 @@ export async function transformRequest(
   // History is single-col dense; use slab cpt unless host pinned charsPerToken.
   // protectedPrefix excludes the slab-bearing first user message — collapsing it
   // would reduce slab images to [image] placeholders and destroy the cache anchor.
-  if (imageHeadroom(info) <= 0) {
+  if (hybridTextMmu) {
+    // Dynamic turns are handled by Text-MMU in hybrid mode.
+  } else if (imageHeadroom(info) <= 0) {
     bumpPassthrough(info, 'image_budget');
     info.imageBudgetSkips = (info.imageBudgetSkips ?? 0) + 1;
     info.historyReason ??= 'too_many_images';
@@ -3156,7 +3440,7 @@ export async function transformRequest(
         const textTok = text.length / Math.max(1e-6, historyCpt);
         const imgTok = imageTokensCost(text, historyGeometry.cols, undefined, true, historyGeometry.maxChars, historyGeometry);
         if (imgTok < textTok) {
-          const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.firstUserSha8 ?? ''}\0history`;
+          const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0history`;
           const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(histCliffKey) : undefined;
           if (stickyCliffAt !== undefined && reqPromptTokensEst > stickyCliffAt) return true;
           const tailTok = estimateTailMsgTokens(req.messages, o.charsPerToken);
@@ -3180,7 +3464,7 @@ export async function transformRequest(
       return false;
     };
     const slabAnchorIdx = (req.messages ?? []).findIndex((m) => m.role === 'user');
-    const tuning = historyGridTuning(info);
+    const tuning = historyGridTuning(info, sessionState);
     const { messages: newMessages, info: histInfo } = await collapseHistory(
       req.messages,
       historyProfitable,
@@ -3191,6 +3475,7 @@ export async function transformRequest(
         style: historyGeometry.style,
         maxHeightPx: historyGeometry.maxHeightPx,
         pageChars: historyGeometry.maxChars,
+        separateAdjacentToolPairs: o.separateAdjacentToolPairs,
         imageBudget: tuning.imageBudget,
         packFill: tuning.packFill,
         minFreezeStep: tuning.minFreezeStep,
@@ -3210,10 +3495,11 @@ export async function transformRequest(
       info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
       info.historyReason = 'image_bytes';
     } else if (histInfo.collapsedTurns > 0) {
-      recordFreezeStep(info.firstUserSha8, histInfo.freezeStep);
+      recordFreezeStep(info.sessionKey ?? info.firstUserSha8, histInfo.freezeStep);
       if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
       if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
       if (tuning.packFill) info.historyPackFill = true;
+      if (o.separateAdjacentToolPairs) info.historySplitAdjacentPairs = true;
       req.messages = newMessages;
       info.collapsedTurns = histInfo.collapsedTurns;
       info.collapsedChars = histInfo.collapsedChars;
@@ -3274,7 +3560,9 @@ export async function transformRequest(
   // history images are already counted in `info` by the time we get here, so
   // `imageHeadroom(info)` is the headroom left after the collapse spent its
   // share. Out of headroom degrades to sharp text, which is the safe direction.
-  await compressToolResultsInPlace(req, info, o, denseGeo, droppedCodepoints);
+  if (!hybridTextMmu) {
+    await compressToolResultsInPlace(req, info, o, denseGeo, droppedCodepoints);
+  }
 
   // The volatile billing line is NOT re-emitted into the body at all. There is
   // no safe body position: req.system precedes the last cache_control marker
@@ -3287,6 +3575,12 @@ export async function transformRequest(
   if (billingLine) info.billingLine = billingLine;
 
   info.compressed = true;
+  if (hybridTextMmu && info.imageCount > 0) {
+    info.reason = 'hybrid_slab_optical';
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_slab_optical')) stages.push('hybrid_slab_optical');
+    info.textHygieneStages = stages;
+  }
   // Attribution signal for prompt-cache busts (#11): digest the exact pinned
   // prefix we send (history/slab boundary; live tail excluded) AFTER all marker
   // placement — incl. relocateAnchorToHistoryImage — is final. Read-only.

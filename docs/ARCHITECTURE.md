@@ -1,56 +1,122 @@
-# Architecture
+# fiche Architecture
 
-`fiche` is a local/edge proxy and hybrid context compiler between a coding agent and its model API. For strong vision readers, it renders bulky, stable context as dense PNG microfiche pages (billed by pixel area rather than text token count); for text-tier models and textual blocks, it runs a 4-layer deterministic text compiler (`TSCG` → `Terminal / JSON / TOON / Drain` → `ACDC` → `CASI-Delta`) with zero images.
+`fiche` (`@sriinnu/fiche`) is a local, cache-safe hybrid optical + deterministic text context compiler, loopback proxy, TLS warp interceptor, MCP server, and native macOS status monitor for coding agents.
 
-A 1568×728 page bills at about 1,456 tokens on Anthropic (1,078 on Gemini) and holds about 28k characters of 5×8 glyphs. As text, those characters cost roughly 7k–19k tokens. That gap — paired with append-only prefix-cache alignment and edit-safe source guards — is the whole product.
+## 1. Design Boundary: Pure Core vs. Host Adapters
 
-## System map
+Every transformation algorithm lives under [`src/core/`](../src/core/) with **zero `node:` imports and zero runtime `Buffer` references** (`node:` / `Buffer` appear only in comments and Web-standard types). The exact same compiler runs inside the Node daemon, the Cloudflare Worker bundle, offline export helpers, and the Vitest suite.
 
-![fiche architecture](architecture/fiche-architecture.svg)
+```text
++-------------------------------------------------------------------------+
+| Host Adapters (Node.js / Cloudflare Workers / TLS Warp / MCP / Swift)   |
+|  - src/node.ts        Loopback HTTP proxy (:47821), CLI, daemon boot     |
+|  - src/worker.ts      Cloudflare Workers entry (edge/serverless parity)  |
+|  - src/warp/          Local HTTPS CONNECT + macOS GUI launcher (--app)   |
+|  - src/mmu-store.ts   Optional 0600 atomic mmu-pages.json persistence    |
+|  - src/calibrate.ts   Live Vision probe runner & CLI calibration store   |
+|  - src/dashboard.ts   Warm Paper UI, PNG strip viewer, /api/mmu/*        |
+|  - src/mcp/server.ts  Stdio & HTTP (:47823) MCP server + proxy fallback  |
+|  - apps/macos-bar/    Swift 6 / SwiftUI menu bar status monitor          |
++------------------------------------+------------------------------------+
+                                     | RequestEnvelope / SessionState
+                                     v
++-------------------------------------------------------------------------+
+| Pure Core Engine (src/core/ — zero node: imports, zero runtime Buffer)  |
+|  - proxy.ts           Inbound/outbound orchestration & fail-open guard   |
+|  - schema-compiler.ts P0: XML-Island TSCG, Merkle $defs._fN, JSON unwrap |
+|  - text-hygiene.ts    Line compaction, ANSI/CR strips, opt-in user clean |
+|  - casi-delta.ts      P1: Gutter strip, seedBase, LIS alignment, FastCDC |
+|  - calibration.ts     P1: 4-axis probe & pixel/height clamps (tile<=768) |
+|  - reader-tier.ts     Model tier routing & calibrated font-band lookup   |
+|  - text-history.ts    P2: LSM-Context L1/L0/L2 single-block sticky epochs|
+|  - context-mmu.ts     P3: Virtual pages (pg_<12hex>), tail hydration,    |
+|                       Markovian folding, Turn-1 skills, IDF pruning      |
+|  - session-state.ts   Sealed epoch keys, pinned skills, folded episodes  |
+|  - google.ts / transform.ts / openai.ts  Wire adapters + Optical guard   |
++-------------------------------------------------------------------------+
+```
 
-| Layer | Files | Job |
-|---|---|---|
-| Entry points | `src/node.ts`, `src/worker.ts`, `src/warp/`, `src/mcp/server.ts`, `src/turn-report.ts` | CLI and local server (port 47821), Cloudflare Worker build, the `warp` CONNECT proxy, MCP server (`fiche-mcp`), `<5 ms` tail turn-report |
-| Proxy core | `src/core/proxy.ts`, `src/core/provider-router.ts`, `src/core/request-guard.ts`, `src/core/upstream-hosts.ts` | Routing, credential classification, model-scope & reader-tier gates, loopback Host/Origin guards, forwarding, streaming, events |
-| Text compiler | `src/core/schema-compiler.ts`, `text-hygiene.ts`, `toon.ts`, `text-history.ts`, `casi-delta.ts` | `TSCG` schema/static compiler, terminal ANSI/CR hygiene + `Drain` log folding + bijective `@toon`, `ACDC` frozen-epoch digestion, `CASI-Delta` line hashing, `isCodeOrDiffProtected` |
-| Wire transforms | `src/core/transform.ts` (Anthropic), `openai.ts` + `openai-history.ts` (Responses, Chat), `google.ts`, `history.ts`, `schema-strip.ts` | Find the static slab, the closed-tool history prefix, large tool results and reminders, and apply text hygiene / optical rendering |
-| Renderer | `src/core/render.ts`, `atlas*.ts`, `png.ts`, `factsheet.ts`, `vision-cost.ts`, `*-model-profiles.ts` | Text to grayscale/RGB PNG (`Spleen 5×8`, `Unifont`, `JetBrains Mono 10/12/14px`), one font and geometry profile per model band, plus verbatim `FactSheet` |
-| Cache state | `src/core/session-state.ts`, `codex-cache.ts` | Keep old pages/epochs byte-identical in `~/.fiche/session-state.json` so they stay in the prompt cache; repack only when no cache is live |
-| Accounting | `src/core/baseline.ts`, `measurement.ts`, `tracker.ts`, `cpt-fit.ts`, `pricing.ts`, `src/stats.ts`, `src/dashboard*.ts` | Cache-aware "without `fiche`" baseline, `~/.fiche/events.jsonl` log, `kosha` pricing & cliff avoidance, fitted CPT, dashboard |
-| Extras | `src/core/pin.ts`, `export.ts`, `messages-chat-bridge.ts`, `messages-responses-bridge.ts` | `@fiche pin` (legacy `@inkling pin` accepted), `fiche export`, and Anthropic-wire clients driving GPT or Chat Completions upstreams |
+## 2. Client Topology & Opt-In Provider Routing
 
-## One request
+`fiche` supports **29 built-in upstream hosts across 21 providers (`6` first-party + `23` COMPAT)** through four opt-in surfaces:
 
-![One request through fiche](architecture/request-flow.svg)
+1. **Shell Wrappers (`fiche shell-init --wrap`)**: Generates POSIX wrapper functions routing invocations via `fiche warp -- <cli>` (with `FICHE_BYPASS=1` bypass) for **9** CLIs (`claude`, `codex`, `agy`, `gemini`, `opencode`, `cursor-agent`, `amp`, `pi`, `aider`).
+2. **Loopback Proxy (`127.0.0.1:47821`)**: Accepts Anthropic Messages, OpenAI Responses & Chat Completions, and Google `generateContent` / `streamGenerateContent` wires.
+3. **TLS Warp (`fiche warp --app`)**: Local `CONNECT` MITM proxy using an owner-only local CA to intercept desktop Electron/native apps without rewriting binary configs.
+4. **Offline & Programmatic (`fiche export`, MCP)**: Deterministic bundle export (`promptfoo` / CI evals) and MCP tools (`check_model`, `transform_request`, `page_in`, `mmu_stats`, `health`, `stats`).
 
-- **Stage 1 (`TSCG`):** strips redundant JSON Schema metadata (`$schema`, `$comment`, redundant titles, divider lines, HTML comments) while preserving parameter names, types, required fields, enums, and constraints verbatim.
-- **Stage 2 (`Terminal / @toon / Drain`):** resolves `\r`/ANSI/backspace sequences, converts uniform JSON arrays to lossless bijective `@toon` tables, and folds repetitive boilerplate logs (`Drain`) while `isCodeOrDiffProtected` keeps numbered source reads and unified diffs byte-exact.
-- **Stage 3 (`ACDC`):** digests aged completed blocks behind `keepTailMessages` into append-only frozen epochs when payback/cliff math clears `kosha` economics.
-- **Stage 4 (`CASI-Delta`):** indexes remaining verbatim tool outputs by 64-bit hash and line postings to replace exact re-reads and near-duplicate diffs with compact cross-turn deltas.
-- **Stage 5 (Optical Microfiche, optical-tier models only):** renders the static slab, closed-tool history prefix, and large tool/reminder blocks into `Spleen` / `Unifont` / `JetBrains Mono` PNG pages paired with a deterministic ~96-token `FactSheet` (paths, SHAs, UUIDs, versions, flags, numbers).
-- **Always text:** the live tail (`keepTail` turns), any open tool sequence, the latest assistant `tool_use` turn, and the current user turn.
+For request attribution and fail-open control:
+- Sending `x-fiche-bypass: 1` forwards requests byte-for-byte untouched.
+- Unexpected exceptions inside any transform catch cleanly and fall back to the original body so inference never fails closed on compiler bugs.
 
-## Cache stability
+## 3. P0–P3 & Context-MMU Transformation Pipeline
 
-Most spend on long agent sessions is cache reads at 0.05×–0.1× the input price, so `fiche` never changes bytes it already sent:
+Depending on the resolved model tier in [`reader-tier.ts`](../src/core/reader-tier.ts) and [`calibration.ts`](../src/core/calibration.ts), a session takes one of two paths:
 
-- Sealed ACDC epochs and optical history grids are append-only. A chunk's bytes/pixels depend only on its message range, so old pages are read from cache on every later turn.
-- With no live cache, `packFill` repacks pages for density instead.
-- The factsheet uses a fixed order and contains no timestamps or randomness.
-- `prompt_cache_breakpoint` is removed for ChatGPT Codex (`/backend-api/codex/`), which rejects it.
+### Path A: Text + Context-MMU (0 images, default for uncalibrated text-tier models)
 
-## Model routing & font bands
+1. **Stage 0 — Turn-1 Skill Linker (`context-mmu.ts`)**: When a prompt carries `<skills>`, `Available skills:`, or `SKILL.md` catalogs (`>= 10` skills) with an active store and net savings `>= 400` chars & `>= 100` tokens, retains `DEFAULT_CORE_SKILLS` plus the top `maxVerbatim = 6` task-relevant skills, stubs low-relevance descriptions as `- <name> [<pgId>] (stubbed; mention name to auto-hydrate)`, and pins kept skills (`pinnedSkillCatalogHash` + up to `32` names per session) in `session-state.ts` so Turns `1..N` stay byte-identical. Mentioning any single- or multi-word stubbed skill later auto-hydrates it in the live tail.
+2. **P0 — Structural Normalization (`schema-compiler.ts`, `text-hygiene.ts`)**:
+   - **XML-Island TSCG**: Separates volatile tags (`VOLATILE_XML_TAGS`: `env`, `context`, `system-reminder`, `fast_mode_info`, `git_status`, `additional_metadata`) before `minParaChars` (`140` static text, `96` tool schemas) deduplication.
+   - **Merkle Schema DAG**: Factors repeated JSON subschemas into `$defs._fN` on Anthropic & OpenAI wires (bypassed on Google wire schemas).
+   - **Single-level JSON-in-JSON Unwrap**: Unescapes escaped strings across `8` standard fields (`output`, `stdout`, `stderr`, `content`, `result`, `body`, `text`, `data`), with `@fiche-kv` fallback for heavily escaped envelopes (`>= 40` tokens & `>= 15%` saved).
+   - **Opt-In User Hygiene**: `cleanUserPayloads` defaults to `false` on all 4 wires (leaving Turn-1 prompts untouched by default); when opted in, applies lossless ANSI/whitespace/`@toon` hygiene (`foldLogs: false`, `enableJsonUnwrap: false`, `enableDensityPrune: false`) to non-code/non-diff user payloads with `>= 1,500` non-volatile chars.
+3. **P1 — Cross-Turn Content-Addressable Dedupe (`casi-delta.ts`)**: Strips line-number gutters, seeds bases from assistant `Write`/`Edit` tool calls (`seedBase`), detects exact duplicates (`[fiche cas: exact duplicate...]`), tracks shifted line spans via Longest Increasing Subsequence (LIS), emits contextual deltas (`[fiche cas-delta vs ...]`, restricting timestamp/duration canonicalization strictly to real log streams so YAML/JSON config edits stay lossless), and falls back to `GEAR_TABLE` FastCDC slices (`8–48` lines).
+4. **P2 — LSM-Context Compacting Prefix (`text-history.ts`)**:
+   - **L1 (`tail = 2`)**: Compacts aged large blocks (`>= 1,500` tokens) strictly as 1-block `[item]` sticky epochs anchored by `sessionKey` + `fnv64Hex(e.raw)` with FIFO single-entry eviction.
+   - **L0 (`tail = 6`)**: Runs Kosha-gated epoch digests on older turns.
+   - **L2 Cold Repack**: Triggers only when upstream cache is confirmed cold (`everCacheAlive && !lastCacheAlive`, `1h + 30s` idle, or `413` backstop) with `justRepacked` anti-thrash protection across all `5` provider cache-read JSON `usage` fields (`cache_read_input_tokens`, `input_tokens_details.cached_tokens`, `prompt_tokens_details.cached_tokens`, `cachedContentTokenCount`, `prompt_cache_hit_tokens`).
+5. **P3 — Context-MMU Paging, Markovian Folding, IDF Pruning & Tail Hydration (`context-mmu.ts`)**:
+   - **Virtual Pages (`pg_<12hex>`)**: Evicted tool blocks become deterministic UTF-8 FNV-1a pages in `ContextPageStore` (`512`-page / `16 MiB` LRU protecting `skill-catalog` pages), rendered inline as `[fiche vm-page pg_<12hex> (<path>, <N>L) | top symbols: ... | page_in("pg_<12hex>")]`.
+   - **Birth-Time IDF Density Pruning (`pruneLowDensityBlob`)**: Scores verbose unstructured dumps using IDF line rarity `log(1 + n / (1 + freq))` plus structural weights while unconditionally skipping `FILE_READ_TOOL_RE`, `isCodeOrDiffProtected`, HTTP JSON, YAML, `STACK_PREFIX_RE`, bare `filename:line` entries, and coalescing only short (`<=64c`) low-score (`lineScores[i] < 4`) 1-line islands; refuses mutation if `store.maxBytes` rejects storage.
+   - **Markovian Folding**: Folds failed-to-passing test/build churn into the longest predecessor (`[fiche causal-episode ep_<10hex>: ...]` + `[folded into ep_<10hex>]`), anchored at first `FAIL`, preserving pre-failure reads, and gating on downstream payback before storing pages.
+   - **Tail Hydration**: `computeTailHydration` (fail-closed when `sessionKey` is missing or empty) injects `±15`-line slices exclusively inside `[fiche vm-hydrate] ... [/fiche vm-hydrate]` at the **live uncached tail** (`MAX_DEREF_CHARS = 65_536`). Explicit `page_in("pg_<12hex>")` via MCP rejects empty `""` `sessionKey` and falls back to daemon HTTP when needed.
 
-`readerTier` (`src/core/reader-tier.ts`) and profile tables (`claude-model-profiles.ts`, `gemini-model-profiles.ts`, `gpt-model-profiles.ts`) route models across four bands:
+### Path B: Hybrid Calibrated Optical (`optical` + TOON + hygiene)
 
-1. **Dense 5×8 bitmap (`spleen-5x8`, 5×8 cell + `Unifont` 8px fallback):** `claude-fable-5`, measured `gemini` vision tiers (`gemini-3.6-flash`, `3.7-flash`, `3.8-flash`, `gemini-4-argon`), `gpt-6` (non-Sol), and default GPT fallback (`312` cols on Claude/Gemini, `152` cols on GPT).
-2. **Spaced 5×8 bitmap (`spleen-5x8` + `2px` row spacing → 5×10 cell):** `claude-fable-5-1`, `claude-fable-5-2`, and other opt-in Claude models (`312` cols, `1568×728` max). Intermediate `jetbrains-mono-10` (`6×11`) and `jetbrains-mono-12` (`8×13`) atlases are also compiled in for `FICHE_GPT_PROFILES`.
-3. **Native 14px (`jetbrains-mono-14`, 9×16 cell + `Unifont` 14px fallback):** opt-in `gpt-5.6-sol` / `gpt-6.1-sol` / `gpt-6.2-sol` (`84` cols, `764×1954`), opt-in `grok-*` (`84` cols, `764×512`), and opt-in `qwen3.8-27b` (`84` cols, `764×512`, `providerImageCap: 32`).
-4. **Text-only deterministic hygiene (zero images):** `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-*`, `gpt-6*-astra`, `gemini-4-neon/carbon/hydrogen`, `deepseek`, `kimi`, `glm`, `minimax`, and `grok` (unless `FICHE_FORCE_IMAGES=1`).
+Models with verified vision legibility (either empirically measured or probed via `fiche calibrate <model>` across `spleen-5x8`, `spleen-5x10`, `jetbrains-mono-12`, and `jetbrains-mono-14` with `HEX >= 0.85`, `CODE >= 0.90`, `NUM >= 0.95`, `GUARD = 1.0`) render aged eligible history blocks onto calibrated monospace microfiche PNG strips (`src/core/calibration.ts` enforces height clamping on `<= 512px` latency-cliff models and pixel-width clamping on `tile` models so images never exceed the `768px` short edge — e.g., `152` cols at `5px`, `95` cols at `8px`, `84` cols at `9px`).
 
-## Further reading
+Two architectural invariants keep the Optical path cache-safe and edit-safe:
+- **Optical + CASI Mutual Exclusion**: When `opticalEnabled` / `effectiveImageCompress` is true across Google, Anthropic/Transform, and OpenAI wires, `CASI` is disabled (`!opticalEnabled`) so live tail diffs never become orphan `[fiche cas: ...]` pointers referencing collapsed PNG strips (`mcp/server.ts` reports `'image+TOON+hygiene'`).
+- **Google `pinnedUserText` Split & Live-Tail File Read Safety (`google.ts`)**: Mutable `pinnedUserText` is detached from `contents[0]` onto the trailing live turn so sealed optical strips in `contents[0]` stay prefix-immutable (`79.7%` cache hit vs `11.9%` prior to decoupling), while `read_file`/`view_file` responses stay verbatim in the live tail until sealed (`49.0%` raw / `34.1%` weighted saved, `editSafe = true`).
 
-- [CACHING_AND_SAVINGS.md](CACHING_AND_SAVINGS.md): how the baseline is computed
-- [HISTORY_CACHE_MODEL.md](HISTORY_CACHE_MODEL.md): the history grid and freeze rules
-- [MODEL_RENDER_PROFILES.md](MODEL_RENDER_PROFILES.md): per-model fonts and geometry
-- [SECURITY_MODEL.md](SECURITY_MODEL.md): credentials and routing
+For algorithm derivations and cost/savings math, see [CONTEXT_MMU_ARCHITECTURE.md](./CONTEXT_MMU_ARCHITECTURE.md).
+
+## 4. State, Security & Persistence Boundaries
+
+| State Artifact | Location | Default Mode | Security Controls |
+| --- | --- | --- | --- |
+| Session prefix seals & skill pins | `~/.fiche/session-state.json` | Enabled (disable via `FICHE_SESSION_STATE=off`) | `0600` file permissions, bounded LRU (`SESSIONS_MAX = 512`) |
+| Calibrated optical registry | `~/.config/fiche/calibrated-models.json` | Enabled for CLI `fiche calibrate` | `lstatSync` + `O_NOFOLLOW`, `1 MiB` load cap, `0600` atomic write |
+| Virtual memory pages (MMU) | `~/.fiche/mmu-pages.json` (adjacent to `$FICHE_LOG` when overridden) | **Daemon RAM-only** (opt-in: `FICHE_MMU_PERSIST=1`) | `lstatSync` + `O_NOFOLLOW`, `O_EXCL`, `0600`, `24h` idle TTL (drops missing/`<= 0`), `32 MiB` `load()` cap, high-confidence secret skip (PEM, `Bearer`, `sk-`, `gh[pousr]_`, `AKIA`, env secrets) |
+| Local savings events | `~/.fiche/events.jsonl` | Local append-only JSONL | Reverse-tail scanner (`<5 ms`), zero outbound telemetry |
+
+[`src/node.ts`](../src/node.ts) enforces loopback/Host validation, `sec-fetch-site: cross-site` rejection, and same-origin `Origin` checks across all dashboard routes (`GET` + mutations). [`src/dashboard.ts`](../src/dashboard.ts) serves `/api/mmu/*` and `/api/calibration` via `mmuJsonResponse` (`Cache-Control: no-store`, `X-Content-Type-Options: nosniff`), omits `factTokens` on unscoped `/api/mmu/stats`, rejects empty `sessionKey` with HTTP `400`, and caps query strings at `512` chars.
+
+## 5. CLI, MCP & Native Monitor Surfaces
+
+- **Calibration CLI**: `fiche calibrate <model> [--provider auto|google|anthropic|openai] [--band auto|spleen-5x8|spleen-5x10|jetbrains-mono-12|jetbrains-mono-14] [--dry-run] [--list] [--clear <model>] [--json]`
+- **MMU Inspection CLI**: `fiche mmu [stats | pages | page <id>] [--query <text>] [--session <key>] [--port <P>] [--json]`
+- **MCP Server (`:47823` / stdio)**: `page_in`, `mmu_stats` (`{ source, stats, pageCount, pages }`), `check_model`, `transform_request`, `health`, `stats` (with automatic HTTP fallback to the running daemon when local `page_in` misses, propagating `sessionKey`).
+- **FicheBar.app (`apps/macos-bar/`)**: Native Swift 6 / SwiftUI menu bar monitor tracking weighted vs. raw savings, cache hit rate, built-in compiler stages, and opt-in provider status.
+
+## 6. Verified Benchmark Summary (`bench/context-mmu-eval.mts`)
+
+Measured on the hardened 30-turn coding replay (`gemini-4-neon`, `google` wire, `904,363` baseline raw tokens / `281,715` weighted tokens):
+
+| Arm | Raw Save | Weighted Save | Cache Hit (Part / Unit) | p50 / p95 ms | EditSafe | Tail Recall |
+| --- | ---: | ---: | ---: | ---: | :---: | :---: |
+| Baseline (uncompressed) | 0.0% | 0.0% | 91.8% / 91.8% | 0.00 / 0.00 | `true` | `true` |
+| v0.18 Text (`lsm/mmu/skillLinker` off) | 42.5% | 35.8% | 87.0% / 86.9% | 8.65 / 13.60 | `true` | `false` |
+| P0–P3 Text + Context-MMU (0 images) | 43.1% | 37.0% | 87.4% / 87.3% | 15.83 / 21.06 | `true` | `true` |
+| P0–P3 + Calibrated Optical (`spleen-5x8`, 153 imgs) | 49.0% | 34.1% | 79.7% / 76.3% | 3.11 / 46.91 | `true` | `true` |
+
+Cross-wire 30-turn checks (all `14` active stages including `markov_fold`, both `editSafe = true` and `tailRecallVerified = true`):
+- **Anthropic (`claude-opus-5-5`, 1.25× write premium modeled)**: `45.1%` raw saved, `33.9%` weighted saved, `88.3%` cache hit (`15.05 ms` avg).
+- **OpenAI Responses (`gpt-6-astra`)**: `45.4%` raw saved, `39.5%` weighted saved, `89.7%` cache hit (`14.61 ms` avg).
+
+## 7. Zero-Drop Transport, Socket Activation & Warp Fail-Open (`#33` / `#34`)
+
+- **Upstream HTTP/1.1 Keep-Alive Fetch (`src/node-fetch.ts`, `#33`)**: Node adapter uses dedicated HTTP/1.1 `node:http` / `node:https` keep-alive `Agent`s (`keepAlive: true`) with persistent `'error'` listeners, `AbortSignal` teardown (`req.signal` client-disconnect propagation from `src/node.ts`), pull-based backpressure, and streaming decompression — avoiding Node 26 / `undici` HTTP/2 idle-reaper `ClientHttp2Stream` crashes.
+- **`launchd` & `systemd` Socket Activation (`src/launchd-socket.ts`, `src/node.ts`, `#34`)**: `fiche service install` compiles a `<launch.h>` exec trampoline (`~/.fiche/bin/fiche-launchd-exec`) and emits `<key>Sockets</key>` (`Listeners`), `ThrottleInterval: 1`, and `ExitTimeOut: 65`. `fiche` adopts inherited fd `3` via `LISTEN_FDS`/`LISTEN_PID` (also compatible with Linux `systemd`), binds `server.listen({ fd })` ahead of slow store/replay startup behind `readyPromise`, and preserves freshly accepted sockets across `SIGTERM` via `connTrack` (`closeIdleSockets(false)`) during the `60s` active SSE drain (`API_SHUTDOWN` absorbs one subsequent `launchctl bootout` `SIGTERM`).
+- **Fail-Open `fiche warp` & Loopback `NO_PROXY` (`src/warp/`)**: Probes `127.0.0.1:port` (`isLocalDaemonReachable`) and launches unwrapped (`FICHE_BYPASS=1`) when stopped; sets `NO_PROXY` / `no_proxy` (`mergeNoProxy` preserving existing entries + `localhost,127.0.0.1,::1`); and retries directly against origin on mid-session diverted `ECONNREFUSED` before piping request bytes (`failOpenOnDivertRefused: true`).

@@ -62,6 +62,12 @@ export interface WarpHandlerOptions {
   ca: CertificateAuthority;
   /** Called the first time each route diverts a request, for the log. */
   onDivert?: (host: string, path: string, target: string) => void;
+  /**
+   * When true, a diverted route whose target refuses the TCP connection
+   * (`ECONNREFUSED` before any request bytes are flushed) transparently retries
+   * once directly against the original upstream origin. Defaults to `false`.
+   */
+  failOpenOnDivertRefused?: boolean;
 }
 
 export interface WarpHandlers {
@@ -162,20 +168,26 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     res.socket?.setNoDelay?.(true);
     let normalizedOrigin: URL;
     let resolvedReq: URL;
-    let target: URL;
+    let path: string;
+    let normalizedUri: string;
+    let directTarget: URL;
+    let divertTarget: URL | null = null;
     try {
       normalizedOrigin = new URL(origin);
       resolvedReq = new URL(requestUri, normalizedOrigin);
       if (resolvedReq.origin !== normalizedOrigin.origin) {
         throw new Error('origin mismatch');
       }
-      const path = normalizeRoutePath(resolvedReq.pathname);
-      const normalizedUri = path + resolvedReq.search;
+      path = normalizeRoutePath(resolvedReq.pathname);
+      normalizedUri = path + resolvedReq.search;
       const route = matchRoute(routes, hostPort, path);
-      target = new URL(route ? rewriteUrl(route, normalizedUri) : `${origin}${normalizedUri}`);
-      if (route && !announced.has(route.pattern)) {
-        announced.add(route.pattern);
-        onDivert?.(hostPort, path, target.origin);
+      directTarget = new URL(`${origin}${normalizedUri}`);
+      if (route) {
+        divertTarget = new URL(rewriteUrl(route, normalizedUri));
+        if (!announced.has(route.pattern)) {
+          announced.add(route.pattern);
+          onDivert?.(hostPort, path, divertTarget.origin);
+        }
       }
     } catch {
       if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -185,74 +197,133 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
 
-    const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
-    const hostname =
-      target.hostname.startsWith('[') && target.hostname.endsWith(']')
-        ? target.hostname.slice(1, -1)
-        : target.hostname;
-    const outbound = send({
-      protocol: target.protocol,
-      hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      method: req.method,
-      path: target.pathname + target.search,
-      // Keep the agent's original Host: the downstream routes (and an upstream
-      // may sign) on the vhost, not on wherever we happened to send the bytes.
-      headers: forwardHeaders(req.headers),
-      setHost: false,
-      agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
-    });
-    outbound.setNoDelay?.(true);
+    let activeOutbound: ReturnType<typeof httpRequest> | undefined;
+    let activeUpstreamRes: IncomingMessage | undefined;
+    let downstreamClosed = false;
 
-    let upstreamRes: IncomingMessage | undefined;
+    const cleanupActive = () => {
+      downstreamClosed = true;
+      activeUpstreamRes?.destroy();
+      activeOutbound?.destroy();
+    };
+    res.on('close', () => {
+      if (res.writableFinished) return;
+      cleanupActive();
+    });
+    res.on('error', cleanupActive);
+    req.on('error', (err) => {
+      downstreamClosed = true;
+      if (activeOutbound && !activeOutbound.destroyed) activeOutbound.destroy(err);
+    });
+
     const abortDownstream = (err?: Error): void => {
       if (!res.writableEnded && !res.destroyed) {
         res.destroy(err);
       }
     };
-    outbound.on('response', (upstream) => {
-      upstreamRes = upstream;
-      upstream.socket?.setNoDelay?.(true);
-      upstream.on('error', abortDownstream);
-      upstream.on('aborted', () => abortDownstream());
-      upstream.on('close', () => {
-        if (!upstream.complete) abortDownstream();
-      });
-      res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
-      res.flushHeaders?.();
-      // Streamed, never buffered: /v1/messages is SSE and must arrive token by
-      // token or the agent appears to hang until the response completes.
-      upstream.pipe(res);
-    });
-    outbound.on('error', (err) => {
-      if (!req.destroyed) req.destroy?.();
-      // Our own teardown below surfaces here as ECONNRESET; the client is
-      // already gone, so writing a 502 into it would throw.
-      if (res.writableEnded || res.destroyed) return;
-      if (res.headersSent) {
-        res.destroy?.(err);
-        return;
+
+    const sendToTarget = (target: URL, allowFailOpen: boolean): void => {
+      const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
+      const hostname =
+        target.hostname.startsWith('[') && target.hostname.endsWith(']')
+          ? target.hostname.slice(1, -1)
+          : target.hostname;
+      if (allowFailOpen) {
+        req.pause?.();
       }
-      res.writeHead(502, { 'content-type': 'text/plain' });
-      res.end(`fiche warp: upstream error: ${err.message}`);
-    });
-    // An SSE completion only ends when the model stops. If the agent is killed
-    // mid-stream nothing else cancels the upstream: the response keeps draining
-    // into a dead socket, and the keepAlive agent later hands that same
-    // half-consumed connection to the next request.
-    const cleanup = () => {
-      upstreamRes?.destroy();
-      outbound.destroy();
+      const outbound = send({
+        protocol: target.protocol,
+        hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        method: req.method,
+        path: target.pathname + target.search,
+        // Keep the agent's original Host: the downstream routes (and an upstream
+        // may sign) on the vhost, not on wherever we happened to send the bytes.
+        headers: forwardHeaders(req.headers),
+        setHost: false,
+        agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
+      });
+      activeOutbound = outbound;
+      outbound.setNoDelay?.(true);
+
+      let piped = false;
+      let retried = false;
+      const startPipe = () => {
+        if (piped || downstreamClosed || outbound.destroyed) return;
+        piped = true;
+        if (req.readableEnded) outbound.end();
+        else req.pipe(outbound);
+      };
+
+      const onResponse = (upstream: IncomingMessage) => {
+        activeUpstreamRes = upstream;
+        upstream.socket?.setNoDelay?.(true);
+        upstream.on('error', abortDownstream);
+        upstream.on('aborted', () => abortDownstream());
+        upstream.on('close', () => {
+          if (!upstream.complete) abortDownstream();
+        });
+        res.writeHead(upstream.statusCode ?? 502, forwardHeaders(upstream.headers));
+        res.flushHeaders?.();
+        // Streamed, never buffered: /v1/messages is SSE and must arrive token by
+        // token or the agent appears to hang until the response completes.
+        upstream.pipe(res);
+      };
+
+      const onError = (err: Error) => {
+        if (
+          allowFailOpen
+          && !piped
+          && !retried
+          && !downstreamClosed
+          && !res.headersSent
+          && !res.writableEnded
+          && !res.destroyed
+          && (err as NodeJS.ErrnoException).code === 'ECONNREFUSED'
+        ) {
+          retried = true;
+          outbound.off('response', onResponse);
+          outbound.off('error', onError);
+          outbound.on('error', () => {});
+          if (!outbound.destroyed) outbound.destroy();
+          const failKey = `${hostPort}${path}:failopen`;
+          if (!announced.has(failKey)) {
+            announced.add(failKey);
+            if (!process.stdout.isTTY) {
+              console.error(`[fiche] warp: ${target.origin} refused (${hostPort}${path}) — failing open direct`);
+            }
+          }
+          sendToTarget(directTarget, false);
+          return;
+        }
+        if (!req.destroyed) req.destroy?.();
+        // Our own teardown below surfaces here as ECONNRESET; the client is
+        // already gone, so writing a 502 into it would throw.
+        if (res.writableEnded || res.destroyed) return;
+        if (res.headersSent) {
+          res.destroy?.(err);
+          return;
+        }
+        res.writeHead(502, { 'content-type': 'text/plain' });
+        res.end(`fiche warp: upstream error: ${err.message}`);
+      };
+
+      outbound.on('response', onResponse);
+      outbound.on('error', onError);
+
+      if (allowFailOpen) {
+        outbound.once('socket', (sock) => {
+          if (!sock.connecting) startPipe();
+          else sock.once('connect', startPipe);
+        });
+      } else {
+        startPipe();
+      }
     };
-    res.on('close', () => {
-      if (res.writableFinished) return;
-      cleanup();
-    });
-    res.on('error', cleanup);
-    req.on('error', (err) => {
-      if (!outbound.destroyed) outbound.destroy(err);
-    });
-    req.pipe(outbound);
+
+    const initialTarget = divertTarget ?? directTarget;
+    const allowInitialFailOpen = Boolean(divertTarget && options.failOpenOnDivertRefused);
+    sendToTarget(initialTarget, allowInitialFailOpen);
   };
 
   const connectTargets = new WeakMap<Socket, { host: string; port: string }>();

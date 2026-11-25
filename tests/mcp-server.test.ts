@@ -1,4 +1,6 @@
+import { createServer as createNodeHttpServer } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
+import { getGlobalMmuStore, resetGlobalMmuStore } from '../src/core/context-mmu.js';
 import {
   MCP_MAX_BYTES,
   MCP_TOOLS,
@@ -24,7 +26,10 @@ function rpc(method: string, params?: unknown, id: number | null = 1) {
 }
 
 describe('MCP server', () => {
-  afterEach(() => resetMcpStatsForTests());
+  afterEach(() => {
+    resetMcpStatsForTests();
+    resetGlobalMmuStore();
+  });
 
   it('lists tools with directory annotations and answers initialize', async () => {
     const init = await handleMcpMessage(rpc('initialize', {
@@ -46,6 +51,8 @@ describe('MCP server', () => {
       'transform_request',
       'health',
       'stats',
+      'page_in',
+      'mmu_stats',
     ]);
     for (const tool of tools) {
       expect(tool.annotations).toMatchObject({
@@ -163,6 +170,145 @@ describe('MCP server', () => {
       expect(denied.status).toBe(403);
     } finally {
       await http.close();
+    }
+  });
+
+  it('serves page_in and mmu_stats from in-process MMU store and falls back to daemon loopback', async () => {
+    const store = getGlobalMmuStore();
+    const code = [
+      '// src/demo/auth.ts',
+      'export function helperOne() { return 1; }',
+      'export async function verifySessionToken(tok: string): Promise<boolean> {',
+      '  return tok.startsWith("live_");',
+      '}',
+      'export function helperTwo() { return 2; }',
+    ].join('\n');
+    const page = store.storePage({
+      sessionKey: 'sess-mcp-1',
+      refId: 'src/demo/auth.ts',
+      toolName: 'Read',
+      rawText: code,
+    });
+
+    // 1) page_in by exact pageId + line slice
+    const byId = await handleMcpMessage(rpc('tools/call', {
+      name: 'page_in',
+      arguments: { pageId: page.id, startLine: 3, endLine: 5 },
+    }, 10)) as { result: { isError: boolean; structuredContent: { source: string; pageId: string; startLine: number; endLine: number; text: string } } };
+    expect(byId.result.isError).toBe(false);
+    expect(byId.result.structuredContent.source).toBe('local');
+    expect(byId.result.structuredContent.pageId).toBe(page.id);
+    expect(byId.result.structuredContent.startLine).toBe(3);
+    expect(byId.result.structuredContent.endLine).toBe(5);
+    expect(byId.result.structuredContent.text).toContain('verifySessionToken');
+
+    // 2) page_in by symbol query
+    const byQuery = await handleMcpMessage(rpc('tools/call', {
+      name: 'page_in',
+      arguments: { query: 'verifySessionToken', maxLines: 4 },
+    }, 11)) as { result: { isError: boolean; structuredContent: { pageId: string; text: string; matches: unknown[] } } };
+    expect(byQuery.result.isError).toBe(false);
+    expect(byQuery.result.structuredContent.pageId).toBe(page.id);
+    expect(byQuery.result.structuredContent.text).toContain('verifySessionToken');
+    expect(byQuery.result.structuredContent.matches.length).toBeGreaterThanOrEqual(1);
+
+    // 3) page_in error on missing args and missing pageId
+    const missingArgs = await handleMcpMessage(rpc('tools/call', {
+      name: 'page_in',
+      arguments: {},
+    }, 12)) as { result: { isError: boolean } };
+    expect(missingArgs.result.isError).toBe(true);
+
+    const missingPage = await handleMcpMessage(rpc('tools/call', {
+      name: 'page_in',
+      arguments: { pageId: 'pg_000000000000' },
+    }, 13)) as { result: { isError: boolean } };
+    expect(missingPage.result.isError).toBe(true);
+
+    // 4) mmu_stats local inspection
+    const localStatsRes = await handleMcpMessage(rpc('tools/call', {
+      name: 'mmu_stats',
+      arguments: { sessionKey: 'sess-mcp-1' },
+    }, 14)) as { result: { isError: boolean; structuredContent: { source: string; pageCount: number; stats: { pagesStored: number } } } };
+    expect(localStatsRes.result.isError).toBe(false);
+    expect(localStatsRes.result.structuredContent.source).toBe('local');
+    expect(localStatsRes.result.structuredContent.pageCount).toBe(1);
+    expect(localStatsRes.result.structuredContent.stats.pagesStored).toBeGreaterThanOrEqual(1);
+
+    // 5) Standalone stdio MCP fallback when global store is empty
+    resetGlobalMmuStore();
+    const daemonMock = createNodeHttpServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (url.pathname === '/api/mmu/page') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          pageId: 'pg_deadbeefcafe',
+          startLine: 1,
+          endLine: 2,
+          text: 'daemon line 1\ndaemon line 2',
+        }));
+        return;
+      }
+      if (url.pathname === '/api/mmu/stats') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          stats: { pagesStored: 9 },
+          pageCount: 9,
+          pages: [],
+        }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => daemonMock.listen(0, '127.0.0.1', () => resolve()));
+    const prevPort = process.env.PORT;
+    try {
+      const addr = daemonMock.address() as { port: number };
+      process.env.PORT = String(addr.port);
+
+      const remotePage = await handleMcpMessage(rpc('tools/call', {
+        name: 'page_in',
+        arguments: { pageId: 'pg_deadbeefcafe' },
+      }, 15)) as { result: { isError: boolean; structuredContent: { source: string; pageId: string; text: string } } };
+      expect(remotePage.result.isError).toBe(false);
+      expect(remotePage.result.structuredContent.source).toBe('daemon');
+      expect(remotePage.result.structuredContent.pageId).toBe('pg_deadbeefcafe');
+      expect(remotePage.result.structuredContent.text).toContain('daemon line 1');
+
+      const remoteStats = await handleMcpMessage(rpc('tools/call', {
+        name: 'mmu_stats',
+        arguments: {},
+      }, 16)) as { result: { isError: boolean; structuredContent: { source: string; pageCount: number } } };
+      expect(remoteStats.result.isError).toBe(false);
+      expect(remoteStats.result.structuredContent.source).toBe('daemon');
+      expect(remoteStats.result.structuredContent.pageCount).toBe(9);
+    } finally {
+      await new Promise<void>((resolve) => daemonMock.close(() => resolve()));
+      if (prevPort === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort;
+    }
+
+    // 6) Offline daemon fails cleanly and swiftly
+    const prevPort2 = process.env.PORT;
+    try {
+      process.env.PORT = '1'; // closed port on loopback
+      const offlinePage = await handleMcpMessage(rpc('tools/call', {
+        name: 'page_in',
+        arguments: { pageId: 'pg_deadbeefcafe' },
+      }, 17)) as { result: { isError: boolean; structuredContent: { error: string } } };
+      expect(offlinePage.result.isError).toBe(true);
+      expect(offlinePage.result.structuredContent.error).toContain('unreachable');
+
+      const offlineStats = await handleMcpMessage(rpc('tools/call', {
+        name: 'mmu_stats',
+        arguments: {},
+      }, 18)) as { result: { isError: boolean; structuredContent: { daemonRunning: boolean; pageCount: number } } };
+      expect(offlineStats.result.isError).toBe(false);
+      expect(offlineStats.result.structuredContent.daemonRunning).toBe(false);
+      expect(offlineStats.result.structuredContent.pageCount).toBe(0);
+    } finally {
+      if (prevPort2 === undefined) delete process.env.PORT;
+      else process.env.PORT = prevPort2;
     }
   });
 });

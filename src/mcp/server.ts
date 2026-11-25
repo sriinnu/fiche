@@ -8,13 +8,14 @@ import { shouldImageModel } from '../core/reader-tier.js';
 import { isFicheSupportedModel } from '../core/applicability.js';
 import { transformAnyRequest, countBillable, type RequestWire } from '../core/request-transform.js';
 import { supportsExplicitPromptCacheBreakpoint } from '../core/codex-cache.js';
+import { getGlobalMmuStore } from '../core/context-mmu.js';
 import { defaultEventsFilePath, readTurnReport } from '../turn-report.js';
 
 declare const __FICHE_VERSION__: string | undefined;
 
 export const MCP_PROTOCOL = '2025-03-26';
 export const SERVER_NAME = 'fiche-mcp';
-export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.18.0';
+export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.19.0';
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -106,6 +107,27 @@ export const MCP_TOOLS = [
     [],
     { ...READ_ONLY, idempotentHint: false },
   ),
+  tool(
+    'page_in',
+    'Retrieve verbatim lines from Fiche Context-MMU virtual memory by pageId (e.g. pg_...) or symbol/text query, optionally sliced by startLine/endLine/maxLines. Queries the local MMU store first, then falls back to the running proxy daemon on loopback.',
+    {
+      pageId: { type: 'string', description: 'MMU page ID to dereference, for example pg_a1b2c3d4e5f6.' },
+      query: { type: 'string', description: 'Symbol name, file basename, or text query to find or focus an MMU page (<= 512 chars).' },
+      sessionKey: { type: 'string', description: 'Optional session key to scope page lookup to one session.' },
+      startLine: { type: 'number', description: '1-based start line within the matched page.' },
+      endLine: { type: 'number', description: '1-based end line within the matched page.' },
+      maxLines: { type: 'number', description: 'Maximum lines to return (default 120, max 500).' },
+    },
+    [],
+  ),
+  tool(
+    'mmu_stats',
+    'Inspect Fiche Context-MMU virtual memory counters and resident page metadata (no raw page bodies). Queries the local MMU store first, then falls back to the running proxy daemon on loopback.',
+    {
+      sessionKey: { type: 'string', description: 'Optional session key filter for resident MMU pages.' },
+    },
+    [],
+  ),
 ];
 
 function textResult(payload: unknown, isError = false) {
@@ -120,11 +142,23 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
+function resolveDaemonPort(): number {
+  const envPort = Number(process.env.PORT ?? 47821);
+  return Number.isSafeInteger(envPort) && envPort > 0 && envPort <= 65535 ? envPort : 47821;
+}
+
+function parsePositiveIntArg(value: unknown, field: string): { ok: true; value: number | undefined } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, value: undefined };
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    return { ok: false, error: `${field} must be a positive integer` };
+  }
+  return { ok: true, value };
+}
+
 async function callTool(name: string, args: Record<string, unknown>) {
   stats.calls += 1;
   if (name === 'health') {
-    const envPort = Number(process.env.PORT ?? 47821);
-    const port = Number.isSafeInteger(envPort) && envPort > 0 && envPort <= 65535 ? envPort : 47821;
+    const port = resolveDaemonPort();
     let proxy: Record<string, unknown> = {
       running: false,
       port,
@@ -137,6 +171,8 @@ async function callTool(name: string, args: Record<string, unknown>) {
       if (res.ok) {
         const data = (await res.json()) as Record<string, unknown>;
         proxy = { running: true, ...data };
+      } else {
+        await res.body?.cancel().catch(() => undefined);
       }
     } catch {
       // Proxy daemon unreachable — fast fail-open status
@@ -161,6 +197,169 @@ async function callTool(name: string, args: Record<string, unknown>) {
         : null,
     });
   }
+  if (name === 'page_in') {
+    if (args.pageId !== undefined && (typeof args.pageId !== 'string' || !args.pageId.trim())) {
+      return textResult({ error: 'pageId must be a non-empty string' }, true);
+    }
+    if (args.query !== undefined && (typeof args.query !== 'string' || !args.query.trim())) {
+      return textResult({ error: 'query must be a non-empty string' }, true);
+    }
+    if (args.sessionKey !== undefined && (typeof args.sessionKey !== 'string' || !args.sessionKey.trim())) {
+      return textResult({ error: 'sessionKey must be a non-empty string' }, true);
+    }
+    const pageId = typeof args.pageId === 'string' ? args.pageId.trim() : undefined;
+    const query = typeof args.query === 'string' ? args.query.trim() : undefined;
+    const sessionKey = typeof args.sessionKey === 'string' ? args.sessionKey.trim() : undefined;
+    if (query && query.length > 512) {
+      return textResult({ error: 'query must be <= 512 chars' }, true);
+    }
+    if (!pageId && !query) {
+      return textResult({ error: 'pageId or query must be provided' }, true);
+    }
+    const startParsed = parsePositiveIntArg(args.startLine, 'startLine');
+    if (!startParsed.ok) return textResult({ error: startParsed.error }, true);
+    const endParsed = parsePositiveIntArg(args.endLine, 'endLine');
+    if (!endParsed.ok) return textResult({ error: endParsed.error }, true);
+    const maxParsed = parsePositiveIntArg(args.maxLines, 'maxLines');
+    if (!maxParsed.ok) return textResult({ error: maxParsed.error }, true);
+    const maxLines = maxParsed.value !== undefined ? Math.min(500, maxParsed.value) : 120;
+
+    const store = getGlobalMmuStore();
+    if (pageId) {
+      const hit = store.derefPage(pageId, {
+        sessionKey,
+        startLine: startParsed.value,
+        endLine: endParsed.value,
+        query,
+        maxLines,
+      });
+      if (hit) {
+        return textResult({
+          source: 'local',
+          pageId: hit.page.id,
+          refId: hit.page.refId,
+          sessionKey: hit.page.sessionKey,
+          filePath: hit.page.filePath,
+          lineCount: hit.page.lineCount,
+          startLine: hit.startLine,
+          endLine: hit.endLine,
+          text: hit.text,
+          symbols: hit.page.symbols,
+        });
+      }
+    } else {
+      const matches = store.searchPages(query!, sessionKey);
+      if (matches.length > 0) {
+        const top = matches[0]!;
+        const hit = store.derefPage(top.page.id, {
+          sessionKey: top.page.sessionKey,
+          startLine: startParsed.value,
+          endLine: endParsed.value,
+          query,
+          maxLines,
+        });
+        return textResult({
+          source: 'local',
+          pageId: top.page.id,
+          refId: top.page.refId,
+          sessionKey: top.page.sessionKey,
+          filePath: top.page.filePath,
+          lineCount: top.page.lineCount,
+          startLine: hit?.startLine ?? 1,
+          endLine: hit?.endLine ?? 0,
+          text: hit?.text ?? '',
+          symbols: top.page.symbols,
+          matches: matches.slice(0, 5).map((m) => ({
+            pageId: m.page.id,
+            refId: m.page.refId,
+            filePath: m.page.filePath,
+            score: m.score,
+            matchedLine: m.matchedLine,
+          })),
+        });
+      }
+    }
+
+    const port = resolveDaemonPort();
+    const qs = new URLSearchParams();
+    if (pageId) qs.set('pageId', pageId);
+    if (query) qs.set('query', query);
+    if (sessionKey) qs.set('sessionKey', sessionKey);
+    if (startParsed.value !== undefined) qs.set('startLine', String(startParsed.value));
+    if (endParsed.value !== undefined) qs.set('endLine', String(endParsed.value));
+    qs.set('maxLines', String(maxLines));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/mmu/page?${qs.toString()}`, {
+        signal: AbortSignal.timeout(250),
+      });
+      const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!res.ok || !data) {
+        const msg = typeof data?.error === 'string' ? data.error : `MMU page lookup failed (HTTP ${res.status})`;
+        return textResult({ error: msg, source: 'daemon', port }, true);
+      }
+      return textResult({ source: 'daemon', ...data });
+    } catch {
+      return textResult({
+        error: 'MMU page not found locally and fiche proxy daemon is unreachable',
+        port,
+        hint: 'Start proxy daemon with `fiche` or `fiche service start`',
+      }, true);
+    }
+  }
+  if (name === 'mmu_stats') {
+    if (args.sessionKey !== undefined && (typeof args.sessionKey !== 'string' || !args.sessionKey.trim())) {
+      return textResult({ error: 'sessionKey must be a non-empty string' }, true);
+    }
+    const sessionKey = typeof args.sessionKey === 'string' ? args.sessionKey.trim() : undefined;
+    const store = getGlobalMmuStore();
+    const allPages = store.listPages();
+    const storeStats = store.getStats();
+    const hasLocalState =
+      allPages.length > 0 ||
+      storeStats.pagesStored > 0 ||
+      storeStats.tailHydrations > 0 ||
+      storeStats.markovFolds > 0 ||
+      storeStats.skillsStubbed > 0 ||
+      storeStats.densityPrunedBlocks > 0;
+    if (hasLocalState) {
+      const pages = sessionKey ? store.listPages(sessionKey) : allPages;
+      const safePages = pages.slice(0, 50).map((p) => {
+        if (sessionKey) return p;
+        const { factTokens: _omitted, ...rest } = p;
+        return rest;
+      });
+      return textResult({
+        source: 'local',
+        stats: storeStats,
+        pageCount: pages.length,
+        pages: safePages,
+      });
+    }
+
+    const port = resolveDaemonPort();
+    const qs = sessionKey ? `?sessionKey=${encodeURIComponent(sessionKey)}` : '';
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/mmu/stats${qs}`, {
+        signal: AbortSignal.timeout(250),
+      });
+      const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!res.ok || !data) {
+        const msg = typeof data?.error === 'string' ? data.error : `MMU stats lookup failed (HTTP ${res.status})`;
+        return textResult({ error: msg, source: 'daemon', port }, true);
+      }
+      return textResult({ source: 'daemon', ...data });
+    } catch {
+      // Daemon offline — return fail-open zero stats below
+    }
+    return textResult({
+      source: 'local',
+      daemonRunning: false,
+      port,
+      stats: storeStats,
+      pageCount: 0,
+      pages: [],
+    });
+  }
   if (name === 'check_model') {
     const model = args.model;
     if (typeof model !== 'string' || !model.trim()) return textResult({ error: 'model must be a non-empty string' }, true);
@@ -171,7 +370,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
       model,
       inScope,
       readerTier: tier,
-      textEngine: tier === 'image' ? 'image+CASI+hygiene' : 'TSCG+TOON+CASI+ACDC',
+      textEngine: tier === 'image' ? 'image+TOON+hygiene' : 'TSCG+TOON+CASI+ACDC',
       action: !inScope
         ? 'passthrough: model is outside FICHE_MODELS'
         : tier === 'image'

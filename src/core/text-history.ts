@@ -16,9 +16,12 @@
  * Workers-safe: zero `node:` imports.
  */
 
+import { computeHorizonPaybackLimit, fnv64Hex } from './context-mmu.js';
 import { factSheetText } from './factsheet.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
+import { resetGlobalPrefixTape } from './prefix-tape.js';
 import { evaluateCliffAvoidance, priceMode, resolvePriceRates } from './pricing.js';
+import { hasSealedEpochKey, recordSealedEpochKey } from './session-state.js';
 
 export interface TextEpochBlock {
   readonly msgIndex: number;
@@ -38,6 +41,14 @@ export interface TextEpochPlanArgs {
   readonly keepTailMessages?: number;
   readonly epochTokenTarget?: number;
   readonly maxPaybackReads?: number;
+  readonly sessionKey?: string;
+  readonly sessionCacheCold?: boolean;
+  readonly enableLsm?: boolean;
+  readonly lsmEditTailMessages?: number;
+  readonly lsmMinLargeBlockTokens?: number;
+  /** When true, only replay already-sealed sticky epochs without sealing new candidates. */
+  readonly stickyOnly?: boolean;
+  readonly onPageOut?: (block: TextEpochBlock, raw: string, digest: string) => string | undefined;
 }
 
 export interface TextEpochPlanResult {
@@ -61,8 +72,24 @@ const LOG_CRITICAL_RE =
 const CODE_DECL_RE =
   /^\s*(?:export\s+(?:default\s+)?(?:async\s+)?|pub(?:\([^)]*\))?\s+(?:async\s+)?|async\s+|static\s+|private\s+|protected\s+|public\s+)?(?:function|class|interface|type|enum|struct|trait|impl|fn|func|def|mod|namespace|module)\b|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?(?:\([^)]*\)|\w+)\s*=>|^\s*(?:import|from\s+\S+\s+import|package|use\s+|#include)\b/;
 
+const TOKEN_CACHE_MAX = 2048;
+const tokenCountCache = new Map<string, number>();
+
+function countTokensExactCached(s: string): number {
+  const key = `${s.length}:${fnv64Hex(s)}`;
+  const hit = tokenCountCache.get(key);
+  if (hit !== undefined) return hit;
+  const tok = gptTokenCount(s);
+  if (tokenCountCache.size >= TOKEN_CACHE_MAX) {
+    const oldest = tokenCountCache.keys().next().value;
+    if (oldest !== undefined) tokenCountCache.delete(oldest);
+  }
+  tokenCountCache.set(key, tok);
+  return tok;
+}
+
 function countTokens(s: string): number {
-  if (s.length <= TOKEN_EXACT_LIMIT && !hasLongUnbrokenBpeChunk(s)) return gptTokenCount(s);
+  if (s.length <= TOKEN_EXACT_LIMIT && !hasLongUnbrokenBpeChunk(s)) return countTokensExactCached(s);
   return Math.ceil(s.length / 3.5);
 }
 
@@ -73,7 +100,7 @@ function estimateTokenPair(before: string, after: string): [number, number] {
     !hasLongUnbrokenBpeChunk(before) &&
     !hasLongUnbrokenBpeChunk(after)
   ) {
-    return [gptTokenCount(before), gptTokenCount(after)];
+    return [countTokensExactCached(before), countTokensExactCached(after)];
   }
   return [Math.ceil(before.length / 3.5), Math.ceil(after.length / 3.5)];
 }
@@ -100,6 +127,14 @@ function lastNonWsCode(text: string): number {
 const STICKY_EPOCH_MAX = 1024;
 const stickySealedEpochs = new Set<string>();
 const stickyCliffEpochs = new Map<string, number>();
+
+/** Test seam: drop in-memory sticky epoch caches (e.g. to verify restart recovery via session-state). */
+export function resetTextEpochStickyState(): void {
+  stickySealedEpochs.clear();
+  stickyCliffEpochs.clear();
+  tokenCountCache.clear();
+  resetGlobalPrefixTape();
+}
 
 const LOG_BRACKET_TS_RE = /^\[\s*(?:\d{4}-|\d{2}:)/;
 
@@ -267,12 +302,40 @@ export function extractStructuralDigest(text: string, refId = 'prior'): string {
   return appendSheet([header, ...bodyLines].join('\n'));
 }
 
+function isAlreadyCompactedMarker(raw: string): boolean {
+  return (
+    raw.startsWith('[fiche cas') ||
+    raw.startsWith('[fiche epoch-digest') ||
+    raw.startsWith('[fiche vm-page') ||
+    raw.startsWith('[fiche causal-episode ') ||
+    raw.startsWith('[folded into ') ||
+    raw.startsWith('[inkling cas') ||
+    raw.startsWith('[inkling epoch-digest')
+  );
+}
+
 export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanResult {
   const keepTail = args.keepTailMessages ?? 6;
   const epochTarget = args.epochTokenTarget ?? 4_000;
   const maxPayback = args.maxPaybackReads ?? 12;
+  const lsmActive =
+    args.enableLsm !== false &&
+    (args.enableLsm === true ||
+      args.sessionKey !== undefined ||
+      args.sessionCacheCold !== undefined ||
+      args.onPageOut !== undefined ||
+      args.lsmEditTailMessages !== undefined ||
+      args.lsmMinLargeBlockTokens !== undefined);
+  const lsmEditTail = Math.max(0, args.lsmEditTailMessages ?? 2);
+  const lsmMinLargeTokens = Math.max(1, args.lsmMinLargeBlockTokens ?? 1_500);
+
   const cutoffMsg = args.totalMessages - keepTail;
-  if (cutoffMsg <= 1 || args.blocks.length === 0) {
+  const cutoffL1 = args.totalMessages - lsmEditTail;
+
+  if (args.blocks.length === 0) {
+    return { changed: false, sealedEpochs: 0, compactedBlocks: 0, savedChars: 0, savedTokens: 0 };
+  }
+  if (lsmActive ? cutoffL1 <= 1 && cutoffMsg <= 1 : cutoffMsg <= 1) {
     return { changed: false, sealedEpochs: 0, compactedBlocks: 0, savedChars: 0, savedTokens: 0 };
   }
 
@@ -280,38 +343,120 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     block: TextEpochBlock;
     raw: string;
     rawTokens: number;
+    sig: string;
   }
 
-  const eligible: Candidate[] = [];
+  const maxCandidateCutoff = lsmActive ? Math.max(cutoffMsg, cutoffL1) : cutoffMsg;
+  const agedEligible: Candidate[] = [];
+  const l1ZoneBlocks: Array<Candidate | null> = [];
+  const coldL2Eligible: Candidate[] = [];
+
   for (const b of args.blocks) {
-    if (b.msgIndex <= 0 || b.msgIndex >= cutoffMsg) continue;
+    if (b.msgIndex <= 0 || b.msgIndex >= maxCandidateCutoff) continue;
     const raw = b.getText();
-    if (raw.length < 1000) continue;
-    if (
-      raw.startsWith('[fiche cas') ||
-      raw.startsWith('[fiche epoch-digest') ||
-      raw.startsWith('[inkling cas') ||
-      raw.startsWith('[inkling epoch-digest')
-    ) continue;
-    eligible.push({ block: b, raw, rawTokens: countTokens(raw) });
+    if (raw.length < 1000) {
+      if (lsmActive && !args.sessionCacheCold && b.msgIndex >= Math.max(1, cutoffMsg) && b.msgIndex < cutoffL1) {
+        l1ZoneBlocks.push(null);
+      }
+      continue;
+    }
+    if (isAlreadyCompactedMarker(raw)) {
+      if (lsmActive && !args.sessionCacheCold && b.msgIndex >= Math.max(1, cutoffMsg) && b.msgIndex < cutoffL1) {
+        l1ZoneBlocks.push(null);
+      }
+      continue;
+    }
+    const cand: Candidate = {
+      block: b,
+      raw,
+      rawTokens: countTokens(raw),
+      sig: `${b.refId}:${raw.length}:${fnv64Hex(raw)}`,
+    };
+    if (lsmActive && args.sessionCacheCold === true) {
+      if (b.msgIndex < cutoffL1) coldL2Eligible.push(cand);
+    } else if (b.msgIndex < cutoffMsg) {
+      agedEligible.push(cand);
+    } else if (lsmActive && b.msgIndex < cutoffL1) {
+      l1ZoneBlocks.push(cand);
+    }
   }
 
-  if (eligible.length === 0) {
-    return { changed: false, sealedEpochs: 0, compactedBlocks: 0, savedChars: 0, savedTokens: 0 };
-  }
+  const mode = priceMode();
+  const keyPrefix = `${args.sessionKey ?? ''}\0${mode}\0${args.model ?? ''}\0${args.ttlSec ?? ''}\0${maxPayback}\0`;
+  const buildStickyKey = (epoch: readonly Candidate[]): string =>
+    `${keyPrefix}${epoch.map((e) => e.sig).join('|')}`;
 
-  // Partition deterministically from the oldest eligible block forward into fixed epochs.
-  // Any trailing remainder < epochTarget is NOT sealed, keeping earlier sealed epochs frozen.
+  const isKeySticky = (key: string): boolean =>
+    stickySealedEpochs.has(key) || hasSealedEpochKey(args.sessionKey, key);
+
+  const isEpochStickySealed = (epoch: readonly Candidate[]): boolean => {
+    if (epoch.length === 0) return false;
+    return isKeySticky(buildStickyKey(epoch));
+  };
+
   const sealedList: Candidate[][] = [];
-  let pending: Candidate[] = [];
-  let pendingTokens = 0;
-  for (const item of eligible) {
-    pending.push(item);
-    pendingTokens += item.rawTokens;
-    if (pendingTokens >= epochTarget) {
+  const stickyOnly = args.stickyOnly === true;
+
+  if (lsmActive && args.sessionCacheCold === true) {
+    // L2 Cold-Cache Repack: partition all eligible blocks behind cutoffL1, flushing trailing remainder.
+    let pending: Candidate[] = [];
+    let pendingTokens = 0;
+    let pendingSig = '';
+    for (const item of coldL2Eligible) {
+      if (pending.length === 0 && isKeySticky(`${keyPrefix}${item.sig}`)) {
+        sealedList.push([item]);
+        continue;
+      }
+      pending.push(item);
+      pendingTokens += item.rawTokens;
+      pendingSig = pending.length === 1 ? item.sig : `${pendingSig}|${item.sig}`;
+      const stickyHit = isKeySticky(`${keyPrefix}${pendingSig}`);
+      if (stickyHit || pendingTokens >= epochTarget) {
+        if (!stickyOnly || stickyHit) sealedList.push(pending);
+        pending = [];
+        pendingTokens = 0;
+        pendingSig = '';
+      }
+    }
+    if (!stickyOnly && pending.length > 0) {
       sealedList.push(pending);
-      pending = [];
-      pendingTokens = 0;
+    }
+  } else {
+    // Standard L0/ACDC aged zone behind cutoffMsg.
+    let pending: Candidate[] = [];
+    let pendingTokens = 0;
+    let pendingSig = '';
+    for (const item of agedEligible) {
+      const singleSticky = isKeySticky(`${keyPrefix}${item.sig}`);
+      if (pending.length === 0 && singleSticky) {
+        sealedList.push([item]);
+        continue;
+      }
+      if (lsmActive && pending.length > 0 && singleSticky) {
+        sealedList.push([item]);
+        continue;
+      }
+      pending.push(item);
+      pendingTokens += item.rawTokens;
+      pendingSig = pending.length === 1 ? item.sig : `${pendingSig}|${item.sig}`;
+      const stickyHit = lsmActive && isKeySticky(`${keyPrefix}${pendingSig}`);
+      if (stickyHit || pendingTokens >= epochTarget) {
+        if (!stickyOnly || stickyHit) sealedList.push(pending);
+        pending = [];
+        pendingTokens = 0;
+        pendingSig = '';
+      }
+    }
+
+    // L1 Early Large-Block Compaction behind cutoffL1 (before waiting keepTailMessages = 6 turns).
+    // Strictly 1-block `[item]` epochs so crossing cutoffMsg into L0 never splits a sticky key.
+    if (lsmActive && cutoffL1 > 1) {
+      for (const item of l1ZoneBlocks) {
+        if (!item) continue;
+        if ((!stickyOnly && item.rawTokens >= lsmMinLargeTokens) || isKeySticky(`${keyPrefix}${item.sig}`)) {
+          sealedList.push([item]);
+        }
+      }
     }
   }
 
@@ -330,13 +475,31 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
   let cliffAvoided: { at: number; multiplier: number; savedUsd: number } | undefined;
 
   const blockTokensByBlock = new Map<TextEpochBlock, number>();
-  for (const item of eligible) blockTokensByBlock.set(item.block, item.rawTokens);
+  for (const item of agedEligible) blockTokensByBlock.set(item.block, item.rawTokens);
+  for (const item of coldL2Eligible) blockTokensByBlock.set(item.block, item.rawTokens);
+  for (const item of l1ZoneBlocks) {
+    if (item) blockTokensByBlock.set(item.block, item.rawTokens);
+  }
   for (const b of args.blocks) {
     if (!blockTokensByBlock.has(b)) blockTokensByBlock.set(b, countTokens(b.getText()));
   }
 
-  const mode = priceMode();
+  const coldRepack = lsmActive && args.sessionCacheCold === true;
+
+  const addStickySealed = (key: string): void => {
+    if (stickySealedEpochs.size >= STICKY_EPOCH_MAX && !stickySealedEpochs.has(key)) {
+      const oldest = stickySealedEpochs.values().next().value;
+      if (oldest !== undefined) stickySealedEpochs.delete(oldest);
+    }
+    stickySealedEpochs.add(key);
+    recordSealedEpochKey(args.sessionKey, key);
+  };
+
   for (const epoch of sealedList) {
+    const stickyKey = buildStickyKey(epoch);
+    const alreadySealed =
+      stickySealedEpochs.has(stickyKey) || hasSealedEpochKey(args.sessionKey, stickyKey);
+
     const proposals = epoch.map((item) => {
       const digest = extractStructuralDigest(item.raw, item.block.refId);
       const [rawTokPaired, digestTokPaired] = estimateTokenPair(item.raw, digest);
@@ -345,13 +508,20 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
 
     const epochRawTokens = proposals.reduce((sum, p) => sum + p.rawTokPaired, 0);
     const epochDigestTokens = proposals.reduce((sum, p) => sum + p.digestTokPaired, 0);
-    if (epochDigestTokens >= epochRawTokens * 0.55) continue;
+    if (!alreadySealed && epochDigestTokens >= epochRawTokens * 0.55) continue;
 
     const epochLastMsg = epoch[epoch.length - 1]!.block.msgIndex;
     let downstreamCachedTokens = 0;
-    for (const b of args.blocks) {
-      if (b.msgIndex > epochLastMsg && b.msgIndex < args.totalMessages - 2) {
-        downstreamCachedTokens += blockTokensByBlock.get(b) ?? 0;
+    let midPrefixDownstreamTokens = 0;
+    if (!coldRepack) {
+      for (const b of args.blocks) {
+        if (b.msgIndex > epochLastMsg && b.msgIndex < args.totalMessages - 2) {
+          const tok = blockTokensByBlock.get(b) ?? 0;
+          downstreamCachedTokens += tok;
+          if (b.msgIndex < cutoffMsg) {
+            midPrefixDownstreamTokens += tok;
+          }
+        }
       }
     }
 
@@ -364,8 +534,6 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     const paybackReads =
       savedPerRead > 0 ? Math.ceil(Math.max(0, transitionCost) / savedPerRead) : Infinity;
 
-    const stickyKey = `${mode}\0${args.model ?? ''}\0${args.ttlSec ?? ''}\0${maxPayback}\0${epoch.map((e) => `${e.block.refId}:${e.raw.length}:${e.raw.slice(0, 24)}:${e.raw.slice(-24)}`).join('|')}`;
-    const alreadySealed = stickySealedEpochs.has(stickyKey);
     const stickyCliffAt = mode === 'kosha' ? stickyCliffEpochs.get(stickyKey) : undefined;
     const stickyCliffActive = stickyCliffAt !== undefined && runningPrompt > stickyCliffAt;
 
@@ -379,17 +547,44 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
       ttlSec: args.ttlSec,
     });
 
+    const turnsObserved = Math.max(1, Math.floor(args.totalMessages / 2));
     const cliffWins = Boolean(cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) || stickyCliffActive;
-    if (!alreadySealed && paybackReads > maxPayback && !cliffWins) continue;
+    const effectiveMaxPayback =
+      args.maxPaybackReads !== undefined
+        ? maxPayback
+        : downstreamCachedTokens <= 0
+          ? computeHorizonPaybackLimit({
+              turnsObserved,
+              baseMaxPayback: maxPayback,
+              downstreamCachedTokens: 0,
+            })
+          : midPrefixDownstreamTokens <= 0
+            ? maxPayback
+            : computeHorizonPaybackLimit({
+                turnsObserved,
+                baseMaxPayback: maxPayback,
+                downstreamCachedTokens: midPrefixDownstreamTokens,
+              });
+    if (!alreadySealed && paybackReads > effectiveMaxPayback && !cliffWins) continue;
 
     let epochSavedChars = 0;
     let epochSavedTok = 0;
+    const compactedItems: Candidate[] = [];
     for (const p of proposals) {
       if (p.digest.length < p.item.raw.length && p.digestTokPaired < p.rawTokPaired) {
-        p.item.block.setText(p.digest);
+        const decorated = args.onPageOut ? args.onPageOut(p.item.block, p.item.raw, p.digest) : undefined;
+        const replacement = decorated ?? p.digest;
+        if (replacement.length >= p.item.raw.length) continue;
+        const repTok =
+          replacement === p.digest
+            ? p.digestTokPaired
+            : estimateTokenPair(p.item.raw, replacement)[1];
+        if (repTok >= p.rawTokPaired) continue;
+        p.item.block.setText(replacement);
         compactedBlocks++;
-        epochSavedChars += p.item.raw.length - p.digest.length;
-        epochSavedTok += p.rawTokPaired - p.digestTokPaired;
+        compactedItems.push(p.item);
+        epochSavedChars += p.item.raw.length - replacement.length;
+        epochSavedTok += p.rawTokPaired - repTok;
       }
     }
     if (epochSavedChars > 0) {
@@ -397,10 +592,18 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
       totalSavedChars += epochSavedChars;
       totalSavedTokens += epochSavedTok;
       runningPrompt = Math.max(0, runningPrompt - epochSavedTok);
-      if (stickySealedEpochs.size >= STICKY_EPOCH_MAX) stickySealedEpochs.clear();
-      stickySealedEpochs.add(stickyKey);
+      addStickySealed(stickyKey);
+      if (coldRepack) {
+        // Also pin per-block keys so crossing cutoffMsg after L2 -> Warm never tears an epoch.
+        for (const ci of compactedItems) {
+          addStickySealed(buildStickyKey([ci]));
+        }
+      }
       if (cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) {
-        if (stickyCliffEpochs.size >= STICKY_EPOCH_MAX) stickyCliffEpochs.clear();
+        if (stickyCliffEpochs.size >= STICKY_EPOCH_MAX && !stickyCliffEpochs.has(stickyKey)) {
+          const oldest = stickyCliffEpochs.keys().next().value;
+          if (oldest !== undefined) stickyCliffEpochs.delete(oldest);
+        }
         stickyCliffEpochs.set(stickyKey, cliff.cliffAt);
         if (!cliffAvoided) {
           cliffAvoided = {

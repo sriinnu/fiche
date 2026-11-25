@@ -12,6 +12,7 @@
  */
 
 import { readBrandEnv } from './env.js';
+import { getCalibratedProfileMatch } from './calibration.js';
 import { hasGeminiMeasuredProfile } from './gemini-model-profiles.js';
 
 export type ReaderTier = 'image' | 'text';
@@ -57,19 +58,48 @@ const TEXT_ONLY = [
   /moonshot/i,
   /(?:^|[/._-])glm-/i,
   /minimax/i,
+  /qwen/i,
+  /(?:^|[/._-])(?:meta-)?llama/i,
+  /codellama/i,
+  /(?:^|[/._-])(?:mistral|mixtral|codestral|devstral|ministral|magistral|pixtral)/i,
+  /(?:^|[/._-])command-/i,
+  /(?:^|[/._-])c4ai-aya/i,
+  /(?:^|[/._-])gemma(?:-|$)/i,
+  /(?:^|[/._-])gpt-oss(?:-|$)/i,
+  /(?:^|[/._-])sonar(?:-|$)/i,
+  /(?:^|[/._-])nova(?:-|$)/i,
+  /(?:^|[/._-])jamba(?:-|$)/i,
+  /(?:^|[/._-])mercury(?:-|$)/i,
+  /(?:^|[/._-])solar(?:-|$)/i,
+  /(?:^|[/._-])step-\d/i,
 ];
 
 export function prefersText(model: string | null | undefined, forceImages?: boolean): boolean {
   if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return false;
+  const calMatch = getCalibratedProfileMatch(model);
+  if (calMatch?.exact) {
+    return !(calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only');
+  }
   const ids = modelIds(model);
-  return ids.some((id) => TEXT_ONLY.some((re) => re.test(id)));
+  if (ids.some((id) => TEXT_ONLY.some((re) => re.test(id)))) return true;
+  if (calMatch) {
+    return !(calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only');
+  }
+  return false;
 }
 
 export function readerTier(model: string | null | undefined, forceImages?: boolean): ReaderTier {
   if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return 'image';
+  const calMatch = getCalibratedProfileMatch(model);
+  if (calMatch?.exact) {
+    return calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only' ? 'image' : 'text';
+  }
   const ids = modelIds(model);
   if (ids.length === 0) return 'text';
   if (ids.some((id) => TEXT_ONLY.some((re) => re.test(id)))) return 'text';
+  if (calMatch) {
+    return calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only' ? 'image' : 'text';
+  }
   if (ids.some((id) => GEMINI_READER_RE.test(id))) {
     return hasGeminiMeasuredProfile(model) ? 'image' : 'text';
   }

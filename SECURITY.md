@@ -46,7 +46,7 @@ when a provider credential is configured without this shared secret. Do not
 enable `FICHE_DEBUG_CAPTURE_4XX` (or legacy `INKLING_DEBUG_CAPTURE_4XX`) in
 production: captured request bodies can contain prompts and credentials.
 
-Telemetry, diagnostic captures, rendered PNG dumps, configuration files, and
+Local event logs, diagnostic captures, rendered PNG dumps, configuration files, and
 export artifacts are protected with owner-only permissions on POSIX systems.
 
 See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for trust boundaries,

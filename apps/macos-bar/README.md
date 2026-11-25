@@ -13,7 +13,7 @@ A pure native macOS 14+ AppKit + SwiftUI (`MenuBarExtra`) companion for **Fiche*
 - **Serene Control Center Popover (360px)**:
   - **Hero Savings Band**: 2-column typographic split (`TOKENS SAVED` & `REAL USD SAVED`) plus latest turn summary strip.
   - **Activity**: Per-model savings breakdown (`by_model`) with `OPTICAL` / `TEXT` badges, active session rollup, and lifetime Requests / Compressed / Render Cache stats.
-  - **Models**: Live model-scope toggles synced with `/api/models`, grouped by provider (`Anthropic`, `Google Gemini`, `OpenAI / Codex`, `OpenAI-Compat`).
+  - **Models**: Live model-scope toggles and **My Providers** toggles synced with `/api/models` and `/api/providers`, plus 1-click **Kosha Registry Sync** (`Sync` / `Update & Sync` + `All 21 providers` toggle reading `~/.kosha/registry.json` via `fiche models sync-kosha --apply`), grouped by provider (`Anthropic`, `Google Gemini`, `OpenAI / Codex`, `OpenAI-Compat` with collapsible long lists).
   - **Stages**: Live toggles for built-in compiler stages and discovered `~/.fiche/plugins` & `~/.agents/skills` via `/api/plugins`, with direct folder access.
   - **Control**: Theme picker, live Compression toggle, Auto-start, Start at login (`launchd`), port/poll settings, and Restart/Stop controls.
 

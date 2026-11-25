@@ -23,7 +23,7 @@ function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
   const splitTotal = fiveMinute + oneHour;
   if (!(splitTotal > 0)) return CACHE_CREATE_RATE;
   // The API contract says splitTotal === cc. Normalize malformed/mismatched
-  // payloads to the aggregate so telemetry never invents extra write tokens.
+  // payloads to the aggregate so accounting never invents extra write tokens.
   return (
     fiveMinute * CACHE_CREATE_RATE + oneHour * CACHE_CREATE_1H_RATE
   ) / splitTotal;
@@ -190,7 +190,7 @@ export function computeBaselineInputEff(
   );
 }
 
-/** Tier-aware variant for internal telemetry accounting. */
+/** Tier-aware variant for internal savings accounting. */
 export function computeBaselineInputEffWithCacheTier(
   baseline: number,
   baselineCacheable: number,
@@ -236,7 +236,7 @@ export function computeActualInputEff(
   return computeActualInputEffWithCacheTier(inputTokens, cc, cr, 0);
 }
 
-/** Tier-aware variant for internal telemetry accounting. */
+/** Tier-aware variant for internal savings accounting. */
 export function computeActualInputEffWithCacheTier(
   inputTokens: number,
   cc: number,

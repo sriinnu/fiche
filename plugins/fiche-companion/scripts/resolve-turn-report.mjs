@@ -1,5 +1,5 @@
 /**
- * Shared zero-spawn resolution helpers for Fiche telemetry scripts
+ * Shared zero-spawn resolution helpers for Fiche companion scripts
  * (Antigravity PostInvocation hook & Claude Code statusLine).
  */
 import * as fs from 'node:fs';

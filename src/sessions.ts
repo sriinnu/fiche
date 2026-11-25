@@ -135,7 +135,7 @@ export async function* readEvents(
 export const UNKNOWN_SESSION = '<unknown>';
 
 function sessionIdOf(ev: TrackEvent): string {
-  return ev.first_user_sha8 ?? UNKNOWN_SESSION;
+  return ev.session_key ?? ev.first_user_sha8 ?? UNKNOWN_SESSION;
 }
 
 export interface AggregateResult {

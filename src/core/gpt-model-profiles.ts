@@ -22,9 +22,12 @@
  */
 import { readBrandEnv } from './env.js';
 import { type RenderFont } from './render.js';
+import { calibratedBandToProfile, getCalibratedProfile } from './calibration.js';
 import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
 import { BASE_HISTORY, BASE_PRICING, BASE_STYLE, NATIVE_14PX_HISTORY } from './profile-base.js';
+
+export { calibratedBandToProfile };
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -163,7 +166,7 @@ export interface GptModelProfile {
    *  A guessed cap makes inkling refuse to compress requests the provider would
    *  have accepted, which is the opposite of the point. No family currently
    *  carries one. Largest body each provider has answered 200 for in local
-   *  telemetry, as a lower bound (cacheable prefix already on the wire, so the
+   *  metrics, as a lower bound (cacheable prefix already on the wire, so the
    *  real body was bigger): Claude 11.2 MB, GPT 10.1 MB, Gemini 6.2 MB, Grok
    *  2.7 MB. No provider-originated size rejection has been observed for any. */
   maxSerializedRequestBytes?: number;
@@ -458,6 +461,8 @@ function hasDeclaredProfile(m: string): boolean {
 export function isMisresolvedModelId(model: string | null | undefined): boolean {
   const m = (model ?? '').toLowerCase();
   if (hasDeclaredProfile(m)) return false;
+  const cal = getCalibratedProfile(model);
+  if (cal && cal.scores.passed && cal.band !== 'text-only') return false;
   // Must cover every spelling resolveGptProfile() tries, or guard and resolver
   // disagree: `openrouter/gemini-3.6-flash` resolves to the measured Gemini
   // profile via its unqualified id, so it must not be refused here.
@@ -725,6 +730,13 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
     if (best) return best;
   }
   const qualified = ids.length > 1 ? resolveBuiltin(ids[0]!) : undefined;
-  if (qualified && qualified !== DEFAULT_GPT_PROFILE) return qualified;
-  return resolveBuiltin(ids[ids.length - 1]!);
+  const base =
+    qualified && qualified !== DEFAULT_GPT_PROFILE
+      ? qualified
+      : resolveBuiltin(ids[ids.length - 1]!);
+  const cal = getCalibratedProfile(model);
+  if (cal && cal.scores.passed && cal.band !== 'text-only') {
+    return calibratedBandToProfile(cal.band, base, { cols: cal.cols, maxHeightPx: cal.maxHeightPx });
+  }
+  return base;
 }

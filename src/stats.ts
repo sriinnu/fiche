@@ -180,13 +180,14 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
       baseline > 0);
   if (typeof baseline === 'number' && baseline > 0 && probeOk) {
     s.baselineTokensTotal += baseline;
+    const cacheRead = ev.cache_read_tokens ?? ev.cached_tokens ?? 0;
     const inclusiveOverlap = isInclusiveUsage
-      ? Math.min(ev.input_tokens ?? 0, ev.cache_read_tokens ?? ev.cached_tokens ?? 0)
+      ? Math.min(ev.input_tokens ?? 0, cacheRead)
       : 0;
     s.measuredActualTokensTotal +=
       (ev.input_tokens ?? 0) +
       (ev.cache_create_tokens ?? 0) +
-      (ev.cache_read_tokens ?? 0) -
+      cacheRead -
       inclusiveOverlap;
     s.baselineMeasuredEvents++;
   }
@@ -287,7 +288,7 @@ export function renderTextReport(s: Summary): string {
   }
   lines.push('');
 
-  lines.push('Anthropic token usage:');
+  lines.push('token usage:');
   lines.push(`  input:         ${fmtN(s.inputTokensTotal).padStart(12)}`);
   lines.push(`  output:        ${fmtN(s.outputTokensTotal).padStart(12)}`);
   lines.push(`  cache create:  ${fmtN(s.cacheCreateTokensTotal).padStart(12)}`);

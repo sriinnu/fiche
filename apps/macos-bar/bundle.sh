@@ -7,7 +7,7 @@
 #   ./bundle.sh --no-install  # build & sign into apps/macos-bar/build.noindex/FicheBar.app only
 #
 # Optional env overrides:
-#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.18.0)
+#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.19.0)
 #   CFBundleVersion             (defaults to 1)
 #   SWIFTPM_ARGS                (extra flags passed to swift build, e.g. --disable-sandbox)
 
@@ -48,7 +48,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-DEFAULT_VERSION="0.18.0"
+DEFAULT_VERSION="0.19.0"
 if [[ -f "${REPO_ROOT}/package.json" ]]; then
   PARSED_VER="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "${REPO_ROOT}/package.json" | head -n 1 || true)"
   if [[ -n "${PARSED_VER}" ]]; then

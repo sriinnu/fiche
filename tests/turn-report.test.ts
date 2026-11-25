@@ -317,7 +317,7 @@ describe('per-turn savings telemetry, proxy headers, MCP live stats & plugin hoo
     };
     fs.writeFileSync(eventsFile, JSON.stringify(ev) + '\n');
 
-    const hookScript = path.join(repoRoot, 'plugins', 'fiche-telemetry', 'scripts', 'post-invocation.mjs');
+    const hookScript = path.join(repoRoot, 'plugins', 'fiche-companion', 'scripts', 'post-invocation.mjs');
     const hookEnv = {
       ...process.env,
       FICHE_LOG: eventsFile,

@@ -38,12 +38,17 @@ const SCHEMA_COMPOSITION_KEYS = new Set(['oneOf', 'anyOf', 'allOf']);
 
 /** JSON Schema keys whose values are named-subschema objects.
  *  IMPORTANT: the *keys* inside these objects are user property names, not
- *  annotation keywords — we recurse into the values only. */
+ *  annotation keywords — we recurse into the values only.
+ *  Every container whose keys are property names MUST be listed here, or the
+ *  fallback at the bottom of the walk reads its property keys as annotations. */
 const SCHEMA_NAMED_SUBSCHEMA_KEYS = new Set([
   'properties',
   'patternProperties',
   'definitions',
   '$defs',
+  'dependentSchemas',  // JSON Schema 2019-09+
+  'dependencies',      // draft-07 (subschema OR string[])
+  'dependentRequired', // JSON Schema 2019-09+ (string[])
 ]);
 
 /** JSON Schema keys whose value is a single subschema. */

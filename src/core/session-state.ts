@@ -62,8 +62,11 @@
  * touches a filesystem: without a store the module behaves exactly as before.
  */
 
-/** Sessions tracked before the oldest is evicted. One small record each. */
-const SESSIONS_MAX = 512;
+/** Default sessions tracked before the oldest is evicted. One small record each. */
+const DEFAULT_SESSIONS_MAX = 512;
+const MIN_SESSIONS_MAX = 64;
+const MAX_SESSIONS_MAX = 8192;
+let maxSessions = DEFAULT_SESSIONS_MAX;
 
 /**
  * Grace added to the provider TTL before we call a cache dead. Our clock is the
@@ -106,6 +109,15 @@ const PERSIST_MAX_IDLE_MS = 24 * 3_600_000;
  */
 const PERSIST_DEBOUNCE_MS = 250;
 
+/** Maximum sealed epoch keys retained per session (head-retaining cap so epoch_0 is never evicted). */
+const SEALED_EPOCH_KEYS_MAX = 512;
+
+/** Maximum pinned skill names retained per session. */
+const PINNED_SKILLS_MAX = 32;
+
+/** Maximum persisted folded Markovian episode IDs per session. */
+const FOLDED_EPISODE_IDS_MAX = 256;
+
 interface SessionRecord {
   /** Wall-clock ms of the last request we saw for this session. */
   lastSeenMs: number;
@@ -113,6 +125,12 @@ interface SessionRecord {
   freezeStep: number;
   /** Set when a request for this session failed in a way that leaves no cache. */
   cacheDead: boolean;
+  /**
+   * Transient in-memory flag set when `noteHistoryRequest()` returned `cold: true`
+   * on the current request (meaning a fresh repack is in flight that may populate
+   * an implicit upstream cache). Never persisted.
+   */
+  justRepacked?: boolean;
   /**
    * Did the provider's own accounting show a cache for this session on the last
    * response — either read from it, or written to it? `undefined` = not observed
@@ -127,6 +145,14 @@ interface SessionRecord {
    * that once had one, and then lost it, has provably free room to re-cut.
    */
   everCacheAlive?: boolean;
+  /** Sticky sealed LSM/ACDC text epoch keys (head-retained up to 512 keys). */
+  sealedEpochKeys?: string[];
+  /** Session-pinned skill names (capped to 32 names) for cache prefix stability. */
+  pinnedSkills?: string[];
+  /** Hash of the skill catalog under which `pinnedSkills` were chosen. */
+  pinnedSkillCatalogHash?: string;
+  /** Persisted causal episode IDs folded for this session. */
+  foldedMarkovEpisodeIds?: string[];
 }
 
 const sessions = new Map<string, SessionRecord>();
@@ -145,11 +171,30 @@ function touch(key: string): SessionRecord {
 }
 
 function evictToCapacity(): void {
-  while (sessions.size > SESSIONS_MAX) {
+  while (sessions.size > maxSessions) {
     const oldest = sessions.keys().next().value;
     if (oldest === undefined) break;
     sessions.delete(oldest);
   }
+}
+
+/**
+ * Configure the maximum tracked sessions kept in RAM (clamped to `[64, 8192]`),
+ * evicting oldest entries immediately if capacity shrinks.
+ */
+export function configureMaxSessions(limit?: number): number {
+  if (limit !== undefined && Number.isFinite(limit)) {
+    maxSessions = Math.min(MAX_SESSIONS_MAX, Math.max(MIN_SESSIONS_MAX, Math.floor(limit)));
+  } else {
+    maxSessions = DEFAULT_SESSIONS_MAX;
+  }
+  evictToCapacity();
+  return maxSessions;
+}
+
+/** Current maximum tracked session count. */
+export function getMaxSessions(): number {
+  return maxSessions;
 }
 
 // --- persistence ------------------------------------------------------------
@@ -236,6 +281,30 @@ function isBool(v: unknown): v is boolean {
   return typeof v === 'boolean';
 }
 
+function sanitizeStringArray(raw: unknown, maxLen: number, keepTail: boolean): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== 'string' || item === '') continue;
+    if (keepTail) {
+      if (seen.has(item)) {
+        const idx = deduped.indexOf(item);
+        if (idx >= 0) deduped.splice(idx, 1);
+      } else {
+        seen.add(item);
+      }
+      deduped.push(item);
+    } else if (!seen.has(item)) {
+      seen.add(item);
+      deduped.push(item);
+      if (deduped.length >= maxLen) break;
+    }
+  }
+  if (deduped.length === 0) return undefined;
+  return keepTail && deduped.length > maxLen ? deduped.slice(-maxLen) : deduped;
+}
+
 function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   if (!entry || typeof entry !== 'object') return undefined;
   const e = entry as Partial<PersistedRecord>;
@@ -247,6 +316,15 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   const rec: SessionRecord = { lastSeenMs: e.lastSeenMs, freezeStep: e.freezeStep, cacheDead: e.cacheDead };
   if (isBool(e.lastCacheAlive)) rec.lastCacheAlive = e.lastCacheAlive;
   if (isBool(e.everCacheAlive)) rec.everCacheAlive = e.everCacheAlive;
+  const sealed = sanitizeStringArray(e.sealedEpochKeys, SEALED_EPOCH_KEYS_MAX, false);
+  if (sealed) rec.sealedEpochKeys = sealed;
+  const skills = sanitizeStringArray(e.pinnedSkills, PINNED_SKILLS_MAX, false);
+  if (skills) rec.pinnedSkills = skills;
+  if (typeof e.pinnedSkillCatalogHash === 'string' && e.pinnedSkillCatalogHash !== '') {
+    rec.pinnedSkillCatalogHash = e.pinnedSkillCatalogHash;
+  }
+  const folded = sanitizeStringArray(e.foldedMarkovEpisodeIds, FOLDED_EPISODE_IDS_MAX, false);
+  if (folded) rec.foldedMarkovEpisodeIds = folded;
   return rec;
 }
 
@@ -255,7 +333,27 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
   const out: PersistedRecord[] = [];
   for (const [key, rec] of sessions) {
     if (rec.lastSeenMs <= 0 || nowMs - rec.lastSeenMs > PERSIST_MAX_IDLE_MS) continue;
-    out.push({ key, ...rec });
+    const item: PersistedRecord = {
+      key,
+      lastSeenMs: rec.lastSeenMs,
+      freezeStep: rec.freezeStep,
+      cacheDead: rec.cacheDead,
+    };
+    if (rec.lastCacheAlive !== undefined) item.lastCacheAlive = rec.lastCacheAlive;
+    if (rec.everCacheAlive !== undefined) item.everCacheAlive = rec.everCacheAlive;
+    if (rec.sealedEpochKeys && rec.sealedEpochKeys.length > 0) {
+      item.sealedEpochKeys = rec.sealedEpochKeys.slice(0, SEALED_EPOCH_KEYS_MAX);
+    }
+    if (rec.pinnedSkills && rec.pinnedSkills.length > 0) {
+      item.pinnedSkills = rec.pinnedSkills.slice(0, PINNED_SKILLS_MAX);
+    }
+    if (rec.pinnedSkillCatalogHash !== undefined && rec.pinnedSkillCatalogHash !== '') {
+      item.pinnedSkillCatalogHash = rec.pinnedSkillCatalogHash;
+    }
+    if (rec.foldedMarkovEpisodeIds && rec.foldedMarkovEpisodeIds.length > 0) {
+      item.foldedMarkovEpisodeIds = rec.foldedMarkovEpisodeIds.slice(0, FOLDED_EPISODE_IDS_MAX);
+    }
+    out.push(item);
   }
   const state: PersistedState = { format: PERSIST_FORMAT, saved_at_ms: nowMs, sessions: out };
   return JSON.stringify(state);
@@ -345,8 +443,136 @@ export function noteHistoryRequest(
   const cold = rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
   rec.lastSeenMs = nowMs;
   rec.cacheDead = false; // consumed: this request gets the repack
+  if (cold) {
+    // A fresh repack is in flight that may populate an implicit cache; clear any
+    // stale dead-cache bit so the very next turn does not thrash prematurely.
+    rec.justRepacked = true;
+    rec.lastCacheAlive = undefined;
+  } else {
+    rec.justRepacked = false;
+  }
   scheduleSave();
   return { cold, minFreezeStep: rec.freezeStep };
+}
+
+/**
+ * Non-mutating read checking whether `sessionKey`'s upstream cache is currently cold.
+ * Unknown/unseen sessions return `false` (warm by default).
+ */
+export function isSessionCacheCold(
+  sessionKey: string | undefined,
+  nowMs: number = Date.now(),
+): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return false;
+  const known = rec.lastSeenMs > 0;
+  const idleMs = nowMs - rec.lastSeenMs;
+  const serverSaysAlive = rec.lastCacheAlive === true;
+  const serverSaysGone = rec.lastCacheAlive === false && rec.everCacheAlive === true;
+  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
+  return rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
+}
+
+export function recordSealedEpochKey(
+  sessionKey: string | undefined,
+  epochKey: string,
+): void {
+  if (!sessionKey || !epochKey) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!rec.sealedEpochKeys) {
+    rec.sealedEpochKeys = [epochKey];
+    scheduleSave();
+    return;
+  }
+  if (rec.sealedEpochKeys.includes(epochKey)) return;
+  if (rec.sealedEpochKeys.length >= SEALED_EPOCH_KEYS_MAX) return; // retain earliest head epochs
+  rec.sealedEpochKeys.push(epochKey);
+  scheduleSave();
+}
+
+export function hasSealedEpochKey(
+  sessionKey: string | undefined,
+  epochKey: string,
+): boolean {
+  if (!sessionKey || !epochKey) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.sealedEpochKeys?.includes(epochKey));
+}
+
+export function recordFoldedEpisodeId(
+  sessionKey: string | undefined,
+  episodeId: string,
+): void {
+  if (!sessionKey || !episodeId) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!rec.foldedMarkovEpisodeIds) {
+    rec.foldedMarkovEpisodeIds = [episodeId];
+    scheduleSave();
+    return;
+  }
+  if (rec.foldedMarkovEpisodeIds.includes(episodeId)) return;
+  if (rec.foldedMarkovEpisodeIds.length >= FOLDED_EPISODE_IDS_MAX) return;
+  rec.foldedMarkovEpisodeIds.push(episodeId);
+  scheduleSave();
+}
+
+export function hasFoldedEpisodeId(
+  sessionKey: string | undefined,
+  episodeId: string,
+): boolean {
+  if (!sessionKey || !episodeId) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.foldedMarkovEpisodeIds?.includes(episodeId));
+}
+
+export function hasAnyFoldedEpisodeId(sessionKey: string | undefined): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.foldedMarkovEpisodeIds && rec.foldedMarkovEpisodeIds.length > 0);
+}
+
+export function getPinnedSessionSkills(
+  sessionKey: string | undefined,
+  catalogHash: string,
+): readonly string[] | undefined {
+  if (!sessionKey || !catalogHash) return undefined;
+  const rec = sessions.get(sessionKey);
+  if (!rec || rec.pinnedSkillCatalogHash !== catalogHash || !rec.pinnedSkills) {
+    return undefined;
+  }
+  return [...rec.pinnedSkills];
+}
+
+export function setPinnedSessionSkills(
+  sessionKey: string | undefined,
+  catalogHash: string,
+  skills: readonly string[],
+): void {
+  if (!sessionKey || !catalogHash) return;
+  const cleaned = sanitizeStringArray(skills, PINNED_SKILLS_MAX, false);
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!cleaned) {
+    if (rec.pinnedSkills !== undefined || rec.pinnedSkillCatalogHash !== undefined) {
+      delete rec.pinnedSkills;
+      delete rec.pinnedSkillCatalogHash;
+      scheduleSave();
+    }
+    return;
+  }
+  const sameHash = rec.pinnedSkillCatalogHash === catalogHash;
+  const sameSkills =
+    sameHash &&
+    rec.pinnedSkills !== undefined &&
+    rec.pinnedSkills.length === cleaned.length &&
+    rec.pinnedSkills.every((s, idx) => s === cleaned[idx]);
+  if (sameSkills) return;
+  rec.pinnedSkills = cleaned;
+  rec.pinnedSkillCatalogHash = catalogHash;
+  scheduleSave();
 }
 
 /**
@@ -358,7 +584,9 @@ export function noteHistoryRequest(
  * discards the thing just paid for.
  *
  * Both zero means nothing is cached for this session, so a repack costs nothing
- * — that is the only situation where coarsening the grid is free.
+ * — unless the session just repacked under an implicit-cache provider
+ * (`cacheCreateTokens === undefined`), where a cold miss on that repack turn is
+ * expected while the provider populates its new implicit cache.
  */
 export function noteCacheOutcome(
   sessionKey: string | undefined,
@@ -369,8 +597,19 @@ export function noteCacheOutcome(
   const rec = sessions.get(sessionKey);
   if (!rec) return; // never transformed under this key — nothing to attribute
   const alive = (cacheReadTokens ?? 0) > 0 || (cacheCreateTokens ?? 0) > 0;
-  rec.lastCacheAlive = alive;
-  if (alive) rec.everCacheAlive = true;
+  if (alive) {
+    rec.cacheDead = false;
+    rec.justRepacked = false;
+    rec.lastCacheAlive = true;
+    rec.everCacheAlive = true;
+  } else if (rec.justRepacked && cacheCreateTokens === undefined) {
+    // Implicit-cache provider reporting expected zero-read on the freshly repacked turn.
+    rec.justRepacked = false;
+    rec.lastCacheAlive = undefined;
+  } else {
+    rec.justRepacked = false;
+    rec.lastCacheAlive = false;
+  }
   scheduleSave();
 }
 
@@ -433,6 +672,8 @@ export function responseLeftNoCache(status: number, errorBody?: string): boolean
   return false;
 }
 
+import { resetGlobalPrefixTape } from './prefix-tape.js';
+
 /** Test seam: drop all session state and any pending save. The store stays attached. */
 export function resetSessionState(): void {
   sessions.clear();
@@ -441,18 +682,38 @@ export function resetSessionState(): void {
     saveTimer = undefined;
   }
   dirty = false;
+  resetGlobalPrefixTape();
 }
 
-/** Test/telemetry seam: inspect a session without mutating its clock. */
+/** Test/inspection seam: inspect a session without mutating its clock. */
 export function peekSessionState(
   sessionKey: string,
-): { lastSeenMs: number; freezeStep: number; cacheDead: boolean } | undefined {
+): {
+  lastSeenMs: number;
+  freezeStep: number;
+  cacheDead: boolean;
+  lastCacheAlive?: boolean;
+  everCacheAlive?: boolean;
+  sealedEpochKeys?: string[];
+  pinnedSkills?: string[];
+  pinnedSkillCatalogHash?: string;
+} | undefined {
   const rec = sessions.get(sessionKey);
-  return rec ? { ...rec } : undefined;
+  if (!rec) return undefined;
+  return {
+    ...rec,
+    ...(rec.sealedEpochKeys ? { sealedEpochKeys: [...rec.sealedEpochKeys] } : {}),
+    ...(rec.pinnedSkills ? { pinnedSkills: [...rec.pinnedSkills] } : {}),
+  };
 }
 
-/** Harness envelopes a client injects ahead of the user's own words. */
-const ENVELOPE_RE = /^<(system-notice|system-reminder)>[\s\S]*<\/\1>$/;
+/** Complete client boilerplate elements, with no user prose between them. */
+const BOILERPLATE_ELEMENT_RE =
+  /<(system-notice|system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args)>[\s\S]*?<\/\1>/g;
+
+export function isBoilerplateText(text: string): boolean {
+  return text.replace(BOILERPLATE_ELEMENT_RE, '').trim() === '';
+}
 
 /**
  * Pick the text that identifies a conversation, from the text blocks of its
@@ -461,17 +722,18 @@ const ENVELOPE_RE = /^<(system-notice|system-reminder)>[\s\S]*<\/\1>$/;
  * Blocks that are wholly a harness envelope are skipped: they are boilerplate
  * the client injects into every session (omp opens each one with the same
  * `<system-notice>` device inventory; Claude Code with the project's CLAUDE.md
- * `<system-reminder>`), so keying on them merges every concurrent session into
- * one record, and each session's cache outcomes then re-cut the others' history
- * grids. The first non-envelope block is the user's own prompt. When every block
- * is an envelope, the first one is still better than no key. Capped at 4 KiB.
+ * `<system-reminder>` and local slash-command output), so keying on them merges
+ * every concurrent session into one record, and each session's cache outcomes
+ * then re-cut the others' history grids. The first non-envelope block is the
+ * user's own prompt. When every block is an envelope, the first one is still
+ * better than no key. Capped at 4 KiB.
  */
 export function sessionAnchorText(texts: readonly string[]): string {
-  const anchor = texts.find((t) => t.trim() !== '' && !ENVELOPE_RE.test(t.trim())) ?? texts[0] ?? '';
+  const anchor = texts.find((t) => !isBoilerplateText(t)) ?? texts[0] ?? '';
   return anchor.slice(0, 4096);
 }
 
-/** Telemetry seam: how many sessions are currently tracked. */
+/** Inspection seam: how many sessions are currently tracked. */
 export function sessionStateSize(): number {
   return sessions.size;
 }
