@@ -8,7 +8,14 @@ struct AboutPanelView: View {
     let daemonVersion: String?
 
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.18.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.19.0"
+    }
+
+    private var appBuild: String? {
+        let raw = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
     }
 
     var body: some View {
@@ -24,7 +31,7 @@ struct AboutPanelView: View {
                         .fontWidth(theme.fontWidth)
                         .foregroundStyle(theme.primaryText)
 
-                    Text("v\(appVersion)")
+                    Text(appBuild.map { "v\(appVersion) (\($0))" } ?? "v\(appVersion)")
                         .font(.caption.weight(.semibold))
                         .monospacedDigit()
                         .foregroundStyle(theme.secondaryText)
@@ -177,6 +184,10 @@ final class AboutWindowController {
             window.appearance = appearance
             let hosting = NSHostingController(rootView: content)
             window.contentViewController = hosting
+            hosting.view.frame = NSRect(x: 0, y: 0, width: 320, height: 370)
+            hosting.view.layoutSubtreeIfNeeded()
+            window.setContentSize(NSSize(width: 320, height: max(330, ceil(hosting.view.fittingSize.height))))
+            Self.centerOnActiveScreen(window)
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -195,10 +206,29 @@ final class AboutWindowController {
         win.isMovableByWindowBackground = true
         win.appearance = appearance
         win.contentViewController = hosting
-        win.setContentSize(NSSize(width: 320, height: max(330, hosting.view.fittingSize.height)))
-        win.center()
+        hosting.view.frame = NSRect(x: 0, y: 0, width: 320, height: 370)
+        hosting.view.layoutSubtreeIfNeeded()
+        win.setContentSize(NSSize(width: 320, height: max(330, ceil(hosting.view.fittingSize.height))))
+        Self.centerOnActiveScreen(win)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = win
+    }
+
+    private static func centerOnActiveScreen(_ win: NSWindow) {
+        let mouseLocation = NSEvent.mouseLocation
+        let activeScreen = NSScreen.screens.first(where: { NSMouseInRect(mouseLocation, $0.frame, false) })
+            ?? NSScreen.main
+            ?? win.screen
+            ?? NSScreen.screens.first
+        guard let screen = activeScreen else {
+            win.center()
+            return
+        }
+        let visible = screen.visibleFrame
+        let size = win.frame.size
+        let x = visible.origin.x + floor((visible.width - size.width) / 2.0)
+        let y = visible.origin.y + floor((visible.height - size.height) / 2.0)
+        win.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }

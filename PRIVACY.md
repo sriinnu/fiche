@@ -15,9 +15,11 @@
 All persisted state stays locally under owner-only POSIX file permissions (`0600` / `0700`):
 
 - `~/.fiche/events.jsonl` — Metadata-only accounting rows (timestamp, model name, token counts, weighted savings, dollar estimates, stage tags, latency, and prefix-cache hit ratios). No source code or prompt contents are stored.
-- `~/.fiche/session-state.json` — In-session structural hashes / append-only optical page offsets used solely to preserve upstream KV prefix caches across turns.
+- `~/.fiche/session-state.json` — In-session structural hashes / append-only optical & `LSM-Context` freeze boundaries and Turn-1 skill catalog pins used solely to preserve upstream KV prefix caches across turns.
+- **In-memory `Context-MMU` default (opt-in disk persistence only)**: `ContextPageStore` virtual pages stay strictly in daemon RAM unless you explicitly set `FICHE_MMU_PERSIST=1` (with `FICHE_SESSION_STATE` enabled), which writes `0600` (`O_EXCL | O_NOFOLLOW`) JSON to `~/.fiche/mmu-pages.json` capped at `32 MiB`, `24h` idle TTL, and filtered to skip high-confidence secret patterns (`PEM`, `Bearer`, `sk-*`, GitHub/AWS keys).
+- `~/.config/fiche/calibrated-models.json` — Local 4-axis vision calibration profiles written atomically with `0600` permissions by `fiche calibrate`.
 - `~/.fiche/plugins/` & `~/.config/fiche/config.json` — Your local plugin/skill enablement state and model configuration.
-- `~/.fiche/daemon.{out,err}.log` — Local process lifecycle logs (`FicheBar.app` / `launchd`).
+- `~/.fiche/bin/fiche-launchd-exec` & `~/.fiche/daemon.{out,err}.log` — Compiled local macOS `<launch.h>` socket-activation trampoline (`0755`) and `launchd` process lifecycle logs.
 
 You can purge all local state at any time:
 

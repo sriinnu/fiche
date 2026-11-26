@@ -214,7 +214,7 @@ struct DailySavingsPoint: Decodable, Identifiable, Sendable, Equatable {
         let actual = c.firstDouble("actual_input_weighted", "actualInputWeighted") ?? 0
         self.baselineInputWeighted = baseline
         self.actualInputWeighted = actual
-        self.savedTokens = c.firstDouble("saved_tokens", "savedTokens", "saved_input_tokens") ?? max(0, baseline - actual)
+        self.savedTokens = c.firstDouble("saved_tokens", "savedTokens", "saved_input_tokens") ?? (baseline - actual)
         self.rawSavedTokens = c.firstDouble("raw_saved_tokens", "rawSavedTokens") ?? 0
         self.savedPct = c.firstDouble("saved_pct", "savedPct") ?? 0
         self.savedUsd = c.firstDouble("saved_usd", "savedUsd") ?? 0
@@ -275,7 +275,7 @@ struct ModelStats: Decodable, Sendable, Equatable {
         let baseline = c.firstDouble("baseline_input_weighted", "baselineInputWeighted", "baseline_tokens", "baselineTokens") ?? 0
         let actual = c.firstDouble("actual_input_weighted", "actualInputWeighted", "actual_tokens", "actualTokens") ?? 0
         let saved = c.firstDouble("saved_input_tokens", "savedInputTokens", "saved_tokens", "savedTokens")
-            ?? max(0, baseline - actual)
+            ?? (baseline - actual)
         self.baselineInputWeighted = baseline
         self.actualInputWeighted = actual
         self.savedInputTokens = saved
@@ -367,7 +367,7 @@ struct LastTurnSnapshot: Decodable, Sendable, Equatable {
     var effectiveSavedPct: Double? {
         if let savedPct { return savedPct }
         let raw = rawInputTokens ?? inputTokens ?? 0
-        if raw > 0, savedTokens > 0 {
+        if raw > 0, savedTokens != 0 {
             let baseline = rawInputTokens != nil ? raw : (raw + savedTokens)
             if baseline > 0 {
                 return (savedTokens / baseline) * 100.0
@@ -453,12 +453,14 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
     let label: String
     let family: String
     let hint: String?
+    let engineMode: String?
 
-    init(id: String, label: String, family: String, hint: String? = nil) {
+    init(id: String, label: String, family: String, hint: String? = nil, engineMode: String? = nil) {
         self.id = id
         self.label = label
         self.family = family
         self.hint = hint
+        self.engineMode = engineMode
     }
 
     init(from decoder: Decoder) throws {
@@ -467,6 +469,7 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
             self.label = idStr
             self.family = ModelCatalogItem.inferFamily(for: idStr)
             self.hint = nil
+            self.engineMode = nil
             return
         }
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -475,19 +478,37 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
         self.label = c.firstString("label", "name", "displayName") ?? id
         self.family = c.firstString("family", "provider") ?? ModelCatalogItem.inferFamily(for: id)
         self.hint = c.firstString("hint", "mode", "description")
+        self.engineMode = c.firstString("engine_mode", "engineMode")
     }
 
     static func inferFamily(for id: String) -> String {
         let lower = id.lowercased()
-        if lower.hasPrefix("claude") { return "Anthropic" }
-        if lower.contains("gemini") { return "Google" }
-        if lower.hasPrefix("gpt") || lower.hasPrefix("o1") || lower.hasPrefix("o3") || lower.hasPrefix("o4") {
+        let base = lower.split(separator: "/").last.map(String.init) ?? lower
+        if base.hasPrefix("claude") { return "Anthropic" }
+        if base.contains("gemini") || base.hasPrefix("gemma") { return "Google" }
+        if base.hasPrefix("gpt") || base.hasPrefix("o1") || base.hasPrefix("o3") || base.hasPrefix("o4") {
             return "OpenAI"
         }
-        if lower.hasPrefix("grok") { return "xAI" }
-        if lower.hasPrefix("deepseek") { return "DeepSeek" }
-        if lower.hasPrefix("kimi") { return "Moonshot" }
-        if lower.hasPrefix("glm") { return "Zhipu" }
+        if base.hasPrefix("grok") { return "xAI" }
+        if base.hasPrefix("deepseek") { return "DeepSeek" }
+        if base.hasPrefix("kimi") || base.contains("moonshot") { return "Moonshot" }
+        if base.hasPrefix("glm") || base.hasPrefix("zai-glm") { return "Zhipu" }
+        if base.hasPrefix("qwen") { return "Alibaba" }
+        if base.hasPrefix("mistral")
+            || base.hasPrefix("mixtral")
+            || base.hasPrefix("codestral")
+            || base.hasPrefix("devstral")
+            || base.hasPrefix("ministral")
+            || base.hasPrefix("magistral")
+            || base.hasPrefix("pixtral")
+        {
+            return "Mistral"
+        }
+        if base.hasPrefix("llama") || base.contains("llama") || base.hasPrefix("codellama") {
+            return "Meta"
+        }
+        if base.hasPrefix("minimax") { return "MiniMax" }
+        if base.hasPrefix("command-") || base.hasPrefix("c4ai-aya") { return "Cohere" }
         return "Custom"
     }
 
@@ -497,8 +518,11 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
         ModelCatalogItem(id: "gemini", label: "Gemini (all)", family: "Google", hint: "Optical + 4-layer"),
         ModelCatalogItem(id: "gpt-6-astra", label: "GPT-6 Astra", family: "OpenAI", hint: "4-layer text"),
         ModelCatalogItem(id: "gpt-6.2-astra", label: "GPT-6.2 Astra", family: "OpenAI", hint: "4-layer text"),
-        ModelCatalogItem(id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "OpenAI", hint: "4-layer text"),
-        ModelCatalogItem(id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "OpenAI", hint: "4-layer text"),
+        ModelCatalogItem(id: "gpt-6-sol", label: "GPT-6 Sol", family: "OpenAI", hint: "14px optical"),
+        ModelCatalogItem(id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "OpenAI", hint: "14px optical"),
+        ModelCatalogItem(id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "OpenAI", hint: "14px optical"),
+        ModelCatalogItem(id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "OpenAI", hint: "Optical + 4-layer"),
+        ModelCatalogItem(id: "gpt-6-luna", label: "GPT-6 Luna", family: "OpenAI", hint: "Optical + 4-layer"),
         ModelCatalogItem(id: "deepseek", label: "DeepSeek", family: "DeepSeek", hint: "4-layer text"),
         ModelCatalogItem(id: "kimi", label: "Kimi", family: "Moonshot", hint: "4-layer text"),
         ModelCatalogItem(id: "glm", label: "GLM", family: "Zhipu", hint: "4-layer text"),
@@ -529,6 +553,176 @@ struct ModelsResponse: Decodable, Sendable {
             ?? []
         self.compressionEnabled = c.firstBool("compression_enabled", "compressionEnabled")
     }
+}
+
+struct KoshaSyncResponse: Decodable, Sendable {
+    let ok: Bool
+    let applied: Bool
+    let replace: Bool
+    let source: String
+    let providers: [String]
+    let providersMatched: [String]
+    let scannedModels: Int
+    let matchedModels: Int
+    let discoveredCount: Int
+    let added: [String]
+    let models: [String]
+    let saved: Bool
+    let synced: Bool
+}
+
+// MARK: - GET /api/mmu/stats & /api/calibration
+
+struct MmuStatsSnapshot: Decodable, Sendable, Equatable {
+    let pagesStored: Int
+    let pagesEvicted: Int
+    let activePages: Int
+    let activeBytes: Int64
+    let tailHydrations: Int
+    let tailHydrationTokens: Int
+    let markovFolds: Int
+    let skillsStubbed: Int
+    let densityPrunedBlocks: Int
+
+    init(
+        pagesStored: Int = 0,
+        pagesEvicted: Int = 0,
+        activePages: Int = 0,
+        activeBytes: Int64 = 0,
+        tailHydrations: Int = 0,
+        tailHydrationTokens: Int = 0,
+        markovFolds: Int = 0,
+        skillsStubbed: Int = 0,
+        densityPrunedBlocks: Int = 0
+    ) {
+        self.pagesStored = pagesStored
+        self.pagesEvicted = pagesEvicted
+        self.activePages = activePages
+        self.activeBytes = activeBytes
+        self.tailHydrations = tailHydrations
+        self.tailHydrationTokens = tailHydrationTokens
+        self.markovFolds = markovFolds
+        self.skillsStubbed = skillsStubbed
+        self.densityPrunedBlocks = densityPrunedBlocks
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.pagesStored = c.firstInt("pagesStored", "pages_stored") ?? 0
+        self.pagesEvicted = c.firstInt("pagesEvicted", "pages_evicted") ?? 0
+        self.activePages = c.firstInt("activePages", "active_pages") ?? 0
+        self.activeBytes = c.firstInt64("activeBytes", "active_bytes") ?? 0
+        self.tailHydrations = c.firstInt("tailHydrations", "tail_hydrations") ?? 0
+        self.tailHydrationTokens = c.firstInt("tailHydrationTokens", "tail_hydration_tokens") ?? 0
+        self.markovFolds = c.firstInt("markovFolds", "markov_folds") ?? 0
+        self.skillsStubbed = c.firstInt("skillsStubbed", "skills_stubbed") ?? 0
+        self.densityPrunedBlocks = c.firstInt("densityPrunedBlocks", "density_pruned_blocks") ?? 0
+    }
+}
+
+struct MmuLimitsSnapshot: Decodable, Sendable, Equatable {
+    let maxPages: Int
+    let maxBytes: Int64
+    let persisted: Bool
+
+    init(maxPages: Int = 512, maxBytes: Int64 = 16 * 1024 * 1024, persisted: Bool = false) {
+        self.maxPages = maxPages
+        self.maxBytes = maxBytes
+        self.persisted = persisted
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.maxPages = c.firstInt("maxPages", "max_pages") ?? 512
+        self.maxBytes = c.firstInt64("maxBytes", "max_bytes") ?? Int64(16 * 1024 * 1024)
+        self.persisted = c.firstBool("persisted") ?? false
+    }
+}
+
+struct PrefixTapeSnapshot: Decodable, Sendable, Equatable {
+    let stage2Entries: Int
+    let stage2Hits: Int
+    let stage2Misses: Int
+    let sealSessions: Int
+    let totalSeals: Int
+    let sealHits: Int
+    let casiEntries: Int
+    let casiHits: Int
+    let casiMisses: Int
+
+    var totalHits: Int { stage2Hits + sealHits + casiHits }
+    var totalLookups: Int { totalHits + stage2Misses + casiMisses }
+    var hitPct: Double? {
+        guard totalLookups > 0 else { return nil }
+        return (Double(totalHits) / Double(totalLookups)) * 100.0
+    }
+}
+
+struct MmuStatsResponse: Decodable, Sendable, Equatable {
+    let stats: MmuStatsSnapshot
+    let pageCount: Int
+    let limits: MmuLimitsSnapshot?
+    let prefixTape: PrefixTapeSnapshot?
+}
+
+struct CalibratedModelProfile: Decodable, Identifiable, Sendable, Equatable {
+    var id: String { model }
+    let model: String
+    let band: String
+    let cols: Int
+    let maxHeightPx: Int
+    let calibratedAtIso: String
+    let source: String
+    let overallScore: Double
+    let passed: Bool
+
+    var shortBandLabel: String {
+        switch band.lowercased() {
+        case "spleen-5x8": return "5×8"
+        case "spleen-5x10": return "5×10"
+        case "jetbrains-mono-12": return "12px"
+        case "jetbrains-mono-14": return "14px"
+        case "text-only": return "TEXT"
+        default: return band
+        }
+    }
+
+    init(
+        model: String,
+        band: String,
+        cols: Int,
+        maxHeightPx: Int,
+        calibratedAtIso: String = "",
+        source: String = "probe",
+        overallScore: Double = 1.0,
+        passed: Bool = true
+    ) {
+        self.model = model
+        self.band = band
+        self.cols = cols
+        self.maxHeightPx = maxHeightPx
+        self.calibratedAtIso = calibratedAtIso
+        self.source = source
+        self.overallScore = overallScore
+        self.passed = passed
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.model = c.firstString("model", "id") ?? ""
+        self.band = c.firstString("band") ?? "text-only"
+        self.cols = c.firstInt("cols") ?? 0
+        self.maxHeightPx = c.firstInt("maxHeightPx", "max_height_px") ?? 0
+        self.calibratedAtIso = c.firstString("calibratedAtIso", "calibrated_at_iso") ?? ""
+        self.source = c.firstString("source") ?? "probe"
+        let scores = try? c.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: DynamicCodingKey("scores"))
+        self.overallScore = scores?.firstDouble("overallScore", "overall_score") ?? 1.0
+        self.passed = scores?.firstBool("passed") ?? true
+    }
+}
+
+struct CalibrationResponse: Decodable, Sendable, Equatable {
+    let profiles: [CalibratedModelProfile]
 }
 
 // MARK: - GET / POST /api/providers
@@ -774,13 +968,36 @@ enum Fmt {
         return String(format: "%.1f", mb)
     }
 
+    static func compactBytes(_ bytes: Int64) -> String {
+        let clamped = max(0, bytes)
+        if clamped < 1024 { return "\(clamped) B" }
+        let kb = Double(clamped) / 1024.0
+        if kb < 1024 { return String(format: "%.0f KB", kb) }
+        let mb = kb / 1024.0
+        if mb >= 10 { return String(format: "%.1f MB", mb) }
+        return String(format: "%.2f MB", mb)
+    }
+
     static func stageLabel(_ stage: String) -> String {
         switch stage.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "image", "optical", "microfiche": return "OPTICAL"
+        case "hybrid_slab_optical": return "HYBRID"
+        case "hybrid_tool_optical": return "TOOL OPTICAL"
+        case "hybrid_user_optical": return "USER OPTICAL"
+        case "dir_tree": return "DIR TREE"
+        case "json", "json_compact": return "JSON"
         case "tscg": return "TSCG"
+        case "schema_dag": return "DAG"
         case "toon": return "TOON"
-        case "casi": return "CASI"
-        case "acdc": return "ACDC"
+        case "casi", "casi_delta", "casi_dup", "casi_slice": return "CASI"
+        case "acdc", "acdc_epoch": return "ACDC"
+        case "lsm_l1": return "L1"
+        case "lsm_l2_cold": return "L2"
+        case "mmu_page": return "MMU"
+        case "mmu_hydrate": return "HYDRATE"
+        case "markov_fold": return "MARKOV"
+        case "skill_linker": return "SKILLS"
+        case "density_prune": return "PRUNE"
         default: return stage.uppercased()
         }
     }

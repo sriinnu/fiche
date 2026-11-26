@@ -280,8 +280,8 @@ describe('Wave 4 Track B audit fixes (Proxy, Security, Telemetry, MCP, Plugins, 
         body: JSON.stringify({
           contents: [
             { role: 'user', parts: [{ text: 'inspect workspace' }] },
-            { role: 'model', parts: [{ functionCall: { name: 'read_file', args: { path: 'big.txt' } } }] },
-            { role: 'user', parts: [{ functionResponse: { name: 'read_file', response: { content: bigFnText } } }] },
+            { role: 'model', parts: [{ functionCall: { name: 'search_logs', args: { query: 'item_' } } }] },
+            { role: 'user', parts: [{ functionResponse: { name: 'search_logs', response: { content: bigFnText } } }] },
             { role: 'model', parts: [{ text: 'read it' }] },
             { role: 'user', parts: [{ text: 'now answer concisely' }] },
           ],
@@ -553,13 +553,16 @@ describe('Wave 4 Track B audit fixes (Proxy, Security, Telemetry, MCP, Plugins, 
       expect(guardProxyRequest({ host: '127.0.0.1:47821', secFetchSite: 'cross-site' }, { allowedHosts: ['*'] })).toBeNull();
     });
 
-    it('provides 5 built-in pipeline stage plugins and merges manifest/skill plugins cleanly', () => {
+    it('provides 8 built-in pipeline stage plugins and merges manifest/skill plugins cleanly', () => {
       expect(BUILTIN_STAGE_PLUGINS.map((p) => p.id)).toEqual([
         'optical-microfiche',
         'tscg-schema',
         'toon-structured',
         'acdc-epochs',
         'casi-delta',
+        'lsm-context',
+        'context-mmu',
+        'skill-linker',
       ]);
 
       const custom = parsePluginManifest(
@@ -897,7 +900,7 @@ describe('Wave 4 Track B audit fixes (Proxy, Security, Telemetry, MCP, Plugins, 
     });
 
     it('post-invocation.mjs exits quickly even when stdin pipe remains open and idle', async () => {
-      const script = path.resolve(process.cwd(), 'plugins/fiche-telemetry/scripts/post-invocation.mjs');
+      const script = path.resolve(process.cwd(), 'plugins/fiche-companion/scripts/post-invocation.mjs');
       const child = spawn(process.execPath, [script], {
         stdio: ['pipe', 'pipe', 'pipe'],
       });

@@ -1,9 +1,9 @@
 /**
  * Extensible pipeline stages & skills registry (edge/browser-safe: zero `node:` imports).
  *
- * Built-in stages represent Fiche's 5 deterministic/optical compiler stages.
+ * Built-in stages represent Fiche's deterministic/optical compiler stages.
  * Node hosts discover custom `~/.fiche/plugins/` manifests and `~/.agents/skills/`
- * / `~/.gemini/config/plugins/fiche-telemetry/skills/` entries and merge them with
+ * / `~/.gemini/config/plugins/fiche-companion/skills/` entries and merge them with
  * persisted enabled overrides via `mergeStagePlugins()`.
  */
 
@@ -29,6 +29,9 @@ export interface StageToggles {
   readonly toon: boolean;
   readonly acdc: boolean;
   readonly casi: boolean;
+  readonly lsm: boolean;
+  readonly mmu: boolean;
+  readonly skillLinker: boolean;
 }
 
 const VALID_STAGES: ReadonlySet<PipelineStage> = new Set([
@@ -79,6 +82,30 @@ export const BUILTIN_STAGE_PLUGINS: readonly StagePluginDescriptor[] = [
     stage: 'hygiene',
     kind: 'builtin',
     description: 'Content-addressed duplicate and delta referencing across live tool outputs.',
+    enabled: true,
+  },
+  {
+    id: 'lsm-context',
+    name: 'LSM-Context Hierarchy',
+    stage: 'history',
+    kind: 'builtin',
+    description: 'Multi-level LSM history compaction tiers for long-running sessions.',
+    enabled: true,
+  },
+  {
+    id: 'context-mmu',
+    name: 'Context-MMU Virtual Memory',
+    stage: 'history',
+    kind: 'builtin',
+    description: 'Virtual context paging, Markovian causal episode folding, and live-tail hydration.',
+    enabled: true,
+  },
+  {
+    id: 'skill-linker',
+    name: 'Session Skill Linker',
+    stage: 'pre-hygiene',
+    kind: 'builtin',
+    description: 'Turn-1 pinned skill catalog stubbing with speculative Turn-N auto-hydration.',
     enabled: true,
   },
 ];
@@ -210,5 +237,8 @@ export function stageTogglesFromOverrides(overrides: PluginOverrides = {}): Stag
     toon: flag('toon-structured'),
     acdc: flag('acdc-epochs'),
     casi: flag('casi-delta'),
+    lsm: flag('lsm-context'),
+    mmu: flag('context-mmu'),
+    skillLinker: flag('skill-linker'),
   };
 }

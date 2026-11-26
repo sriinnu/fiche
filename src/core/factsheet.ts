@@ -56,7 +56,10 @@ export const MAX_TOKENS = 96;
 // reconstructable, so they must never crowd out short zero-redundancy tokens.
 const MAX_URLS = 8;
 const MAX_SEEN = 2048; // defensive bound on distinct tokens entering substring-collapse
+const MAX_ALL_PAGES_SEEN = 4096;
 const MAX_SCAN = 262_144; // defensive input bound; tool_results are already paged
+const MAX_ALL_PAGES_SCAN_CHARS = 1_048_576;
+const MAX_ALL_PAGES_COUNT = 32;
 // Match render DENSE_CONTENT_CHARS_PER_IMAGE without importing render (cycle-free).
 export const FACTSHEET_PAGE_CHARS = 28_080;
 const MAX_CHUNK = 512; // whitespace-free chunks longer than this are blobs (base64, minified) — skip
@@ -219,21 +222,13 @@ export interface FactSheetEntry {
  * behaviour; only counts are new. Same-token spans matched by two patterns are
  * deduped by offset so a token is never double-counted.
  */
-export function extractFactSheetEntries(text: string): FactSheetEntry[] {
-  const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
-  const cacheKey = scan.length >= 64 ? factSheetDigestKey(scan) : '';
-  if (cacheKey) {
-    const cached = factsheetDigestCache.get(cacheKey);
-    if (cached !== undefined) {
-      factsheetDigestCache.delete(cacheKey);
-      factsheetDigestCache.set(cacheKey, cached);
-      // Shallow-clone entries so callers never mutate cached arrays/objects in place.
-      return cached.map((e) => ({ token: e.token, count: e.count }));
-    }
-  }
+const TRAILING_PUNCT_RE = /[.,;:!?]+$/;
 
-  const counts = new Map<string, number>();
-  const trailingPunct = /[.,;:!?]+$/;
+function collectRawFactSheetCounts(
+  scan: string,
+  counts: Map<string, number>,
+  maxSeen: number = MAX_SEEN,
+): void {
   for (const chunk of scan.split(/\s+/)) {
     if (chunk.length < MIN_LEN || chunk.length > MAX_CHUNK) continue;
     const mask = chunkCharMask(chunk);
@@ -250,7 +245,7 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
       while ((m = re.exec(chunk)) !== null) {
         // Strip trailing sentence punctuation pulled in from prose (`pull/93.` → `pull/93`);
         // no real identifier we extract ends in these.
-        const tok = (m[1] ?? m[0]).trim().replace(trailingPunct, '');
+        const tok = (m[1] ?? m[0]).trim().replace(TRAILING_PUNCT_RE, '');
         if (tok.length < MIN_LEN || tok.length > MAX_LEN) continue;
         const key = `${m.index}\x00${tok}`;
         if (firstKey === undefined) {
@@ -266,41 +261,107 @@ export function extractFactSheetEntries(text: string): FactSheetEntry[] {
         const prev = counts.get(tok);
         if (prev !== undefined) {
           counts.set(tok, prev + 1);
-        } else if (counts.size < MAX_SEEN) {
+        } else if (counts.size < maxSeen) {
           counts.set(tok, 1);
         }
       }
     }
   }
-  // Phase 1 — substring collapse (length-desc): keep the most-specific form, folding e.g.
-  // a URL's path-portion into the full URL. Cross-tier on purpose. Total order (length,
-  // then lexical) so the result is independent of Set iteration order.
-  const ordered = [...counts.keys()].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
-  // `\n`-delimited buffer preserves O(K) substring dedup (tokens are whitespace-split
-  // and `ordered` is length-desc, so a shorter token matches iff it is a substring of a
-  // kept longer token without ever spanning across `\n` boundaries).
+}
+
+function collapseSubstringsTrigram(ordered: readonly string[]): string[] {
   const specific: string[] = [];
-  let joinedSpecific = '';
+  const triIndex = new Map<string, number[]>();
   for (const t of ordered) {
-    if (!joinedSpecific.includes(t)) {
-      specific.push(t);
-      joinedSpecific += '\n' + t;
+    let shadowed = false;
+    if (t.length >= 3) {
+      const firstTri = t.slice(0, 3);
+      const firstBucket = triIndex.get(firstTri);
+      if (firstBucket !== undefined) {
+        let bestBucket = firstBucket;
+        if (t.length >= 6) {
+          const midStart = t.length >> 1;
+          const midTri = t.slice(midStart, midStart + 3);
+          const midBucket = triIndex.get(midTri);
+          if (midBucket === undefined) {
+            bestBucket = [];
+          } else if (midBucket.length < bestBucket.length) {
+            bestBucket = midBucket;
+          }
+          if (bestBucket.length > 0) {
+            const lastTri = t.slice(t.length - 3);
+            const lastBucket = triIndex.get(lastTri);
+            if (lastBucket === undefined) bestBucket = [];
+            else if (lastBucket.length < bestBucket.length) bestBucket = lastBucket;
+          }
+        }
+        for (let i = 0; i < bestBucket.length; i++) {
+          if (specific[bestBucket[i]!]!.includes(t)) {
+            shadowed = true;
+            break;
+          }
+        }
+      }
+    }
+    if (shadowed) continue;
+    const idx = specific.length;
+    specific.push(t);
+    if (t.length >= 3) {
+      const seenTri = new Set<string>();
+      for (let j = 0; j <= t.length - 3; j++) {
+        const tri = t.slice(j, j + 3);
+        if (seenTri.has(tri)) continue;
+        seenTri.add(tri);
+        let bucket = triIndex.get(tri);
+        if (!bucket) {
+          bucket = [idx];
+          triIndex.set(tri, bucket);
+        } else {
+          bucket.push(idx);
+        }
+      }
     }
   }
-  // Phase 2 — allocate the budget by priority tier (shape, not length) so short,
-  // zero-redundancy tokens (SHAs, ports, flags) can never be evicted by long low-risk URLs.
-  // URLs are kept only as a few exemplars. Comparator is total → byte-stable output.
+  return specific;
+}
+
+function collapseAndSelectFactSheet(
+  counts: ReadonlyMap<string, number>,
+): { kept: FactSheetEntry[]; dropped: number } {
+  // Phase 1 — substring collapse (length-desc): keep the most-specific form.
+  const ordered = [...counts.keys()].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+  const specific = collapseSubstringsTrigram(ordered);
+
+  // Phase 2 — allocate the budget by priority tier (shape, not length).
   const ranked = specific
     .map((t) => ({ t, tier: priorityTier(t) }))
     .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-  const kept: string[] = [];
+  const kept: FactSheetEntry[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
     if (kept.length >= MAX_TOKENS) break;
     if (tier === 2 && urls++ >= MAX_URLS) continue;
-    kept.push(t);
+    kept.push({ token: t, count: counts.get(t) ?? 1 });
   }
-  const result = kept.map((t) => ({ token: t, count: counts.get(t) ?? 1 }));
+  return { kept, dropped: specific.length - kept.length };
+}
+
+export function extractFactSheetEntries(text: string): FactSheetEntry[] {
+  const scan = text.length > MAX_SCAN ? text.slice(0, MAX_SCAN) : text;
+  const cacheKey = scan.length >= 64 ? factSheetDigestKey(scan) : '';
+  if (cacheKey) {
+    const cached = factsheetDigestCache.get(cacheKey);
+    if (cached !== undefined) {
+      factsheetDigestCache.delete(cacheKey);
+      factsheetDigestCache.set(cacheKey, cached);
+      // Shallow-clone entries so callers never mutate cached arrays/objects in place.
+      return cached.map((e) => ({ token: e.token, count: e.count }));
+    }
+  }
+
+  const counts = new Map<string, number>();
+  collectRawFactSheetCounts(scan, counts, MAX_SEEN);
+  const { kept: result } = collapseAndSelectFactSheet(counts);
   if (cacheKey) {
     if (factsheetDigestCache.size >= FACTSHEET_CACHE_CAP) {
       const oldest = factsheetDigestCache.keys().next().value;
@@ -333,8 +394,8 @@ export function extractFactSheetTokensAllPages(
   return { kept: kept.map((e) => e.token), dropped };
 }
 
-/** Entry-carrying variant of `extractFactSheetTokensAllPages`: same kept set and
- *  order, with per-token occurrence counts summed across all pages. */
+/** Entry-carrying variant of `extractFactSheetTokensAllPages`: accumulates raw
+ *  counts across bounded head+tail pages before a single global collapse & selection. */
 export function extractFactSheetEntriesAllPages(
   text: string,
   charsPerPage: number,
@@ -342,8 +403,7 @@ export function extractFactSheetEntriesAllPages(
   const counts = new Map<string, number>();
   const step = Math.max(1, Number.isFinite(charsPerPage) ? Math.floor(charsPerPage) : 1);
 
-  // Walk the text in page-sized chunks snapped to whitespace boundaries so we
-  // neither loop endlessly on small inputs nor slice an identifier in half.
+  const pageBounds: Array<[number, number]> = [];
   let pos = 0;
   while (pos < text.length || pos === 0) {
     let end = Math.min(text.length, pos + step);
@@ -358,40 +418,39 @@ export function extractFactSheetEntriesAllPages(
         if (fwd < text.length && /\s/.test(text[fwd]!)) end = fwd + 1;
       }
     }
-    const chunk = text.slice(pos, end);
-    for (const { token, count } of extractFactSheetEntries(chunk)) {
-      counts.set(token, (counts.get(token) ?? 0) + count);
-    }
+    pageBounds.push([pos, end]);
     if (end >= text.length) break;
     pos = end;
   }
 
-  // Re-run global substring deduplication across pages so a longer token on page 2
-  // folds an extracted path substring from page 1, then apply the global priority budget.
-  const ordered = [...counts.keys()].sort(
-    (a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0),
-  );
-  const specific: string[] = [];
-  let joinedSpecific = '';
-  for (const t of ordered) {
-    if (!joinedSpecific.includes(t)) {
-      specific.push(t);
-      joinedSpecific += '\n' + t;
+  let selectedBounds: Array<[number, number]>;
+  if (pageBounds.length <= MAX_ALL_PAGES_COUNT && text.length <= MAX_ALL_PAGES_SCAN_CHARS) {
+    selectedBounds = pageBounds;
+  } else {
+    const halfPages = Math.max(1, Math.floor(MAX_ALL_PAGES_COUNT / 2));
+    const headEndIdx = Math.min(halfPages, pageBounds.length);
+    const tailStartIdx = Math.max(headEndIdx, pageBounds.length - halfPages);
+    selectedBounds = [];
+    let scannedChars = 0;
+    for (let i = 0; i < headEndIdx && scannedChars < MAX_ALL_PAGES_SCAN_CHARS; i++) {
+      const b = pageBounds[i]!;
+      selectedBounds.push(b);
+      scannedChars += b[1] - b[0];
+    }
+    for (let i = tailStartIdx; i < pageBounds.length && scannedChars < MAX_ALL_PAGES_SCAN_CHARS; i++) {
+      const b = pageBounds[i]!;
+      selectedBounds.push(b);
+      scannedChars += b[1] - b[0];
     }
   }
 
-  const ranked = specific
-    .map((t) => ({ t, tier: priorityTier(t) }))
-    .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-  const kept: FactSheetEntry[] = [];
-  let urls = 0;
-  for (const { t, tier } of ranked) {
-    if (kept.length >= MAX_TOKENS) break;
-    if (tier === 2 && urls++ >= MAX_URLS) continue;
-    kept.push({ token: t, count: counts.get(t) ?? 1 });
+  for (const [start, end] of selectedBounds) {
+    const chunk = text.slice(start, end);
+    const scan = chunk.length > MAX_SCAN ? chunk.slice(0, MAX_SCAN) : chunk;
+    collectRawFactSheetCounts(scan, counts, MAX_ALL_PAGES_SEEN);
   }
 
-  return { kept, dropped: specific.length - kept.length };
+  return collapseAndSelectFactSheet(counts);
 }
 
 const OPEN =

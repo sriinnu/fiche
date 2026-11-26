@@ -204,7 +204,7 @@ export function parseExportArgv(
     } else if (a === '--out') {
       i++;
       const val = argv[i];
-      if (val === undefined) return { kind: 'error', message: '--out requires a value' };
+      if (val === undefined || val.startsWith('-')) return { kind: 'error', message: '--out requires a value' };
       out = val;
     } else if (a.startsWith('--out=')) {
       const v = a.slice('--out='.length);
@@ -213,7 +213,7 @@ export function parseExportArgv(
     } else if (a === '--model') {
       i++;
       const val = argv[i];
-      if (val === undefined) return { kind: 'error', message: '--model requires a value' };
+      if (val === undefined || val.startsWith('-')) return { kind: 'error', message: '--model requires a value' };
       model = val;
     } else if (a.startsWith('--model=')) {
       const v = a.slice('--model='.length);

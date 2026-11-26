@@ -23,7 +23,7 @@ function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
   const splitTotal = fiveMinute + oneHour;
   if (!(splitTotal > 0)) return CACHE_CREATE_RATE;
   // The API contract says splitTotal === cc. Normalize malformed/mismatched
-  // payloads to the aggregate so telemetry never invents extra write tokens.
+  // payloads to the aggregate so accounting never invents extra write tokens.
   return (
     fiveMinute * CACHE_CREATE_RATE + oneHour * CACHE_CREATE_1H_RATE
   ) / splitTotal;
@@ -190,7 +190,7 @@ export function computeBaselineInputEff(
   );
 }
 
-/** Tier-aware variant for internal telemetry accounting. */
+/** Tier-aware variant for internal savings accounting. */
 export function computeBaselineInputEffWithCacheTier(
   baseline: number,
   baselineCacheable: number,
@@ -236,7 +236,7 @@ export function computeActualInputEff(
   return computeActualInputEffWithCacheTier(inputTokens, cc, cr, 0);
 }
 
-/** Tier-aware variant for internal telemetry accounting. */
+/** Tier-aware variant for internal savings accounting. */
 export function computeActualInputEffWithCacheTier(
   inputTokens: number,
   cc: number,
@@ -248,4 +248,26 @@ export function computeActualInputEffWithCacheTier(
   return inputTokens
     + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
     + cr * readRate;
+}
+
+/**
+ * Validate that an Anthropic `count_tokens` baseline probe represents a usable
+ * full-request baseline rather than a rejected/partial probe or a server-side
+ * `thread_continue` delta probe (which only probes the incremental delta while
+ * Anthropic expands the full cached thread in usage).
+ */
+export function isUsableAnthropicBaselineProbe(args: {
+  baselineTokens: number | undefined;
+  probeStatus: string | undefined;
+  threadContinue?: boolean;
+  cacheReadTokens: number;
+}): boolean {
+  const { baselineTokens, probeStatus, threadContinue, cacheReadTokens } = args;
+  if (baselineTokens === undefined || !Number.isFinite(baselineTokens) || !(baselineTokens > 0)) {
+    return false;
+  }
+  if (threadContinue === true) return false;
+  if (probeStatus !== undefined && probeStatus !== 'ok') return false;
+  if (cacheReadTokens > 2000 && baselineTokens < cacheReadTokens * 0.5) return false;
+  return true;
 }

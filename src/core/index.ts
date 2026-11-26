@@ -17,6 +17,7 @@ export {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
   countCacheControlMarkers,
+  isThreadContinuation,
   type CountTokensBodies,
 } from './measurement.js';
 export {
@@ -63,3 +64,57 @@ export {
   CACHE_CREATE_RATE,
   CACHE_READ_RATE,
 } from './baseline.js';
+export {
+  buildCalibrationProbe,
+  scoreCalibrationResponse,
+  getCalibratedProfile,
+  setCalibratedProfile,
+  removeCalibratedProfile,
+  listCalibratedProfiles,
+  clearCalibratedProfiles,
+  serializeCalibratedProfiles,
+  restoreCalibratedProfiles,
+  type CalibrationBand,
+  type CalibratedModelProfile,
+  type CalibrationProbe,
+  type CalibrationScores,
+} from './calibration.js';
+export {
+  ContextPageStore,
+  getGlobalMmuStore,
+  configureMmuPersistence,
+  flushMmuPersistence,
+  resetGlobalMmuStore,
+  computeTailHydration,
+  extractFaultSignalSnippet,
+  computeHorizonPaybackLimit,
+  foldMarkovianEpisodes,
+  linkSessionSkills,
+  pruneLowDensityBlob,
+  extractSymbolSpans,
+  type MmuPage,
+  type MmuPageSummary,
+  type MmuStats,
+  type MmuSymbolSpan,
+  type MmuPersistenceAdapter,
+  type TailHydrationResult,
+  type FoldMarkovianEpisodesResult,
+  type LinkSessionSkillsResult,
+  type PruneLowDensityResult,
+} from './context-mmu.js';
+export {
+  PrefixMemoTape,
+  getGlobalPrefixTape,
+  resetGlobalPrefixTape,
+  tapeHash64Hex,
+  INITIAL_PREFIX_HASH,
+  type Stage2MemoEntry,
+  type CommittedSlotSeal,
+  type CasiMemoEntry,
+  type PrefixTapeStats,
+  type PrefixMemoTapeOptions,
+} from './prefix-tape.js';
+export {
+  resolveOpticalHistoryPolicy,
+  type OpticalMode,
+} from './transform.js';

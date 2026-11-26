@@ -313,7 +313,7 @@ the next contributor doesn't relitigate the same decisions.)
 
 `src/core/transform.ts` is the transform itself — the runtime-agnostic
 function that takes a request body and returns the rewritten body plus
-`TransformInfo` telemetry. `src/core/proxy.ts` is the runtime-agnostic
+`TransformInfo` stats. `src/core/proxy.ts` is the runtime-agnostic
 request handler that calls the transform, forwards the rewritten request to
 the Anthropic API, tees the response body to extract usage tokens, and fires
 the `onRequest` callback. `src/node.ts` is the Node `http` server entrypoint

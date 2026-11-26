@@ -12,7 +12,7 @@
  *   GET  /proxy-recent               → JSON ring buffer of recent requests
  *   GET  /proxy-latest-png[?crop=N]  → raw PNG of the latest rendered image
  *
- * Session endpoints (read-only telemetry — no destructive operations):
+ * Session endpoints (read-only local metrics — no destructive operations):
  *
  *   GET  /api/sessions.json          → grouped sessions (sha8 + project + counts)
  *   GET  /api/stats.json             → full-history aggregate (formerly `inkling stats`)
@@ -30,6 +30,7 @@
 
 import * as fs from 'node:fs';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
@@ -39,6 +40,7 @@ import {
   computeActualInputEffWithCacheTier,
   computeBaselineInputEffWithCacheTier,
   deriveBaselineWarmth,
+  isUsableAnthropicBaselineProbe,
   observedCacheTtlSec,
   type BaselineWarmthPrev,
 } from './core/baseline.js';
@@ -56,6 +58,7 @@ import {
   aggregateSessions,
   claudeCodeMap,
   filterSessions,
+  type AggregateResult,
   type ClaudeCodeSessionRef,
   type ListOptions,
   type SessionsPaths,
@@ -82,10 +85,17 @@ import {
 } from './dashboard/fragments.js';
 export { FICHE_ICON_SVG };
 import { readBrandEnv } from './core/env.js';
+import { getCalibratedProfile, listCalibratedProfiles } from './core/calibration.js';
+import { getGlobalMmuStore } from './core/context-mmu.js';
+import { getGlobalPrefixTape } from './core/prefix-tape.js';
+import { readerTier } from './core/reader-tier.js';
+import { isTextHygieneActive } from './core/text-hygiene.js';
+import { resolveOpticalHistoryPolicy } from './core/transform.js';
 import {
   getAllowedModelBases,
   getConfiguredModelBases,
   isFicheSupportedModel,
+  isInConfiguredModelBases,
   setAllowedModelBases,
 } from './core/applicability.js';
 import {
@@ -115,6 +125,7 @@ import type {
 const RECENT_CAP = 50;
 const DAILY_CHART_DAYS = 14;
 const MAX_DAILY_BUCKETS = 90;
+const MAX_MODEL_KEYS = 256;
 
 function localDateKey(ms: number): string {
   const d = new Date(ms);
@@ -389,7 +400,7 @@ interface Totals {
   /** Kosha mode: exact per-row USD across compressed vs passthrough paths. */
   compressedActualUsdKosha: number;
   passthroughActualUsdKosha: number;
-  /** Prefix-safe text-hygiene token/char savings and cliff avoidance telemetry. */
+  /** Prefix-safe text-hygiene token/char savings and cliff avoidance metrics. */
   textHygieneSavedTokens: number;
   textHygieneSavedChars: number;
   cliffAvoidedEvents: number;
@@ -508,6 +519,7 @@ function googleEff(args: {
   baselineImagedTokens: number;
   nativeInjectedTokens: number;
   textHygieneSavedTokens?: number;
+  warmth?: { warm: boolean; selfBusted: boolean; prevPrefixTokens: number };
 }): {
   haveUsage: boolean;
   haveBaseline: boolean;
@@ -531,14 +543,20 @@ function googleEff(args: {
   const baseline = measuredBaseline || estimatedBaseline;
   const haveBaseline = baseline > 0;
   const creditSaving = haveBaseline && haveUsage && compressed;
+  const cached = Math.min(inp, Math.max(0, args.cachedTokens ?? 0));
   if (priceMode() === 'kosha') {
     const rates = resolvePriceRates(args.model, { promptTokens: inp });
-    const cached = Math.min(inp, Math.max(0, args.cachedTokens ?? 0));
     const actualInputEff = haveUsage ? (inp - cached) + cached * rates.read : 0;
-    const delta = baseline - inp;
-    const baselineInputEff = creditSaving
-      ? actualInputEff + delta * (cached > 0 ? rates.read : 1)
-      : actualInputEff;
+    let baselineInputEff = actualInputEff;
+    if (creditSaving) {
+      if (args.warmth?.selfBusted) {
+        const reused = Math.min(baseline, args.warmth.prevPrefixTokens);
+        baselineInputEff = reused * rates.read + (baseline - reused) * 1.0;
+      } else {
+        const delta = baseline - inp;
+        baselineInputEff = actualInputEff + delta * (cached > 0 ? rates.read : 1);
+      }
+    }
     const outputEquiv = haveUsage ? out * rates.output : 0;
     return {
       haveUsage,
@@ -548,18 +566,24 @@ function googleEff(args: {
       baselineInputEff,
       outputEquiv,
       rawBaseline: creditSaving ? baseline : inp,
-      warmForRow: cached > 0,
+      warmForRow: cached > 0 || Boolean(args.warmth?.warm),
     };
+  }
+  let baselineInputEff = creditSaving ? baseline : inp;
+  if (creditSaving && args.warmth?.selfBusted) {
+    const rates = resolvePriceRates(args.model, { promptTokens: inp });
+    const reused = Math.min(baseline, args.warmth.prevPrefixTokens);
+    baselineInputEff = reused * rates.read + (baseline - reused) * 1.0;
   }
   return {
     haveUsage,
     haveBaseline,
     creditSaving,
     actualInputEff: inp,
-    baselineInputEff: creditSaving ? baseline : inp,
+    baselineInputEff,
     outputEquiv: out,
     rawBaseline: creditSaving ? baseline : inp,
-    warmForRow: false,
+    warmForRow: cached > 0 || Boolean(args.warmth?.warm),
   };
 }
 
@@ -630,7 +654,7 @@ function gptEff(args: {
 declare const __FICHE_VERSION__: string | undefined;
 
 function defaultDashboardVersion(): string {
-  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.18.0';
+  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.19.0';
 }
 
 export interface DashboardHooks {
@@ -646,6 +670,7 @@ export interface DashboardHooks {
   ) => { updatedCount: number; enabled: boolean; plugins: StagePluginDescriptor[] };
   readonly onProvidersPersist?: (providers: readonly ProviderId[]) => void;
   readonly onShutdown?: () => void;
+  readonly getActiveRequests?: () => number;
 }
 
 export class DashboardState {
@@ -665,8 +690,9 @@ export class DashboardState {
    *  sizes its reused vs grown prefix tokens. Reconstructed identically in
    *  replay() from persisted timestamps, so live and restored numbers agree.
    *  Capped with sessions. */
-  private baselineWarmth: Map<string, BaselineWarmthPrev> = new Map();
+  private baselineWarmth: Map<string, BaselineWarmthPrev & { observedCachedTokens?: number }> = new Map();
   private openaiWarmth: Map<string, OpenAIWarmthPrev> = new Map();
+  private googleWarmth: Map<string, OpenAIWarmthPrev> = new Map();
   /** Default max age of a prior row that can still make the text path warm.
    *  A prior that wrote 1h-tier tokens carries its own 3600 s window instead. */
   private static readonly CACHE_TTL_SEC = 300;
@@ -679,9 +705,15 @@ export class DashboardState {
    * only currently enabled model families, so toggling a model updates the
    * overall numbers without discarding its history. */
   private readonly totalsByModel = new Map<string, Totals>();
+  private otherHasSupportedModel = false;
   /** Daily accounting partitioned by local YYYY-MM-DD and exact model id.
    *  Capped to MAX_DAILY_BUCKETS days in memory. */
   private readonly dailyByDateModel = new Map<string, Map<string, DailyBucket>>();
+  private readonly dailyOtherSupported = new Map<string, boolean>();
+  private apiStatsCache: { sig: string; body: Record<string, unknown> } | null = null;
+  private apiStatsInFlight: { sig: string; promise: Promise<Record<string, unknown> | null> } | null = null;
+  private apiSessionsCache: { sig: string; result: AggregateResult } | null = null;
+  private apiSessionsInFlight: { sig: string; promise: Promise<AggregateResult> } | null = null;
   /** Bounded ring of the most recently rendered images (last IMAGE_RING_CAP).
    *  Each request that rendered an image pushes one entry; the matching
    *  RecentRow carries `img_id` so the dashboard can pull any image still in
@@ -744,8 +776,51 @@ export class DashboardState {
     this.hooks = hooks;
   }
 
+  private lruGet<V>(map: Map<string, V>, key: string): V | undefined {
+    const val = map.get(key);
+    if (val !== undefined) {
+      map.delete(key);
+      map.set(key, val);
+    }
+    return val;
+  }
+
+  private lruSet<V>(map: Map<string, V>, key: string, val: V, cap: number): void {
+    if (map.has(key)) map.delete(key);
+    map.set(key, val);
+    while (map.size > cap) {
+      const firstKey = map.keys().next().value;
+      if (firstKey === undefined) break;
+      map.delete(firstKey);
+    }
+  }
+
+  private isModelIncludedInStats(
+    model: string,
+    textHygieneSavedTokens: number,
+    otherSupported = false,
+  ): boolean {
+    return (
+      isInConfiguredModelBases(model) ||
+      isFicheSupportedModel(model) ||
+      textHygieneSavedTokens > 0 ||
+      (model === 'other' && otherSupported)
+    );
+  }
+
   private totalsForModel(model: string | undefined): Totals {
-    const key = model ?? '';
+    const rawKey = model ?? '';
+    let key = rawKey;
+    if (
+      !this.totalsByModel.has(rawKey) &&
+      (this.totalsByModel.size >= MAX_MODEL_KEYS ||
+        (this.totalsByModel.size === MAX_MODEL_KEYS - 1 && !this.totalsByModel.has('other')))
+    ) {
+      key = 'other';
+      if (isInConfiguredModelBases(rawKey) || isFicheSupportedModel(rawKey)) {
+        this.otherHasSupportedModel = true;
+      }
+    }
     let totals = this.totalsByModel.get(key);
     if (!totals) {
       totals = emptyTotals(this.startedAt);
@@ -757,7 +832,7 @@ export class DashboardState {
   private enabledTotals(): Totals {
     const combined = emptyTotals(this.startedAt);
     for (const [model, totals] of this.totalsByModel) {
-      if (!isFicheSupportedModel(model) && totals.textHygieneSavedTokens <= 0) continue;
+      if (!this.isModelIncludedInStats(model, totals.textHygieneSavedTokens, this.otherHasSupportedModel)) continue;
       for (const key of Object.keys(combined) as Array<keyof Totals>) {
         if (key !== 'startedAt') combined[key] += totals[key];
       }
@@ -775,10 +850,24 @@ export class DashboardState {
         for (const k of this.dailyByDateModel.keys()) {
           if (oldestKey === undefined || k < oldestKey) oldestKey = k;
         }
-        if (oldestKey !== undefined) this.dailyByDateModel.delete(oldestKey);
+        if (oldestKey !== undefined) {
+          this.dailyByDateModel.delete(oldestKey);
+          this.dailyOtherSupported.delete(oldestKey);
+        }
       }
     }
-    const modelKey = model ?? '';
+    const rawKey = model ?? '';
+    let modelKey = rawKey;
+    if (
+      !byModel.has(rawKey) &&
+      (byModel.size >= MAX_MODEL_KEYS ||
+        (byModel.size === MAX_MODEL_KEYS - 1 && !byModel.has('other')))
+    ) {
+      modelKey = 'other';
+      if (isInConfiguredModelBases(rawKey) || isFicheSupportedModel(rawKey)) {
+        this.dailyOtherSupported.set(dateKey, true);
+      }
+    }
     let bucket = byModel.get(modelKey);
     if (!bucket) {
       bucket = emptyDailyBucket();
@@ -903,7 +992,7 @@ export class DashboardState {
       daily.cliffSavedUsd += cliffUsd;
     }
 
-    const rawSaved = creditSaving && rawBaseline > 0 ? Math.max(0, rawBaseline - rawActual) : 0;
+    const rawSaved = creditSaving && rawBaseline > 0 ? rawBaseline - rawActual : 0;
 
     if (creditSaving) {
       totals.baselineInputWeighted += baselineInputEff;
@@ -926,9 +1015,12 @@ export class DashboardState {
         const usdPerMtok = inputUsdPerMtok(model, { promptTokens: inp + cc + cr, at: eventMs });
         if (usdPerMtok !== undefined) {
           const rowUsd = ((baselineInputEff - actualInputEff) * usdPerMtok) / 1e6;
-          totals.pricedSavedUsd += rowUsd;
+          const effectiveRowUsd = rowUsd < 0
+            ? rowUsd
+            : (cliffAvoided && cliffUsd > 0 ? Math.max(rowUsd, cliffUsd) : rowUsd);
+          totals.pricedSavedUsd += effectiveRowUsd;
           totals.usdPricedRequests += 1;
-          daily.pricedSavedUsd += rowUsd;
+          daily.pricedSavedUsd += effectiveRowUsd;
         } else {
           totals.usdUnpricedRequests += 1;
         }
@@ -977,7 +1069,7 @@ export class DashboardState {
 
     if (typeof sid === 'string' && sid.length > 0) {
       this.currentSessionId = sid;
-      let s = this.sessions.get(sid);
+      let s = this.lruGet(this.sessions, sid);
       if (!s) {
         s = {
           sessionId: sid,
@@ -990,11 +1082,7 @@ export class DashboardState {
           rawBaselineTokens: 0,
           rawOutputTokens: 0,
         };
-        this.sessions.set(sid, s);
-        if (this.sessions.size > DashboardState.SESSION_CAP) {
-          const firstKey = this.sessions.keys().next().value;
-          if (firstKey !== undefined) this.sessions.delete(firstKey);
-        }
+        this.lruSet(this.sessions, sid, s, DashboardState.SESSION_CAP);
       }
       if (creditSaving && dollarEligible) {
         s.baselineInputWeighted += baselineInputEff;
@@ -1103,11 +1191,28 @@ export class DashboardState {
     // Anthropic cr>0 or GPT cached_tokens>0. Drives Context Map narration.
 
     if (google) {
+      const sidGoogle = info?.firstUserSha8;
+      const cachedGoogle = u?.cached_tokens ?? 0;
+      const completionSecGoogle = eventMs / 1000;
+      const requestStartSecGoogle = completionSecGoogle - Math.max(0, ev.durationMs || 0) / 1000;
+      const googlePrev = typeof sidGoogle === 'string' && sidGoogle.length > 0
+        ? this.lruGet(this.googleWarmth, sidGoogle)
+        : undefined;
+      const pxShaGoogle = info?.cachePrefixSha8 ?? info?.historyImageSha;
+      const warmthGoogle = deriveOpenAIBaselineWarmth(
+        googlePrev,
+        requestStartSecGoogle,
+        cachedGoogle,
+        info?.systemSha8,
+        ev.model,
+        DashboardState.CACHE_TTL_SEC,
+        pxShaGoogle,
+      );
       const e = googleEff({
         model: ev.model,
         inputTokens: inp,
         outputTokens: out,
-        cachedTokens: u?.cached_tokens ?? 0,
+        cachedTokens: cachedGoogle,
         compressed,
         baselineTokens: info?.baselineTokens ?? 0,
         baselineProbeStatus: info?.baselineProbeStatus,
@@ -1115,7 +1220,22 @@ export class DashboardState {
         baselineImagedTokens: info?.baselineImagedTokens ?? 0,
         nativeInjectedTokens: info?.nativeInjectedTokens ?? 0,
         textHygieneSavedTokens: info?.textHygieneSavedTokens ?? 0,
+        warmth: warmthGoogle,
       });
+      if (typeof sidGoogle === 'string' && sidGoogle.length > 0 && e.haveUsage) {
+        this.lruSet(
+          this.googleWarmth,
+          sidGoogle,
+          {
+            ts: completionSecGoogle,
+            cachedOrPrefixTokens: cachedGoogle > 0 ? cachedGoogle : Math.max(googlePrev?.cachedOrPrefixTokens ?? 0, inp),
+            prefixSha: info?.systemSha8 ?? googlePrev?.prefixSha,
+            pxPrefixSha: pxShaGoogle ?? googlePrev?.pxPrefixSha,
+            model: ev.model ?? googlePrev?.model,
+          },
+          DashboardState.SESSION_CAP,
+        );
+      }
       haveUsage = e.haveUsage;
       haveBaseline = e.haveBaseline;
       creditSaving = e.creditSaving;
@@ -1125,7 +1245,7 @@ export class DashboardState {
       rawActual = inp;
       rawBaseline = e.rawBaseline;
       baselineForRow = creditSaving ? e.rawBaseline : 0;
-      cacheReadForRow = u?.cached_tokens ?? 0;
+      cacheReadForRow = cachedGoogle;
       warmForRow = e.warmForRow;
     } else if (gpt) {
       const sidGpt = info?.firstUserSha8;
@@ -1133,7 +1253,7 @@ export class DashboardState {
       const completionSecGpt = Date.now() / 1000;
       const requestStartSecGpt = completionSecGpt - Math.max(0, ev.durationMs || 0) / 1000;
       const gptPrev = typeof sidGpt === 'string' && sidGpt.length > 0
-        ? this.openaiWarmth.get(sidGpt)
+        ? this.lruGet(this.openaiWarmth, sidGpt)
         : undefined;
       const pxShaGpt = info?.cachePrefixSha8 ?? info?.historyImageSha;
       const warmthGpt = deriveOpenAIBaselineWarmth(
@@ -1159,17 +1279,18 @@ export class DashboardState {
         compressed,
       });
       if (typeof sidGpt === 'string' && sidGpt.length > 0 && e.haveUsage) {
-        this.openaiWarmth.set(sidGpt, {
-          ts: completionSecGpt,
-          cachedOrPrefixTokens: cachedGpt > 0 ? cachedGpt : Math.max(gptPrev?.cachedOrPrefixTokens ?? 0, inp),
-          prefixSha: info?.systemSha8 ?? gptPrev?.prefixSha,
-          pxPrefixSha: pxShaGpt ?? gptPrev?.pxPrefixSha,
-          model: ev.model ?? gptPrev?.model,
-        });
-        if (this.openaiWarmth.size > DashboardState.SESSION_CAP) {
-          const firstKey = this.openaiWarmth.keys().next().value;
-          if (firstKey !== undefined) this.openaiWarmth.delete(firstKey);
-        }
+        this.lruSet(
+          this.openaiWarmth,
+          sidGpt,
+          {
+            ts: completionSecGpt,
+            cachedOrPrefixTokens: cachedGpt > 0 ? cachedGpt : Math.max(gptPrev?.cachedOrPrefixTokens ?? 0, inp),
+            prefixSha: info?.systemSha8 ?? gptPrev?.prefixSha,
+            pxPrefixSha: pxShaGpt ?? gptPrev?.pxPrefixSha,
+            model: ev.model ?? gptPrev?.model,
+          },
+          DashboardState.SESSION_CAP,
+        );
       }
       haveUsage = e.haveUsage;
       haveBaseline = e.haveBaseline;
@@ -1193,11 +1314,12 @@ export class DashboardState {
       // rate on tokens that actually would have been cache-discounted —
       // fabricating "$ saved". Excluding the row is the only honest move
       // until the probe succeeds.
-      const probeOk = info?.baselineProbeStatus === 'ok'
-        // Back-compat: hosts that haven't adopted baselineProbeStatus yet
-        // still see fields land; we accept legacy rows where the full-body
-        // probe resolved AND (either no markers existed OR cacheable did too).
-        || (info?.baselineProbeStatus === undefined && baseline !== undefined && baseline > 0);
+      const probeOk = isUsableAnthropicBaselineProbe({
+        baselineTokens: baseline,
+        probeStatus: info?.baselineProbeStatus,
+        threadContinue: info?.threadContinue,
+        cacheReadTokens: cr,
+      });
       haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
       // Weighted INPUT cost we actually paid this turn.
@@ -1227,7 +1349,7 @@ export class DashboardState {
       const requestStartSec = completionSec - Math.max(0, ev.durationMs || 0) / 1000;
       const warmthPrev =
         typeof sidNow === 'string' && sidNow.length > 0
-          ? this.baselineWarmth.get(sidNow)
+          ? this.lruGet(this.baselineWarmth, sidNow)
           : undefined;
       // Centralised in deriveBaselineWarmth so update()/replay()/sessions can't drift.
       const toolsShaNow = info?.cachePrefixToolsSha8;
@@ -1241,6 +1363,7 @@ export class DashboardState {
         toolsShaNow,
         { pxPrefixSha: info?.cachePrefixSha8, model: ev.model },
       );
+      const readRateNow = anthropicReadRate(ev.model);
       baselineInputEff = creditSaving
         ? computeBaselineInputEffWithCacheTier(
             baseline as number,
@@ -1252,46 +1375,61 @@ export class DashboardState {
             prevCacheable,
             cc1h,
             cc5m,
-            anthropicReadRate(ev.model),
+            readRateNow,
           )
         : actualInputEff;
       const hygieneTok = info?.textHygieneSavedTokens ?? 0;
       if (!haveBaseline && compressed && haveUsage && hygieneTok > 0 && (info?.imageCount ?? 0) === 0) {
         haveBaseline = true;
         creditSaving = true;
-        const deltaWeight = cr > 0
-          ? anthropicReadRate(ev.model)
-          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
-        baselineInputEff = actualInputEff + hygieneTok * deltaWeight;
+        if (warm && cr === 0) {
+          const unproxiedRaw = inp + cc + hygieneTok;
+          const reusedTarget = prevCacheable > 0 ? prevCacheable : (warmthPrev?.observedCachedTokens ?? 0);
+          if (reusedTarget > 0) {
+            const reused = Math.min(unproxiedRaw, reusedTarget);
+            const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+            baselineInputEff = reused * readRateNow + (unproxiedRaw - reused) * createRate;
+          } else {
+            baselineInputEff = actualInputEff + hygieneTok * readRateNow;
+          }
+        } else {
+          const deltaWeight = cr > 0
+            ? readRateNow
+            : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          baselineInputEff = actualInputEff + hygieneTok * deltaWeight;
+        }
       }
       // Record this completed turn's prefix for later warmth/split decisions.
       // Carry the prior cacheable when this row has no probe.
       if (typeof sidNow === 'string' && sidNow.length > 0 && haveUsage) {
-        this.baselineWarmth.set(sidNow, {
-          ts: completionSec,
-          cacheable: cacheable > 0 ? cacheable : (warmthPrev?.cacheable ?? 0),
-          prefixSha: prefixShaNow ?? warmthPrev?.prefixSha,
-          toolsSha: toolsShaNow ?? warmthPrev?.toolsSha,
-          pxPrefixSha: info?.cachePrefixSha8 ?? warmthPrev?.pxPrefixSha,
-          model: ev.model ?? warmthPrev?.model,
-          ttlSec: observedCacheTtlSec(cc1h, warmthPrev?.ttlSec),
-        });
-        if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
-          const firstKey = this.baselineWarmth.keys().next().value;
-          if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
-        }
+        this.lruSet(
+          this.baselineWarmth,
+          sidNow,
+          {
+            ts: completionSec,
+            cacheable: cacheable > 0 ? cacheable : (warmthPrev?.cacheable ?? 0),
+            prefixSha: prefixShaNow ?? warmthPrev?.prefixSha,
+            toolsSha: toolsShaNow ?? warmthPrev?.toolsSha,
+            pxPrefixSha: info?.cachePrefixSha8 ?? warmthPrev?.pxPrefixSha,
+            model: ev.model ?? warmthPrev?.model,
+            ttlSec: observedCacheTtlSec(cc1h, warmthPrev?.ttlSec),
+            observedCachedTokens: cr > 0 || cc > 0 ? cr + cc : warmthPrev?.observedCachedTokens,
+          },
+          DashboardState.SESSION_CAP,
+        );
       }
 
       // Output tokens are identical with/without compression — the proxy never
       // touches the response body. They show up on BOTH sides of the savings
-      // ratio at their actual rate (OUTPUT_TOKEN_RATE × input rate) so the
-      // denominator reflects the full bill the user actually pays. Without
-      // this, an output-heavy turn would silently inflate the "saved %"
-      // headline relative to what Anthropic's weekly limit meters as token
-      // consumption (input + output × 5).
-      outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
+      // ratio at their actual rate (resolvePriceRates(model).output × input rate) so the
+      // denominator reflects the full bill the user actually pays.
+      outputEquiv = haveUsage
+        ? out * resolvePriceRates(ev.model, { promptTokens: inp + cc + cr, at: eventMs }).output
+        : 0;
       rawActual = inp + cc + cr;
-      rawBaseline = baseline ?? (creditSaving && hygieneTok > 0 ? rawActual + hygieneTok : 0);
+      rawBaseline = probeOk && typeof baseline === 'number'
+        ? baseline
+        : (creditSaving && hygieneTok > 0 ? rawActual + hygieneTok : 0);
       baselineForRow = rawBaseline;
       cacheReadForRow = cr;
       warmForRow = warm; // server-observed cache read (cr>0)
@@ -1504,6 +1642,22 @@ export class DashboardState {
           const durationMs = Math.max(0, finiteNum(t.duration_ms));
 
           if (google) {
+            const sidGoogleR = (t as { first_user_sha8?: string }).first_user_sha8;
+            const completionSecGoogleR = eventMs / 1000;
+            const requestStartSecGoogleR = completionSecGoogleR - durationMs / 1000;
+            const googlePrevR = typeof sidGoogleR === 'string' && sidGoogleR.length > 0
+              ? this.lruGet(this.googleWarmth, sidGoogleR)
+              : undefined;
+            const pxShaGoogleR = t.cache_prefix_sha8 ?? (t as { history_image_sha8?: string }).history_image_sha8;
+            const warmthGoogleR = deriveOpenAIBaselineWarmth(
+              googlePrevR,
+              requestStartSecGoogleR,
+              cachedTok,
+              (t as { system_sha8?: string }).system_sha8,
+              t.model,
+              DashboardState.CACHE_TTL_SEC,
+              pxShaGoogleR,
+            );
             const e = googleEff({
               model: t.model,
               inputTokens: inp,
@@ -1517,7 +1671,22 @@ export class DashboardState {
               baselineImagedTokens: baselineImagedTok,
               nativeInjectedTokens: nativeInjectedTok,
               textHygieneSavedTokens: hygieneTok,
+              warmth: warmthGoogleR,
             });
+            if (typeof sidGoogleR === 'string' && sidGoogleR.length > 0 && e.haveUsage) {
+              this.lruSet(
+                this.googleWarmth,
+                sidGoogleR,
+                {
+                  ts: completionSecGoogleR,
+                  cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : Math.max(googlePrevR?.cachedOrPrefixTokens ?? 0, inp),
+                  prefixSha: (t as { system_sha8?: string }).system_sha8 ?? googlePrevR?.prefixSha,
+                  pxPrefixSha: pxShaGoogleR ?? googlePrevR?.pxPrefixSha,
+                  model: t.model ?? googlePrevR?.model,
+                },
+                DashboardState.SESSION_CAP,
+              );
+            }
             haveUsage = e.haveUsage;
             haveBaseline = e.haveBaseline;
             creditSaving = e.creditSaving;
@@ -1534,7 +1703,7 @@ export class DashboardState {
             const completionSecGptR = eventMs / 1000;
             const requestStartSecGptR = completionSecGptR - durationMs / 1000;
             const gptPrevR = typeof sidGptR === 'string' && sidGptR.length > 0
-              ? this.openaiWarmth.get(sidGptR)
+              ? this.lruGet(this.openaiWarmth, sidGptR)
               : undefined;
             const pxShaGptR = t.cache_prefix_sha8 ?? (t as { history_image_sha8?: string }).history_image_sha8;
             const warmthGptR = deriveOpenAIBaselineWarmth(
@@ -1560,17 +1729,18 @@ export class DashboardState {
               compressed,
             });
             if (typeof sidGptR === 'string' && sidGptR.length > 0 && e.haveUsage) {
-              this.openaiWarmth.set(sidGptR, {
-                ts: completionSecGptR,
-                cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : Math.max(gptPrevR?.cachedOrPrefixTokens ?? 0, inp),
-                prefixSha: (t as { system_sha8?: string }).system_sha8 ?? gptPrevR?.prefixSha,
-                pxPrefixSha: pxShaGptR ?? gptPrevR?.pxPrefixSha,
-                model: t.model ?? gptPrevR?.model,
-              });
-              if (this.openaiWarmth.size > DashboardState.SESSION_CAP) {
-                const firstKey = this.openaiWarmth.keys().next().value;
-                if (firstKey !== undefined) this.openaiWarmth.delete(firstKey);
-              }
+              this.lruSet(
+                this.openaiWarmth,
+                sidGptR,
+                {
+                  ts: completionSecGptR,
+                  cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : Math.max(gptPrevR?.cachedOrPrefixTokens ?? 0, inp),
+                  prefixSha: (t as { system_sha8?: string }).system_sha8 ?? gptPrevR?.prefixSha,
+                  pxPrefixSha: pxShaGptR ?? gptPrevR?.pxPrefixSha,
+                  model: t.model ?? gptPrevR?.model,
+                },
+                DashboardState.SESSION_CAP,
+              );
             }
             haveUsage = e.haveUsage;
             haveBaseline = e.haveBaseline;
@@ -1590,8 +1760,12 @@ export class DashboardState {
             const probeStatus = (t as { baseline_probe_status?: string }).baseline_probe_status;
             // Same gating rule as update(): require an explicit 'ok' status when
             // present; fall back to "have a baseline number" for legacy JSONL.
-            const probeOk = probeStatus === 'ok'
-              || (probeStatus === undefined && baselineOpt !== undefined && baselineOpt > 0);
+            const probeOk = isUsableAnthropicBaselineProbe({
+              baselineTokens: baselineOpt,
+              probeStatus,
+              threadContinue: (t as { thread_continue?: boolean }).thread_continue,
+              cacheReadTokens: cr,
+            });
             haveBaseline = baselineOpt !== undefined && baselineOpt > 0 && probeOk;
             actualInputEff = haveUsage
               ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(t.model, { at: eventMs }))
@@ -1607,7 +1781,7 @@ export class DashboardState {
             const completionSecR = eventMs / 1000;
             const requestStartSecR = completionSecR - durationMs / 1000;
             const warmthPrevR =
-              typeof sidR === 'string' && sidR.length > 0 ? this.baselineWarmth.get(sidR) : undefined;
+              typeof sidR === 'string' && sidR.length > 0 ? this.lruGet(this.baselineWarmth, sidR) : undefined;
             const toolsShaR = (t as { cache_prefix_tools_sha8?: string }).cache_prefix_tools_sha8;
             const { warm: warmR, prevCacheable: prevCacheableR } = deriveBaselineWarmth(
               warmthPrevR,
@@ -1619,6 +1793,7 @@ export class DashboardState {
               toolsShaR,
               { pxPrefixSha: t.cache_prefix_sha8, model: t.model },
             );
+            const readRateR = anthropicReadRate(t.model, { at: eventMs });
             baselineInputEff = creditSaving
               ? computeBaselineInputEffWithCacheTier(
                   baselineOpt as number,
@@ -1630,35 +1805,53 @@ export class DashboardState {
                   prevCacheableR,
                   cc1h,
                   cc5m,
-                  anthropicReadRate(t.model, { at: eventMs }),
+                  readRateR,
                 )
               : actualInputEff;
             if (!haveBaseline && compressed && haveUsage && hygieneTok > 0 && imageCount === 0) {
               haveBaseline = true;
               creditSaving = true;
-              const deltaWeightR = cr > 0
-                ? anthropicReadRate(t.model, { at: eventMs })
-                : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
-              baselineInputEff = actualInputEff + hygieneTok * deltaWeightR;
-            }
-            if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
-              this.baselineWarmth.set(sidR, {
-                ts: completionSecR,
-                cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
-                prefixSha: prefixShaR ?? warmthPrevR?.prefixSha,
-                toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
-                pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
-                model: t.model ?? warmthPrevR?.model,
-                ttlSec: observedCacheTtlSec(cc1h, warmthPrevR?.ttlSec),
-              });
-              if (this.baselineWarmth.size > DashboardState.SESSION_CAP) {
-                const firstKey = this.baselineWarmth.keys().next().value;
-                if (firstKey !== undefined) this.baselineWarmth.delete(firstKey);
+              if (warmR && cr === 0) {
+                const unproxiedRawR = inp + cc + hygieneTok;
+                const reusedTargetR = prevCacheableR > 0 ? prevCacheableR : (warmthPrevR?.observedCachedTokens ?? 0);
+                if (reusedTargetR > 0) {
+                  const reusedR = Math.min(unproxiedRawR, reusedTargetR);
+                  const createRateR = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+                  baselineInputEff = reusedR * readRateR + (unproxiedRawR - reusedR) * createRateR;
+                } else {
+                  baselineInputEff = actualInputEff + hygieneTok * readRateR;
+                }
+              } else {
+                const deltaWeightR = cr > 0
+                  ? readRateR
+                  : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+                baselineInputEff = actualInputEff + hygieneTok * deltaWeightR;
               }
             }
-            outputEquiv = haveUsage ? out * OUTPUT_TOKEN_RATE : 0;
+            if (typeof sidR === 'string' && sidR.length > 0 && haveUsage) {
+              this.lruSet(
+                this.baselineWarmth,
+                sidR,
+                {
+                  ts: completionSecR,
+                  cacheable: cacheable > 0 ? cacheable : (warmthPrevR?.cacheable ?? 0),
+                  prefixSha: prefixShaR ?? warmthPrevR?.prefixSha,
+                  toolsSha: toolsShaR ?? warmthPrevR?.toolsSha,
+                  pxPrefixSha: t.cache_prefix_sha8 ?? warmthPrevR?.pxPrefixSha,
+                  model: t.model ?? warmthPrevR?.model,
+                  ttlSec: observedCacheTtlSec(cc1h, warmthPrevR?.ttlSec),
+                  observedCachedTokens: cr > 0 || cc > 0 ? cr + cc : warmthPrevR?.observedCachedTokens,
+                },
+                DashboardState.SESSION_CAP,
+              );
+            }
+            outputEquiv = haveUsage
+              ? out * resolvePriceRates(t.model, { promptTokens: inp + cc + cr, at: eventMs }).output
+              : 0;
             rawActual = inp + cc + cr;
-            rawBaseline = baselineOpt ?? (creditSaving && hygieneTok > 0 ? rawActual + hygieneTok : 0);
+            rawBaseline = probeOk && baselineOpt !== undefined
+              ? baselineOpt
+              : (creditSaving && hygieneTok > 0 ? rawActual + hygieneTok : 0);
             baselineForRow = rawBaseline;
             cacheReadForRow = cr;
             warmForRow = warmR;
@@ -1858,7 +2051,7 @@ export class DashboardState {
         message: 'no active session yet',
       });
     }
-    const s = this.sessions.get(this.currentSessionId);
+    const s = this.lruGet(this.sessions, this.currentSessionId);
     if (!s) {
       return jsonResponse({ sessionId: null, message: 'no active session yet' });
     }
@@ -1980,10 +2173,11 @@ export class DashboardState {
       const d = new Date(todayDate.getFullYear(), todayDate.getMonth(), todayDate.getDate() - offset);
       const dateKey = localDateKey(d.getTime());
       const byModelMap = this.dailyByDateModel.get(dateKey);
+      const dayOtherSupported = this.dailyOtherSupported.get(dateKey) === true;
       const sum = emptyDailyBucket();
       if (byModelMap) {
         for (const [model, b] of byModelMap) {
-          if (!isFicheSupportedModel(model) && b.textHygieneSavedTokens <= 0) {
+          if (!this.isModelIncludedInStats(model, b.textHygieneSavedTokens, dayOtherSupported)) {
             continue;
           }
           sum.requests += b.requests;
@@ -2102,6 +2296,9 @@ export class DashboardState {
       by_model: (() => {
         const byModel: Record<string, ModelStatsPayload> = {};
         for (const [model, t] of this.totalsByModel) {
+          if (!this.isModelIncludedInStats(model, t.textHygieneSavedTokens, this.otherHasSupportedModel)) {
+            continue;
+          }
           const key = model || 'unknown';
           const baseline = Math.round(t.baselineInputWeighted);
           const actual = Math.round(t.actualInputWeighted);
@@ -2163,7 +2360,12 @@ export class DashboardState {
       },
     };
     return new Response(JSON.stringify(payload, null, 2), {
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'cross-origin-resource-policy': 'same-origin',
+      },
     });
   }
 
@@ -2178,9 +2380,7 @@ export class DashboardState {
       // been evicted and their "view" button should be disabled.
       image_ids: this.images.map((im) => im.id),
     };
-    return new Response(JSON.stringify(payload), {
-      headers: { 'content-type': 'application/json' },
-    });
+    return jsonResponse(payload);
   }
 
   /** GET /proxy-latest-png[?id=N] — raw PNG from the image ring. With no id
@@ -2195,10 +2395,22 @@ export class DashboardState {
         ? this.images.find((im) => im.id === id)
         : this.images[this.images.length - 1];
     if (!entry) {
-      return new Response('no image yet', { status: 404 });
+      return new Response('no image yet', {
+        status: 404,
+        headers: {
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+          'cross-origin-resource-policy': 'same-origin',
+        },
+      });
     }
     return new Response(entry.png as unknown as BodyInit, {
-      headers: { 'content-type': 'image/png', 'cache-control': 'no-cache' },
+      headers: {
+        'content-type': 'image/png',
+        'cache-control': 'no-store',
+        'x-content-type-options': 'nosniff',
+        'cross-origin-resource-policy': 'same-origin',
+      },
     });
   }
 
@@ -2211,15 +2423,9 @@ export class DashboardState {
         ? this.images.find((im) => im.id === id)
         : this.images[this.images.length - 1];
     if (!entry || entry.sourceText === undefined) {
-      return new Response(JSON.stringify({ error: 'no source text' }), {
-        status: 404,
-        headers: { 'content-type': 'application/json' },
-      });
+      return jsonResponse({ error: 'no source text' }, 404);
     }
-    return new Response(
-      JSON.stringify({ id: entry.id, meta: entry.meta, source_text: entry.sourceText }),
-      { headers: { 'content-type': 'application/json' } },
-    );
+    return jsonResponse({ id: entry.id, meta: entry.meta, source_text: entry.sourceText });
   }
 
   serveHtml(port: number): Response {
@@ -2318,13 +2524,52 @@ export class DashboardState {
   // these on a 5s cadence, which is fine for a single-user dev tool — even at
   // ~3k events / 1.5 MB the round-trip is <100ms on a warm SSD.
 
+  private statSig(filePath: string): string | null {
+    try {
+      const st = fs.statSync(filePath);
+      return `${st.ino}:${st.size}:${st.mtimeMs}`;
+    } catch {
+      return null;
+    }
+  }
+
+  private async loadSessionsAggregate(): Promise<AggregateResult> {
+    if (!this.paths) {
+      return { sessions: new Map(), sidecarsBySession: new Map() };
+    }
+    const evSig = this.statSig(this.paths.eventsFile) ?? 'missing';
+    const scSig = this.statSig(this.paths.sidecarDir) ?? 'missing';
+    const sig = `${evSig}|${scSig}`;
+    if (this.apiSessionsCache && this.apiSessionsCache.sig === sig) {
+      return this.apiSessionsCache.result;
+    }
+    if (this.apiSessionsInFlight && this.apiSessionsInFlight.sig === sig) {
+      return this.apiSessionsInFlight.promise;
+    }
+    const p = aggregateSessions(this.paths);
+    this.apiSessionsInFlight = { sig, promise: p };
+    try {
+      const result = await p;
+      const afterEvSig = this.statSig(this.paths.eventsFile) ?? 'missing';
+      const afterScSig = this.statSig(this.paths.sidecarDir) ?? 'missing';
+      if (`${afterEvSig}|${afterScSig}` === sig && evSig !== 'missing') {
+        this.apiSessionsCache = { sig, result };
+      }
+      return result;
+    } finally {
+      if (this.apiSessionsInFlight?.promise === p) {
+        this.apiSessionsInFlight = null;
+      }
+    }
+  }
+
   /** GET /api/sessions.json — grouped sessions enriched with the Claude Code
    *  cross-reference. The body is the top-level `sessions` array; the client
    *  renders a bar chart of the top savers. */
   async serveSessionsJson(opts: ListOptions = {}): Promise<Response> {
     if (!this.paths) return notConfigured('sessions');
     const [{ sessions }, ccMap] = await Promise.all([
-      aggregateSessions(this.paths),
+      this.loadSessionsAggregate(),
       this.ccMapFn(),
     ]);
     const rows = filterSessions(sessions, opts);
@@ -2339,18 +2584,54 @@ export class DashboardState {
    *  former `inkling stats` CLI. */
   async serveApiStats(): Promise<Response> {
     if (!this.paths) return notConfigured('stats');
-    const result = await aggregateEventsFile(this.paths.eventsFile);
-    if (!result) {
+    const sig = this.statSig(this.paths.eventsFile);
+    if (!sig) {
+      this.apiStatsCache = null;
       return jsonResponse({
         error: 'no events file yet',
         path: this.paths.eventsFile,
       }, 404);
     }
-    return jsonResponse({
-      parsed: result.parsed,
-      dropped: result.dropped,
-      summary: summaryToJson(result.summary),
+    if (this.apiStatsCache && this.apiStatsCache.sig === sig) {
+      return jsonResponse(this.apiStatsCache.body);
+    }
+    if (this.apiStatsInFlight && this.apiStatsInFlight.sig === sig) {
+      const shared = await this.apiStatsInFlight.promise;
+      if (!shared) {
+        return jsonResponse({
+          error: 'no events file yet',
+          path: this.paths.eventsFile,
+        }, 404);
+      }
+      return jsonResponse(shared);
+    }
+    const p = aggregateEventsFile(this.paths.eventsFile).then((result) => {
+      if (!result) return null;
+      return {
+        parsed: result.parsed,
+        dropped: result.dropped,
+        summary: summaryToJson(result.summary),
+      };
     });
+    this.apiStatsInFlight = { sig, promise: p };
+    try {
+      const body = await p;
+      if (!body) {
+        this.apiStatsCache = null;
+        return jsonResponse({
+          error: 'no events file yet',
+          path: this.paths.eventsFile,
+        }, 404);
+      }
+      if (this.statSig(this.paths.eventsFile) === sig) {
+        this.apiStatsCache = { sig, body };
+      }
+      return jsonResponse(body);
+    } finally {
+      if (this.apiStatsInFlight?.promise === p) {
+        this.apiStatsInFlight = null;
+      }
+    }
   }
 
   /** GET /api/last-turn.json — latest turn & active session savings summary. */
@@ -2369,6 +2650,7 @@ export class DashboardState {
       host: this.hooks.host ?? '127.0.0.1',
       port,
       uptime_sec: round1(Math.max(0, Date.now() / 1000 - this.startedAt)),
+      active_requests: Math.max(0, this.hooks.getActiveRequests?.() ?? 0),
       compression_enabled: this.compressionEnabled,
       price_mode: priceMode(),
       allowed_models: getAllowedModelBases(),
@@ -2393,9 +2675,60 @@ export class DashboardState {
     return jsonResponse({ compression_enabled: body.enabled });
   }
 
-  /** GET /api/models — current allowed model bases. */
+  /** GET /api/models — current allowed model bases + canonical engine catalog. */
   serveModels(): Response {
-    return jsonResponse({ models: getAllowedModelBases() });
+    const allowed = getAllowedModelBases();
+    const configured = getConfiguredModelBases();
+    const hygieneActive = isTextHygieneActive();
+    const curatedMap = new Map(CURATED_MODEL_CATALOG.map((m) => [m.id, m]));
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const id of [
+      ...CURATED_MODEL_CATALOG.map((m) => m.id),
+      ...configured,
+      ...allowed,
+      ...listCalibratedProfiles().map((p) => p.model),
+    ]) {
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+    }
+    const catalog = ids.map((id) => {
+      const curated = curatedMap.get(id);
+      const cal = getCalibratedProfile(id);
+      const tier = readerTier(id);
+      let engineMode: 'optical' | 'hybrid' | 'text';
+      if (tier === 'text' || cal?.band === 'text-only') {
+        engineMode = 'text';
+      } else {
+        const policy = resolveOpticalHistoryPolicy({
+          model: id,
+          textHygieneActive: hygieneActive,
+        });
+        engineMode = policy === 'hybrid' ? 'hybrid' : 'optical';
+      }
+      const hint =
+        engineMode === 'hybrid'
+          ? 'Hybrid optical + Text-MMU'
+          : engineMode === 'optical'
+            ? 'Optical + 4-layer'
+            : '4-layer text';
+      return {
+        id,
+        label: curated?.label ?? id,
+        family: curated?.family ?? inferModelFamily(id),
+        hint,
+        engine_mode: engineMode,
+      };
+    });
+    return jsonResponse({
+      models: allowed,
+      allowed_models: allowed,
+      configured_models: configured,
+      compression_enabled: this.compressionEnabled,
+      catalog,
+    });
   }
 
   /** POST /api/models — update runtime model scope (`{ model, on }` or `{ models: string[] }`). */
@@ -2410,11 +2743,11 @@ export class DashboardState {
       }
       const cleaned = (obj.models as string[]).map((s) => s.trim()).filter(Boolean);
       this.applyModelBases(cleaned);
-      return jsonResponse({ models: getAllowedModelBases() });
+      return this.serveModels();
     }
     if (typeof obj.model === 'string' && obj.model.trim().length > 0 && typeof obj.on === 'boolean') {
       this.handleModelsToggle(obj.model.trim(), obj.on);
-      return jsonResponse({ models: getAllowedModelBases() });
+      return this.serveModels();
     }
     return jsonResponse(
       { error: 'body must specify { model: string, on: boolean } or { models: string[] }' },
@@ -2520,6 +2853,110 @@ export class DashboardState {
     return jsonResponse({ shutting_down: true });
   }
 
+  /** GET /api/mmu/stats — Context-MMU counters & bounded page summaries. */
+  serveMmuStats(sessionKey?: string): Response {
+    if (sessionKey !== undefined && !sessionKey.trim()) {
+      return mmuJsonResponse({ error: 'sessionKey must be a non-empty string' }, 400);
+    }
+    const store = getGlobalMmuStore();
+    const sk = sessionKey?.trim();
+    const pages = store.listPages(sk);
+    const safePages = pages.slice(0, 50).map((p) => {
+      if (sk) return p;
+      const { factTokens: _omitted, ...rest } = p;
+      return rest;
+    });
+    return mmuJsonResponse({
+      stats: store.getStats(),
+      pageCount: pages.length,
+      pages: safePages,
+      limits: store.getLimits(),
+      prefixTape: getGlobalPrefixTape().getStats(),
+    });
+  }
+
+  /** GET /api/mmu/page — retrieve exact slice by `id`/`pageId` or search by `query`. */
+  serveMmuPage(params: URLSearchParams): Response {
+    const pageId = (params.get('id') ?? params.get('pageId'))?.trim() || undefined;
+    const query = params.get('query')?.trim() || undefined;
+    if (params.has('sessionKey') && !params.get('sessionKey')!.trim()) {
+      return mmuJsonResponse({ error: 'sessionKey must be a non-empty string' }, 400);
+    }
+    const sessionKey = params.get('sessionKey')?.trim() || undefined;
+    if (!pageId && !query) {
+      return mmuJsonResponse({ error: 'id/pageId or query parameter is required' }, 400);
+    }
+    if (query && query.length > 512) {
+      return mmuJsonResponse({ error: 'query must be <= 512 chars' }, 400);
+    }
+    const parseOptPosInt = (name: string): number | undefined => {
+      const raw = params.get(name);
+      if (raw === null || raw.trim() === '') return undefined;
+      const n = Number(raw);
+      return Number.isSafeInteger(n) && n >= 1 ? n : NaN;
+    };
+    const startLine = parseOptPosInt('startLine');
+    const endLine = parseOptPosInt('endLine');
+    const maxLinesRaw = parseOptPosInt('maxLines');
+    if (Number.isNaN(startLine) || Number.isNaN(endLine) || Number.isNaN(maxLinesRaw)) {
+      return mmuJsonResponse({ error: 'startLine, endLine, and maxLines must be positive integers' }, 400);
+    }
+    const maxLines = maxLinesRaw !== undefined ? Math.min(500, maxLinesRaw) : 120;
+    const store = getGlobalMmuStore();
+
+    if (pageId) {
+      const hit = store.derefPage(pageId, { sessionKey, startLine, endLine, query, maxLines });
+      if (!hit) return mmuJsonResponse({ error: `MMU page not found: ${pageId}` }, 404);
+      return mmuJsonResponse({
+        pageId: hit.page.id,
+        refId: hit.page.refId,
+        sessionKey: hit.page.sessionKey,
+        filePath: hit.page.filePath,
+        lineCount: hit.page.lineCount,
+        startLine: hit.startLine,
+        endLine: hit.endLine,
+        text: hit.text,
+        symbols: hit.page.symbols,
+      });
+    }
+
+    const matches = store.searchPages(query!, sessionKey);
+    if (matches.length === 0) {
+      return mmuJsonResponse({ error: `no MMU pages matching query: ${query}`, matches: [] }, 404);
+    }
+    const top = matches[0]!;
+    const hit = store.derefPage(top.page.id, {
+      sessionKey: top.page.sessionKey,
+      startLine,
+      endLine,
+      query,
+      maxLines,
+    });
+    return mmuJsonResponse({
+      pageId: top.page.id,
+      refId: top.page.refId,
+      sessionKey: top.page.sessionKey,
+      filePath: top.page.filePath,
+      lineCount: top.page.lineCount,
+      startLine: hit?.startLine ?? 1,
+      endLine: hit?.endLine ?? 0,
+      text: hit?.text ?? '',
+      symbols: top.page.symbols,
+      matches: matches.slice(0, 5).map((m) => ({
+        pageId: m.page.id,
+        refId: m.page.refId,
+        filePath: m.page.filePath,
+        score: m.score,
+        matchedLine: m.matchedLine,
+      })),
+    });
+  }
+
+  /** GET /api/calibration — Auto-Canary calibrated visual model profiles. */
+  serveCalibration(): Response {
+    return mmuJsonResponse({ profiles: listCalibratedProfiles() });
+  }
+
   /** POST /fragments/models — add/remove ONE model (Claude or GPT) from the
    *  runtime compress scope. The model checks read this live. Persisted via
    *  the host's `persistModelBases` hook when provided (Node writes the
@@ -2589,11 +3026,78 @@ export function serveFavicon(sub: 'svg' | 'empty', headOnly = false): Response {
   });
 }
 
+const CURATED_MODEL_CATALOG: ReadonlyArray<{
+  id: string;
+  label: string;
+  family: string;
+}> = [
+  { id: 'claude-fable-5', label: 'Claude Fable 5', family: 'Anthropic' },
+  { id: 'claude-opus-5', label: 'Opus 5', family: 'Anthropic' },
+  { id: 'claude-opus-5-5', label: 'Claude Opus 5.5', family: 'Anthropic' },
+  { id: 'claude-sonnet-5-5', label: 'Sonnet 5.5', family: 'Anthropic' },
+  { id: 'gemini', label: 'Gemini (all versions)', family: 'Google' },
+  { id: 'gemini-3.6-flash', label: 'Gemini 3.6 Flash', family: 'Google' },
+  { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', family: 'Google' },
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash', family: 'Google' },
+  { id: 'gemini-4', label: 'Gemini 4', family: 'Google' },
+  { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol', family: 'OpenAI' },
+  { id: 'gpt-6-sol', label: 'GPT-6 Sol', family: 'OpenAI' },
+  { id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', family: 'OpenAI' },
+  { id: 'gpt-6.2-sol', label: 'GPT-6.2 Sol', family: 'OpenAI' },
+  { id: 'gpt-5.5', label: 'GPT 5.5', family: 'OpenAI' },
+  { id: 'gpt-6-astra', label: 'GPT-6 Astra', family: 'OpenAI' },
+  { id: 'gpt-6.2-astra', label: 'GPT-6.2 Astra', family: 'OpenAI' },
+  { id: 'gpt-6.1-terra', label: 'GPT-6.1 Terra', family: 'OpenAI' },
+  { id: 'gpt-6-luna', label: 'GPT-6 Luna', family: 'OpenAI' },
+  { id: 'grok-4.6', label: 'Grok 4.6', family: 'xAI' },
+  { id: 'grok-4.5', label: 'Grok 4.5', family: 'xAI' },
+  { id: 'deepseek', label: 'DeepSeek', family: 'DeepSeek' },
+  { id: 'kimi', label: 'Kimi', family: 'Moonshot' },
+  { id: 'glm', label: 'GLM', family: 'Zhipu' },
+];
+
+function inferModelFamily(id: string): string {
+  const lower = id.toLowerCase();
+  const base = lower.split('/').pop() ?? lower;
+  if (base.startsWith('claude')) return 'Anthropic';
+  if (base.includes('gemini') || base.startsWith('gemma')) return 'Google';
+  if (base.startsWith('gpt') || base.startsWith('o1') || base.startsWith('o3') || base.startsWith('o4')) {
+    return 'OpenAI';
+  }
+  if (base.startsWith('grok')) return 'xAI';
+  if (base.startsWith('deepseek')) return 'DeepSeek';
+  if (base.startsWith('kimi') || base.includes('moonshot')) return 'Moonshot';
+  if (base.startsWith('glm') || base.startsWith('zai-glm')) return 'Zhipu';
+  if (base.startsWith('qwen')) return 'Alibaba';
+  if (/^(?:mistral|mixtral|codestral|devstral|ministral|magistral|pixtral)/.test(base)) {
+    return 'Mistral';
+  }
+  if (base.includes('llama') || base.startsWith('codellama')) return 'Meta';
+  if (base.startsWith('minimax')) return 'MiniMax';
+  if (base.startsWith('command-') || base.startsWith('c4ai-aya')) return 'Cohere';
+  return 'Custom';
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
       'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'cross-origin-resource-policy': 'same-origin',
+    },
+  });
+}
+
+function mmuJsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'cross-origin-resource-policy': 'same-origin',
     },
   });
 }
@@ -2634,6 +3138,9 @@ export type DashboardRoute =
   | { kind: 'api-plugins' } // /api/plugins (GET/POST) — pipeline stages & skills registry
   | { kind: 'api-shutdown' } // /api/shutdown (POST) — graceful daemon shutdown
   | { kind: 'api-image-source' } // /api/image-source[?id=N] — source text behind a rendered PNG
+  | { kind: 'api-mmu-stats' } // /api/mmu/stats — Context-MMU counters & page index
+  | { kind: 'api-mmu-page' } // /api/mmu/page — Context-MMU page deref/search
+  | { kind: 'api-calibration' } // /api/calibration — calibrated visual model profiles
   | { kind: 'fragment'; name: string }; // /fragments/<name> — server-rendered htmx panels
 
 /** Match dashboard paths (handle query strings on /proxy-latest-png). */
@@ -2657,6 +3164,9 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/api/plugins') return { kind: 'api-plugins' };
   if (pathname === '/api/shutdown') return { kind: 'api-shutdown' };
   if (pathname === '/api/image-source') return { kind: 'api-image-source' };
+  if (pathname === '/api/mmu/stats') return { kind: 'api-mmu-stats' };
+  if (pathname === '/api/mmu/page') return { kind: 'api-mmu-page' };
+  if (pathname === '/api/calibration') return { kind: 'api-calibration' };
   if (pathname.startsWith('/fragments/')) {
     return { kind: 'fragment', name: pathname.slice('/fragments/'.length) };
   }
@@ -2788,6 +3298,15 @@ export async function dispatchDashboard(
     case 'api-shutdown':
       if (method !== 'POST') return methodNotAllowed('POST');
       return dashboard.handleShutdown();
+    case 'api-mmu-stats':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveMmuStats(url.searchParams.has('sessionKey') ? url.searchParams.get('sessionKey')! : undefined);
+    case 'api-mmu-page':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveMmuPage(url.searchParams);
+    case 'api-calibration':
+      if (method !== 'GET') return methodNotAllowed('GET');
+      return dashboard.serveCalibration();
     case 'fragment': {
       if (route.name === 'toggle' && method === 'POST') {
         let enabled = false;

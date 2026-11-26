@@ -120,7 +120,8 @@ export function isInConfiguredModelBases(model: string | null | undefined): bool
   const unqualified = unqualifiedModelId(base);
   return allowedModelBases().some((b) => {
     const target = b.toLowerCase();
-    const hit = (id: string): boolean => id === target || id.startsWith(`${target}-`);
+    const hit = (id: string): boolean =>
+      id === target || id.startsWith(`${target}-`) || id.startsWith(`${target}.`);
     return hit(base) || (unqualified !== null && hit(unqualified));
   });
 }

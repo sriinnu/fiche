@@ -2,13 +2,15 @@
 # bundle.sh — build, bundle, ad-hoc sign, and optionally install FicheBar.app
 #
 # Usage:
-#   ./bundle.sh               # build, sign, install to /Applications/FicheBar.app & relaunch
+#   ./bundle.sh               # build, ad-hoc sign, install to /Applications/FicheBar.app & relaunch
 #   ./bundle.sh --install     # same as default: install to /Applications/FicheBar.app & relaunch
 #   ./bundle.sh --no-install  # build & sign into apps/macos-bar/build.noindex/FicheBar.app only
+#   ./bundle.sh --dev-id      # sign with Developer ID Application + Hardened Runtime (sign-app.sh)
+#   ./bundle.sh --unsigned    # skip code signing (for split CI build jobs)
 #
 # Optional env overrides:
-#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.18.0)
-#   CFBundleVersion             (defaults to 1)
+#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.19.0)
+#   CFBundleVersion             (defaults to apps/macos-bar/BUILD_NUMBER, or 1)
 #   SWIFTPM_ARGS                (extra flags passed to swift build, e.g. --disable-sandbox)
 
 set -euo pipefail
@@ -17,12 +19,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 INSTALL=1
+SIGN_MODE="adhoc"
 for arg in "$@"; do
   case "${arg}" in
     --install)    INSTALL=1 ;;
     --no-install) INSTALL=0 ;;
+    --dev-id)     SIGN_MODE="dev-id" ;;
+    --unsigned)   SIGN_MODE="none" ;;
     -h|--help)
-      sed -n '2,12p' "$0"
+      sed -n '2,14p' "$0"
       exit 0
       ;;
     "") ;;
@@ -48,7 +53,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-DEFAULT_VERSION="0.18.0"
+DEFAULT_VERSION="0.19.0"
 if [[ -f "${REPO_ROOT}/package.json" ]]; then
   PARSED_VER="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "${REPO_ROOT}/package.json" | head -n 1 || true)"
   if [[ -n "${PARSED_VER}" ]]; then
@@ -56,10 +61,30 @@ if [[ -f "${REPO_ROOT}/package.json" ]]; then
   fi
 fi
 
-SHORT_VERSION="${CFBundleShortVersionString:-${DEFAULT_VERSION}}"
-BUILD_VERSION="${CFBundleVersion:-1}"
+DEFAULT_BUILD_VERSION="1"
+if [[ -f "${SCRIPT_DIR}/BUILD_NUMBER" ]]; then
+  PARSED_BUILD="$(tr -d '[:space:]' < "${SCRIPT_DIR}/BUILD_NUMBER")"
+  if [[ "${PARSED_BUILD}" =~ ^[1-9][0-9]*$ ]]; then
+    DEFAULT_BUILD_VERSION="${PARSED_BUILD}"
+  else
+    echo "ERROR: ${SCRIPT_DIR}/BUILD_NUMBER must be a positive integer (got '${PARSED_BUILD}')" >&2
+    exit 1
+  fi
+fi
 
-echo "==> Building ${APP_NAME} (${SHORT_VERSION}) in release mode..."
+SHORT_VERSION="${CFBundleShortVersionString:-${DEFAULT_VERSION}}"
+BUILD_VERSION="${CFBundleVersion:-${DEFAULT_BUILD_VERSION}}"
+
+if [[ ! "${SHORT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.]+)?$ ]]; then
+  echo "ERROR: CFBundleShortVersionString must match semver (got '${SHORT_VERSION}')" >&2
+  exit 1
+fi
+if [[ ! "${BUILD_VERSION}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: CFBundleVersion must be a positive integer (got '${BUILD_VERSION}')" >&2
+  exit 1
+fi
+
+echo "==> Building ${APP_NAME} (${SHORT_VERSION}, build ${BUILD_VERSION}) in release mode..."
 # shellcheck disable=SC2086
 swift build -c release --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-}
 
@@ -240,8 +265,19 @@ cat > "${CONTENTS_DIR}/Info.plist" <<EOF
 </plist>
 EOF
 
-echo "==> Ad-hoc signing ${APP_DIR}..."
-codesign --force --deep -s - "${APP_DIR}"
+case "${SIGN_MODE}" in
+  none)
+    echo "==> Skipping code signing (--unsigned)..."
+    xattr -cr "${APP_DIR}" 2>/dev/null || true
+    find "${APP_DIR}" -name '._*' -delete 2>/dev/null || true
+    ;;
+  adhoc)
+    "${SCRIPT_DIR}/sign-app.sh" --adhoc "${APP_DIR}"
+    ;;
+  dev-id)
+    "${SCRIPT_DIR}/sign-app.sh" "${APP_DIR}"
+    ;;
+esac
 
 if [[ "${INSTALL}" -eq 1 ]]; then
   TARGET_APP="/Applications/${APP_NAME}.app"

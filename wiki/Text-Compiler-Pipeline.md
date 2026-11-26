@@ -1,34 +1,33 @@
-# 4-Layer Deterministic Text Compiler Pipeline
+# Text Compiler Pipeline (`P0–P3` & `Context-MMU`)
 
-On text-tier models (and on textual blocks alongside optical rendering), `fiche` runs four composable, pure-TypeScript compression stages without ever risking code edits:
+On text-tier models (and on non-optical blocks), `fiche` runs a four-pass (`P0–P3`) pure-TypeScript compiler plus `Context-MMU` virtual memory without mutating live source edits or sealed KV-cache prefixes:
 
-## 0. Edit & Action Preservation Guard (`isCodeOrDiffProtected`)
+## 0. Edit & Action Preservation Guard (`isCodeOrDiffProtected` & Live Tail)
 
-Before mutating whitespace, folding lines, or transforming JSON, `src/core/text-hygiene.ts` inspects the block in a single zero-array newline scan:
-- Source file reads (numbered lines `123→`, declarations) and unified diffs (`diff --git`, `@@`, `---`/`+++` pairs) are marked **code-protected**.
-- On code-protected blocks, terminal stripping cleans only literal ANSI escape sequences and leaves every space, tab, indentation level, and repeated line intact so `Edit` / `apply_patch` anchors never break.
+Before mutating whitespace, folding lines, or transforming JSON, `src/core/text-hygiene.ts` inspects blocks in a single zero-array newline scan:
+- Source file reads (`FILE_READ_TOOL_RE`, numbered lines `123→`, declarations) and unified diffs (`diff --git`, `@@`, `---`/`+++` pairs) are marked **code-protected**.
+- On code-protected blocks, terminal stripping cleans only literal ANSI escape sequences and leaves spaces, tabs, indentation, and repeated lines verbatim. Live-tail `read_file`/`view_file` responses stay verbatim until sealed into history so `Edit` / `apply_patch` / `replace_file_content` anchors remain exact.
 
-## Layer 1 — `TSCG`: Tool-Schema & Static-Prompt Compiler (`src/core/schema-compiler.ts`)
+## `P0` — Structural Normalization (`src/core/schema-compiler.ts`, `src/core/text-hygiene.ts`)
 
-- Strips redundant JSON Schema metadata (`$schema`, `$comment`, titles mirroring keys, decorative divider lines, unclosed HTML comments in linear O(N) time via `stripHtmlComments`).
-- Preserves parameter names, required arrays, types, enums, and constraints verbatim.
-- Deduplicates cross-tool shared instruction prose and caches compiled outputs (bounded 4 MiB caches).
+- **XML-Island `TSCG`**: Isolates `6` volatile `VOLATILE_XML_TAGS` (`<env>`, `<context>`, `<system-reminder>`, etc.) before deduplicating tool schemas (`96` chars) and static system text (`140` chars), while stripping redundant `$schema`/`$comment` metadata and preserving `dependent*` property containers.
+- **Merkle Schema DAG**: Factors repeated JSON subschemas into shared `$defs._fN` entries on Anthropic and OpenAI wires (cleanly bypassed on Google wires).
+- **Observation Hygiene, JSON Unwrap & `@toon`**: Emulates `\r`/`\x08`/ANSI (`emulateTerminal`), folds repetitive logs (`Drain`, anchored on stack frames/errors/`file:line`), unwraps single-level JSON-in-JSON across `8` wrapper keys (`output`, `stdout`, `stderr`, `content`, `result`, `body`, `text`, `data`) with `@fiche-kv` fallback, and encodes uniform arrays (`>=5` rows) into bijective `@toon`.
+- **Opt-In User Prompt Hygiene**: `cleanUserPayloads` stays `false` by default across all `4` wires (protecting Turn-1 prompts `>= 4,000` chars); canonical pre-hygiene `firstUserSha8` stays unchanged everywhere.
 
-## Layer 2 — Deterministic Observation Hygiene (`src/core/text-hygiene.ts`, `src/core/toon.ts`)
+## `P1` — `CASI v2` FastCDC & `seedBase` (`src/core/casi-delta.ts`)
 
-1. **Terminal Emulation (`emulateTerminal`)**: Resolves `\r` progress overwrites, `\x08` backspaces, CSI/OSC ANSI escape sequences, and trailing line whitespace cleanly in O(N).
-2. **`Drain` Structural Log Folding (`foldRepetitiveLogs`)**: Anchors head/tail lines plus any stack frames, error/warning keywords, or `file:line` references (via linear backtracking-free `hasFileLineLocation`), and folds contiguous/high-frequency boilerplate templates into explicit `[... K similar lines folded ...]`.
-3. **Bijective `@toon` Tabular Compiler (`encodeToon` / `decodeToon`)**: Converts uniform arrays of objects (≥5 rows, ≤24 columns, ≥75% density) into schema-once pipe-delimited rows when strictly profitable (≥20% token savings measured symmetrically via `estimateTokenPair`). Guaranteed 100% lossless round-trip (`decodeToon(encodeToon(x)) === x`).
+- Strips line-number gutters, seeds bases directly from assistant `Write` / `Edit` calls (`seedBase`), aligns shifted re-reads via `lisAnchors`, restricts timestamp/duration canonicalization strictly to real log streams, and falls back to `GEAR_TABLE` FastCDC (`8–48` lines) to emit exact `[fiche cas-delta vs <refId>: ...]`.
+- **Optical Mutual Exclusion**: Disabled automatically whenever Optical rendering is active (`!opticalEnabled`) so live tail diffs never emit orphan pointers into PNG plates.
 
-## Layer 3 — `ACDC`: Append-Only Frozen-Epoch History Compactor (`src/core/text-history.ts`)
+## `P2` — `LSM-Context` Single-Block Sticky Epochs (`src/core/text-history.ts`)
 
-- Runs **before** `CASI` so `CASI` never indexes a block that becomes an epoch digest (preventing circular live-tail references).
-- Groups aged observations behind the active tail (`keepTailMessages`, default 6) into fixed epochs (`>= 4000` tokens).
-- Seals an epoch once when its payback / cliff threshold clears `kosha` economics, emitting deterministic structural skeletons (`[fiche epoch-digest <refId>: ...]`) + embedded `FactSheet` anchors via `extractStructuralDigest` (backed by an 8 MiB digest cache).
-- Live tail turns stay raw and untouched, and sealed epochs stay bit-identical across subsequent turns.
+- Seals large observations (`>= 1,500` tok) past `L1` (`tail = 2`) and aged blocks past `L0` (`tail = 6`) **strictly as 1-block `[item]` sticky epochs** keyed by `(sessionKey, fnv64Hex)` with FIFO eviction — preventing multi-block coalesce from breaking warm KV prefixes.
+- Triggers `L2` cold-cache repack only when upstream `usage` confirms cache expiration (`everCacheAlive && !lastCacheAlive`, `1h + 30s` idle, or `413` backstop) with `justRepacked` cooldown across all `5` provider cache-read JSON `usage` fields.
 
-## Layer 4 — `CASI-Delta`: Cross-Turn Duplicate & Diff Index (`src/core/casi-delta.ts`)
+## `P3` — `Context-MMU` Virtual Memory (`src/core/context-mmu.ts`)
 
-- Scans remaining verbatim tool outputs monotonically in prefix order (`0 -> N-1`) using dual 64-bit hashes and line postings (`LinePostings` skipping ultra-hot boilerplate lines).
-- **Exact Duplicate**: Emits `[fiche cas: exact duplicate of earlier tool output <refId> ...]`.
-- **Modified File / Log Re-read**: Computes line-level anchor alignment (`lisAnchors`) and emits `[fiche cas-delta vs <refId>: matched/total lines unchanged; only changed hunks below (±2 context)]`.
+- **Virtual Paging (`ContextPageStore`)**: Indexes evicted blocks under deterministic zero-`Buffer` UTF-8 `pg_<12hex>` IDs in a per-`sessionKey` RAM-first LRU (`512` pages / `16 MiB`; opt-in `FICHE_MMU_PERSIST=1`).
+- **Turn-1 Skill Linker (`linkSessionSkills`)**: Keeps `DEFAULT_CORE_SKILLS` + top `6` task-relevant skills on Turn 1, stubs remaining `>= 10`-skill catalog descriptions as `[pgId]`, persists pinned skill hashes in `session-state.ts`, and auto-hydrates later mentions.
+- **`FAIL→PASS` Markovian Folding (`foldMarkovianEpisodes`)**: Anchors on the first failing test/command, preserves pre-failure file reads, checks payback/cliff economics before archiving into `ContextPageStore`, and collapses resolved loops once verified.
+- **Birth-Time IDF Pruning (`pruneLowDensityBlob`) & Live-Tail Hydration (`computeTailHydration`)**: Coalesces noisy unstructured search/log dumps while sparing code/JSON/YAML/stack frames, and injects `±15`-line symbol slices strictly inside the uncached trailing live turn (`[fiche vm-hydrate]`, `MAX_DEREF_CHARS = 65_536`).

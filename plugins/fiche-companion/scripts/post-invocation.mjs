@@ -84,7 +84,8 @@ async function main() {
   }
 
   const eventsFile = resolveEventsFile();
-  let cursorPath = process.env.FICHE_TELEMETRY_CURSOR?.trim();
+  let cursorPath =
+    process.env.FICHE_COMPANION_CURSOR?.trim() || process.env.FICHE_TELEMETRY_CURSOR?.trim();
   if (!cursorPath) {
     const dataDir =
       process.env.PLUGIN_DATA?.trim() || path.join(os.homedir(), '.fiche', 'cursors');

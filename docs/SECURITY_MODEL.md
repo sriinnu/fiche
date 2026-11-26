@@ -25,7 +25,7 @@ maintainer -> GitHub Actions -> npm trusted publishing
 ```
 
 The client-to-proxy and proxy-to-provider hops cross network trust boundaries.
-The Node dashboard crosses a separate boundary because it exposes telemetry
+The Node dashboard crosses a separate boundary because it exposes local stats
 and captured context. Dependency installation and publishing cross the
 software supply-chain boundary.
 
@@ -49,7 +49,7 @@ software supply-chain boundary.
 | Public deployment spends a configured API key | Worker requires `FICHE_WORKER_SECRET` (legacy `INKLING_WORKER_SECRET` fallback, presented via `x-fiche-secret` or `x-inkling-secret`) and fails closed | Preserve the fail-closed check and constant-work comparison tests |
 | Provider credential is routed to the wrong upstream | An explicit inbound-credential x route policy (`resolveOpenAIRouteAuth`): Anthropic-shaped credentials never reach an OpenAI upstream, subscription OAuth is preserved rather than substituted, and a host key replaces only ordinary keys. Classification is by header shape; no local token store is read | Extend the policy table, not the call site, for every new route or provider, and keep the full matrix under test |
 | A request reaches a provider it was not meant for | Routing is by path family: `/backend-api/*` goes to the ChatGPT upstream, Google API shapes (`/v1beta/`, `/v1alpha/`, `/v1internal:`, `models/<id>:<method>`) to Google, and `/v1/*` and `/api/*` to Anthropic. On the stock Anthropic upstream any other path answers 404 and is never forwarded with injected keys. A custom upstream keeps forwarding unknown paths | Add a new agent's paths to a family predicate in `proxy.ts`, with a `createProxy` test that checks the upstream URL and the credential that arrives |
-| Prompt or secret leaks through telemetry | Full 4xx body capture is opt-in; normal events retain hashes/metadata; local artifacts are owner-only | Do not add raw content to logs; document any new persistence |
+| Prompt or secret leaks through local logs | Full 4xx body capture is opt-in; normal events retain hashes/metadata; local artifacts are owner-only | Do not add raw content to logs; document any new persistence |
 | Dashboard exposes captured context | Dashboard routes require loopback source and host; cross-site mutations are rejected | Treat every dashboard route as sensitive and preserve both checks |
 | A web page spends the local proxy's keys (cross-site request or DNS rebinding) | The Node proxy API refuses any `Origin` that is not loopback (403) and any `Host` that is a public DNS name other than a known provider host (421). Loopback names, IP literals, single-label container names, `*.internal` and the provider hosts `fiche warp` keeps are accepted. `FICHE_ALLOWED_HOSTS` (or legacy `INKLING_ALLOWED_HOSTS`) adds names; `*` turns the check off (`src/core/request-guard.ts`) | Keep the guard ahead of the proxy handler and test Host cases over `node:http`, since `fetch()` drops a caller-set Host |
 | Oversized dashboard request exhausts memory | Dashboard request bodies are bounded | Keep bounds before parsing and add negative tests for new endpoints |

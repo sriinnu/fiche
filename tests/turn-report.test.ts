@@ -108,8 +108,8 @@ describe('per-turn savings telemetry, proxy headers, MCP live stats & plugin hoo
         compressed: false,
         text_hygiene_saved_tokens: 6100,
         text_hygiene_stages: ['tscg', 'casi_dup'],
-        input_tokens: 2000,
-        cache_read_tokens: 18_000,
+        input_tokens: 20_000,
+        cached_tokens: 18_000,
         first_user_sha8: 'sess2222',
       },
     ];
@@ -317,7 +317,7 @@ describe('per-turn savings telemetry, proxy headers, MCP live stats & plugin hoo
     };
     fs.writeFileSync(eventsFile, JSON.stringify(ev) + '\n');
 
-    const hookScript = path.join(repoRoot, 'plugins', 'fiche-telemetry', 'scripts', 'post-invocation.mjs');
+    const hookScript = path.join(repoRoot, 'plugins', 'fiche-companion', 'scripts', 'post-invocation.mjs');
     const hookEnv = {
       ...process.env,
       FICHE_LOG: eventsFile,

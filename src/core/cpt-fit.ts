@@ -3,7 +3,7 @@
  *
  * The profitability gate compares `imageTokens` (exact, from pixel area) against
  * `textTokens = chars / CPT`. CPT was a hand-tuned constant per call site (4 for
- * reminders/tool_results, 2.0 for slab/history). Production telemetry showed the
+ * reminders/tool_results, 2.0 for slab/history). Measured logs showed the
  * real marginal density is ~1.5 for dense content, so the constant under-counted
  * text cost and biased the gate toward passthrough — leaving savings on the table.
  *

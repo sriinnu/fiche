@@ -155,7 +155,7 @@ Build and install the native macOS 14+ SwiftUI menubar companion ([apps/macos-ba
    {
      "statusLine": {
        "type": "command",
-       "command": "node /path/to/fiche/plugins/fiche-telemetry/scripts/claude-statusline.mjs"
+       "command": "node /path/to/fiche/plugins/fiche-companion/scripts/claude-statusline.mjs"
      }
    }
    ```
@@ -183,11 +183,11 @@ Build and install the native macOS 14+ SwiftUI menubar companion ([apps/macos-ba
 
 ### Antigravity (AGY)
 
-Copy the bundled telemetry + MCP + skill plugin into Antigravity's global plugin directory:
+Copy the bundled companion + MCP + skill plugin into Antigravity's global plugin directory:
 
 ```bash
 mkdir -p ~/.gemini/config/plugins
-cp -R plugins/fiche-telemetry ~/.gemini/config/plugins/fiche-telemetry
+cp -R plugins/fiche-companion ~/.gemini/config/plugins/fiche-companion
 ```
 
 This wires:

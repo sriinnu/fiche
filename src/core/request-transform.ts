@@ -7,10 +7,12 @@
  * The proxy has its own per-route wiring; the MCP server and scripts use this.
  */
 import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
+import { getAllowedModelBases, isFicheSupportedModel, isInConfiguredModelBases } from './applicability.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint, type PromptCacheRoute } from './codex-cache.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { transformGoogleGenerateContent } from './google.js';
-import { readerTier, type ReaderTier } from './reader-tier.js';
+import { shouldImageModel, type ReaderTier } from './reader-tier.js';
+import { isTextHygieneActive, resolveTextHygieneMode } from './text-hygiene.js';
 import { transformRequest, type TransformInfo, type TransformOptions } from './transform.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
 import { visionTokens } from './vision-cost.js';
@@ -58,15 +60,21 @@ export function countBillable(body: Uint8Array | string, imageTokens = 0): numbe
   return o200kCountTokens(stripped) + imageTokens;
 }
 
-function detectWire(body: Uint8Array, hinted: RequestWire | undefined): Exclude<RequestWire, 'auto'> {
-  if (hinted && hinted !== 'auto') return hinted;
-  let parsed: unknown;
+function parseJsonObject(body: Uint8Array): Record<string, unknown> | null {
   try {
-    parsed = JSON.parse(dec.decode(body));
+    const parsed = JSON.parse(dec.decode(body)) as unknown;
+    return isRecord(parsed) ? parsed : null;
   } catch {
-    return 'anthropic';
+    return null;
   }
-  if (!isRecord(parsed)) return 'anthropic';
+}
+
+function detectWireFromParsed(
+  parsed: Record<string, unknown> | null,
+  hinted: RequestWire | undefined,
+): Exclude<RequestWire, 'auto'> {
+  if (hinted && hinted !== 'auto') return hinted;
+  if (!parsed) return 'anthropic';
   if (typeof parsed.instructions === 'string' || Array.isArray(parsed.input)) return 'responses';
   if (parsed.systemInstruction || parsed.contents) return 'google';
   if (Array.isArray(parsed.messages)) {
@@ -76,6 +84,12 @@ function detectWire(body: Uint8Array, hinted: RequestWire | undefined): Exclude<
     return 'chat';
   }
   return 'anthropic';
+}
+
+function modelFromGooglePathname(pathname: string | null | undefined): string | undefined {
+  if (!pathname) return undefined;
+  const m = /\/models\/([^/:]+):/.exec(pathname);
+  return m?.[1] ? decodeURIComponent(m[1]) : undefined;
 }
 
 function chargedImageTokens(info: TransformInfo, model: string | undefined): number {
@@ -103,15 +117,41 @@ export async function transformAnyRequest(
   body: Uint8Array,
   options: RequestTransformOptions = {},
 ): Promise<{ body: Uint8Array; info: TransformInfo; report: RequestReport }> {
-  const model = options.model;
-  const tier = readerTier(model, options.forceImages);
+  const parsed = parseJsonObject(body);
+  const wire = detectWireFromParsed(parsed, options.wire);
+  const bodyModel = typeof parsed?.model === 'string' && parsed.model.trim()
+    ? parsed.model.trim()
+    : wire === 'google'
+      ? modelFromGooglePathname(options.route?.pathname)
+      : undefined;
+  const model = options.model ?? bodyModel;
+  const inScope = model ? isFicheSupportedModel(model) : false;
+  const familyInScope = inScope || (model ? isInConfiguredModelBases(model) : false);
+  const hygieneMode = resolveTextHygieneMode(options.textHygiene);
+  const hygieneActive = isTextHygieneActive(options.textHygiene);
+  const imageThisRequest =
+    options.compress !== false &&
+    options.stageToggles?.optical !== false &&
+    shouldImageModel(model, inScope, options.forceImages);
+  const tier: ReaderTier = imageThisRequest ? 'image' : 'text';
   const allow = allowBreakpoints(options);
-  const wire = detectWire(body, options.wire);
-  const imageTier = tier === 'image' && options.compress !== false;
+  const imageTier = imageThisRequest;
+  const canRunTextHygiene =
+    hygieneActive &&
+    (hygieneMode === 'on' || familyInScope || getAllowedModelBases().length > 0);
+  const shouldRun = options.compress !== false && (imageTier || canRunTextHygiene);
   let outBody = body;
   let info: TransformInfo = {
     compressed: false,
-    reason: options.compress === false ? 'compress=false' : imageTier ? 'noop' : 'weak_reader',
+    reason: options.compress === false
+      ? 'compress=false'
+      : !familyInScope && hygieneMode !== 'on' && !canRunTextHygiene
+        ? 'unsupported_model'
+        : hygieneMode === 'off'
+          ? 'text_hygiene_off'
+          : imageTier
+            ? 'noop'
+            : 'weak_reader',
     origChars: 0,
     compressedChars: 0,
     imageCount: 0,
@@ -121,7 +161,7 @@ export async function transformAnyRequest(
     dynamicBlockCount: 0,
     droppedChars: 0,
   };
-  if (options.compress !== false) {
+  if (shouldRun) {
     const wireOpts: TransformOptions = {
       ...options,
       model,

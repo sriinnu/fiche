@@ -22,9 +22,12 @@
  */
 import { readBrandEnv } from './env.js';
 import { type RenderFont } from './render.js';
+import { calibratedBandToProfile, getCalibratedProfile } from './calibration.js';
 import { hasGeminiMeasuredProfile, resolveGeminiProfile } from './gemini-model-profiles.js';
 import { isClaudeModel, resolveClaudeProfile } from './claude-model-profiles.js';
 import { BASE_HISTORY, BASE_PRICING, BASE_STYLE, NATIVE_14PX_HISTORY } from './profile-base.js';
+
+export { calibratedBandToProfile };
 
 export const GPT_MAX_HEIGHT_PX = 1932;
 
@@ -163,7 +166,7 @@ export interface GptModelProfile {
    *  A guessed cap makes inkling refuse to compress requests the provider would
    *  have accepted, which is the opposite of the point. No family currently
    *  carries one. Largest body each provider has answered 200 for in local
-   *  telemetry, as a lower bound (cacheable prefix already on the wire, so the
+   *  metrics, as a lower bound (cacheable prefix already on the wire, so the
    *  real body was bigger): Claude 11.2 MB, GPT 10.1 MB, Gemini 6.2 MB, Grok
    *  2.7 MB. No provider-originated size rejection has been observed for any. */
   maxSerializedRequestBytes?: number;
@@ -305,6 +308,10 @@ const miniNanoProfile = (
   style: BASE_STYLE,
 });
 
+/** True for GPT-5.6 / GPT-6+ Sol optical reader models (incl. gpt-6-sol, gpt-6.1-sol, gpt-6.2-sol, future 6.x/7+). */
+export const isGptSolModel = (m: string): boolean =>
+  /^gpt-(?:5\.6|(?:[6-9]|\d{2,})(?:\.\d+)?)-sol(?:-|$)/.test(m);
+
 /**
  * Built-in profiles, evaluated in order (first match wins). Precedence and
  * numbers reproduce the previous hardcoded `resolveVisionCost` EXACTLY:
@@ -314,14 +321,15 @@ const BUILTIN_RULES: ProfileRule[] = [
   // Exact Sol variant observed on production traffic. Do not match bare 5.6/6.1
   // or sibling variants (for example gpt-5.6-terra): model-specific visual
   // tuning must not leak across variants merely because they share a version
-  // number. Evaluated before the generic gpt-6 family rule so gpt-6.1-sol
-  // inherits Sol's native 14px profile rather than GPT6_PROFILE's 5x8 Spleen.
+  // number. Evaluated before the generic GPT-6+ family rule so gpt-6-sol and
+  // future gpt-6.x-sol / gpt-7+-sol inherit Sol's native 14px profile rather
+  // than GPT6_PROFILE's 5x8 Spleen.
   {
-    test: (m) => /^gpt-(?:5\.6|6\.[12])-sol(?:-|$)/.test(m),
+    test: isGptSolModel,
     profile: GPT56_SOL_PROFILE,
   },
   {
-    test: (m) => /^gpt-6(?:[.-]|$)/.test(m),
+    test: (m) => /^gpt-(?:[6-9]|\d{2,})(?:[.-]|$)/.test(m),
     profile: GPT6_PROFILE,
   },
   // nano patch models: ceil(patches * 2.46), cap 1536
@@ -458,6 +466,8 @@ function hasDeclaredProfile(m: string): boolean {
 export function isMisresolvedModelId(model: string | null | undefined): boolean {
   const m = (model ?? '').toLowerCase();
   if (hasDeclaredProfile(m)) return false;
+  const cal = getCalibratedProfile(model);
+  if (cal && cal.scores.passed && cal.band !== 'text-only') return false;
   // Must cover every spelling resolveGptProfile() tries, or guard and resolver
   // disagree: `openrouter/gemini-3.6-flash` resolves to the measured Gemini
   // profile via its unqualified id, so it must not be refused here.
@@ -560,10 +570,9 @@ function parseEnvProfiles(raw: string): Map<string, GptModelProfile> {
     // An exact override key may be a prefix of the real model id. Resolve the
     // known family explicitly so `{"gpt-5.6-sol":{...}}` inherits Sol's font
     // and geometry even when a suffixed runtime id is expected.
-    const base =
-      key === 'gpt-5.6-sol' || key === 'gpt-6.1-sol' || key === 'gpt-6.2-sol'
-        ? GPT56_SOL_PROFILE
-        : resolveBuiltin(key);
+    const base = isGptSolModel(key)
+      ? GPT56_SOL_PROFILE
+      : resolveBuiltin(key);
     const p = v as Partial<GptModelProfile>;
     const styleIn = (p as { style?: GptRenderStyle }).style;
     const historyIn = (p as { history?: Partial<GptHistoryProfile> }).history;
@@ -725,6 +734,13 @@ export function resolveGptProfile(model: string | null | undefined): GptModelPro
     if (best) return best;
   }
   const qualified = ids.length > 1 ? resolveBuiltin(ids[0]!) : undefined;
-  if (qualified && qualified !== DEFAULT_GPT_PROFILE) return qualified;
-  return resolveBuiltin(ids[ids.length - 1]!);
+  const base =
+    qualified && qualified !== DEFAULT_GPT_PROFILE
+      ? qualified
+      : resolveBuiltin(ids[ids.length - 1]!);
+  const cal = getCalibratedProfile(model);
+  if (cal && cal.scores.passed && cal.band !== 'text-only') {
+    return calibratedBandToProfile(cal.band, base, { cols: cal.cols, maxHeightPx: cal.maxHeightPx });
+  }
+  return base;
 }

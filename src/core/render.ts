@@ -308,7 +308,7 @@ export interface RenderedImage {
   height: number;
   /** Input codepoints rendered (wide chars count as 1, not 2). */
   charsRendered: number;
-  /** Codepoints absent from atlas, rendered as blank cells. Surface as telemetry. */
+  /** Codepoints absent from atlas, rendered as blank cells. Surface in counters. */
   droppedChars: number;
   /** Per-codepoint drop histogram. Empty when droppedChars === 0; never undefined. */
   droppedCodepoints: Map<number, number>;
@@ -526,7 +526,7 @@ export function dereflow(reflowed: string): string {
 // --- atlas-miss escaping -----------------------------------------------------
 //
 // Codepoints absent from the atlas used to render as blank cells (droppedChars
-// telemetry). Emoji and other astral glyphs can't be DRAWN at 5×8 px, but they
+// metrics). Emoji and other astral glyphs can't be DRAWN at 5×8 px, but they
 // can be PRESERVED: substitute a deterministic textual escape (`[U+HEX]`) before
 // wrap, so the model reads the codepoint instead of a gap. Applied at the same layer
 // as tab expansion (wrapLines + measureContentCols), so wrap math and canvas
@@ -1268,6 +1268,8 @@ interface RenderCacheEntry {
 }
 
 const renderCache = new Map<string, RenderCacheEntry>();
+const renderInFlight = new Map<string, Promise<RenderedImage[]>>();
+let renderCacheEpoch = 0;
 let renderCacheBytes = 0;
 let renderCacheHits = 0;
 let renderCacheMisses = 0;
@@ -1323,6 +1325,7 @@ export function setRenderCacheMaxBytes(maxBytes: number): void {
   if (renderCacheMaxBytesValue === 0) {
     // Not clearRenderCache(): shrinking the budget is not a reason to throw away the
     // hit/miss history an operator is reading.
+    renderCacheEpoch++;
     renderCache.clear();
     renderCacheBytes = 0;
     return;
@@ -1344,6 +1347,7 @@ function evictToBudget(pinnedKey?: string): void {
 
 /** Drop every entry. Tests use this to isolate hit/miss accounting. */
 export function clearRenderCache(): void {
+  renderCacheEpoch++;
   renderCache.clear();
   renderCacheBytes = 0;
   renderCacheHits = 0;
@@ -1445,30 +1449,47 @@ export async function renderTextToPngsWithCharLimit(
   }
   renderCacheMisses++;
 
-  const images = await renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
-
-  // Key strings are UTF-16 in memory; 2 bytes/unit is the honest estimate. The digest
-  // is fixed-width, so this term is now a constant per entry rather than a second copy
-  // of the input — the budget bounds retained pages, which is what it claims to bound.
-  let bytes = key.length * 2;
-  for (const img of images) bytes += img.png.byteLength;
-  // A single render larger than the whole budget is not cacheable — storing it would
-  // evict everything and then itself. Serve it and move on.
-  if (bytes <= renderCacheMaxBytesValue) {
-    // Two concurrent requests can render the same slab: both miss (the lookup
-    // happens before the await), both render, both land here. Without crediting
-    // back the entry being replaced, the second store adds its bytes while the
-    // Map still holds one entry, and the counter drifts upward permanently —
-    // eventually evicting a cache that is nowhere near its budget.
-    const replaced = renderCache.get(key);
-    if (replaced !== undefined) renderCacheBytes -= replaced.bytes;
-    renderCache.set(key, { images, bytes });
-    renderCacheBytes += bytes;
-    evictToBudget(key); // never evict the entry just stored
-  } else {
-    renderCacheOversized++;
+  const pending = renderInFlight.get(key);
+  if (pending !== undefined) {
+    return cloneForCaller(await pending);
   }
-  return cloneForCaller(images);
+
+  const startEpoch = renderCacheEpoch;
+  const task = (async (): Promise<RenderedImage[]> => {
+    const images = await renderTextToPngsUncached(text, cols, maxCharsPerImage, style, maxHeightPx, slotText);
+    if (renderCacheMaxBytesValue === 0 || renderCacheEpoch !== startEpoch) {
+      return images;
+    }
+    // Key strings are UTF-16 in memory; 2 bytes/unit is the honest estimate. The digest
+    // is fixed-width, so this term is now a constant per entry rather than a second copy
+    // of the input — the budget bounds retained pages, which is what it claims to bound.
+    let bytes = key.length * 2;
+    for (const img of images) bytes += img.png.byteLength;
+    // A single render larger than the whole budget is not cacheable — storing it would
+    // evict everything and then itself. Serve it and move on.
+    if (bytes <= renderCacheMaxBytesValue) {
+      const replaced = renderCache.get(key);
+      if (replaced !== undefined) {
+        renderCacheBytes -= replaced.bytes;
+        renderCache.delete(key);
+      }
+      renderCache.set(key, { images, bytes });
+      renderCacheBytes += bytes;
+      evictToBudget(key); // never evict the entry just stored
+    } else {
+      renderCacheOversized++;
+    }
+    return images;
+  })();
+
+  renderInFlight.set(key, task);
+  try {
+    return cloneForCaller(await task);
+  } finally {
+    if (renderInFlight.get(key) === task) {
+      renderInFlight.delete(key);
+    }
+  }
 }
 
 async function renderTextToPngsUncached(
@@ -1562,4 +1583,46 @@ export async function renderDensePages(
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
   const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
   return renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
+}
+
+/** Visual row count after soft-wrap at `cols` (only hard newlines start a new row). */
+export function countVisualRows(text: string, cols: number): number {
+  const sentinel = NL_SENTINEL.charCodeAt(0);
+  let rows = 0;
+  let lineStart = 0;
+  let padCells = 0;
+  const len = text.length;
+  for (let i = 0; i <= len; i++) {
+    const cc = i < len ? text.charCodeAt(i) : -1;
+    if (cc === sentinel) padCells += 2 * NL_SENTINEL_PAD_CELLS;
+    if (i === len || cc === 10 /* \n */) {
+      const lineLen = i - lineStart + padCells;
+      rows += lineLen === 0 ? 1 : Math.ceil(lineLen / Math.max(1, cols));
+      lineStart = i + 1;
+      padCells = 0;
+    }
+  }
+  return rows;
+}
+
+/** Estimate how many images `text` will render to at the given column width and page limits. */
+export function estimateImageCount(
+  textOrLen: string | number,
+  cols: number,
+  maxChars: number = READABLE_CHARS_PER_IMAGE,
+  maxLinesPerColumn: number = LINES_PER_IMAGE,
+): number {
+  const readableLinesPerCol = Math.max(1, Math.floor(maxChars / Math.max(1, cols)));
+  const hardLinesPerCol = Math.max(1, Math.floor(maxLinesPerColumn));
+  const linesPerImage = Math.min(hardLinesPerCol, readableLinesPerCol);
+  const charBudget = Math.max(1, maxChars);
+  if (typeof textOrLen === 'number') {
+    return Math.max(1, Math.ceil(textOrLen / charBudget));
+  }
+  const rows = countVisualRows(textOrLen, cols);
+  return Math.max(
+    1,
+    Math.ceil(rows / linesPerImage),
+    Math.ceil(textOrLen.length / charBudget),
+  );
 }

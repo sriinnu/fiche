@@ -1,25 +1,41 @@
 /**
- * CASI: Append-Only Content-Addressed Suffix-Indexed Delta Store.
+ * CASI v2: Append-Only Content-Addressed Gutter-Normalized FastCDC Delta Store.
  *
  * Scans tool outputs monotonically in prefix order (`0 -> N-1`). Each block `k`
  * queries ONLY intact prior entries `0..k-1`, guaranteeing 100% prefix-cache
  * invariance across multi-turn conversations: turn T's prefix bytes remain bit-
  * identical when turn T+1 appends new messages.
  *
- * Emits either:
- *  - Exact duplicate reference (`[inkling cas: exact duplicate of ...]`)
- *  - Anchor-aligned unified diff hunk (`[inkling cas-delta vs ... (±2 context)]`)
+ * Emits:
+ *  - Exact / gutter-shifted duplicate reference (`[fiche cas: ...]`)
+ *  - Anchor-aligned unified diff hunk (`[fiche cas-delta vs ... (±2 context)]`)
+ *  - FastCDC sub-block slice splice (`[fiche cas-slice: ...]`)
  *
- * Deltas are never re-indexed as bases (chain depth <= 1). Zero `node:` imports.
+ * Deltas and slices are never re-indexed as bases (chain depth <= 1). Zero `node:` imports.
  */
 
 export interface CasiResult {
   readonly text: string;
   readonly changed: boolean;
-  readonly kind?: 'exact_dup' | 'delta';
+  readonly kind?: 'exact_dup' | 'delta' | 'slice';
   readonly baseRefId?: string;
   readonly savedChars: number;
   readonly savedTokens: number;
+}
+
+interface FastCdcChunk {
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly lineCount: number;
+  readonly key: string;
+}
+
+interface ChunkRef {
+  readonly entryIdx: number;
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly lineCount: number;
+  next?: ChunkRef;
 }
 
 interface CasiEntry {
@@ -28,10 +44,19 @@ interface CasiEntry {
   readonly turnGroup?: number;
   readonly rawText: string;
   readonly lineCount: number;
+  readonly effectiveLineCount: number;
   readonly hash64: string;
+  readonly bodyDocHash: string;
+  readonly allHaveLineNums: boolean;
+  readonly isCodeLike: boolean;
+  readonly isLogLike: boolean;
   readonly lines: readonly string[];
-  readonly lineHashes: Uint32Array;
+  readonly bodies: readonly string[];
+  readonly canonLines: readonly string[];
+  readonly lineNums: Int32Array;
+  readonly canonHashes: Uint32Array;
   readonly lineFreq: Map<number, number>;
+  readonly chunks: readonly FastCdcChunk[];
 }
 
 // Keep total postings alongside bounded entry indices so hot lines (e.g. `{` or `return;`) skip voting cleanly.
@@ -41,6 +66,7 @@ interface LinePostings {
 }
 
 const MAX_CASI_ENTRIES = 128;
+const MAX_SEED_ENTRIES = 48;
 const MAX_LINE_POSTINGS = 24;
 const HOT_POSTING_VOTE_SKIP = 16;
 const MIN_EXACT_DUP_CHARS = 400;
@@ -48,6 +74,84 @@ const MIN_DELTA_CHARS = 800;
 const MIN_DELTA_LINES = 16;
 const MAX_INPUT_CHARS = 512_000;
 const HUNK_CONTEXT = 2;
+const HISTOGRAM_MAX_DEPTH = 16;
+const HISTOGRAM_MAX_OCCURRENCES = 64;
+const PREPARED_CACHE_MAX_ENTRIES = 192;
+const PREPARED_CACHE_MAX_CHARS = 16 * 1024 * 1024;
+const PREPARED_CACHE_MIN_CHARS = 256;
+const CDC_MIN_LINES = 8;
+const CDC_AVG_LINES = 20;
+const CDC_MAX_LINES = 48;
+// High-bit Normalized FastCDC masks operating on the 8-line Gear rolling window
+// (4 left-shifts per line across 32 bits): stricter below avg, relaxed at/above avg.
+const CDC_MASK_S = 0xf8000000;
+const CDC_MASK_L = 0xe0000000;
+const MAX_CHUNK_REFS_PER_KEY = 8;
+
+const GUTTER_NUM_RE = /^\s*(\d{1,7})(?:\t|→|\s*[|│](?:\s|$))/;
+const ALT_GUTTER_NUM_RE = /^L(\d{1,7}):\s/;
+const ISO_TS_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b/g;
+const CLOCK_TS_RE = /\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b/g;
+const VOLATILE_DURATION_RE = /\b\d+(?:\.\d+)?\s*(?:ns|us|µs|ms|s)\b/g;
+
+/** Deterministic 256-entry FastCDC Gear table generated via SplitMix32 constants. */
+export const GEAR_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256);
+  let state = 0x9e3779b9;
+  for (let i = 0; i < 256; i++) {
+    state = (state + 0x9e3779b9) | 0;
+    let z = state;
+    z = Math.imul(z ^ (z >>> 16), 0x85ebca6b);
+    z = Math.imul(z ^ (z >>> 13), 0xc2b2ae35);
+    table[i] = (z ^ (z >>> 16)) >>> 0;
+  }
+  return table;
+})();
+
+/**
+ * Strip `read_file` / `bat` / `view_file` line-number gutters (`1→`, `1\t`, `1 │ `, `L1: `)
+ * into `{ lineNum, body }` without altering body indentation.
+ */
+export function stripLineGutter(line: string): { lineNum: number | null; body: string } {
+  if (!line) return { lineNum: null, body: line };
+  const c0 = line.charCodeAt(0);
+  if (c0 === 76) {
+    const m = ALT_GUTTER_NUM_RE.exec(line);
+    if (m) {
+      return {
+        lineNum: Number.parseInt(m[1]!, 10),
+        body: line.slice(m[0].length),
+      };
+    }
+    return { lineNum: null, body: line };
+  }
+  if ((c0 >= 48 && c0 <= 57) || c0 === 32 || c0 === 9) {
+    const m = GUTTER_NUM_RE.exec(line);
+    if (m) {
+      return {
+        lineNum: Number.parseInt(m[1]!, 10),
+        body: line.slice(m[0].length),
+      };
+    }
+  }
+  return { lineNum: null, body: line };
+}
+
+/**
+ * Normalize volatile ISO timestamps, clock timestamps, and durations ONLY for
+ * similarity voting and chunk matching while preserving exact `curLines` in output.
+ */
+export function canonicalForMatching(body: string): string {
+  if (!body) return body;
+  let out = body;
+  if (out.includes(':')) {
+    out = out.replace(ISO_TS_RE, '<TS>').replace(CLOCK_TS_RE, '<TIME>');
+  }
+  if (out.includes('s') || out.includes('S')) {
+    out = out.replace(VOLATILE_DURATION_RE, '<DUR>');
+  }
+  return out;
+}
 
 // Allocation-free check matching `line.trim().length >= 4` on hot CASI scan paths.
 function hasAtLeast4NonWs(line: string): boolean {
@@ -75,10 +179,8 @@ function dualHash64Hex(s: string): string {
   let h2 = 0x9e3779b1 >>> 0;
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    h1 ^= c;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= c;
-    h2 = Math.imul(h2, 0x01000193);
+    h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
+    h2 = Math.imul((h2 ^ ((c + (i & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
   }
   return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
 }
@@ -130,23 +232,252 @@ function lisAnchors(pairs: readonly AnchorPair[]): AnchorPair[] {
   return out;
 }
 
+function chunkHash64(canonLines: readonly string[], start: number, end: number): string {
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x9e3779b1 >>> 0;
+  for (let i = start; i < end; i++) {
+    const rel = i - start;
+    if (i > start) {
+      h1 = Math.imul((h1 ^ 10) >>> 0, 0x01000193) >>> 0;
+      h2 = Math.imul((h2 ^ (10 + (rel & 0xff))) >>> 0, 0x85ebca6b) >>> 0;
+    }
+    const line = canonLines[i]!;
+    for (let j = 0; j < line.length; j++) {
+      const c = line.charCodeAt(j);
+      h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
+      h2 = Math.imul((h2 ^ ((c + (j & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
+    }
+  }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+function computeFastCdcChunks(
+  canonLines: readonly string[],
+  canonHashes: Uint32Array,
+): FastCdcChunk[] {
+  const n = canonLines.length;
+  if (n < CDC_MIN_LINES) return [];
+  const chunks: FastCdcChunk[] = [];
+  let start = 0;
+  let gear = 0;
+  for (let i = 0; i < n; i++) {
+    const h = canonHashes[i]!;
+    gear = ((gear << 1) + GEAR_TABLE[h & 0xff]!) >>> 0;
+    gear = ((gear << 1) + GEAR_TABLE[(h >>> 8) & 0xff]!) >>> 0;
+    gear = ((gear << 1) + GEAR_TABLE[(h >>> 16) & 0xff]!) >>> 0;
+    gear = ((gear << 1) + GEAR_TABLE[(h >>> 24) & 0xff]!) >>> 0;
+    const lineCount = i - start + 1;
+    const mask = lineCount < CDC_AVG_LINES ? CDC_MASK_S : CDC_MASK_L;
+    if (lineCount >= CDC_MAX_LINES || (lineCount >= CDC_MIN_LINES && ((gear & mask) >>> 0) === 0)) {
+      chunks.push({
+        startLine: start,
+        endLine: i + 1,
+        lineCount,
+        key: chunkHash64(canonLines, start, i + 1),
+      });
+      start = i + 1;
+      gear = 0;
+    }
+  }
+  if (n - start >= CDC_MIN_LINES) {
+    chunks.push({
+      startLine: start,
+      endLine: n,
+      lineCount: n - start,
+      key: chunkHash64(canonLines, start, n),
+    });
+  }
+  return chunks;
+}
+
+interface PreparedLines {
+  readonly lines: readonly string[];
+  readonly bodies: readonly string[];
+  readonly canonLines: readonly string[];
+  readonly lineNums: Int32Array;
+  readonly canonHashes: Uint32Array;
+  readonly effectiveLineCount: number;
+  readonly allHaveLineNums: boolean;
+  readonly isCodeLike: boolean;
+  readonly isLogLike: boolean;
+  readonly bodyDocHash: string;
+  readonly rawLength: number;
+}
+
+interface PreparedCacheEntry {
+  readonly rawText: string;
+  readonly prep: PreparedLines;
+  readonly chunks: readonly FastCdcChunk[];
+}
+
+const PREPARED_LINES_CACHE = new Map<string, PreparedCacheEntry>();
+let preparedCacheChars = 0;
+
+export function clearCasiPreparedCacheForTests(): void {
+  PREPARED_LINES_CACHE.clear();
+  preparedCacheChars = 0;
+}
+
+function getPreparedAndChunks(
+  rawText: string,
+  hash64?: string,
+): { readonly prep: PreparedLines; readonly chunks: readonly FastCdcChunk[] } {
+  const canCache =
+    rawText.length >= PREPARED_CACHE_MIN_CHARS &&
+    rawText.length <= MAX_INPUT_CHARS &&
+    rawText.length <= PREPARED_CACHE_MAX_CHARS;
+  const cacheKey = canCache ? `${rawText.length}:${hash64 ?? dualHash64Hex(rawText)}` : '';
+  if (canCache) {
+    const cached = PREPARED_LINES_CACHE.get(cacheKey);
+    if (cached && cached.rawText === rawText) {
+      PREPARED_LINES_CACHE.delete(cacheKey);
+      PREPARED_LINES_CACHE.set(cacheKey, cached);
+      return { prep: cached.prep, chunks: cached.chunks };
+    }
+  }
+  const prep = prepareLines(rawText);
+  const chunks = computeFastCdcChunks(prep.canonLines, prep.canonHashes);
+  if (canCache) {
+    const existing = PREPARED_LINES_CACHE.get(cacheKey);
+    if (existing) {
+      preparedCacheChars -= existing.rawText.length;
+      PREPARED_LINES_CACHE.delete(cacheKey);
+    }
+    while (
+      (PREPARED_LINES_CACHE.size >= PREPARED_CACHE_MAX_ENTRIES ||
+        preparedCacheChars + rawText.length > PREPARED_CACHE_MAX_CHARS) &&
+      PREPARED_LINES_CACHE.size > 0
+    ) {
+      const oldestKey = PREPARED_LINES_CACHE.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldest = PREPARED_LINES_CACHE.get(oldestKey);
+      PREPARED_LINES_CACHE.delete(oldestKey);
+      if (oldest) preparedCacheChars -= oldest.rawText.length;
+    }
+    PREPARED_LINES_CACHE.set(cacheKey, { rawText, prep, chunks });
+    preparedCacheChars += rawText.length;
+  }
+  return { prep, chunks };
+}
+
+const CODE_HINT_RE = /(?:^|\s)(?:export|import|function|const|let|var|class|interface|type|enum|def|async|fn|pub|func|struct|return|throw)\b|=>|;\s*$/;
+const LOG_LINE_HINT_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b|^\s*\[?(?:INFO|WARN|WARNING|ERROR|DEBUG|TRACE|FATAL)\]?(?:\s|:)/i;
+
+function isMonotonicLineNums(lineNums: Int32Array, count: number): boolean {
+  for (let i = 1; i < count; i++) {
+    if (lineNums[i]! <= lineNums[i - 1]!) return false;
+  }
+  return count > 0 && lineNums[0]! >= 0;
+}
+
+function prepareLines(rawText: string): PreparedLines {
+  const lines = rawText.split('\n');
+  const n = lines.length;
+  // Ignore a single trailing empty line produced by a final `\n`.
+  const effectiveLineCount = n > 1 && lines[n - 1] === '' ? n - 1 : n;
+  const bodies = new Array<string>(n);
+  const canonLines = new Array<string>(n);
+  const lineNums = new Int32Array(n);
+  const canonHashes = new Uint32Array(n);
+  let allHaveLineNums = effectiveLineCount > 0;
+  let codeHintHits = 0;
+  let logHintHits = 0;
+  let ch1 = 0x811c9dc5 >>> 0;
+  let ch2 = 0x9e3779b1 >>> 0;
+
+  for (let i = 0; i < n; i++) {
+    const { lineNum, body } = stripLineGutter(lines[i]!);
+    bodies[i] = body;
+    const canon = canonicalForMatching(body);
+    canonLines[i] = canon;
+    if (lineNum === null) {
+      lineNums[i] = -1;
+      if (i < effectiveLineCount) allHaveLineNums = false;
+    } else {
+      lineNums[i] = lineNum;
+    }
+    if (i < effectiveLineCount && codeHintHits < 3 && CODE_HINT_RE.test(body)) {
+      codeHintHits++;
+    }
+    if (i < effectiveLineCount && logHintHits < 4 && LOG_LINE_HINT_RE.test(body)) {
+      logHintHits++;
+    }
+    canonHashes[i] = fnv1a32(canon);
+    if (i < effectiveLineCount) {
+      if (i > 0) {
+        ch1 = Math.imul((ch1 ^ 10) >>> 0, 0x01000193) >>> 0;
+        ch2 = Math.imul((ch2 ^ 10) >>> 0, 0x01000193) >>> 0;
+      }
+      for (let j = 0; j < body.length; j++) {
+        const c = body.charCodeAt(j);
+        ch1 = Math.imul((ch1 ^ c) >>> 0, 0x01000193) >>> 0;
+        ch2 = Math.imul((ch2 ^ c) >>> 0, 0x01000193) >>> 0;
+      }
+    }
+  }
+
+  const bodyDocHash =
+    (ch1 >>> 0).toString(16).padStart(8, '0') + (ch2 >>> 0).toString(16).padStart(8, '0');
+  return {
+    lines,
+    bodies,
+    canonLines,
+    lineNums,
+    canonHashes,
+    effectiveLineCount,
+    allHaveLineNums,
+    isCodeLike: codeHintHits >= 2,
+    isLogLike: logHintHits >= 3,
+    bodyDocHash,
+    rawLength: rawText.length,
+  };
+}
+
+function sliceCharLength(lines: readonly string[], start: number, end: number): number {
+  let len = Math.max(0, end - start - 1);
+  for (let i = start; i < end; i++) {
+    len += lines[i]!.length;
+  }
+  return len;
+}
+
 function formatUnifiedDelta(
   base: CasiEntry,
-  curLines: readonly string[],
-  curHashes: Uint32Array,
-): { text: string; matchedLines: number } | null {
+  cur: PreparedLines,
+): { text: string; matchedLines: number; exactBodyMatch?: boolean } | null {
+  const { lines: curLines, bodies: curBodies, canonLines: curCanonLines, canonHashes: curCanonHashes } = cur;
+  // Use canonical matching only on unguttered non-code log streams; any guttered,
+  // code-like, or structured non-log payload (YAML/JSON/config) MUST verify exact body equality.
+  const strictBody =
+    base.allHaveLineNums ||
+    cur.allHaveLineNums ||
+    base.isCodeLike ||
+    cur.isCodeLike ||
+    !(base.isLogLike && cur.isLogLike);
+  const matchCanon = (bIdx: number, cIdx: number): boolean =>
+    strictBody ? base.bodies[bIdx] === curBodies[cIdx] : base.canonLines[bIdx] === curCanonLines[cIdx];
+
+  const baseLen = base.lines.length;
+  const curLen = curLines.length;
+  const baseHas4 = new Uint8Array(baseLen);
+  for (let i = 0; i < baseLen; i++) {
+    if (hasAtLeast4NonWs(base.canonLines[i]!)) baseHas4[i] = 1;
+  }
+
   // Build hash -> unique base line position map (freq == 1 in base, 1..3 in cur).
+  const curHas4 = new Uint8Array(curLen);
   const curFreq = new Map<number, number>();
-  for (let i = 0; i < curLines.length; i++) {
-    if (!hasAtLeast4NonWs(curLines[i]!)) continue;
-    const h = curHashes[i]!;
+  for (let i = 0; i < curLen; i++) {
+    if (!hasAtLeast4NonWs(curCanonLines[i]!)) continue;
+    curHas4[i] = 1;
+    const h = curCanonHashes[i]!;
     curFreq.set(h, (curFreq.get(h) ?? 0) + 1);
   }
 
   const basePosUnique = new Map<number, number>();
-  for (let i = 0; i < base.lines.length; i++) {
-    if (!hasAtLeast4NonWs(base.lines[i]!)) continue;
-    const h = base.lineHashes[i]!;
+  for (let i = 0; i < baseLen; i++) {
+    if (!baseHas4[i]) continue;
+    const h = base.canonHashes[i]!;
     if ((base.lineFreq.get(h) ?? 0) !== 1) continue;
     const cf = curFreq.get(h) ?? 0;
     if (cf === 0 || cf > 3) continue;
@@ -154,67 +485,323 @@ function formatUnifiedDelta(
   }
 
   const rawPairs: AnchorPair[] = [];
-  for (let cIdx = 0; cIdx < curLines.length; cIdx++) {
-    const h = curHashes[cIdx]!;
+  for (let cIdx = 0; cIdx < curLen; cIdx++) {
+    if (!curHas4[cIdx]) continue;
+    const h = curCanonHashes[cIdx]!;
     const bIdx = basePosUnique.get(h);
     if (bIdx === undefined) continue;
-    if (base.lines[bIdx] === curLines[cIdx]) {
+    if (matchCanon(bIdx, cIdx)) {
       rawPairs.push({ baseIdx: bIdx, curIdx: cIdx });
     }
   }
-  if (rawPairs.length === 0) return null;
 
-  const anchors = lisAnchors(rawPairs);
-  if (anchors.length === 0) return null;
+  // Compute monotonic alignment segments by expanding around pinned LIS anchors,
+  // then recursively anchor remaining unmatched intervals via Histogram Diff.
+  const matchedCur = new Int32Array(curLen).fill(-1);
+  const usedBase = new Uint8Array(baseLen);
+  if (rawPairs.length > 0) {
+    const anchors = lisAnchors(rawPairs);
+    for (const a of anchors) {
+      if (matchedCur[a.curIdx] !== -1 || usedBase[a.baseIdx]) continue;
+      matchedCur[a.curIdx] = a.baseIdx;
+      usedBase[a.baseIdx] = 1;
+    }
 
-  // Compute monotonic alignment segments by expanding around pinned LIS anchors.
-  const matchedCur = new Int32Array(curLines.length).fill(-1);
-  const usedBase = new Uint8Array(base.lines.length);
-  for (const a of anchors) {
-    if (matchedCur[a.curIdx] !== -1 || usedBase[a.baseIdx]) continue;
-    matchedCur[a.curIdx] = a.baseIdx;
-    usedBase[a.baseIdx] = 1;
+    // Forward & backward greedy expansion bounded by strictly monotonic neighbors.
+    for (let i = 0; i < anchors.length; i++) {
+      const curStart = anchors[i]!.curIdx;
+      const baseStart = anchors[i]!.baseIdx;
+      const nextCurBound = i + 1 < anchors.length ? anchors[i + 1]!.curIdx : curLen;
+      const nextBaseBound = i + 1 < anchors.length ? anchors[i + 1]!.baseIdx : baseLen;
+      let c = curStart + 1;
+      let b = baseStart + 1;
+      while (
+        c < nextCurBound &&
+        b < nextBaseBound &&
+        matchedCur[c] === -1 &&
+        !usedBase[b] &&
+        curCanonHashes[c] === base.canonHashes[b] &&
+        matchCanon(b, c)
+      ) {
+        matchedCur[c] = b;
+        usedBase[b] = 1;
+        c++;
+        b++;
+      }
+
+      const prevCurBound = i > 0 ? anchors[i - 1]!.curIdx : -1;
+      const prevBaseBound = i > 0 ? anchors[i - 1]!.baseIdx : -1;
+      c = curStart - 1;
+      b = baseStart - 1;
+      while (
+        c > prevCurBound &&
+        b > prevBaseBound &&
+        matchedCur[c] === -1 &&
+        !usedBase[b] &&
+        curCanonHashes[c] === base.canonHashes[b] &&
+        matchCanon(b, c)
+      ) {
+        matchedCur[c] = b;
+        usedBase[b] = 1;
+        c--;
+        b--;
+      }
+    }
   }
 
-  // Forward & backward greedy expansion bounded by strictly monotonic neighbors.
-  for (let i = 0; i < anchors.length; i++) {
-    const curStart = anchors[i]!.curIdx;
-    const baseStart = anchors[i]!.baseIdx;
-    const nextCurBound = i + 1 < anchors.length ? anchors[i + 1]!.curIdx : curLines.length;
-    const nextBaseBound = i + 1 < anchors.length ? anchors[i + 1]!.baseIdx : base.lines.length;
-    let c = curStart + 1;
-    let b = baseStart + 1;
-    while (
-      c < nextCurBound &&
-      b < nextBaseBound &&
-      matchedCur[c] === -1 &&
-      !usedBase[b] &&
-      curHashes[c] === base.lineHashes[b] &&
-      curLines[c] === base.lines[b]
-    ) {
-      matchedCur[c] = b;
-      usedBase[b] = 1;
-      c++;
-      b++;
+  const lisIntervalFallback = (bStart: number, bEnd: number, cStart: number, cEnd: number): void => {
+    const localCurFreq = new Map<number, number>();
+    for (let c = cStart; c < cEnd; c++) {
+      if (matchedCur[c] !== -1 || !curHas4[c]) continue;
+      const h = curCanonHashes[c]!;
+      localCurFreq.set(h, (localCurFreq.get(h) ?? 0) + 1);
+    }
+    const localBaseFreq = new Map<number, number>();
+    const localBasePos = new Map<number, number>();
+    for (let b = bStart; b < bEnd; b++) {
+      if (usedBase[b] || !baseHas4[b]) continue;
+      const h = base.canonHashes[b]!;
+      localBaseFreq.set(h, (localBaseFreq.get(h) ?? 0) + 1);
+      localBasePos.set(h, b);
+    }
+    const pairs: AnchorPair[] = [];
+    for (let c = cStart; c < cEnd; c++) {
+      if (matchedCur[c] !== -1 || !curHas4[c]) continue;
+      const h = curCanonHashes[c]!;
+      if (localBaseFreq.get(h) !== 1) continue;
+      const cf = localCurFreq.get(h) ?? 0;
+      if (cf === 0 || cf > 3) continue;
+      const b = localBasePos.get(h)!;
+      if (matchCanon(b, c)) {
+        pairs.push({ baseIdx: b, curIdx: c });
+      }
+    }
+    if (pairs.length === 0) return;
+    const subAnchors = lisAnchors(pairs);
+    for (const a of subAnchors) {
+      if (matchedCur[a.curIdx] !== -1 || usedBase[a.baseIdx]) continue;
+      matchedCur[a.curIdx] = a.baseIdx;
+      usedBase[a.baseIdx] = 1;
+    }
+    for (let i = 0; i < subAnchors.length; i++) {
+      const curStart = subAnchors[i]!.curIdx;
+      const baseStart = subAnchors[i]!.baseIdx;
+      const nextC = i + 1 < subAnchors.length ? subAnchors[i + 1]!.curIdx : cEnd;
+      const nextB = i + 1 < subAnchors.length ? subAnchors[i + 1]!.baseIdx : bEnd;
+      let c = curStart + 1;
+      let b = baseStart + 1;
+      while (
+        c < nextC &&
+        b < nextB &&
+        matchedCur[c] === -1 &&
+        !usedBase[b] &&
+        curCanonHashes[c] === base.canonHashes[b] &&
+        matchCanon(b, c)
+      ) {
+        matchedCur[c] = b;
+        usedBase[b] = 1;
+        c++;
+        b++;
+      }
+      const prevC = i > 0 ? subAnchors[i - 1]!.curIdx : cStart - 1;
+      const prevB = i > 0 ? subAnchors[i - 1]!.baseIdx : bStart - 1;
+      c = curStart - 1;
+      b = baseStart - 1;
+      while (
+        c > prevC &&
+        b > prevB &&
+        matchedCur[c] === -1 &&
+        !usedBase[b] &&
+        curCanonHashes[c] === base.canonHashes[b] &&
+        matchCanon(b, c)
+      ) {
+        matchedCur[c] = b;
+        usedBase[b] = 1;
+        c--;
+        b--;
+      }
+    }
+  };
+
+  // Recursive Histogram Diff on unmatched intervals: resolves repeated boilerplate
+  // blocks (freq >= 2) where globally unique anchors are sparse or exhausted.
+  const histogramAnchors = (
+    bStart: number,
+    bEnd: number,
+    cStart: number,
+    cEnd: number,
+    depth: number,
+  ): void => {
+    if (bEnd <= bStart || cEnd <= cStart) return;
+    if (depth >= HISTOGRAM_MAX_DEPTH) {
+      lisIntervalFallback(bStart, bEnd, cStart, cEnd);
+      return;
     }
 
-    const prevCurBound = i > 0 ? anchors[i - 1]!.curIdx : -1;
-    const prevBaseBound = i > 0 ? anchors[i - 1]!.baseIdx : -1;
-    c = curStart - 1;
-    b = baseStart - 1;
-    while (
-      c > prevCurBound &&
-      b > prevBaseBound &&
-      matchedCur[c] === -1 &&
-      !usedBase[b] &&
-      curHashes[c] === base.lineHashes[b] &&
-      curLines[c] === base.lines[b]
-    ) {
+    const basePositions = new Map<number, number[]>();
+    for (let b = bStart; b < bEnd; b++) {
+      if (usedBase[b] || !baseHas4[b]) continue;
+      const h = base.canonHashes[b]!;
+      let arr = basePositions.get(h);
+      if (!arr) {
+        arr = [b];
+        basePositions.set(h, arr);
+      } else if (arr.length <= HISTOGRAM_MAX_OCCURRENCES) {
+        arr.push(b);
+      }
+    }
+    if (basePositions.size === 0) return;
+
+    const curPositions = new Map<number, number[]>();
+    for (let c = cStart; c < cEnd; c++) {
+      if (matchedCur[c] !== -1 || !curHas4[c]) continue;
+      const h = curCanonHashes[c]!;
+      const bArr = basePositions.get(h);
+      if (!bArr || bArr.length > HISTOGRAM_MAX_OCCURRENCES) continue;
+      let cArr = curPositions.get(h);
+      if (!cArr) {
+        cArr = [c];
+        curPositions.set(h, cArr);
+      } else if (cArr.length <= HISTOGRAM_MAX_OCCURRENCES) {
+        cArr.push(c);
+      }
+    }
+    if (curPositions.size === 0) return;
+
+    interface HistogramCandidate {
+      readonly score: number;
+      readonly bArr: readonly number[];
+      readonly cArr: readonly number[];
+    }
+    const candidates: HistogramCandidate[] = [];
+    for (const [h, cArr] of curPositions) {
+      if (cArr.length > HISTOGRAM_MAX_OCCURRENCES) continue;
+      const bArr = basePositions.get(h)!;
+      candidates.push({
+        score: bArr.length + cArr.length,
+        bArr,
+        cArr,
+      });
+    }
+    if (candidates.length === 0) {
+      lisIntervalFallback(bStart, bEnd, cStart, cEnd);
+      return;
+    }
+    candidates.sort((a, b) => a.score - b.score || a.cArr[0]! - b.cArr[0]!);
+
+    let bestScore = Infinity;
+    let bestRunLen = 0;
+    let bestBStart = 0;
+    let bestBEnd = 0;
+    let bestCStart = 0;
+    let bestCEnd = 0;
+    const diagCovered = new Map<number, Array<[number, number]>>();
+
+    for (const cand of candidates) {
+      if (bestRunLen > 0 && cand.score > bestScore) break;
+      for (let bi = 0; bi < cand.bArr.length; bi++) {
+        const bIdx = cand.bArr[bi]!;
+        for (let ci = 0; ci < cand.cArr.length; ci++) {
+          const cIdx = cand.cArr[ci]!;
+          const diag = bIdx - cIdx;
+          const spans = diagCovered.get(diag);
+          if (spans) {
+            let already = false;
+            for (let s = 0; s < spans.length; s++) {
+              const sp = spans[s]!;
+              if (cIdx >= sp[0] && cIdx < sp[1]) {
+                already = true;
+                break;
+              }
+            }
+            if (already) continue;
+          }
+          if (!matchCanon(bIdx, cIdx)) continue;
+
+          let rbStart = bIdx;
+          let rcStart = cIdx;
+          while (
+            rbStart > bStart &&
+            rcStart > cStart &&
+            !usedBase[rbStart - 1] &&
+            matchedCur[rcStart - 1] === -1 &&
+            curCanonHashes[rcStart - 1] === base.canonHashes[rbStart - 1] &&
+            matchCanon(rbStart - 1, rcStart - 1)
+          ) {
+            rbStart--;
+            rcStart--;
+          }
+          let rbEnd = bIdx + 1;
+          let rcEnd = cIdx + 1;
+          while (
+            rbEnd < bEnd &&
+            rcEnd < cEnd &&
+            !usedBase[rbEnd] &&
+            matchedCur[rcEnd] === -1 &&
+            curCanonHashes[rcEnd] === base.canonHashes[rbEnd] &&
+            matchCanon(rbEnd, rcEnd)
+          ) {
+            rbEnd++;
+            rcEnd++;
+          }
+
+          if (spans) {
+            spans.push([rcStart, rcEnd]);
+          } else {
+            diagCovered.set(diag, [[rcStart, rcEnd]]);
+          }
+
+          const runLen = rcEnd - rcStart;
+          const isBetter =
+            bestRunLen === 0 ||
+            runLen > bestRunLen ||
+            (runLen === bestRunLen &&
+              (rcStart < bestCStart || (rcStart === bestCStart && rbStart < bestBStart)));
+          if (isBetter) {
+            bestScore = cand.score;
+            bestRunLen = runLen;
+            bestBStart = rbStart;
+            bestBEnd = rbEnd;
+            bestCStart = rcStart;
+            bestCEnd = rcEnd;
+          }
+        }
+      }
+    }
+
+    if (bestRunLen === 0) return;
+
+    for (let k = 0; k < bestRunLen; k++) {
+      const b = bestBStart + k;
+      const c = bestCStart + k;
       matchedCur[c] = b;
       usedBase[b] = 1;
-      c--;
-      b--;
     }
+
+    histogramAnchors(bStart, bestBStart, cStart, bestCStart, depth + 1);
+    histogramAnchors(bestBEnd, bEnd, bestCEnd, cEnd, depth + 1);
+  };
+
+  const initialIntervals: Array<[number, number, number, number]> = [];
+  {
+    let pC = -1;
+    let pB = -1;
+    for (let c = 0; c <= curLen; c++) {
+      const b = c < curLen ? matchedCur[c]! : baseLen;
+      if (c < curLen && b < 0) continue;
+      const bStart = pB + 1;
+      const bEnd = b;
+      const cStart = pC + 1;
+      const cEnd = c;
+      if (bEnd > bStart && cEnd > cStart) {
+        initialIntervals.push([bStart, bEnd, cStart, cEnd]);
+      }
+      pC = c;
+      pB = b;
+    }
+  }
+  for (const [bStart, bEnd, cStart, cEnd] of initialIntervals) {
+    histogramAnchors(bStart, bEnd, cStart, cEnd, 0);
   }
 
   // Gap fill between consecutive matched anchors for identical lines.
@@ -223,10 +810,9 @@ function formatUnifiedDelta(
   for (let c = 0; c <= curLines.length; c++) {
     const b = c < curLines.length ? matchedCur[c]! : base.lines.length;
     if (c < curLines.length && b < 0) continue;
-    // Try filling the gap (prevC, c) vs (prevB, b) greedily from both ends.
     let lc = prevC + 1;
     let lb = prevB + 1;
-    while (lc < c && lb < b && curLines[lc] === base.lines[lb]) {
+    while (lc < c && lb < b && matchCanon(lb, lc)) {
       matchedCur[lc] = lb;
       usedBase[lb] = 1;
       lc++;
@@ -234,7 +820,7 @@ function formatUnifiedDelta(
     }
     let rc = c - 1;
     let rb = b - 1;
-    while (rc >= lc && rb >= lb && curLines[rc] === base.lines[rb]) {
+    while (rc >= lc && rb >= lb && matchCanon(rb, rc)) {
       matchedCur[rc] = rb;
       usedBase[rb] = 1;
       rc--;
@@ -274,13 +860,34 @@ function formatUnifiedDelta(
     prevB = b;
   }
 
-  if (gaps.length === 0) return null;
+  if (gaps.length === 0) {
+    if (base.effectiveLineCount === cur.effectiveLineCount) {
+      let exact = true;
+      for (let i = 0; i < cur.effectiveLineCount; i++) {
+        if (base.bodies[i] !== curBodies[i]) {
+          exact = false;
+          break;
+        }
+      }
+      if (exact) {
+        const range =
+          cur.allHaveLineNums && isMonotonicLineNums(cur.lineNums, cur.effectiveLineCount)
+            ? `L${cur.lineNums[0]!}..${cur.lineNums[cur.effectiveLineCount - 1]!}, `
+            : '';
+        return {
+          text: `[fiche cas: body identical to ${base.refId} (${range}${cur.effectiveLineCount} lines, ${cur.rawLength} chars) — unchanged]`,
+          matchedLines,
+          exactBodyMatch: true,
+        };
+      }
+    }
+    return null;
+  }
 
-  // Merge gaps whose ±HUNK_CONTEXT regions overlap, then render hunks.
+  // Merge gaps whose ±HUNK_CONTEXT regions overlap, then render hunks with exact raw lines.
   const hunks: string[] = [];
   let gIdx = 0;
   while (gIdx < gaps.length) {
-    // Capture `firstIdx` directly so hunk rendering iterates O(G) instead of calling `gaps.indexOf(first)`.
     const firstIdx = gIdx;
     const first = gaps[firstIdx]!;
     let last = first;
@@ -300,15 +907,32 @@ function formatUnifiedDelta(
     const ctxCEnd = Math.min(curLines.length, last.cEnd + HUNK_CONTEXT);
     const ctxBEnd = Math.min(base.lines.length, last.bEnd + HUNK_CONTEXT);
 
+    const resolveHunkEndLineNum = (
+      prepared: { readonly allHaveLineNums: boolean; readonly lineNums: Int32Array },
+      startIdx: number,
+      endIdx: number,
+      startNum: number,
+    ): number => {
+      if (prepared.allHaveLineNums && endIdx > startIdx) {
+        for (let k = endIdx - 1; k >= startIdx; k--) {
+          const ln = prepared.lineNums[k]!;
+          if (ln > 0) return ln;
+        }
+      }
+      return endIdx > startIdx ? Math.max(startNum, endIdx) : endIdx;
+    };
+
+    const ctxBNumStart = base.allHaveLineNums && base.lineNums[ctxBStart]! > 0 ? base.lineNums[ctxBStart]! : ctxBStart + 1;
+    const ctxBNumEnd = resolveHunkEndLineNum(base, ctxBStart, ctxBEnd, ctxBNumStart);
+    const ctxCNumStart = cur.allHaveLineNums && cur.lineNums[ctxCStart]! > 0 ? cur.lineNums[ctxCStart]! : ctxCStart + 1;
+    const ctxCNumEnd = resolveHunkEndLineNum(cur, ctxCStart, ctxCEnd, ctxCNumStart);
     const hunkLines: string[] = [
-      `@@ base:${ctxBStart + 1}-${ctxBEnd} -> cur:${ctxCStart + 1}-${ctxCEnd} @@`,
+      `@@ base:${ctxBNumStart}-${ctxBNumEnd} -> cur:${ctxCNumStart}-${ctxCNumEnd} @@`,
     ];
 
-    // Emit leading context.
     for (let c = ctxCStart; c < first.cStart; c++) {
       hunkLines.push(` ${curLines[c]!}`);
     }
-    // Emit each gap and inter-gap matched context inside this hunk.
     for (let k = firstIdx; ; k++) {
       const g = gaps[k]!;
       for (let b = g.bStart; b < g.bEnd; b++) hunkLines.push(`-${base.lines[b]!}`);
@@ -319,7 +943,6 @@ function formatUnifiedDelta(
         hunkLines.push(` ${curLines[c]!}`);
       }
     }
-    // Emit trailing context.
     for (let c = last.cEnd; c < ctxCEnd; c++) {
       hunkLines.push(` ${curLines[c]!}`);
     }
@@ -334,47 +957,64 @@ function formatUnifiedDelta(
 
 export class CasiIndex {
   private readonly exactByHash = new Map<string, CasiEntry[]>();
+  private readonly exactBodyByHash = new Map<string, CasiEntry[]>();
   private readonly lineIndex = new Map<number, LinePostings>();
+  private readonly chunkIndex = new Map<string, ChunkRef>();
   private readonly entries: CasiEntry[] = [];
+  private readonly seedHashes = new Set<string>();
+  private seedCount = 0;
 
   private indexEntry(
     rawText: string,
     refId: string,
     hash64: string,
-    lines: string[],
-    lineHashes: Uint32Array,
+    prep: PreparedLines,
     turnGroup?: number,
+    precomputedChunks?: readonly FastCdcChunk[],
   ): void {
     if (this.entries.length >= MAX_CASI_ENTRIES) return;
     const entryIdx = this.entries.length;
     const lineFreq = new Map<number, number>();
-    for (let i = 0; i < lines.length; i++) {
-      if (!hasAtLeast4NonWs(lines[i]!)) continue;
-      const h = lineHashes[i]!;
+    for (let i = 0; i < prep.effectiveLineCount; i++) {
+      if (!hasAtLeast4NonWs(prep.canonLines[i]!)) continue;
+      const h = prep.canonHashes[i]!;
       lineFreq.set(h, (lineFreq.get(h) ?? 0) + 1);
     }
+    const chunks = precomputedChunks ?? computeFastCdcChunks(prep.canonLines, prep.canonHashes);
     const entry: CasiEntry = {
       idx: entryIdx,
       refId,
       turnGroup,
       rawText,
-      lineCount: lines.length,
+      lineCount: prep.lines.length,
+      effectiveLineCount: prep.effectiveLineCount,
       hash64,
-      lines,
-      lineHashes,
+      bodyDocHash: prep.bodyDocHash,
+      allHaveLineNums: prep.allHaveLineNums,
+      isCodeLike: prep.isCodeLike,
+      isLogLike: prep.isLogLike,
+      lines: prep.lines,
+      bodies: prep.bodies,
+      canonLines: prep.canonLines,
+      lineNums: prep.lineNums,
+      canonHashes: prep.canonHashes,
       lineFreq,
+      chunks,
     };
     this.entries.push(entry);
+
     const exactBucket = this.exactByHash.get(hash64);
-    if (exactBucket) {
-      exactBucket.push(entry);
-    } else {
-      this.exactByHash.set(hash64, [entry]);
-    }
+    if (exactBucket) exactBucket.push(entry);
+    else this.exactByHash.set(hash64, [entry]);
+
+    const bodyBucket = this.exactBodyByHash.get(prep.bodyDocHash);
+    if (bodyBucket) bodyBucket.push(entry);
+    else this.exactBodyByHash.set(prep.bodyDocHash, [entry]);
+
     const seenEntryHashes = new Set<number>();
-    for (let i = 0; i < lines.length; i++) {
-      if (!hasAtLeast4NonWs(lines[i]!)) continue;
-      const h = lineHashes[i]!;
+    for (let i = 0; i < prep.canonLines.length; i++) {
+      if (!hasAtLeast4NonWs(prep.canonLines[i]!)) continue;
+      const h = prep.canonHashes[i]!;
       if (seenEntryHashes.has(h)) continue;
       seenEntryHashes.add(h);
       let postings = this.lineIndex.get(h);
@@ -388,6 +1028,238 @@ export class CasiIndex {
         }
       }
     }
+
+    // Prefix-monotonic chunk index: first occurrence sits at the head.
+    const seenChunks = new Set<string>();
+    for (const chunk of chunks) {
+      if (seenChunks.has(chunk.key)) continue;
+      seenChunks.add(chunk.key);
+      const ref: ChunkRef = {
+        entryIdx,
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+        lineCount: chunk.lineCount,
+      };
+      const head = this.chunkIndex.get(chunk.key);
+      if (!head) {
+        this.chunkIndex.set(chunk.key, ref);
+      } else {
+        let cur: ChunkRef = head;
+        let count = 1;
+        while (cur.next && count < MAX_CHUNK_REFS_PER_KEY) {
+          cur = cur.next;
+          count++;
+        }
+        if (!cur.next && count < MAX_CHUNK_REFS_PER_KEY) {
+          cur.next = ref;
+        }
+      }
+    }
+  }
+
+  /**
+   * Read-only base seeding (e.g. from `tool_use.input` / `functionCall.args` payloads >= 400 chars)
+   * without mutating assistant/model messages.
+   */
+  seedBase(rawText: string, refId: string, turnGroup?: number): void {
+    if (
+      typeof rawText !== 'string' ||
+      rawText.length < MIN_EXACT_DUP_CHARS ||
+      rawText.length > MAX_INPUT_CHARS ||
+      this.entries.length >= MAX_CASI_ENTRIES ||
+      this.seedCount >= MAX_SEED_ENTRIES
+    ) {
+      return;
+    }
+    const hash64 = dualHash64Hex(rawText);
+    if (this.seedHashes.has(hash64)) return;
+    this.seedHashes.add(hash64);
+    this.seedCount++;
+    const { prep, chunks } = getPreparedAndChunks(rawText, hash64);
+    this.indexEntry(rawText, refId, hash64, prep, turnGroup, chunks);
+  }
+
+  /**
+   * Warm-replay counterpart of an unmatched `ingest()` base, bounded by `MAX_CASI_ENTRIES`
+   * (128) and independent of `MAX_SEED_ENTRIES` / `seedHashes`.
+   */
+  replayIndexedBase(rawText: string, refId: string, turnGroup?: number): void {
+    if (
+      typeof rawText !== 'string' ||
+      rawText.length < MIN_EXACT_DUP_CHARS ||
+      rawText.length > MAX_INPUT_CHARS ||
+      this.entries.length >= MAX_CASI_ENTRIES
+    ) {
+      return;
+    }
+    const hash64 = dualHash64Hex(rawText);
+    const { prep, chunks } = getPreparedAndChunks(rawText, hash64);
+    this.indexEntry(rawText, refId, hash64, prep, turnGroup, chunks);
+  }
+
+  private tryFastCdcSplice(
+    rawText: string,
+    prep: PreparedLines,
+    curChunks: readonly FastCdcChunk[],
+    isEligibleBase: (entry: CasiEntry) => boolean,
+  ): CasiResult | null {
+    if (this.chunkIndex.size === 0) return null;
+    if (curChunks.length === 0) return null;
+
+    interface MatchSpan {
+      curStart: number;
+      curEnd: number;
+      baseEntryIdx: number;
+      baseStart: number;
+      baseEnd: number;
+    }
+
+    const rawSpans: MatchSpan[] = [];
+    // Sub-block slice omission ALWAYS verifies exact body line equality so
+    // numeric/timestamp/duration differences (e.g. latency tables) are never masked.
+    const linesEqual = (base: CasiEntry, bIdx: number, cIdx: number): boolean =>
+      bIdx < base.effectiveLineCount &&
+      cIdx < prep.effectiveLineCount &&
+      base.bodies[bIdx] === prep.bodies[cIdx];
+
+    for (const chunk of curChunks) {
+      let ref = this.chunkIndex.get(chunk.key);
+      while (ref) {
+        const base = this.entries[ref.entryIdx];
+        if (base && isEligibleBase(base) && ref.lineCount === chunk.lineCount) {
+          let exact = true;
+          for (let k = 0; k < chunk.lineCount; k++) {
+            if (!linesEqual(base, ref.startLine + k, chunk.startLine + k)) {
+              exact = false;
+              break;
+            }
+          }
+          if (exact) {
+            rawSpans.push({
+              curStart: chunk.startLine,
+              curEnd: chunk.endLine,
+              baseEntryIdx: ref.entryIdx,
+              baseStart: ref.startLine,
+              baseEnd: ref.endLine,
+            });
+            break;
+          }
+        }
+        ref = ref.next;
+      }
+    }
+
+    if (rawSpans.length === 0) return null;
+
+    // Pass 1: coalesce adjacent matched chunks pointing to contiguous lines in the same base.
+    const merged: MatchSpan[] = [rawSpans[0]!];
+    for (let i = 1; i < rawSpans.length; i++) {
+      const prev = merged[merged.length - 1]!;
+      const cur = rawSpans[i]!;
+      if (
+        prev.baseEntryIdx === cur.baseEntryIdx &&
+        prev.curEnd === cur.curStart &&
+        prev.baseEnd === cur.baseStart
+      ) {
+        prev.curEnd = cur.curEnd;
+        prev.baseEnd = cur.baseEnd;
+      } else {
+        merged.push(cur);
+      }
+    }
+
+    // Pass 2: extend each span backward & forward line-by-line within non-overlapping bounds.
+    for (let i = 0; i < merged.length; i++) {
+      const s = merged[i]!;
+      const base = this.entries[s.baseEntryIdx]!;
+      const minCur = i > 0 ? merged[i - 1]!.curEnd : 0;
+      const maxCur = i + 1 < merged.length ? merged[i + 1]!.curStart : prep.lines.length;
+      while (s.curStart > minCur && s.baseStart > 0 && linesEqual(base, s.baseStart - 1, s.curStart - 1)) {
+        s.curStart--;
+        s.baseStart--;
+      }
+      while (
+        s.curEnd < maxCur &&
+        s.baseEnd < base.effectiveLineCount &&
+        linesEqual(base, s.baseEnd, s.curEnd)
+      ) {
+        s.curEnd++;
+        s.baseEnd++;
+      }
+    }
+
+    // Pass 3: coalesce spans that touched after line extension.
+    const finalSpans: MatchSpan[] = [merged[0]!];
+    for (let i = 1; i < merged.length; i++) {
+      const prev = finalSpans[finalSpans.length - 1]!;
+      const cur = merged[i]!;
+      if (
+        prev.baseEntryIdx === cur.baseEntryIdx &&
+        prev.curEnd === cur.curStart &&
+        prev.baseEnd === cur.baseStart
+      ) {
+        prev.curEnd = cur.curEnd;
+        prev.baseEnd = cur.baseEnd;
+      } else {
+        finalSpans.push(cur);
+      }
+    }
+
+    interface BuiltSlice {
+      readonly span: MatchSpan;
+      readonly marker: string;
+      readonly saved: number;
+      readonly baseRefId: string;
+    }
+    const keptSlices: BuiltSlice[] = [];
+    for (const s of finalSpans) {
+      const matchLen = s.curEnd - s.curStart;
+      if (matchLen < CDC_MIN_LINES) continue;
+      const base = this.entries[s.baseEntryIdx]!;
+      const rawSliceChars = sliceCharLength(prep.lines, s.curStart, s.curEnd);
+      const baseStartNum =
+        base.allHaveLineNums && base.lineNums[s.baseStart]! > 0 ? base.lineNums[s.baseStart]! : s.baseStart + 1;
+      const baseEndNum =
+        base.allHaveLineNums && s.baseEnd > 0 && base.lineNums[s.baseEnd - 1]! > 0 ? base.lineNums[s.baseEnd - 1]! : s.baseEnd;
+      const curGutterNote =
+        prep.allHaveLineNums && prep.lineNums[s.curStart]! > 0 && prep.lineNums[s.curStart]! !== s.curStart + 1
+          ? `; file L${prep.lineNums[s.curStart]!}..${prep.lineNums[s.curEnd - 1]!}`
+          : '';
+      const marker = `[fiche cas-slice: lines ${s.curStart + 1}..${s.curEnd} identical to ${base.refId}:${baseStartNum}..${baseEndNum} (${matchLen} lines, ${rawSliceChars} chars) — omitted${curGutterNote}]`;
+      const saved = rawSliceChars - marker.length;
+      if (saved < 40) continue;
+      keptSlices.push({ span: s, marker, saved, baseRefId: base.refId });
+    }
+
+    if (keptSlices.length === 0) return null;
+
+    const outLines: string[] = [];
+    let cursor = 0;
+    let bestSlice = keptSlices[0]!;
+    for (const ks of keptSlices) {
+      if (ks.saved > bestSlice.saved) bestSlice = ks;
+      for (let i = cursor; i < ks.span.curStart; i++) {
+        outLines.push(prep.lines[i]!);
+      }
+      outLines.push(ks.marker);
+      cursor = ks.span.curEnd;
+    }
+    for (let i = cursor; i < prep.lines.length; i++) {
+      outLines.push(prep.lines[i]!);
+    }
+
+    const outText = outLines.join('\n');
+    const savedChars = rawText.length - outText.length;
+    if (savedChars < 400) return null;
+
+    return {
+      text: outText,
+      changed: true,
+      kind: 'slice',
+      baseRefId: bestSlice.baseRefId,
+      savedChars,
+      savedTokens: estimateSavedTokens(rawText, outText),
+    };
   }
 
   ingest(
@@ -414,6 +1286,7 @@ export class CasiIndex {
       return true;
     };
 
+    // Step 1a: Exact raw duplicate check.
     const hash64 = dualHash64Hex(rawText);
     const exactCandidates = this.exactByHash.get(hash64);
     let exactHit: CasiEntry | undefined;
@@ -441,28 +1314,85 @@ export class CasiIndex {
       return { text: rawText, changed: false, savedChars: 0, savedTokens: 0 };
     }
 
-    const lines = rawText.split('\n');
-    const lineHashes = new Uint32Array(lines.length);
+    const { prep, chunks } = getPreparedAndChunks(rawText, hash64);
+
+    // Step 1b: Gutter-normalized exact body duplicate (uniform line-number shift deltaL !== 0,
+    // or guttered Read matching an unguttered Write seedBase).
+    const bodyCandidates = this.exactBodyByHash.get(prep.bodyDocHash);
+    if (bodyCandidates && prep.allHaveLineNums && isMonotonicLineNums(prep.lineNums, prep.effectiveLineCount)) {
+      for (let i = bodyCandidates.length - 1; i >= 0; i--) {
+        const base = bodyCandidates[i]!;
+        if (!isEligibleBase(base) || base.effectiveLineCount !== prep.effectiveLineCount) {
+          continue;
+        }
+        if (base.allHaveLineNums) {
+          if (!isMonotonicLineNums(base.lineNums, base.effectiveLineCount)) continue;
+          const deltaL = prep.lineNums[0]! - base.lineNums[0]!;
+          if (deltaL === 0) continue;
+          let uniform = true;
+          for (let k = 0; k < prep.effectiveLineCount; k++) {
+            if (
+              prep.lineNums[k]! - base.lineNums[k]! !== deltaL ||
+              prep.bodies[k] !== base.bodies[k]
+            ) {
+              uniform = false;
+              break;
+            }
+          }
+          if (!uniform) continue;
+          const marker = `[fiche cas: lines shifted ${deltaL > 0 ? '+' : ''}${deltaL}L vs ${base.refId} (${prep.effectiveLineCount} lines, ${rawText.length} chars) — body unchanged]`;
+          if (rawText.length - marker.length >= 200) {
+            return {
+              text: marker,
+              changed: true,
+              kind: 'exact_dup',
+              baseRefId: base.refId,
+              savedChars: rawText.length - marker.length,
+              savedTokens: estimateSavedTokens(rawText, marker),
+            };
+          }
+        } else {
+          let exact = true;
+          for (let k = 0; k < prep.effectiveLineCount; k++) {
+            if (prep.bodies[k] !== base.bodies[k]) {
+              exact = false;
+              break;
+            }
+          }
+          if (!exact) continue;
+          const first = prep.lineNums[0]!;
+          const last = prep.lineNums[prep.effectiveLineCount - 1]!;
+          const marker = `[fiche cas: body identical to ${base.refId} (L${first}..${last}, ${prep.effectiveLineCount} lines, ${rawText.length} chars) — unchanged]`;
+          if (rawText.length - marker.length >= 200) {
+            return {
+              text: marker,
+              changed: true,
+              kind: 'exact_dup',
+              baseRefId: base.refId,
+              savedChars: rawText.length - marker.length,
+              savedTokens: estimateSavedTokens(rawText, marker),
+            };
+          }
+        }
+      }
+    }
+
     const canVote =
-      this.entries.length > 0 && rawText.length >= MIN_DELTA_CHARS && lines.length >= MIN_DELTA_LINES;
+      this.entries.length > 0 && rawText.length >= MIN_DELTA_CHARS && prep.effectiveLineCount >= MIN_DELTA_LINES;
 
     if (!canVote) {
-      for (let i = 0; i < lines.length; i++) {
-        lineHashes[i] = fnv1a32(lines[i]!);
-      }
-      this.indexEntry(rawText, refId, hash64, lines, lineHashes, turnGroup);
+      this.indexEntry(rawText, refId, hash64, prep, turnGroup, chunks);
       return { text: rawText, changed: false, savedChars: 0, savedTokens: 0 };
     }
 
+    // Step 2: Canonical whole-block voting & anchor-aligned unified delta.
     const votes = new Int32Array(this.entries.length);
-    // Count distinct shared line hashes once per candidate (matching legacy base.lineHashes Set intersection).
     const seenQueryHashes = new Set<number>();
     let anyVote = false;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]!;
-      const h = fnv1a32(line);
-      lineHashes[i] = h;
-      if (!hasAtLeast4NonWs(line)) continue;
+    for (let i = 0; i < prep.canonLines.length; i++) {
+      const canon = prep.canonLines[i]!;
+      if (!hasAtLeast4NonWs(canon)) continue;
+      const h = prep.canonHashes[i]!;
       if (seenQueryHashes.has(h)) continue;
       seenQueryHashes.add(h);
       const postings = this.lineIndex.get(h);
@@ -488,17 +1418,17 @@ export class CasiIndex {
       }
       if (bestEntryIdx >= 0) {
         const base = this.entries[bestEntryIdx]!;
-        if (bestVotes >= Math.max(lines.length, base.lines.length) * 0.45) {
-          const delta = formatUnifiedDelta(base, lines, lineHashes);
+        if (bestVotes >= Math.max(prep.lines.length, base.lines.length) * 0.45) {
+          const delta = formatUnifiedDelta(base, prep);
           if (
             delta &&
-            rawText.length - delta.text.length >= 400 &&
-            delta.text.length <= rawText.length * 0.55
+            rawText.length - delta.text.length >= (delta.exactBodyMatch ? 200 : 400) &&
+            (delta.exactBodyMatch || delta.text.length <= rawText.length * 0.55)
           ) {
             return {
               text: delta.text,
               changed: true,
-              kind: 'delta',
+              kind: delta.exactBodyMatch ? 'exact_dup' : 'delta',
               baseRefId: base.refId,
               savedChars: rawText.length - delta.text.length,
               savedTokens: estimateSavedTokens(rawText, delta.text),
@@ -508,7 +1438,13 @@ export class CasiIndex {
       }
     }
 
-    this.indexEntry(rawText, refId, hash64, lines, lineHashes, turnGroup);
+    // Step 3: Sub-block FastCDC splice fallback when whole-block overlap < 65%.
+    const spliced = this.tryFastCdcSplice(rawText, prep, chunks, isEligibleBase);
+    if (spliced) {
+      return spliced;
+    }
+
+    this.indexEntry(rawText, refId, hash64, prep, turnGroup, chunks);
     return { text: rawText, changed: false, savedChars: 0, savedTokens: 0 };
   }
 }

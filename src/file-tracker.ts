@@ -21,16 +21,30 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
   private fd: number | null = null;
   private fdIno: number | null = null;
   private fdDev: number | null = null;
+  private lastStatCheckAt = 0;
   private bytesWritten = 0;
   private brokenLogged = false;
   private rewriting = false;
   private closed = false;
   private pendingDuringRewrite: string[] = [];
+  private pendingBytesDuringRewrite = 0;
   private readonly unregisterCoordinator: () => void;
   private static readonly MAX_FILE_BYTES = 100 * 1024 * 1024;
+  private static readonly STAT_CHECK_INTERVAL_MS = 1000;
+  private static readonly MAX_PENDING_REWRITE_LINES = 10_000;
+  private static readonly MAX_PENDING_REWRITE_BYTES = 16 * 1024 * 1024;
 
   constructor(private readonly filePath: string) {
     this.unregisterCoordinator = registerEventsFileCoordinator(this.filePath, this);
+  }
+
+  private static writeAllSync(fd: number, buf: Buffer): void {
+    let offset = 0;
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset);
+      if (written <= 0) throw new Error('short write returned 0 bytes');
+      offset += written;
+    }
   }
 
   private closeFd(): void {
@@ -43,12 +57,18 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
       this.fd = null;
       this.fdIno = null;
       this.fdDev = null;
+      this.lastStatCheckAt = 0;
       this.bytesWritten = 0;
     }
   }
 
   private ensureOpen(): boolean {
     if (this.fd != null) {
+      const now = Date.now();
+      if (now - this.lastStatCheckAt < FileTracker.STAT_CHECK_INTERVAL_MS) {
+        return true;
+      }
+      this.lastStatCheckAt = now;
       let needsReopen = false;
       try {
         const st = fs.statSync(this.filePath);
@@ -71,12 +91,22 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
       /* dir may already exist or be unmkable; openSync below will surface */
     }
     try {
-      this.fd = fs.openSync(this.filePath, 'a', 0o600);
+      const flags =
+        fs.constants.O_WRONLY |
+        fs.constants.O_APPEND |
+        fs.constants.O_CREAT |
+        (fs.constants.O_NOFOLLOW ?? 0);
+      this.fd = fs.openSync(this.filePath, flags, 0o600);
       const fst = fs.fstatSync(this.fd);
+      if (!fst.isFile()) {
+        this.closeFd();
+        return false;
+      }
+      fs.fchmodSync(this.fd, 0o600);
       this.fdIno = fst.ino;
       this.fdDev = fst.dev;
       this.bytesWritten = fst.size;
-      fs.chmodSync(this.filePath, 0o600);
+      this.lastStatCheckAt = Date.now();
       return true;
     } catch (err) {
       if (!this.brokenLogged) {
@@ -105,7 +135,7 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
     if (!this.ensureOpen()) return;
     try {
       const buf = Buffer.from(line, 'utf8');
-      fs.writeSync(this.fd!, buf);
+      FileTracker.writeAllSync(this.fd!, buf);
       this.bytesWritten += buf.length;
       if (this.bytesWritten > FileTracker.MAX_FILE_BYTES) this.rotate();
     } catch (err) {
@@ -127,7 +157,14 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
       return;
     }
     if (this.rewriting) {
-      this.pendingDuringRewrite.push(line);
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      if (
+        this.pendingDuringRewrite.length < FileTracker.MAX_PENDING_REWRITE_LINES &&
+        this.pendingBytesDuringRewrite + lineBytes <= FileTracker.MAX_PENDING_REWRITE_BYTES
+      ) {
+        this.pendingDuringRewrite.push(line);
+        this.pendingBytesDuringRewrite += lineBytes;
+      }
       return;
     }
     this.writeSerializedLine(line);
@@ -146,11 +183,17 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
         flushedCount += batch.length;
         for (const line of batch) {
           if (writeLine) writeLine(outFd, line);
-          else fs.writeSync(outFd, line);
+          else FileTracker.writeAllSync(outFd, Buffer.from(line, 'utf8'));
         }
       });
       if (flushedCount > 0) {
-        this.pendingDuringRewrite.splice(0, flushedCount);
+        const removed = this.pendingDuringRewrite.splice(0, flushedCount);
+        for (const line of removed) {
+          this.pendingBytesDuringRewrite = Math.max(
+            0,
+            this.pendingBytesDuringRewrite - Buffer.byteLength(line, 'utf8'),
+          );
+        }
       }
       return result;
     } finally {
@@ -158,12 +201,14 @@ export class FileTracker implements Tracker, EventsFileCoordinator {
       this.rewriting = false;
       if (this.pendingDuringRewrite.length > 0 && !this.closed) {
         const remaining = this.pendingDuringRewrite.splice(0, this.pendingDuringRewrite.length);
+        this.pendingBytesDuringRewrite = 0;
         for (const line of remaining) {
           this.writeSerializedLine(line);
         }
       }
       if (this.closed) {
         this.pendingDuringRewrite.length = 0;
+        this.pendingBytesDuringRewrite = 0;
         this.closeFd();
       }
     }

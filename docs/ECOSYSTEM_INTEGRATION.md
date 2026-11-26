@@ -12,7 +12,7 @@ flowchart LR
   A["Coding Agents\nClaude · Codex · AGY ·\nOpenCode · LLM Bar · Ribhu"] -->|"Live inference\nHTTP / CONNECT"| F
   F -->|"Compressed requests\n(Optical PNGs or 4-Layer Text)"| U["Upstream LLM APIs"]
   U -->|"x-fiche-* headers\n+ stream passthrough"| A
-  F -->|"Append-only telemetry\n~/.fiche/events.jsonl"| T["tokmeter (:9877)\nGross + Net Savings Ledger"]
+  F -->|"Append-only local log\n~/.fiche/events.jsonl"| T["tokmeter (:9877)\nGross + Net Savings Ledger"]
   F <-->|"3s live poll &\nPause/Stop/Model/Plugin toggles"| FB["FicheBar.app\n(macOS Menubar)"]
   F -->|"runic-mcp-plugin.json\n(fiche_health, fiche_savings)"| R["Runic\n(15-Provider Quota Menubar)"]
   A <-->|"Cross-session handoff\nbriefs (~200k -> ~3k)"| B["baton"]
@@ -106,7 +106,7 @@ Point `~/.claude/settings.json` to that script:
 
 | Capability | `FicheBar.app` (Dedicated) | `Runic` + `fiche` MCP Package |
 | :--- | :--- | :--- |
-| **Primary role** | High-frequency (3s) live proxy telemetry & interactive control plane | Unified 15-provider quota, reset window & usage monitor |
+| **Primary role** | High-frequency (3s) live proxy stats & interactive control plane | Unified 15-provider quota, reset window & usage monitor |
 | **Interactive daemon switches** | Pause/Resume, Restart/Stop, LaunchAgent toggle, Model scope, Stages & Skills | Read-only MCP tool snapshots (`fiche_health`, `fiche_savings`) |
 | **Transport** | Direct loopback HTTP `127.0.0.1:47821` + `launchctl` | Child process per MCP tool call via `runic-mcp-plugin.json` |
 
@@ -121,7 +121,7 @@ Create `~/Library/Application Support/Runic/mcpservers/fiche/runic-mcp-plugin.js
   "apiVersion": 1,
   "id": "fiche",
   "name": "Fiche Context Compiler",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "executable": "fiche-runic-tool.mjs",
   "tools": [
     {

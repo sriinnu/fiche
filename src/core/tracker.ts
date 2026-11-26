@@ -101,6 +101,9 @@ export interface TrackEvent {
    *  was therefore allowed to repack for density. Pair with cache_read_tokens:
    *  a repack that lands on a live cache would show as a cache_create spike. */
   history_pack_fill?: boolean;
+  /** History collapse treated each closed tool call/result pair as its own round
+   *  (Claude Code detection or FICHE_TRUST_ADJACENT_TOOL_ROUNDS=1). */
+  history_split_adjacent_pairs?: boolean;
   /** Codepoints not in the glyph atlas. A spike means users type glyphs we don't ship — widen ATLAS_PROFILE. */
   dropped_chars?: number;
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
@@ -155,6 +158,8 @@ export interface TrackEvent {
   // Fingerprints:
   system_sha8?: string;
   first_user_sha8?: string;
+  session_key?: string;
+  session_key_source?: 'fiche-header' | 'claude-code-header' | 'anchor';
 
   // From Anthropic/OpenAI Usage:
   input_tokens?: number;
@@ -196,6 +201,11 @@ export interface TrackEvent {
   baseline_cacheable_tokens?: number;
   /** Probe outcome. Dashboards must only attribute "$ saved" to rows where status === 'ok'. */
   baseline_probe_status?: 'ok' | 'partial' | 'failed';
+  /** Why the baseline probe failed (HTTP status + upstream error snippet). Present only on failure. */
+  baseline_probe_error?: string;
+  /** Server-side thread continuation: the body (and so baseline_tokens) is the delta only,
+   *  while provider usage includes the server-held thread. Probe status is 'partial'. */
+  thread_continue?: boolean;
 
   // Errors:
   error?: string;
@@ -219,6 +229,13 @@ export interface Tracker {
   flush?(): void | Promise<void>;
 }
 
+/** Redact Bearer and `sk-*` API tokens from error/telemetry snippets before persisting or logging. */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi, '$1[REDACTED]')
+    .replace(/\bsk-(?:ant-[A-Za-z0-9._-]+|proj-[A-Za-z0-9._-]+|[A-Za-z0-9._-]{8,})/gi, '[REDACTED]');
+}
+
 /** Convert a ProxyEvent to its flat persisted shape. Shared in core so Node/Worker hosts stay in sync. */
 export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   const info = ev.info;
@@ -235,8 +252,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.accountingProvider) out.accounting_provider = ev.accountingProvider;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.transformMs !== undefined) out.transform_ms = ev.transformMs;
-  if (ev.error) out.error = ev.error;
-  if (ev.errorBody) out.error_body = ev.errorBody;
+  if (ev.error) out.error = redactSecrets(ev.error);
+  if (ev.errorBody) out.error_body = redactSecrets(ev.errorBody);
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
   // Body sample: sidecar path (Node) > inline base64 if it fits > drop (Workers, oversized).
   if (ev.reqBodySamplePath) {
@@ -330,6 +347,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.historyFreezeStep !== undefined) out.history_freeze_step = info.historyFreezeStep;
     if (info.historyBudgetTrimmed) out.history_budget_trimmed = true;
     if (info.historyPackFill) out.history_pack_fill = true;
+    if (info.historySplitAdjacentPairs) out.history_split_adjacent_pairs = true;
     if (info.droppedChars !== undefined && info.droppedChars > 0) {
       out.dropped_chars = info.droppedChars;
     }
@@ -367,6 +385,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.churning_static_tags = info.churningStaticTags;
     if (info.systemSha8) out.system_sha8 = info.systemSha8;
     if (info.firstUserSha8) out.first_user_sha8 = info.firstUserSha8;
+    if (info.sessionKey) out.session_key = info.sessionKey;
+    if (info.sessionKeySource) out.session_key_source = info.sessionKeySource;
     if (info.baselineTokens !== undefined && info.baselineTokens > 0) {
       out.baseline_tokens = info.baselineTokens;
     }
@@ -379,6 +399,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.baselineProbeStatus !== undefined) {
       out.baseline_probe_status = info.baselineProbeStatus;
     }
+    if (info.baselineProbeError !== undefined) {
+      out.baseline_probe_error = redactSecrets(info.baselineProbeError);
+    }
+    if (info.threadContinue) out.thread_continue = true;
   }
   if (env) {
     if (env.cwd) out.cwd = env.cwd;

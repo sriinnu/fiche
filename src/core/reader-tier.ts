@@ -12,6 +12,7 @@
  */
 
 import { readBrandEnv } from './env.js';
+import { getCalibratedProfileMatch } from './calibration.js';
 import { hasGeminiMeasuredProfile } from './gemini-model-profiles.js';
 
 export type ReaderTier = 'image' | 'text';
@@ -20,7 +21,7 @@ const GEMINI_READER_RE = /(?:^|\/)gemini(?:-|$|\[)/;
 const IMAGE_READER = [
   GEMINI_READER_RE,
   /claude-fable-5/,
-  /gpt-(?:5\.6|6\.[12])-sol(?:-|$|\[)/,
+  /(?:^|\/)gpt-(?:5\.6|(?:[6-9]|\d{2,})(?:\.\d+)?)-sol(?:-|$|\[)/,
 ];
 
 export function forceImagesEnabled(): boolean {
@@ -41,15 +42,19 @@ const TEXT_ONLY = [
   // Dash, dot or Vertex `@version` spellings: claude-opus-5-5, claude-opus-5.5,
   // claude-opus-5-5@20261001.
   /claude-(?:opus|sonnet|haiku)-5[-.]5(?:[-@.:]|$)/,
-  /claude-haiku(?:[-@.:]|$)/,
+  /claude-(?:[\d.-]+)?haiku(?:[-@.:]|$)/,
+  // Legacy / unmeasured OpenAI families routed to deterministic text hygiene.
+  /(?:^|[/.])gpt-5\.5(?:[-@.:]|$)/,
+  /(?:^|[/.])o[13](?:[-@.:]|$)/,
+  /(?:^|[/.])o4-mini(?:[-@.:]|$)/,
   // grok-4.7, x-ai/grok-4.7, x-ai.grok-4.7.
   /(?:^|[/.])grok(?:-|$)/,
   // Gemini 4 hydrogen, carbon, and neon have no reading measurements yet; the
   // `gemini` image rule would otherwise give them argon's profile blind.
   /gemini-4-(?:hydrogen|carbon|neon)/,
-  // GPT-6 Astra scored 2/15 hex and 26/98 gist on Spleen 5x8 (docs/BENCHMARKS.md);
-  // keep it on 3-stage text hygiene by default unless INKLING_FORCE_IMAGES=1.
-  /gpt-6(?:\.\d+)?-astra(?:-|$|\[)/,
+  // GPT-6+ Astra scored 2/15 hex and 26/98 gist on Spleen 5x8 (docs/BENCHMARKS.md);
+  // keep all 6.x/7+ Astra releases on 4-layer text hygiene by default unless FICHE_FORCE_IMAGES=1.
+  /(?:^|\/)gpt-(?:[6-9]|\d{2,})(?:\.\d+)?-astra(?:-|$|\[)/,
   // Third-party text / unmeasured coding families routed directly via warp or /to/.
   // Prefix-safe text hygiene still compresses tool outputs for these without imaging.
   /deepseek/i,
@@ -57,19 +62,48 @@ const TEXT_ONLY = [
   /moonshot/i,
   /(?:^|[/._-])glm-/i,
   /minimax/i,
+  /qwen/i,
+  /(?:^|[/._-])(?:meta-)?llama/i,
+  /codellama/i,
+  /(?:^|[/._-])(?:mistral|mixtral|codestral|devstral|ministral|magistral|pixtral)/i,
+  /(?:^|[/._-])command-/i,
+  /(?:^|[/._-])c4ai-aya/i,
+  /(?:^|[/._-])gemma(?:-|$)/i,
+  /(?:^|[/._-])gpt-oss(?:-|$)/i,
+  /(?:^|[/._-])sonar(?:-|$)/i,
+  /(?:^|[/._-])nova(?:-|$)/i,
+  /(?:^|[/._-])jamba(?:-|$)/i,
+  /(?:^|[/._-])mercury(?:-|$)/i,
+  /(?:^|[/._-])solar(?:-|$)/i,
+  /(?:^|[/._-])step-\d/i,
 ];
 
 export function prefersText(model: string | null | undefined, forceImages?: boolean): boolean {
   if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return false;
+  const calMatch = getCalibratedProfileMatch(model);
+  if (calMatch?.exact) {
+    return !(calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only');
+  }
   const ids = modelIds(model);
-  return ids.some((id) => TEXT_ONLY.some((re) => re.test(id)));
+  if (ids.some((id) => TEXT_ONLY.some((re) => re.test(id)))) return true;
+  if (calMatch) {
+    return !(calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only');
+  }
+  return false;
 }
 
 export function readerTier(model: string | null | undefined, forceImages?: boolean): ReaderTier {
   if (forceImages === true || (forceImages === undefined && forceImagesEnabled())) return 'image';
+  const calMatch = getCalibratedProfileMatch(model);
+  if (calMatch?.exact) {
+    return calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only' ? 'image' : 'text';
+  }
   const ids = modelIds(model);
   if (ids.length === 0) return 'text';
   if (ids.some((id) => TEXT_ONLY.some((re) => re.test(id)))) return 'text';
+  if (calMatch) {
+    return calMatch.profile.scores.passed && calMatch.profile.band !== 'text-only' ? 'image' : 'text';
+  }
   if (ids.some((id) => GEMINI_READER_RE.test(id))) {
     return hasGeminiMeasuredProfile(model) ? 'image' : 'text';
   }

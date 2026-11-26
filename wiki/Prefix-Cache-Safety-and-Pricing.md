@@ -1,17 +1,20 @@
 # Prefix Cache Safety & Kosha Pricing
 
-In multi-turn coding agents, 85–95% of billed tokens are KV-cache hits (0.05×–0.10× read cost on Anthropic/OpenAI/Gemini). Mutating historical content naively invalidates the cache prefix and triggers a full 1.0×–1.25× write across the remaining transcript.
+In multi-turn coding agents, 85–95% of billed tokens are KV-cache hits (`0.05×–0.10×` read cost on Anthropic/OpenAI/Gemini). Trimming even `50` tokens inside a `10,000`-token warm prefix busts the cache across all `10,000` tokens (`9.5×` segment spike / `+8,950` net penalty = `179×` worse than the `50` tokens saved).
 
-## Three Cache-Conservation Rules in `fiche`
+## Four Cache-Conservation Rules in `fiche` (`v0.19`)
 
-1. **Deterministic Pure Block Transforms**:
-   - Stage 1 (`TSCG`) and Stage 2 (`emulateTerminal`, `foldRepetitiveLogs`, `encodeToon`) are pure functions of a single message/block `f(block)`, so a tool output enters the prefix compacted on turn *t* and stays byte-identical on turns *t+1 ... t+N*.
-2. **Append-Only Sealed Boundaries (`src/core/history.ts`, `src/core/text-history.ts`)**:
-   - Optical history pages and `ACDC` epochs only seal completed prefix chunks behind the recent tail.
-   - Sealed pages keep stable chunk boundaries across growth (`session-state.ts` persists freeze-step floors in `~/.fiche/session-state.json`) so earlier cache entries stay bit-identical.
-   - Anthropic adapters never invent extra `cache_control` markers — the caller's single cache marker is conserved at the clean boundary; OpenAI Codex routes (`/backend-api/codex/` and `chatgpt.com`) automatically strip unsupported `prompt_cache_breakpoint`.
-3. **Live-Tail Instruction Pins (`src/core/pin.ts`)**:
-   - `@fiche pin <rule>` (and legacy `@inkling pin <rule>`) removes matching pin lines deterministically from early `CLAUDE.md`/`AGENTS.md` or earlier user turns and appends them cleanly at the live tail (`[fiche pin] ...`), keeping rules in the model's recency window without mutating the cached prefix.
+1. **Deterministic Pure Block Transforms (`P0` XML-Island `TSCG` + `Drain` + `@toon`)**:
+   - Volatile XML envelopes (`VOLATILE_XML_TAGS`) are separated before static deduplication (`140` chars / `96` schema), while `P0` keeps `cleanUserPayloads` off by default and preserves canonical `firstUserSha8`.
+2. **Single-Block `LSM-Context` Sticky Epochs (`L1` / `L0` / `L2`, `src/core/text-history.ts`)**:
+   - Seals large blocks (`>= 1,500` tok) past `L1` (`tail = 2`) and aged turns past `L0` (`tail = 6`) strictly one block at a time (`[item]`) keyed by `(sessionKey, fnv64Hex)` with FIFO eviction — preventing multi-block merge invalidation.
+   - `L2` cold repack fires only when upstream `usage` confirms cache expiration (`everCacheAlive && !lastCacheAlive`, `1h + 30s` idle, or `413` backstop) with `justRepacked` cooldown across all `5` provider cache-read JSON `usage` fields.
+   - `session-state.ts` persists freeze floors and Turn-1 skill catalog pins (`PINNED_SKILLS_MAX = 32` across `512` LRU sessions) in `~/.fiche/session-state.json`.
+   - Anthropic adapters conserve the caller's single cache marker without inventing extra `cache_control` blocks; OpenAI Codex routes (`/backend-api/codex/` and `chatgpt.com`) strip unsupported `prompt_cache_breakpoint`.
+3. **Google `contents[0]` Seal & Live-Tail Isolation (`src/core/google.ts`)**:
+   - Mutable `pinnedUserText` is routed onto the trailing live `user` turn instead of `contents[0]`, and `CASI` is turned off whenever Optical is active (`!opticalEnabled`) — raising 30-turn Google Optical cache hit from **`11.9%` → `79.7%`**.
+4. **Live-Tail Instruction Pins (`src/core/pin.ts`) & `Context-MMU` Tail Hydration**:
+   - `@fiche pin <rule>` and `Context-MMU` `[fiche vm-hydrate]` (`±15`-line slices) inject strictly into the trailing uncached turn so sealed historical prefixes stay byte-identical.
 
 ## Kosha Pricing & Long-Context Cliff Avoidance (`src/core/pricing.ts`)
 

@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 // reference-style links, and simple HTML href/src across the tracked docs.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** README + top docs + docs/**, wiki/**, plugins/fiche-telemetry/**, and eval/**\/README.md markdown files. */
+/** README + top docs + docs/**, wiki/**, plugins/fiche-companion/**, and eval/**\/README.md markdown files. */
 function markdownFiles(): string[] {
   const out = ['README.md', 'CHANGELOG.md', 'FINDINGS.md', 'SECURITY.md', 'CONTRIBUTING.md'];
   const walk = (rel: string, opts: { onlyReadme?: boolean } = {}): void => {
@@ -30,7 +30,7 @@ function markdownFiles(): string[] {
   };
   walk('docs');
   walk('wiki');
-  walk('plugins/fiche-telemetry');
+  walk('plugins/fiche-companion');
   walk('eval', { onlyReadme: true });
   return [...new Set(out)].filter((f) => fs.existsSync(path.join(repoRoot, f)));
 }
@@ -144,7 +144,7 @@ describe('docs integrity', () => {
   const anchorsByFile = new Map<string, Set<string>>();
   for (const f of files) anchorsByFile.set(f, headingAnchors(fs.readFileSync(path.join(repoRoot, f), 'utf8')));
 
-  it('scans README, CHANGELOG, FINDINGS, SECURITY, CONTRIBUTING, docs/**, wiki/**, plugins/fiche-telemetry/**, and eval/**/README.md', () => {
+  it('scans README, CHANGELOG, FINDINGS, SECURITY, CONTRIBUTING, docs/**, wiki/**, plugins/fiche-companion/**, and eval/**/README.md', () => {
     expect(files).toContain('README.md');
     expect(files).toContain('SECURITY.md');
     expect(files).toContain('CONTRIBUTING.md');
@@ -153,7 +153,7 @@ describe('docs integrity', () => {
     expect(files).toContain('docs/PLUGINS_AND_SKILLS.md');
     expect(files).toContain('docs/RENDER_SIZING.md');
     expect(files).toContain('wiki/Home.md');
-    expect(files).toContain('plugins/fiche-telemetry/README.md');
+    expect(files).toContain('plugins/fiche-companion/README.md');
     expect(fs.existsSync(path.join(repoRoot, 'docs/assets/efficiency-vs-latency.png'))).toBe(true);
     expect(files.length).toBeGreaterThan(10);
   });

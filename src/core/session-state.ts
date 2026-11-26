@@ -62,8 +62,11 @@
  * touches a filesystem: without a store the module behaves exactly as before.
  */
 
-/** Sessions tracked before the oldest is evicted. One small record each. */
-const SESSIONS_MAX = 512;
+/** Default sessions tracked before the oldest is evicted. One small record each. */
+const DEFAULT_SESSIONS_MAX = 512;
+const MIN_SESSIONS_MAX = 64;
+const MAX_SESSIONS_MAX = 8192;
+let maxSessions = DEFAULT_SESSIONS_MAX;
 
 /**
  * Grace added to the provider TTL before we call a cache dead. Our clock is the
@@ -106,27 +109,54 @@ const PERSIST_MAX_IDLE_MS = 24 * 3_600_000;
  */
 const PERSIST_DEBOUNCE_MS = 250;
 
-interface SessionRecord {
-  /** Wall-clock ms of the last request we saw for this session. */
+/** Maximum sealed epoch keys retained per session (head-retaining cap so epoch_0 is never evicted). */
+const SEALED_EPOCH_KEYS_MAX = 512;
+
+/** Maximum pinned skill names retained per session. */
+const PINNED_SKILLS_MAX = 32;
+
+/** Maximum persisted folded Markovian episode IDs per session. */
+const FOLDED_EPISODE_IDS_MAX = 256;
+
+/** Maximum per-session liveness scopes retained (e.g. opus vs haiku vs systemSha8). */
+const LIVENESS_SCOPES_MAX = 16;
+
+export type OpticalHistoryPolicy = 'hybrid' | 'full';
+
+export interface SessionLivenessScopeOpts {
+  readonly nowMs?: number;
+  readonly model?: string;
+  readonly modelFamily?: string;
+  readonly systemSha8?: string;
+  readonly scope?: string;
+}
+
+interface ScopedLivenessRecord {
   lastSeenMs: number;
-  /** Coarsest freeze step this session has been rendered at, in messages. */
   freezeStep: number;
-  /** Set when a request for this session failed in a way that leaves no cache. */
   cacheDead: boolean;
-  /**
-   * Did the provider's own accounting show a cache for this session on the last
-   * response — either read from it, or written to it? `undefined` = not observed
-   * yet. This is the server's answer to a question the clock can only guess at.
-   */
+  repackInFlightCount?: number;
+  repackGeneration?: number;
   lastCacheAlive?: boolean;
-  /**
-   * Has this session EVER shown a cache? Absence of caching is not the same fact
-   * as a cache that died: a request carrying no `cache_control` marker reports
-   * both counters zero forever, and repacking such a session every turn would
-   * re-cut the grid over and over for a cache that never existed. Only a session
-   * that once had one, and then lost it, has provably free room to re-cut.
-   */
   everCacheAlive?: boolean;
+  opticalHistoryPolicy?: OpticalHistoryPolicy;
+}
+
+interface SessionRecord extends ScopedLivenessRecord {
+  primaryScope?: string;
+  livenessScopes?: Record<string, ScopedLivenessRecord>;
+  /** Sticky sealed LSM/ACDC text epoch keys (head-retained up to 512 keys). */
+  sealedEpochKeys?: string[];
+  /** Sticky sealed Stage-2 text hygiene & frontier optical slot keys (head-retained up to 512 keys). */
+  sealedStage2SlotKeys?: string[];
+  /** Session-pinned skill names (capped to 32 names) for cache prefix stability. */
+  pinnedSkills?: string[];
+  /** Hash of the skill catalog under which `pinnedSkills` were chosen. */
+  pinnedSkillCatalogHash?: string;
+  /** Persisted causal episode IDs folded for this session. */
+  foldedMarkovEpisodeIds?: string[];
+  /** Frozen certificate bytes keyed by folded episode ID so page eviction never mutates replay. */
+  foldedMarkovCertificates?: Record<string, string>;
 }
 
 const sessions = new Map<string, SessionRecord>();
@@ -145,11 +175,30 @@ function touch(key: string): SessionRecord {
 }
 
 function evictToCapacity(): void {
-  while (sessions.size > SESSIONS_MAX) {
+  while (sessions.size > maxSessions) {
     const oldest = sessions.keys().next().value;
     if (oldest === undefined) break;
     sessions.delete(oldest);
   }
+}
+
+/**
+ * Configure the maximum tracked sessions kept in RAM (clamped to `[64, 8192]`),
+ * evicting oldest entries immediately if capacity shrinks.
+ */
+export function configureMaxSessions(limit?: number): number {
+  if (limit !== undefined && Number.isFinite(limit)) {
+    maxSessions = Math.min(MAX_SESSIONS_MAX, Math.max(MIN_SESSIONS_MAX, Math.floor(limit)));
+  } else {
+    maxSessions = DEFAULT_SESSIONS_MAX;
+  }
+  evictToCapacity();
+  return maxSessions;
+}
+
+/** Current maximum tracked session count. */
+export function getMaxSessions(): number {
+  return maxSessions;
 }
 
 // --- persistence ------------------------------------------------------------
@@ -236,6 +285,30 @@ function isBool(v: unknown): v is boolean {
   return typeof v === 'boolean';
 }
 
+function sanitizeStringArray(raw: unknown, maxLen: number, keepTail: boolean): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== 'string' || item === '') continue;
+    if (keepTail) {
+      if (seen.has(item)) {
+        const idx = deduped.indexOf(item);
+        if (idx >= 0) deduped.splice(idx, 1);
+      } else {
+        seen.add(item);
+      }
+      deduped.push(item);
+    } else if (!seen.has(item)) {
+      seen.add(item);
+      deduped.push(item);
+      if (deduped.length >= maxLen) break;
+    }
+  }
+  if (deduped.length === 0) return undefined;
+  return keepTail && deduped.length > maxLen ? deduped.slice(-maxLen) : deduped;
+}
+
 function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   if (!entry || typeof entry !== 'object') return undefined;
   const e = entry as Partial<PersistedRecord>;
@@ -247,6 +320,62 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   const rec: SessionRecord = { lastSeenMs: e.lastSeenMs, freezeStep: e.freezeStep, cacheDead: e.cacheDead };
   if (isBool(e.lastCacheAlive)) rec.lastCacheAlive = e.lastCacheAlive;
   if (isBool(e.everCacheAlive)) rec.everCacheAlive = e.everCacheAlive;
+  const sealed = sanitizeStringArray(e.sealedEpochKeys, SEALED_EPOCH_KEYS_MAX, false);
+  if (sealed) rec.sealedEpochKeys = sealed;
+  const stage2Sealed = sanitizeStringArray(e.sealedStage2SlotKeys, SEALED_EPOCH_KEYS_MAX, false);
+  if (stage2Sealed) rec.sealedStage2SlotKeys = stage2Sealed;
+  const skills = sanitizeStringArray(e.pinnedSkills, PINNED_SKILLS_MAX, false);
+  if (skills) rec.pinnedSkills = skills;
+  if (typeof e.pinnedSkillCatalogHash === 'string' && e.pinnedSkillCatalogHash !== '') {
+    rec.pinnedSkillCatalogHash = e.pinnedSkillCatalogHash;
+  }
+  const folded = sanitizeStringArray(e.foldedMarkovEpisodeIds, FOLDED_EPISODE_IDS_MAX, false);
+  if (folded) rec.foldedMarkovEpisodeIds = folded;
+  if (e.foldedMarkovCertificates && typeof e.foldedMarkovCertificates === 'object' && !Array.isArray(e.foldedMarkovCertificates)) {
+    const certs: Record<string, string> = {};
+    let count = 0;
+    for (const [k, v] of Object.entries(e.foldedMarkovCertificates)) {
+      if (typeof k === 'string' && k && typeof v === 'string' && v && count < FOLDED_EPISODE_IDS_MAX) {
+        certs[k] = v;
+        count++;
+      }
+    }
+    if (count > 0) rec.foldedMarkovCertificates = certs;
+  }
+  if (e.opticalHistoryPolicy === 'hybrid' || e.opticalHistoryPolicy === 'full') {
+    rec.opticalHistoryPolicy = e.opticalHistoryPolicy;
+  }
+  if (typeof e.primaryScope === 'string' && e.primaryScope) {
+    rec.primaryScope = e.primaryScope;
+  }
+  if (e.livenessScopes && typeof e.livenessScopes === 'object' && !Array.isArray(e.livenessScopes)) {
+    const scopes: Record<string, ScopedLivenessRecord> = {};
+    let sc = 0;
+    for (const [sk, rawScope] of Object.entries(e.livenessScopes)) {
+      if (sc >= LIVENESS_SCOPES_MAX || typeof sk !== 'string' || !sk || !rawScope || typeof rawScope !== 'object') continue;
+      const sr = rawScope as Partial<ScopedLivenessRecord>;
+      if (
+        typeof sr.lastSeenMs !== 'number' || !Number.isFinite(sr.lastSeenMs) || sr.lastSeenMs < 0 ||
+        typeof sr.freezeStep !== 'number' || !Number.isFinite(sr.freezeStep) || sr.freezeStep < 0 ||
+        !isBool(sr.cacheDead)
+      ) {
+        continue;
+      }
+      const cleanScope: ScopedLivenessRecord = {
+        lastSeenMs: sr.lastSeenMs,
+        freezeStep: sr.freezeStep,
+        cacheDead: sr.cacheDead,
+      };
+      if (isBool(sr.lastCacheAlive)) cleanScope.lastCacheAlive = sr.lastCacheAlive;
+      if (isBool(sr.everCacheAlive)) cleanScope.everCacheAlive = sr.everCacheAlive;
+      if (sr.opticalHistoryPolicy === 'hybrid' || sr.opticalHistoryPolicy === 'full') {
+        cleanScope.opticalHistoryPolicy = sr.opticalHistoryPolicy;
+      }
+      scopes[sk] = cleanScope;
+      sc++;
+    }
+    if (sc > 0) rec.livenessScopes = scopes;
+  }
   return rec;
 }
 
@@ -255,7 +384,59 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
   const out: PersistedRecord[] = [];
   for (const [key, rec] of sessions) {
     if (rec.lastSeenMs <= 0 || nowMs - rec.lastSeenMs > PERSIST_MAX_IDLE_MS) continue;
-    out.push({ key, ...rec });
+    const item: PersistedRecord = {
+      key,
+      lastSeenMs: rec.lastSeenMs,
+      freezeStep: rec.freezeStep,
+      cacheDead: rec.cacheDead,
+    };
+    if (rec.lastCacheAlive !== undefined) item.lastCacheAlive = rec.lastCacheAlive;
+    if (rec.everCacheAlive !== undefined) item.everCacheAlive = rec.everCacheAlive;
+    if (rec.opticalHistoryPolicy !== undefined) item.opticalHistoryPolicy = rec.opticalHistoryPolicy;
+    if (rec.primaryScope !== undefined) item.primaryScope = rec.primaryScope;
+    if (rec.livenessScopes) {
+      const persistedScopes: Record<string, ScopedLivenessRecord> = {};
+      let sc = 0;
+      for (const [sk, sr] of Object.entries(rec.livenessScopes)) {
+        if (sc >= LIVENESS_SCOPES_MAX) break;
+        persistedScopes[sk] = {
+          lastSeenMs: sr.lastSeenMs,
+          freezeStep: sr.freezeStep,
+          cacheDead: sr.cacheDead,
+          ...(sr.lastCacheAlive !== undefined ? { lastCacheAlive: sr.lastCacheAlive } : {}),
+          ...(sr.everCacheAlive !== undefined ? { everCacheAlive: sr.everCacheAlive } : {}),
+          ...(sr.opticalHistoryPolicy !== undefined ? { opticalHistoryPolicy: sr.opticalHistoryPolicy } : {}),
+        };
+        sc++;
+      }
+      if (sc > 0) item.livenessScopes = persistedScopes;
+    }
+    if (rec.sealedEpochKeys && rec.sealedEpochKeys.length > 0) {
+      item.sealedEpochKeys = rec.sealedEpochKeys.slice(0, SEALED_EPOCH_KEYS_MAX);
+    }
+    if (rec.sealedStage2SlotKeys && rec.sealedStage2SlotKeys.length > 0) {
+      item.sealedStage2SlotKeys = rec.sealedStage2SlotKeys.slice(0, SEALED_EPOCH_KEYS_MAX);
+    }
+    if (rec.pinnedSkills && rec.pinnedSkills.length > 0) {
+      item.pinnedSkills = rec.pinnedSkills.slice(0, PINNED_SKILLS_MAX);
+    }
+    if (rec.pinnedSkillCatalogHash !== undefined && rec.pinnedSkillCatalogHash !== '') {
+      item.pinnedSkillCatalogHash = rec.pinnedSkillCatalogHash;
+    }
+    if (rec.foldedMarkovEpisodeIds && rec.foldedMarkovEpisodeIds.length > 0) {
+      item.foldedMarkovEpisodeIds = rec.foldedMarkovEpisodeIds.slice(0, FOLDED_EPISODE_IDS_MAX);
+    }
+    if (rec.foldedMarkovCertificates) {
+      const certs: Record<string, string> = {};
+      let count = 0;
+      for (const [k, v] of Object.entries(rec.foldedMarkovCertificates)) {
+        if (count >= FOLDED_EPISODE_IDS_MAX) break;
+        certs[k] = v;
+        count++;
+      }
+      if (count > 0) item.foldedMarkovCertificates = certs;
+    }
+    out.push(item);
   }
   const state: PersistedState = { format: PERSIST_FORMAT, saved_at_ms: nowMs, sessions: out };
   return JSON.stringify(state);
@@ -305,6 +486,78 @@ export interface HistorySessionState {
 /** Neutral answer for callers without a session identity (no fingerprint yet). */
 const UNKNOWN_STATE: HistorySessionState = { cold: false, minFreezeStep: 0 };
 
+/** Normalize a model ID to its liveness family so auxiliary Haiku calls never clobber main-thread liveness. */
+export function normalizeSessionModelFamily(model: string | undefined): string {
+  const raw = (model ?? '').trim().toLowerCase().replace(/\[[^\]]*\]/g, '');
+  if (!raw) return '';
+  const tail = raw.includes('/') ? raw.slice(raw.lastIndexOf('/') + 1) : raw;
+  const bare = tail.split('@')[0]!;
+  if (bare.includes('claude') || bare.includes('anthropic')) {
+    if (bare.includes('haiku')) return 'claude-haiku';
+    if (bare.includes('opus')) return 'claude-opus';
+    if (bare.includes('sonnet')) return 'claude-sonnet';
+    if (bare.includes('fable')) return 'claude-fable';
+    return 'claude';
+  }
+  return bare.replace(/-\d{8}$/, '').replace(/-\d{4}-\d{2}-\d{2}$/, '');
+}
+
+function resolveScopeKey(opts?: SessionLivenessScopeOpts): string | undefined {
+  if (!opts) return undefined;
+  if (opts.scope) return opts.scope;
+  const family = opts.modelFamily ?? (opts.model ? normalizeSessionModelFamily(opts.model) : '');
+  if (family && opts.systemSha8) return `${family}:${opts.systemSha8}`;
+  if (family) return family;
+  if (opts.systemSha8) return opts.systemSha8;
+  return undefined;
+}
+
+function isAuxiliaryScope(scope: string | undefined): boolean {
+  return scope !== undefined && (scope === 'claude-haiku' || scope.startsWith('claude-haiku:'));
+}
+
+function getOrCreateScopeRecord(rec: SessionRecord, scope: string): ScopedLivenessRecord {
+  if (!rec.livenessScopes) rec.livenessScopes = {};
+  const existing = rec.livenessScopes[scope];
+  if (existing) return existing;
+  const keys = Object.keys(rec.livenessScopes);
+  if (keys.length >= LIVENESS_SCOPES_MAX) {
+    let oldestKey = keys[0];
+    for (const k of keys) {
+      if (k !== rec.primaryScope && (oldestKey === rec.primaryScope || rec.livenessScopes[k]!.lastSeenMs < rec.livenessScopes[oldestKey!]!.lastSeenMs)) {
+        oldestKey = k;
+      }
+    }
+    if (oldestKey !== undefined && oldestKey !== rec.primaryScope) {
+      delete rec.livenessScopes[oldestKey];
+    }
+  }
+  const fresh: ScopedLivenessRecord = { lastSeenMs: 0, freezeStep: 0, cacheDead: false };
+  rec.livenessScopes[scope] = fresh;
+  return fresh;
+}
+
+function computeCold(target: ScopedLivenessRecord, nowMs: number): boolean {
+  const known = target.lastSeenMs > 0;
+  const idleMs = nowMs - target.lastSeenMs;
+  const serverSaysAlive = target.lastCacheAlive === true;
+  const serverSaysGone = target.lastCacheAlive === false && target.everCacheAlive === true;
+  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
+  return target.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
+}
+
+function applyHistoryRequestToTarget(target: ScopedLivenessRecord, nowMs: number): HistorySessionState {
+  const cold = computeCold(target, nowMs);
+  target.lastSeenMs = nowMs;
+  target.cacheDead = false; // consumed: this request gets the repack
+  if (cold) {
+    target.repackInFlightCount = (target.repackInFlightCount ?? 0) + 1;
+    target.repackGeneration = (target.repackGeneration ?? 0) + 1;
+    target.lastCacheAlive = undefined;
+  }
+  return { cold, minFreezeStep: target.freezeStep };
+}
+
 /**
  * Record a request for `sessionKey` and report what the history collapse may
  * assume about the upstream cache. Call once per transformed request, BEFORE the
@@ -315,38 +568,251 @@ const UNKNOWN_STATE: HistorySessionState = { cold: false, minFreezeStep: 0 };
  */
 export function noteHistoryRequest(
   sessionKey: string | undefined,
-  nowMs: number = Date.now(),
+  nowMsOrOpts: number | SessionLivenessScopeOpts = Date.now(),
 ): HistorySessionState {
   if (!sessionKey) return UNKNOWN_STATE;
+  const nowMs = typeof nowMsOrOpts === 'number' ? nowMsOrOpts : (nowMsOrOpts.nowMs ?? Date.now());
+  const scope = typeof nowMsOrOpts === 'number' ? undefined : resolveScopeKey(nowMsOrOpts);
   const rec = touch(sessionKey);
-  const known = rec.lastSeenMs > 0;
-  const idleMs = nowMs - rec.lastSeenMs;
 
-  // Server truth beats the clock. If the provider's accounting showed a cache on
-  // the last response — read from OR written to — one exists now, and re-cutting
-  // the grid would throw it away.
-  //
-  // The clock alone was wrong most of the time it mattered. Measured over 143
-  // gaps on a production host: past a 5.5-minute gap the cache was still warm in
-  // 66% of cases, past 15 minutes in 40%, past an hour in 13%. One session was
-  // repacked three times in an hour on ~10-minute gaps, each time re-keying the
-  // whole prefix — and each of those turns had just WRITTEN a cache
-  // (create 60-98k, read 0), which the clock could not see and this can.
-  const serverSaysAlive = rec.lastCacheAlive === true;
-  // "Gone" requires that one existed. A session whose counters were always zero
-  // is not a dead cache, it is a session that never had one — repacking it every
-  // turn would churn the grid forever for nothing to reclaim.
-  const serverSaysGone = rec.lastCacheAlive === false && rec.everCacheAlive === true;
+  if (scope) {
+    if (!rec.primaryScope && !isAuxiliaryScope(scope)) {
+      rec.primaryScope = scope;
+    }
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    const result = applyHistoryRequestToTarget(scoped, nowMs);
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      applyHistoryRequestToTarget(rec, nowMs);
+    } else if (rec.lastSeenMs <= 0) {
+      // Keep record non-stale for persistence without triggering primary coldness.
+      rec.lastSeenMs = nowMs;
+    }
+    scheduleSave();
+    return result;
+  }
 
-  // Backstop for the case the server cannot answer: no observation yet, or an
-  // observation old enough that warmth is empirically rare (13% past an hour).
-  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
-
-  const cold = rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
-  rec.lastSeenMs = nowMs;
-  rec.cacheDead = false; // consumed: this request gets the repack
+  const result = applyHistoryRequestToTarget(rec, nowMs);
   scheduleSave();
-  return { cold, minFreezeStep: rec.freezeStep };
+  return result;
+}
+
+/**
+ * Non-mutating read checking whether `sessionKey`'s upstream cache is currently cold.
+ * Unknown/unseen sessions return `false` (warm by default).
+ */
+export function isSessionCacheCold(
+  sessionKey: string | undefined,
+  nowMsOrOpts: number | SessionLivenessScopeOpts = Date.now(),
+): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return false;
+  const nowMs = typeof nowMsOrOpts === 'number' ? nowMsOrOpts : (nowMsOrOpts.nowMs ?? Date.now());
+  const scope = typeof nowMsOrOpts === 'number' ? undefined : resolveScopeKey(nowMsOrOpts);
+  if (scope) {
+    const scoped = rec.livenessScopes?.[scope];
+    if (scoped) return computeCold(scoped, nowMs);
+    if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+      return false;
+    }
+  }
+  return computeCold(rec, nowMs);
+}
+
+export function getPinnedOpticalHistoryPolicy(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): OpticalHistoryPolicy | undefined {
+  if (!sessionKey) return undefined;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return undefined;
+  const scope = resolveScopeKey(opts);
+  if (scope && rec.livenessScopes?.[scope]?.opticalHistoryPolicy !== undefined) {
+    return rec.livenessScopes[scope]!.opticalHistoryPolicy;
+  }
+  if (scope && isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+    return undefined;
+  }
+  return rec.opticalHistoryPolicy;
+}
+
+export function setPinnedOpticalHistoryPolicy(
+  sessionKey: string | undefined,
+  policy: OpticalHistoryPolicy,
+  opts?: SessionLivenessScopeOpts,
+): void {
+  if (!sessionKey) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    if (scoped.lastSeenMs <= 0) scoped.lastSeenMs = rec.lastSeenMs;
+    if (scoped.opticalHistoryPolicy !== policy) {
+      scoped.opticalHistoryPolicy = policy;
+      scheduleSave();
+    }
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      if (rec.opticalHistoryPolicy !== policy) {
+        rec.opticalHistoryPolicy = policy;
+        scheduleSave();
+      }
+    }
+    return;
+  }
+  if (rec.opticalHistoryPolicy !== policy) {
+    rec.opticalHistoryPolicy = policy;
+    scheduleSave();
+  }
+}
+
+export function recordSealedEpochKey(
+  sessionKey: string | undefined,
+  epochKey: string,
+): void {
+  if (!sessionKey || !epochKey) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!rec.sealedEpochKeys) {
+    rec.sealedEpochKeys = [epochKey];
+    scheduleSave();
+    return;
+  }
+  if (rec.sealedEpochKeys.includes(epochKey)) return;
+  if (rec.sealedEpochKeys.length >= SEALED_EPOCH_KEYS_MAX) return; // retain earliest head epochs
+  rec.sealedEpochKeys.push(epochKey);
+  scheduleSave();
+}
+
+export function hasSealedEpochKey(
+  sessionKey: string | undefined,
+  epochKey: string,
+): boolean {
+  if (!sessionKey || !epochKey) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.sealedEpochKeys?.includes(epochKey));
+}
+
+/**
+ * Record a Stage-2 text-hygiene or hybrid optical slot seal key (head-retaining
+ * cap 512) so any compression performed at the uncached frontier replays
+ * bit-identically once downstream cache_control breakpoints cover that slot.
+ */
+export function recordStage2SealKey(
+  sessionKey: string | undefined,
+  slotKey: string,
+): void {
+  if (!sessionKey || !slotKey) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!rec.sealedStage2SlotKeys) {
+    rec.sealedStage2SlotKeys = [slotKey];
+    scheduleSave();
+    return;
+  }
+  if (rec.sealedStage2SlotKeys.includes(slotKey)) return;
+  if (rec.sealedStage2SlotKeys.length >= SEALED_EPOCH_KEYS_MAX) return;
+  rec.sealedStage2SlotKeys.push(slotKey);
+  scheduleSave();
+}
+
+export function hasStage2SealKey(
+  sessionKey: string | undefined,
+  slotKey: string,
+): boolean {
+  if (!sessionKey || !slotKey) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.sealedStage2SlotKeys?.includes(slotKey));
+}
+
+export function recordFoldedEpisodeId(
+  sessionKey: string | undefined,
+  episodeId: string,
+  certificate?: string,
+): void {
+  if (!sessionKey || !episodeId) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  let updated = false;
+  if (!rec.foldedMarkovEpisodeIds) {
+    rec.foldedMarkovEpisodeIds = [episodeId];
+    updated = true;
+  } else if (!rec.foldedMarkovEpisodeIds.includes(episodeId) && rec.foldedMarkovEpisodeIds.length < FOLDED_EPISODE_IDS_MAX) {
+    rec.foldedMarkovEpisodeIds.push(episodeId);
+    updated = true;
+  }
+  if (certificate) {
+    if (!rec.foldedMarkovCertificates) rec.foldedMarkovCertificates = {};
+    if (rec.foldedMarkovCertificates[episodeId] !== certificate && Object.keys(rec.foldedMarkovCertificates).length < FOLDED_EPISODE_IDS_MAX) {
+      rec.foldedMarkovCertificates[episodeId] = certificate;
+      updated = true;
+    }
+  }
+  if (updated) scheduleSave();
+}
+
+export function getFoldedEpisodeCertificate(
+  sessionKey: string | undefined,
+  episodeId: string,
+): string | undefined {
+  if (!sessionKey || !episodeId) return undefined;
+  return sessions.get(sessionKey)?.foldedMarkovCertificates?.[episodeId];
+}
+
+export function hasFoldedEpisodeId(
+  sessionKey: string | undefined,
+  episodeId: string,
+): boolean {
+  if (!sessionKey || !episodeId) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.foldedMarkovEpisodeIds?.includes(episodeId));
+}
+
+export function hasAnyFoldedEpisodeId(sessionKey: string | undefined): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.foldedMarkovEpisodeIds && rec.foldedMarkovEpisodeIds.length > 0);
+}
+
+export function getPinnedSessionSkills(
+  sessionKey: string | undefined,
+  catalogHash: string,
+): readonly string[] | undefined {
+  if (!sessionKey || !catalogHash) return undefined;
+  const rec = sessions.get(sessionKey);
+  if (!rec || rec.pinnedSkillCatalogHash !== catalogHash || !rec.pinnedSkills) {
+    return undefined;
+  }
+  return [...rec.pinnedSkills];
+}
+
+export function setPinnedSessionSkills(
+  sessionKey: string | undefined,
+  catalogHash: string,
+  skills: readonly string[],
+): void {
+  if (!sessionKey || !catalogHash) return;
+  const cleaned = sanitizeStringArray(skills, PINNED_SKILLS_MAX, false);
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!cleaned) {
+    if (rec.pinnedSkills !== undefined || rec.pinnedSkillCatalogHash !== undefined) {
+      delete rec.pinnedSkills;
+      delete rec.pinnedSkillCatalogHash;
+      scheduleSave();
+    }
+    return;
+  }
+  const sameHash = rec.pinnedSkillCatalogHash === catalogHash;
+  const sameSkills =
+    sameHash &&
+    rec.pinnedSkills !== undefined &&
+    rec.pinnedSkills.length === cleaned.length &&
+    rec.pinnedSkills.every((s, idx) => s === cleaned[idx]);
+  if (sameSkills) return;
+  rec.pinnedSkills = cleaned;
+  rec.pinnedSkillCatalogHash = catalogHash;
+  scheduleSave();
 }
 
 /**
@@ -358,19 +824,54 @@ export function noteHistoryRequest(
  * discards the thing just paid for.
  *
  * Both zero means nothing is cached for this session, so a repack costs nothing
- * — that is the only situation where coarsening the grid is free.
+ * — unless the session just repacked under an implicit-cache provider
+ * (`cacheCreateTokens === undefined`), where a cold miss on that repack turn is
+ * expected while the provider populates its new implicit cache.
  */
+function applyCacheOutcomeToTarget(
+  target: ScopedLivenessRecord,
+  alive: boolean,
+  cacheCreateTokens: number | undefined,
+): void {
+  if (alive) {
+    target.cacheDead = false;
+    target.repackInFlightCount = 0;
+    target.lastCacheAlive = true;
+    target.everCacheAlive = true;
+  } else if ((target.repackInFlightCount ?? 0) > 0 && cacheCreateTokens === undefined) {
+    // Implicit-cache provider reporting expected zero-read on a freshly repacked turn.
+    target.repackInFlightCount = Math.max(0, (target.repackInFlightCount ?? 0) - 1);
+    target.lastCacheAlive = undefined;
+  } else {
+    target.repackInFlightCount = Math.max(0, (target.repackInFlightCount ?? 0) - 1);
+    target.lastCacheAlive = false;
+  }
+}
+
 export function noteCacheOutcome(
   sessionKey: string | undefined,
   cacheReadTokens: number | undefined,
   cacheCreateTokens: number | undefined,
+  opts?: SessionLivenessScopeOpts,
 ): void {
   if (!sessionKey) return;
   const rec = sessions.get(sessionKey);
   if (!rec) return; // never transformed under this key — nothing to attribute
   const alive = (cacheReadTokens ?? 0) > 0 || (cacheCreateTokens ?? 0) > 0;
-  rec.lastCacheAlive = alive;
-  if (alive) rec.everCacheAlive = true;
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    applyCacheOutcomeToTarget(scoped, alive, cacheCreateTokens);
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      applyCacheOutcomeToTarget(rec, alive, cacheCreateTokens);
+    }
+    scheduleSave();
+    return;
+  }
+  applyCacheOutcomeToTarget(rec, alive, cacheCreateTokens);
+  if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
+    applyCacheOutcomeToTarget(rec.livenessScopes[rec.primaryScope]!, alive, cacheCreateTokens);
+  }
   scheduleSave();
 }
 
@@ -381,13 +882,27 @@ export function noteCacheOutcome(
 export function recordFreezeStep(
   sessionKey: string | undefined,
   step: number | undefined,
+  opts?: SessionLivenessScopeOpts,
 ): void {
   if (!sessionKey || !step || !Number.isFinite(step) || step <= 0) return;
   const rec = touch(sessionKey);
-  if (step > rec.freezeStep) {
+  const scope = resolveScopeKey(opts);
+  let changed = false;
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    if (step > scoped.freezeStep) {
+      scoped.freezeStep = step;
+      changed = true;
+    }
+    if ((rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) && step > rec.freezeStep) {
+      rec.freezeStep = step;
+      changed = true;
+    }
+  } else if (step > rec.freezeStep) {
     rec.freezeStep = step;
-    scheduleSave();
+    changed = true;
   }
+  if (changed) scheduleSave();
 }
 
 /**
@@ -395,9 +910,22 @@ export function recordFreezeStep(
  * nothing was cached and the next one may re-cut the grid for density. Call on
  * the failure paths that leave no cache entry (oversized request → opaque 500).
  */
-export function markCacheDead(sessionKey: string | undefined): void {
+export function markCacheDead(sessionKey: string | undefined, opts?: SessionLivenessScopeOpts): void {
   if (!sessionKey) return;
-  touch(sessionKey).cacheDead = true;
+  const rec = touch(sessionKey);
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    scoped.cacheDead = true;
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      rec.cacheDead = true;
+    }
+  } else {
+    rec.cacheDead = true;
+    if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
+      rec.livenessScopes[rec.primaryScope]!.cacheDead = true;
+    }
+  }
   scheduleSave();
 }
 
@@ -433,6 +961,8 @@ export function responseLeftNoCache(status: number, errorBody?: string): boolean
   return false;
 }
 
+import { resetGlobalPrefixTape } from './prefix-tape.js';
+
 /** Test seam: drop all session state and any pending save. The store stays attached. */
 export function resetSessionState(): void {
   sessions.clear();
@@ -441,18 +971,44 @@ export function resetSessionState(): void {
     saveTimer = undefined;
   }
   dirty = false;
+  resetGlobalPrefixTape();
 }
 
-/** Test/telemetry seam: inspect a session without mutating its clock. */
+/** Test/inspection seam: inspect a session without mutating its clock. */
 export function peekSessionState(
   sessionKey: string,
-): { lastSeenMs: number; freezeStep: number; cacheDead: boolean } | undefined {
+): {
+  lastSeenMs: number;
+  freezeStep: number;
+  cacheDead: boolean;
+  repackInFlightCount?: number;
+  justRepacked: boolean;
+  lastCacheAlive?: boolean;
+  everCacheAlive?: boolean;
+  opticalHistoryPolicy?: OpticalHistoryPolicy;
+  sealedEpochKeys?: string[];
+  sealedStage2SlotKeys?: string[];
+  pinnedSkills?: string[];
+  pinnedSkillCatalogHash?: string;
+} | undefined {
   const rec = sessions.get(sessionKey);
-  return rec ? { ...rec } : undefined;
+  if (!rec) return undefined;
+  return {
+    ...rec,
+    justRepacked: (rec.repackInFlightCount ?? 0) > 0,
+    ...(rec.sealedEpochKeys ? { sealedEpochKeys: [...rec.sealedEpochKeys] } : {}),
+    ...(rec.sealedStage2SlotKeys ? { sealedStage2SlotKeys: [...rec.sealedStage2SlotKeys] } : {}),
+    ...(rec.pinnedSkills ? { pinnedSkills: [...rec.pinnedSkills] } : {}),
+  };
 }
 
-/** Harness envelopes a client injects ahead of the user's own words. */
-const ENVELOPE_RE = /^<(system-notice|system-reminder)>[\s\S]*<\/\1>$/;
+/** Complete client boilerplate elements, with no user prose between them. */
+const BOILERPLATE_ELEMENT_RE =
+  /<(system-notice|system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args)>[\s\S]*?<\/\1>/g;
+
+export function isBoilerplateText(text: string): boolean {
+  return text.replace(BOILERPLATE_ELEMENT_RE, '').trim() === '';
+}
 
 /**
  * Pick the text that identifies a conversation, from the text blocks of its
@@ -461,17 +1017,18 @@ const ENVELOPE_RE = /^<(system-notice|system-reminder)>[\s\S]*<\/\1>$/;
  * Blocks that are wholly a harness envelope are skipped: they are boilerplate
  * the client injects into every session (omp opens each one with the same
  * `<system-notice>` device inventory; Claude Code with the project's CLAUDE.md
- * `<system-reminder>`), so keying on them merges every concurrent session into
- * one record, and each session's cache outcomes then re-cut the others' history
- * grids. The first non-envelope block is the user's own prompt. When every block
- * is an envelope, the first one is still better than no key. Capped at 4 KiB.
+ * `<system-reminder>` and local slash-command output), so keying on them merges
+ * every concurrent session into one record, and each session's cache outcomes
+ * then re-cut the others' history grids. The first non-envelope block is the
+ * user's own prompt. When every block is an envelope, the first one is still
+ * better than no key. Capped at 4 KiB.
  */
 export function sessionAnchorText(texts: readonly string[]): string {
-  const anchor = texts.find((t) => t.trim() !== '' && !ENVELOPE_RE.test(t.trim())) ?? texts[0] ?? '';
+  const anchor = texts.find((t) => !isBoilerplateText(t)) ?? texts[0] ?? '';
   return anchor.slice(0, 4096);
 }
 
-/** Telemetry seam: how many sessions are currently tracked. */
+/** Inspection seam: how many sessions are currently tracked. */
 export function sessionStateSize(): number {
   return sessions.size;
 }

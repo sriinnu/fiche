@@ -13,6 +13,7 @@
 
 import * as fs from 'node:fs';
 import * as readline from 'node:readline';
+import { isUsableAnthropicBaselineProbe } from './core/baseline.js';
 import type { TrackEvent } from './core/tracker.js';
 
 // ---- pure aggregator ------------------------------------------------------
@@ -108,6 +109,20 @@ export function newSummary(): Summary {
   };
 }
 
+const RESERVOIR_CAP = 4096;
+const reservoirSeen = new WeakMap<Summary, { dur: number; fb: number }>();
+
+function reservoirSample(arr: number[], seen: number, value: number): number {
+  const nextSeen = seen + 1;
+  if (arr.length < RESERVOIR_CAP) {
+    arr.push(value);
+  } else {
+    const idx = Math.floor(Math.random() * nextSeen);
+    if (idx < RESERVOIR_CAP) arr[idx] = value;
+  }
+  return nextSeen;
+}
+
 export function fold(s: Summary, ev: TrackEvent): Summary {
   s.total++;
   if (ev.status >= 200 && ev.status < 300) s.ok2xx++;
@@ -130,8 +145,17 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     s.pinEvents++;
   }
 
-  if (typeof ev.duration_ms === 'number') s.durationMs.push(ev.duration_ms);
-  if (typeof ev.first_byte_ms === 'number') s.firstByteMs.push(ev.first_byte_ms);
+  let counts = reservoirSeen.get(s);
+  if (!counts) {
+    counts = { dur: s.durationMs.length, fb: s.firstByteMs.length };
+    reservoirSeen.set(s, counts);
+  }
+  if (typeof ev.duration_ms === 'number' && Number.isFinite(ev.duration_ms)) {
+    counts.dur = reservoirSample(s.durationMs, counts.dur, ev.duration_ms);
+  }
+  if (typeof ev.first_byte_ms === 'number' && Number.isFinite(ev.first_byte_ms)) {
+    counts.fb = reservoirSample(s.firstByteMs, counts.fb, ev.first_byte_ms);
+  }
 
   const hasUsage =
     typeof ev.input_tokens === 'number' ||
@@ -143,13 +167,21 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
     ev.accounting_provider === 'openai' ||
     ev.accounting_provider === 'google' ||
     (ev.cached_tokens !== undefined && ev.cache_read_tokens === undefined);
+  const cacheRead = ev.cache_read_tokens ?? ev.cached_tokens ?? 0;
+  const inclusiveOverlap = isInclusiveUsage
+    ? Math.min(ev.input_tokens ?? 0, cacheRead)
+    : 0;
+  const actualInput =
+    (ev.input_tokens ?? 0) +
+    (ev.cache_create_tokens ?? 0) +
+    cacheRead -
+    inclusiveOverlap;
   if (hasUsage) {
     s.eventsWithUsage++;
     const evInput = ev.input_tokens ?? 0;
     s.inputTokensTotal += evInput;
     s.outputTokensTotal += ev.output_tokens ?? 0;
     s.cacheCreateTokensTotal += ev.cache_create_tokens ?? 0;
-    const cacheRead = ev.cache_read_tokens ?? ev.cached_tokens ?? 0;
     s.cacheReadTokensTotal += cacheRead;
     if (isInclusiveUsage && cacheRead > 0) {
       s.inclusiveCacheReadTotal += Math.min(evInput, cacheRead);
@@ -168,26 +200,32 @@ export function fold(s: Summary, ev: TrackEvent): Summary {
   }
 
   // Measured savings: pair count_tokens(original body) against real usage on
-  // the SAME row, gated on an OK probe. Same rule as the dashboard's per-row
-  // `probeOk` — an explicit 'ok' status, or a positive baseline on legacy rows
-  // that predate the status field. Rows without a trustworthy baseline are
-  // excluded from BOTH totals so the ratio never mixes measured with estimated.
+  // the SAME row, gated on an OK probe, 2xx status, real usage, and non-passthrough.
   const baseline = ev.baseline_tokens;
-  const probeOk =
-    ev.baseline_probe_status === 'ok' ||
-    (ev.baseline_probe_status === undefined &&
-      typeof baseline === 'number' &&
-      baseline > 0);
-  if (typeof baseline === 'number' && baseline > 0 && probeOk) {
+  const probeOk = isInclusiveUsage
+    ? (ev.baseline_probe_status === 'ok' ||
+        (ev.baseline_probe_status === undefined &&
+          typeof baseline === 'number' &&
+          baseline > 0))
+    : isUsableAnthropicBaselineProbe({
+        baselineTokens: baseline,
+        probeStatus: ev.baseline_probe_status,
+        threadContinue: ev.thread_continue === true,
+        cacheReadTokens: cacheRead,
+      });
+  const statusOk = ev.status >= 200 && ev.status < 300;
+  const compressionEligible = ev.compressed === true || (ev.compressed === undefined && !ev.reason);
+  if (
+    compressionEligible &&
+    statusOk &&
+    hasUsage &&
+    actualInput > 0 &&
+    typeof baseline === 'number' &&
+    baseline > 0 &&
+    probeOk
+  ) {
     s.baselineTokensTotal += baseline;
-    const inclusiveOverlap = isInclusiveUsage
-      ? Math.min(ev.input_tokens ?? 0, ev.cache_read_tokens ?? ev.cached_tokens ?? 0)
-      : 0;
-    s.measuredActualTokensTotal +=
-      (ev.input_tokens ?? 0) +
-      (ev.cache_create_tokens ?? 0) +
-      (ev.cache_read_tokens ?? 0) -
-      inclusiveOverlap;
+    s.measuredActualTokensTotal += actualInput;
     s.baselineMeasuredEvents++;
   }
 
@@ -287,7 +325,7 @@ export function renderTextReport(s: Summary): string {
   }
   lines.push('');
 
-  lines.push('Anthropic token usage:');
+  lines.push('token usage:');
   lines.push(`  input:         ${fmtN(s.inputTokensTotal).padStart(12)}`);
   lines.push(`  output:        ${fmtN(s.outputTokensTotal).padStart(12)}`);
   lines.push(`  cache create:  ${fmtN(s.cacheCreateTokensTotal).padStart(12)}`);
@@ -411,8 +449,8 @@ export async function aggregateEventsFile(
  * tuples. Caps each map at 20 entries to keep the response bounded.
  */
 export function summaryToJson(s: Summary): Record<string, unknown> {
-  const topN = <K, V>(m: Map<K, V>, n = 20): [K, V][] =>
-    [...m.entries()].slice(0, n);
+  const topN = <K, V>(m: Map<K, V>, scoreOf: (v: V) => number, n = 20): [K, V][] =>
+    [...m.entries()].sort((a, b) => scoreOf(b[1]) - scoreOf(a[1])).slice(0, n);
   const sortedDur = [...s.durationMs].sort((a, b) => a - b);
   const sortedFB = [...s.firstByteMs].sort((a, b) => a - b);
   return {
@@ -445,10 +483,10 @@ export function summaryToJson(s: Summary): Record<string, unknown> {
     durationP95: percentile(sortedDur, 95),
     firstByteP50: percentile(sortedFB, 50),
     firstByteP95: percentile(sortedFB, 95),
-    skipReasons: topN(s.skipReasons),
-    byCwd: topN(s.byCwd),
-    systemShaHist: topN(s.systemShaHist),
-    unknownTags: topN(s.unknownTags),
+    skipReasons: topN(s.skipReasons, (v) => v),
+    byCwd: topN(s.byCwd, (v) => v.count),
+    systemShaHist: topN(s.systemShaHist, (v) => v),
+    unknownTags: topN(s.unknownTags, (v) => v),
   };
 }
 

@@ -1,8 +1,16 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private var controller: DaemonController?
+    private var statusItem: NSStatusItem?
+    private var popover: NSPopover?
+    private var cancellables: Set<AnyCancellable> = []
+    private var localEventMonitor: Any?
+    private var globalEventMonitor: Any?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let dir = Self.snapshotDirArgument() {
             Self.renderSnapshots(to: dir)
@@ -10,6 +18,220 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         NSApplication.shared.setActivationPolicy(.accessory)
+        Self.installMinimalEditMenu()
+
+        let controller = DaemonController()
+        self.controller = controller
+        setupStatusItem(controller: controller)
+    }
+
+    private static func installMinimalEditMenu() {
+        let mainMenu = NSApp.mainMenu ?? NSMenu()
+        if mainMenu.items.isEmpty {
+            let appItem = NSMenuItem()
+            appItem.submenu = NSMenu()
+            mainMenu.addItem(appItem)
+        }
+        let hasEditShortcuts = mainMenu.items.contains { item in
+            item.submenu?.items.contains(where: { $0.action == #selector(NSText.paste(_:)) }) == true
+        }
+        if !hasEditShortcuts {
+            let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+            let editMenu = NSMenu(title: "Edit")
+            editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+            editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+            editMenu.addItem(.separator())
+            editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+            editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+            editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+            editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+            editItem.submenu = editMenu
+            mainMenu.addItem(editItem)
+        }
+        NSApp.mainMenu = mainMenu
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    private func setupStatusItem(controller: DaemonController) {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.imagePosition = .imageLeading
+            button.font = NSFont.monospacedDigitSystemFont(
+                ofSize: NSFont.menuBarFont(ofSize: 0).pointSize,
+                weight: .regular
+            )
+            button.target = self
+            button.action = #selector(togglePopover(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+        self.statusItem = item
+        updateStatusItemDisplay(controller: controller)
+
+        Publishers.CombineLatest(controller.$phase, controller.$stats)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak controller] _, _ in
+                guard let self, let controller else { return }
+                self.updateStatusItemDisplay(controller: controller)
+            }
+            .store(in: &cancellables)
+
+        controller.$themeID
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] themeID in
+                self?.popover?.appearance = Self.nsAppearance(for: Theme.of(themeID).scheme)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func updateStatusItemDisplay(controller: DaemonController) {
+        guard let button = statusItem?.button else { return }
+        let display = Self.menuBarDisplay(phase: controller.phase, stats: controller.stats)
+        button.image = FicheMenuBarIcon.makeTemplateImage(phase: controller.phase)
+        button.title = display.text
+        button.setAccessibilityLabel(display.accessibilityText)
+    }
+
+    @objc private func togglePopover(_ sender: Any?) {
+        if popover?.isShown == true {
+            closePopover()
+            return
+        }
+        guard let button = (sender as? NSStatusBarButton) ?? statusItem?.button,
+              let controller
+        else {
+            return
+        }
+        showPopover(relativeTo: button, controller: controller)
+    }
+
+    private func showPopover(relativeTo button: NSStatusBarButton, controller: DaemonController) {
+        let hosting = NSHostingController(rootView: PopoverView(controller: controller))
+        hosting.sizingOptions = [.preferredContentSize]
+        hosting.view.frame = NSRect(x: 0, y: 0, width: 360, height: 640)
+        hosting.view.layoutSubtreeIfNeeded()
+        let maxHeight = min(740.0, max(420.0, (button.window?.screen?.visibleFrame.height ?? 800.0) - 48.0))
+        let fitHeight = max(420.0, min(ceil(hosting.view.fittingSize.height), maxHeight))
+        let initialSize = NSSize(width: 360, height: fitHeight)
+        hosting.preferredContentSize = initialSize
+
+        let popover = NSPopover()
+        popover.behavior = .applicationDefined
+        popover.animates = true
+        popover.delegate = self
+        popover.appearance = Self.nsAppearance(for: Theme.of(controller.themeID).scheme)
+        popover.contentViewController = hosting
+        popover.contentSize = initialSize
+        self.popover = popover
+
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
+        installPopoverDismissMonitors(anchor: button)
+    }
+
+    private func closePopover() {
+        removePopoverDismissMonitors()
+        let current = popover
+        popover = nil
+        current?.performClose(nil)
+    }
+
+    private func installPopoverDismissMonitors(anchor button: NSStatusBarButton) {
+        removePopoverDismissMonitors()
+        let localMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]
+        let globalMask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+
+        localEventMonitor = NSEvent.addLocalMonitorForEvents(matching: localMask) { [weak self, weak button] event in
+            guard let self, self.popover?.isShown == true else { return event }
+            if event.type == .keyDown {
+                if event.keyCode == 53,
+                   let popoverWindow = self.popover?.contentViewController?.view.window,
+                   event.window === popoverWindow
+                {
+                    if popoverWindow.firstResponder is NSTextView {
+                        return event
+                    }
+                    self.closePopover()
+                    return nil
+                }
+                return event
+            }
+            if !self.eventIsInsidePopoverOrAnchor(event, anchor: button) {
+                self.closePopover()
+            }
+            return event
+        }
+
+        globalEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: globalMask) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.popover?.isShown == true else { return }
+                self.closePopover()
+            }
+        }
+    }
+
+    private func removePopoverDismissMonitors() {
+        if let monitor = localEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            localEventMonitor = nil
+        }
+        if let monitor = globalEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            globalEventMonitor = nil
+        }
+    }
+
+    private func eventIsInsidePopoverOrAnchor(_ event: NSEvent, anchor button: NSStatusBarButton?) -> Bool {
+        if let eventWindow = event.window {
+            if eventWindow.level.rawValue >= NSWindow.Level.popUpMenu.rawValue {
+                return true
+            }
+            if let popoverWindow = popover?.contentViewController?.view.window {
+                if eventWindow === popoverWindow {
+                    return true
+                }
+                if popoverWindow.childWindows?.contains(where: { $0 === eventWindow }) == true {
+                    return true
+                }
+            }
+        }
+        guard let button,
+              let buttonWindow = button.window,
+              event.window === buttonWindow
+        else {
+            return false
+        }
+        let location = button.convert(event.locationInWindow, from: nil)
+        return button.bounds.contains(location)
+    }
+
+    nonisolated func popoverDidClose(_ notification: Notification) {
+        let closedID = (notification.object as AnyObject?).map(ObjectIdentifier.init)
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                guard let active = self.popover, closedID == ObjectIdentifier(active) else { return }
+                self.removePopoverDismissMonitors()
+                self.popover = nil
+            }
+        } else {
+            Task { @MainActor [weak self] in
+                guard let self, let active = self.popover, closedID == ObjectIdentifier(active) else { return }
+                self.removePopoverDismissMonitors()
+                self.popover = nil
+            }
+        }
+    }
+
+    private static func nsAppearance(for scheme: ColorScheme?) -> NSAppearance? {
+        switch scheme {
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        case nil: return nil
+        @unknown default: return nil
+        }
     }
 
     private static func snapshotDirArgument() -> URL? {
@@ -47,7 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? data.write(to: outURL)
         }
 
-        let aboutView = AboutPanelView(daemonVersion: "0.18.0").themed(Theme.of(.editorial))
+        let aboutView = AboutPanelView(daemonVersion: "0.19.0").themed(Theme.of(.editorial))
         if let aboutData = renderRetinaPNG(
             rootView: aboutView,
             width: 320,
@@ -112,30 +334,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.close()
         return rep.representation(using: .png, properties: [:])
     }
-}
 
-@main
-struct FicheBarApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var controller = DaemonController()
-
-    var body: some Scene {
-        MenuBarExtra {
-            PopoverView(controller: controller)
-        } label: {
-            Label {
-                Text(menuBarDisplay.text)
-                    .monospacedDigit()
-            } icon: {
-                Image(nsImage: FicheMenuBarIcon.makeTemplateImage(phase: controller.phase))
-            }
-            .accessibilityLabel(menuBarDisplay.accessibilityText)
-        }
-        .menuBarExtraStyle(.window)
-    }
-
-    private var menuBarDisplay: (text: String, accessibilityText: String) {
-        switch controller.phase {
+    private static func menuBarDisplay(
+        phase: DaemonPhase,
+        stats: ProxyStatsResponse?
+    ) -> (text: String, accessibilityText: String) {
+        switch phase {
         case .stopped:
             return ("Off", "Fiche daemon stopped")
         case .starting:
@@ -143,29 +347,44 @@ struct FicheBarApp: App {
         case .paused:
             return ("Paused", "Fiche compression paused")
         case .live:
-            let compressed = controller.stats?.compressedRequests ?? 0
-            let savedTokens = controller.stats?.savedInputTokens ?? 0
-            let savedPct = controller.stats?.savedPct ?? 0
-            let savedUsd = controller.stats?.savedUsd ?? 0
+            let compressed = stats?.compressedRequests ?? 0
+            let savedTokens = stats?.savedInputTokens ?? 0
+            let savedPct = stats?.savedPct ?? 0
+            let savedUsd = stats?.savedUsd ?? 0
 
-            guard compressed > 0 || savedTokens > 0 else {
+            guard compressed > 0 || abs(savedTokens) >= 0.5 else {
                 return ("fiche", "Fiche active, no compressed turns yet")
             }
 
             let usdStr = Fmt.usd(savedUsd)
             let summary: String
-            if savedPct >= 0.5 {
-                summary = "-\(Int(savedPct.rounded()))% · \(usdStr)"
-            } else if savedTokens > 0 {
-                summary = "-\(Fmt.tokens(savedTokens)) · \(usdStr)"
+            if abs(savedPct) >= 0.5 {
+                summary = "\(Fmt.signedPctDelta(savedPct)) · \(usdStr)"
+            } else if abs(savedTokens) >= 0.5 {
+                summary = "\(Fmt.signedTokenDelta(savedTokens)) · \(usdStr)"
             } else {
                 summary = "\(compressed) req · \(usdStr)"
             }
 
-            return (
-                summary,
-                "Fiche active: \(Fmt.tokens(savedTokens)) tokens saved, \(usdStr) saved"
-            )
+            let accessibilityText: String
+            if savedTokens < -0.5 || savedUsd < 0 {
+                accessibilityText = "Fiche active: \(Fmt.signedTokenDelta(savedTokens)) tokens delta, \(usdStr) net impact"
+            } else {
+                accessibilityText = "Fiche active: \(Fmt.tokens(savedTokens)) tokens saved, \(usdStr) saved"
+            }
+
+            return (summary, accessibilityText)
+        }
+    }
+}
+
+@main
+struct FicheBarApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        Settings {
+            EmptyView()
         }
     }
 }

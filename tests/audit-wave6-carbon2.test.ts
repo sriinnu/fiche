@@ -435,7 +435,7 @@ describe('Wave 2 Step 5 — Warp CA, route normalization, no-SNI TLS & app args'
     expect(resolved?.isElectron).toBe(true);
 
     const script = renderShellInitScript({ wrap: true });
-    expect(script).toContain('if [ "${FICHE_BYPASS:-0}" = "1" ]; then command claude "$@"; else "$FICHE_BIN" warp -- claude "$@"; fi');
+    expect(script).toContain('function claude { if [ "${FICHE_BYPASS:-0}" = "1" ] || [ "${FICHE_WARP_ACTIVE:-0}" = "1" ]');
   });
 
   it('completes real CONNECT TLS handshake without SNI for an IP literal target', async () => {

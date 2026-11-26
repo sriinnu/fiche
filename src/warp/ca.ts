@@ -324,7 +324,7 @@ export class CertificateAuthority {
     const bundlePath = join(dir, 'warp-ca-bundle.pem');
     const { pem: roots, source } = readSystemRoots();
     const sep = roots && !roots.endsWith('\n') ? '\n' : '';
-    writeFileAtomic(bundlePath, certPem + roots + sep, 0o644);
+    writeFileAtomic(bundlePath, certPem + roots + sep, 0o600);
     return { bundlePath, systemRootsPath: source };
   }
 
@@ -363,6 +363,7 @@ export class CertificateAuthority {
       ) {
         try {
           chmodSync(keyPath, 0o600);
+          chmodSync(certPath, 0o600);
         } catch {
           /* ignore */
         }
@@ -410,7 +411,7 @@ export class CertificateAuthority {
     const certPem = pem('CERTIFICATE', der);
     // Write private key first so readers never observe a new cert paired with a stale key.
     writeFileAtomic(keyPath, privateKeyPem(ca.privateKey), 0o600);
-    writeFileAtomic(certPath, certPem, 0o644);
+    writeFileAtomic(certPath, certPem, 0o600);
 
     const leaf = newKeyPair();
     const bundle = CertificateAuthority.writeBundle(dir, certPem);
@@ -443,6 +444,7 @@ export class CertificateAuthority {
       notBefore: new Date(now - 60 * 60 * 1000),
       notAfter: new Date(now + 365 * 24 * 60 * 60 * 1000),
       extensions: [
+        extension(OID_BASIC_CONSTRAINTS, true, seq()),
         keyUsageExtension([0]),
         extension(OID_EXT_KEY_USAGE, false, seq(oid(OID_SERVER_AUTH))),
         subjectAltNameExtension(name, sanCritical),
@@ -451,6 +453,21 @@ export class CertificateAuthority {
       ],
     });
     return pem('CERTIFICATE', der);
+  }
+
+  /**
+   * Mint PEM `{ key, cert }` credentials for `host` (root included for full chain validation).
+   * Useful both for SNI contexts and TLS servers bound to IP literals where clients omit SNI.
+   */
+  leafCredentialsFor(host: string): { key: string; cert: string } {
+    const stripped = host.replace(/\.$/, '');
+    const name = isIP(stripped) ? stripped : stripped.toLowerCase();
+    return {
+      key: this.leafKeyPem,
+      // Ship the root alongside the leaf so the child validates the whole chain
+      // from NODE_EXTRA_CA_CERTS without a separate fetch.
+      cert: this.mintLeafCertPem(name) + this.certPem,
+    };
   }
 
   /**
@@ -469,13 +486,7 @@ export class CertificateAuthority {
       return cached;
     }
 
-    const leafPem = this.mintLeafCertPem(name);
-    const context = createSecureContext({
-      key: this.leafKeyPem,
-      // Ship the root alongside the leaf so the child validates the whole chain
-      // from NODE_EXTRA_CA_CERTS without a separate fetch.
-      cert: leafPem + this.certPem,
-    });
+    const context = createSecureContext(this.leafCredentialsFor(name));
     if (this.leaves.size >= MAX_LEAF_CONTEXTS) {
       const oldest = this.leaves.keys().next().value;
       if (oldest !== undefined) this.leaves.delete(oldest);

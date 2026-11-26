@@ -28,7 +28,14 @@ private struct CommandOutput: Sendable {
 private enum HTTPResult<T: Sendable>: Sendable {
     case ok(T)
     case httpError(status: Int, body: String)
+    case timedOut(String)
     case unreachable(String)
+}
+
+private enum PollOutcome: Sendable {
+    case reachable
+    case offline
+    case superseded
 }
 
 private final class TaskCancellationBox: @unchecked Sendable {
@@ -52,6 +59,34 @@ private final class TaskCancellationBox: @unchecked Sendable {
     }
 }
 
+private final class LockedDataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func set(_ next: Data) {
+        lock.lock()
+        data = next
+        lock.unlock()
+    }
+
+    func appendBounded(_ chunk: Data, maxBytes: Int) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        data.append(chunk)
+        if data.count > maxBytes {
+            data = Data(data.suffix(maxBytes))
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        let copy = data
+        lock.unlock()
+        return copy
+    }
+}
+
 // MARK: - DaemonController
 
 @MainActor
@@ -71,9 +106,11 @@ final class DaemonController: ObservableObject {
                 return
             }
             UserDefaults.standard.set(clamped, forKey: DefaultsKey.daemonPort)
+            consecutivePollTimeouts = 0
             pollGeneration &+= 1
+            inFlightPoll = nil
             Task { [weak self] in
-                await self?.pollOnce()
+                await self?.pollOnce(forceRefresh: true)
             }
         }
     }
@@ -97,11 +134,18 @@ final class DaemonController: ObservableObject {
         }
     }
 
+    // Preserved Popover UI state across close/reopen
+    @Published var selectedTab: PopoverTab = .activity
+    @Published var heroScope: HeroScope = .lifetime
+    @Published var dailyMetric: DailyChartMetric = .tokens
+
     // Live daemon state
     @Published private(set) var phase: DaemonPhase = .stopped
     @Published private(set) var health: HealthResponse?
     @Published private(set) var stats: ProxyStatsResponse?
     @Published private(set) var lastTurn: LastTurnResponse?
+    @Published private(set) var mmuStats: MmuStatsResponse?
+    @Published private(set) var calibratedProfiles: [CalibratedModelProfile] = []
     @Published private(set) var allowedModels: [String] = []
     @Published private(set) var modelCatalog: [ModelCatalogItem] = ModelCatalogItem.curatedDefaults
     @Published private(set) var providers: [ProviderDescriptor] = ProviderDescriptor.fallbackDefaults
@@ -110,9 +154,16 @@ final class DaemonController: ObservableObject {
     @Published private(set) var isLoginAgentInstalled: Bool = false
     @Published private(set) var isShellAutoWrapInstalled: Bool = false
     @Published private(set) var shellRCDisplayName: String = "~/.zshrc"
+    @Published private(set) var unsupportedShellName: String? = nil
     @Published private(set) var discoveredDesktopApps: [DiscoveredDesktopApp] = []
     @Published private(set) var discoveredCLIAgents: [DiscoveredCLIAgent] = []
     @Published private(set) var hasCompletedAgentDiscovery: Bool = false
+    @Published private(set) var hasKoshaCLI: Bool = false
+    @Published private(set) var hasKoshaRegistry: Bool = false
+    @Published private(set) var koshaRegistryUpdatedAt: Date? = nil
+    @Published private(set) var isSyncingKosha: Bool = false
+    @Published private(set) var koshaSyncStage: String? = nil
+    @Published private(set) var lastKoshaSyncSummary: String? = nil
     @Published private(set) var transientNotice: String? = nil
     @Published private(set) var isBusy: Bool = false
     @Published private(set) var lastError: String?
@@ -123,11 +174,16 @@ final class DaemonController: ObservableObject {
     private let isPreview: Bool
     private let session: URLSession
     private let pollBox = TaskCancellationBox()
+    private var inFlightPoll: (port: Int, generation: Int, task: Task<PollOutcome, Never>)?
     private var hasPerformedStartupCheck = false
     private var noticeGeneration: Int = 0
     private var pollGeneration: Int = 0
+    private var consecutivePollTimeouts: Int = 0
     private var discoveryGeneration: Int = 0
+    private var koshaGeneration: Int = 0
     private var isUpdatingShellAutoWrap: Bool = false
+
+    private static let maxTransientTimeoutsBeforeOffline = 3
 
     var isPreviewMode: Bool { isPreview }
 
@@ -155,14 +211,15 @@ final class DaemonController: ObservableObject {
         self.themeID = ThemeID(rawValue: defaults.string(forKey: DefaultsKey.theme) ?? "") ?? .editorial
 
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 2.5
-        config.timeoutIntervalForResource = 5.0
+        config.timeoutIntervalForRequest = 5.0
+        config.timeoutIntervalForResource = 10.0
         config.waitsForConnectivity = false
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: config)
 
         startPolling()
         refreshAgentDiscovery()
+        refreshKoshaStatus()
     }
 
     private init(previewTheme: ThemeID) {
@@ -182,7 +239,7 @@ final class DaemonController: ObservableObject {
         {
           "ok": true,
           "name": "fiche",
-          "version": "0.18.0",
+          "version": "0.19.0",
           "pid": 17130,
           "host": "127.0.0.1",
           "port": 47821,
@@ -325,6 +382,9 @@ final class DaemonController: ObservableObject {
             PluginDescriptor(id: "toon-structured", name: "TOON Structured Encoder", description: "Lossless tabular TOON encoding for repetitive JSON payloads.", kind: .stage, source: "builtin", enabled: true, mutable: false),
             PluginDescriptor(id: "acdc-epochs", name: "ACDC Epoch Collapse", description: "Amortized cache-safe collapsing of older text history turns.", kind: .stage, source: "builtin", enabled: true, mutable: false),
             PluginDescriptor(id: "casi-delta", name: "CASI Delta Deduplicator", description: "Content-addressed duplicate and delta referencing.", kind: .stage, source: "builtin", enabled: true, mutable: false),
+            PluginDescriptor(id: "lsm-context", name: "LSM-Context Hierarchy", description: "Multi-level LSM history compaction tiers for long-running sessions.", kind: .stage, source: "builtin", enabled: true, mutable: false),
+            PluginDescriptor(id: "context-mmu", name: "Context-MMU Virtual Memory", description: "Virtual context paging, Markovian episode folding, and live-tail hydration.", kind: .stage, source: "builtin", enabled: true, mutable: false),
+            PluginDescriptor(id: "skill-linker", name: "Session Skill Linker", description: "Turn-1 pinned skill catalog stubbing with Turn-N auto-hydration.", kind: .stage, source: "builtin", enabled: true, mutable: false),
             PluginDescriptor(id: "skill:fiche", name: "fiche", description: "Inspect token & dollar savings from the fiche context compiler.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:azure-ai", name: "azure-ai", description: "External Azure AI skill extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
             PluginDescriptor(id: "skill:baton-handover", name: "baton-handover", description: "External session baton handover extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
@@ -346,6 +406,58 @@ final class DaemonController: ObservableObject {
             DiscoveredCLIAgent(id: "opencode", name: "OpenCode", command: "opencode", provider: "Multi", installed: true, binaryPath: "/Users/demo/.opencode/bin/opencode", attachedCount: 0, directCount: 0),
             DiscoveredCLIAgent(id: "aider", name: "Aider", command: "aider", provider: "Multi", installed: false, binaryPath: nil, attachedCount: 0, directCount: 0),
         ]
+        self.hasKoshaCLI = true
+        self.hasKoshaRegistry = true
+        self.koshaRegistryUpdatedAt = Date().addingTimeInterval(-1_800)
+        self.lastKoshaSyncSummary = "Up to date · 8 active bases"
+        self.mmuStats = MmuStatsResponse(
+            stats: MmuStatsSnapshot(
+                pagesStored: 16,
+                pagesEvicted: 0,
+                activePages: 16,
+                activeBytes: 428_032,
+                tailHydrations: 4,
+                tailHydrationTokens: 1_552,
+                markovFolds: 1,
+                skillsStubbed: 12,
+                densityPrunedBlocks: 1
+            ),
+            pageCount: 16,
+            limits: MmuLimitsSnapshot(maxPages: 512, maxBytes: 16 * 1024 * 1024, persisted: false),
+            prefixTape: PrefixTapeSnapshot(
+                stage2Entries: 24,
+                stage2Hits: 82,
+                stage2Misses: 12,
+                sealSessions: 2,
+                totalSeals: 14,
+                sealHits: 28,
+                casiEntries: 18,
+                casiHits: 31,
+                casiMisses: 6
+            )
+        )
+        self.calibratedProfiles = [
+            CalibratedModelProfile(
+                model: "gemini-4-argon",
+                band: "spleen-5x8",
+                cols: 312,
+                maxHeightPx: 768,
+                calibratedAtIso: "2026-11-25T10:00:00Z",
+                source: "probe",
+                overallScore: 0.99,
+                passed: true
+            ),
+            CalibratedModelProfile(
+                model: "gpt-6.2-sol",
+                band: "jetbrains-mono-14",
+                cols: 95,
+                maxHeightPx: 512,
+                calibratedAtIso: "2026-11-25T10:00:00Z",
+                source: "probe",
+                overallScore: 0.96,
+                passed: true
+            ),
+        ]
     }
 
     static func previewSample(theme: ThemeID) -> DaemonController {
@@ -354,9 +466,27 @@ final class DaemonController: ObservableObject {
 
     deinit {
         pollBox.cancel()
+        session.invalidateAndCancel()
     }
 
     // MARK: - Computed Properties
+
+    func calibratedProfile(for modelId: String) -> CalibratedModelProfile? {
+        let stripped = modelId
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: #"\[[^\]]*\]"#, with: "", options: .regularExpression)
+        guard !stripped.isEmpty else { return nil }
+        if let exact = calibratedProfiles.first(where: { $0.model.lowercased() == stripped }) {
+            return exact
+        }
+        let base = stripped.split(separator: "/").last.map(String.init) ?? stripped
+        return calibratedProfiles.first(where: {
+            let p = $0.model.lowercased()
+            let pBase = p.split(separator: "/").last.map(String.init) ?? p
+            return pBase == base
+        })
+    }
 
     var baseURL: URL {
         URL(string: "http://127.0.0.1:\(daemonPort)")!
@@ -383,6 +513,7 @@ final class DaemonController: ObservableObject {
     }
 
     var mergedModelsCatalog: [ModelCatalogItem] {
+        let liveById = Dictionary(modelCatalog.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var result: [ModelCatalogItem] = []
         var seen = Set<String>()
 
@@ -393,7 +524,17 @@ final class DaemonController: ObservableObject {
         }
 
         for item in ModelCatalogItem.curatedDefaults {
-            append(item)
+            if let live = liveById[item.id] {
+                append(ModelCatalogItem(
+                    id: item.id,
+                    label: live.label.isEmpty ? item.label : live.label,
+                    family: live.family.isEmpty ? item.family : live.family,
+                    hint: live.hint ?? item.hint,
+                    engineMode: live.engineMode ?? item.engineMode
+                ))
+            } else {
+                append(item)
+            }
         }
         for item in modelCatalog {
             append(item)
@@ -446,29 +587,67 @@ final class DaemonController: ObservableObject {
         guard !hasPerformedStartupCheck else { return }
         hasPerformedStartupCheck = true
 
-        let reachable = await pollOnce()
-        if !reachable && autoStartDaemon {
+        let outcome = await pollOnceOutcome()
+        if outcome == .offline && autoStartDaemon {
             await startDaemon()
         }
     }
 
     @discardableResult
-    func pollOnce() async -> Bool {
-        pollGeneration &+= 1
-        let gen = pollGeneration
-        let targetPort = daemonPort
+    func pollOnce(forceRefresh: Bool = false) async -> Bool {
+        let outcome = await pollOnceOutcome(forceRefresh: forceRefresh)
+        switch outcome {
+        case .reachable:
+            return true
+        case .offline:
+            return false
+        case .superseded:
+            if let current = inFlightPoll, current.port == daemonPort {
+                return await current.task.value == .reachable
+            }
+            return false
+        }
+    }
 
+    private func pollOnceOutcome(forceRefresh: Bool = false) async -> PollOutcome {
+        let targetPort = daemonPort
+        if !forceRefresh,
+           let active = inFlightPoll,
+           active.port == targetPort,
+           active.generation == pollGeneration
+        {
+            return await active.task.value
+        }
+
+        if forceRefresh {
+            pollGeneration &+= 1
+        }
+        let gen = pollGeneration
+        let task = Task<PollOutcome, Never> { [weak self] in
+            guard let self else { return .offline }
+            return await self.executePoll(generation: gen, targetPort: targetPort)
+        }
+        inFlightPoll = (port: targetPort, generation: gen, task: task)
+        let outcome = await task.value
+        if inFlightPoll?.generation == gen && inFlightPoll?.port == targetPort {
+            inFlightPoll = nil
+        }
+        return outcome
+    }
+
+    private func executePoll(generation gen: Int, targetPort: Int) async -> PollOutcome {
         let loginInstalled = await Task.detached(priority: .utility) {
             Self.checkLaunchAgentExists()
         }.value
-        guard gen == pollGeneration, targetPort == daemonPort else { return false }
+        guard gen == pollGeneration, targetPort == daemonPort else { return .superseded }
         isLoginAgentInstalled = loginInstalled
 
         // Probe /api/health first; fall back to /proxy-stats if daemon predates /api/health
         let healthResult: HTTPResult<HealthResponse> = await getJSON(path: "/api/health")
-        guard gen == pollGeneration, targetPort == daemonPort else { return false }
+        guard gen == pollGeneration, targetPort == daemonPort else { return .superseded }
         switch healthResult {
         case .ok(let h):
+            consecutivePollTimeouts = 0
             health = h
             if let models = h.allowedModels {
                 allowedModels = models
@@ -478,21 +657,38 @@ final class DaemonController: ObservableObject {
             // Older daemon without /api/health — check /proxy-stats below
             health = nil
         case .httpError(let status, let body):
+            consecutivePollTimeouts = 0
             health = nil
             lastTurn = nil
+            mmuStats = nil
             if phase != .starting {
                 phase = .stopped
             }
             lastError = "Daemon returned HTTP \(status): \(body)"
-            return false
-        case .unreachable:
+            return .offline
+        case .timedOut:
+            consecutivePollTimeouts += 1
+            if (phase == .live || phase == .paused) && consecutivePollTimeouts < Self.maxTransientTimeoutsBeforeOffline {
+                return .reachable
+            }
             health = nil
             stats = nil
             lastTurn = nil
+            mmuStats = nil
             if phase != .starting {
                 phase = .stopped
             }
-            return false
+            return .offline
+        case .unreachable:
+            consecutivePollTimeouts = 0
+            health = nil
+            stats = nil
+            lastTurn = nil
+            mmuStats = nil
+            if phase != .starting {
+                phase = .stopped
+            }
+            return .offline
         }
 
         async let statsFetch: HTTPResult<ProxyStatsResponse> = getJSON(path: "/proxy-stats")
@@ -500,15 +696,19 @@ final class DaemonController: ObservableObject {
         async let modelsFetch: HTTPResult<ModelsResponse> = getJSON(path: "/api/models")
         async let providersFetch: HTTPResult<ProvidersResponse> = getJSON(path: "/api/providers")
         async let pluginsFetch: HTTPResult<PluginsResponse> = getJSON(path: "/api/plugins")
+        async let mmuFetch: HTTPResult<MmuStatsResponse> = getJSON(path: "/api/mmu/stats")
+        async let calibrationFetch: HTTPResult<CalibrationResponse> = getJSON(path: "/api/calibration")
 
-        let (statsRes, turnRes, modelsRes, providersRes, pluginsRes) = await (
+        let (statsRes, turnRes, modelsRes, providersRes, pluginsRes, mmuRes, calibrationRes) = await (
             statsFetch,
             turnFetch,
             modelsFetch,
             providersFetch,
-            pluginsFetch
+            pluginsFetch,
+            mmuFetch,
+            calibrationFetch
         )
-        guard gen == pollGeneration, targetPort == daemonPort else { return false }
+        guard gen == pollGeneration, targetPort == daemonPort else { return .superseded }
 
         var anyReachable = health != nil
 
@@ -519,17 +719,27 @@ final class DaemonController: ObservableObject {
             if let models = s.allowedModels {
                 allowedModels = models
             }
-        case .httpError, .unreachable:
+        case .httpError, .timedOut, .unreachable:
             break
         }
 
         if !anyReachable {
+            if case .timedOut = statsRes,
+               (phase == .live || phase == .paused),
+               consecutivePollTimeouts + 1 < Self.maxTransientTimeoutsBeforeOffline
+            {
+                consecutivePollTimeouts += 1
+                return .reachable
+            }
+            consecutivePollTimeouts = 0
             lastTurn = nil
+            mmuStats = nil
             if phase != .starting {
                 phase = .stopped
             }
-            return false
+            return .offline
         }
+        consecutivePollTimeouts = 0
 
         if case .ok(let t) = turnRes {
             lastTurn = t
@@ -560,15 +770,27 @@ final class DaemonController: ObservableObject {
             pluginsDir = p.pluginsDir
         case .httpError(let status, _) where status == 404:
             pluginsEndpointSupported = false
-        case .httpError, .unreachable:
+        case .httpError, .timedOut, .unreachable:
             break
+        }
+
+        if case .ok(let mmu) = mmuRes {
+            mmuStats = mmu
+        } else if case .httpError(let status, _) = mmuRes, status == 404 {
+            mmuStats = nil
+        }
+
+        if case .ok(let cal) = calibrationRes {
+            calibratedProfiles = cal.profiles
+        } else if case .httpError(let status, _) = calibrationRes, status == 404 {
+            calibratedProfiles = []
         }
 
         let enabled = health?.compressionEnabled ?? stats?.compressionEnabled ?? true
         phase = enabled ? .live : .paused
         lastUpdatedAt = Date()
         lastError = nil
-        return true
+        return .reachable
     }
 
     // MARK: - Daemon Start / Stop / Restart
@@ -582,12 +804,17 @@ final class DaemonController: ObservableObject {
         defer { isBusy = false }
 
         if await isDaemonReachable() {
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
             return
         }
 
-        isLoginAgentInstalled = Self.checkLaunchAgentExists()
-        if isLoginAgentInstalled {
+        let port = daemonPort
+        let (loginInstalled, agentPort) = await Task.detached(priority: .utility) {
+            (Self.checkLaunchAgentExists(), Self.installedLaunchAgentPort())
+        }.value
+        isLoginAgentInstalled = loginInstalled
+
+        if loginInstalled && agentPort == port {
             let launchErr = await Self.kickstartLaunchAgent()
             if let launchErr {
                 lastError = launchErr
@@ -595,7 +822,6 @@ final class DaemonController: ObservableObject {
                 return
             }
         } else {
-            let port = daemonPort
             let spawnResult = await Task.detached(priority: .userInitiated) {
                 Self.spawnDetachedDaemon(port: port)
             }.value
@@ -614,7 +840,7 @@ final class DaemonController: ObservableObject {
         for _ in 0..<16 {
             try? await Task.sleep(for: .milliseconds(250))
             if await isDaemonReachable() {
-                await pollOnce()
+                await pollOnce(forceRefresh: true)
                 return
             }
         }
@@ -638,37 +864,116 @@ final class DaemonController: ObservableObject {
         defer { isBusy = false }
 
         let knownPid = daemonPid
-        let shutdownRes: HTTPResult<Data> = await postEmpty(path: "/api/shutdown")
+        let port = daemonPort
+        let (loginInstalled, agentPort) = await Task.detached(priority: .utility) {
+            (Self.checkLaunchAgentExists(), Self.installedLaunchAgentPort())
+        }.value
+        isLoginAgentInstalled = loginInstalled
+        let useLaunchAgent = loginInstalled && agentPort == port
 
-        if isLoginAgentInstalled {
-            _ = await Self.bootoutLaunchAgent()
-        } else if case .httpError(let status, _) = shutdownRes, status == 404, let pid = knownPid, Self.isFicheProcess(pid: pid) {
-            Darwin.kill(pid_t(pid), SIGTERM)
-        } else if case .unreachable = shutdownRes, let pid = knownPid, Self.isFicheProcess(pid: pid) {
-            Darwin.kill(pid_t(pid), SIGTERM)
-        }
+        if useLaunchAgent {
+            // Bootout LaunchAgent BEFORE any HTTP/reachability probe so launchd socket
+            // activation cannot respawn the daemon mid-shutdown.
+            let bootoutRes = await Self.bootoutLaunchAgent()
 
-        for _ in 0..<12 {
-            try? await Task.sleep(for: .milliseconds(150))
-            if !(await isDaemonReachable()) {
-                break
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(150))
+                let stillActive = await Task.detached(priority: .utility) {
+                    let loaded = Self.isLaunchAgentLoaded()
+                    let pidAlive = knownPid.map { Self.isLiveFicheProcess(pid: $0) } ?? false
+                    return loaded || pidAlive
+                }.value
+                if !stillActive {
+                    break
+                }
             }
-        }
 
-        if await isDaemonReachable(), let pid = knownPid, !isLoginAgentInstalled, Self.isFicheProcess(pid: pid) {
-            Darwin.kill(pid_t(pid), SIGTERM)
-            try? await Task.sleep(for: .milliseconds(250))
+            let stillRunning = await Task.detached(priority: .utility) {
+                let loaded = Self.isLaunchAgentLoaded()
+                let pidAlive = knownPid.map { Self.isLiveFicheProcess(pid: $0) } ?? false
+                return (loaded, pidAlive)
+            }.value
+
+            if stillRunning.0 || stillRunning.1 {
+                if !stillRunning.0 {
+                    _ = await postEmpty(path: "/api/shutdown")
+                    if let pid = knownPid {
+                        let isFiche = await Task.detached(priority: .utility) {
+                            Self.isLiveFicheProcess(pid: pid)
+                        }.value
+                        if isFiche {
+                            Darwin.kill(pid_t(pid), SIGTERM)
+                            try? await Task.sleep(for: .milliseconds(250))
+                        }
+                    }
+                } else if bootoutRes.exitCode != 0 {
+                    lastError = bootoutRes.stderr.isEmpty
+                        ? "launchctl bootout failed (exit \(bootoutRes.exitCode))"
+                        : bootoutRes.stderr
+                }
+            }
+        } else {
+            let shutdownRes: HTTPResult<Data> = await postEmpty(path: "/api/shutdown")
+            var needTerm = false
+            switch shutdownRes {
+            case .ok:
+                needTerm = false
+            case .httpError(let status, _) where status == 404:
+                needTerm = true
+            case .httpError, .unreachable, .timedOut:
+                needTerm = true
+            }
+
+            if needTerm, let pid = knownPid {
+                let isFiche = await Task.detached(priority: .utility) {
+                    Self.isLiveFicheProcess(pid: pid)
+                }.value
+                if isFiche {
+                    Darwin.kill(pid_t(pid), SIGTERM)
+                }
+            }
+
+            for _ in 0..<12 {
+                try? await Task.sleep(for: .milliseconds(150))
+                if let pid = knownPid {
+                    let alive = await Task.detached(priority: .utility) {
+                        Self.isLiveFicheProcess(pid: pid)
+                    }.value
+                    if !alive { break }
+                } else if !(await isDaemonReachable()) {
+                    break
+                }
+            }
+
+            if let pid = knownPid {
+                let stillAlive = await Task.detached(priority: .utility) {
+                    Self.isLiveFicheProcess(pid: pid)
+                }.value
+                if stillAlive {
+                    Darwin.kill(pid_t(pid), SIGTERM)
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+            }
         }
 
         health = nil
         stats = nil
+        lastTurn = nil
+        mmuStats = nil
         spawnedPid = nil
+        consecutivePollTimeouts = 0
         phase = .stopped
     }
 
     func restartDaemon() async {
         guard !isBusy else { return }
-        if isLoginAgentInstalled {
+        let port = daemonPort
+        let (loginInstalled, agentPort) = await Task.detached(priority: .utility) {
+            (Self.checkLaunchAgentExists(), Self.installedLaunchAgentPort())
+        }.value
+        isLoginAgentInstalled = loginInstalled
+
+        if loginInstalled && agentPort == port {
             isBusy = true
             phase = .starting
             lastError = nil
@@ -676,18 +981,18 @@ final class DaemonController: ObservableObject {
 
             if let launchErr = await Self.kickstartLaunchAgent() {
                 lastError = launchErr
-                await pollOnce()
+                await pollOnce(forceRefresh: true)
                 return
             }
             for _ in 0..<16 {
                 try? await Task.sleep(for: .milliseconds(250))
                 if await isDaemonReachable() {
-                    await pollOnce()
+                    await pollOnce(forceRefresh: true)
                     return
                 }
             }
             lastError = "Daemon restart timed out on :\(daemonPort)."
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
             return
         }
 
@@ -722,12 +1027,32 @@ final class DaemonController: ObservableObject {
         let res: HTTPResult<CompressionToggleResponse> = await postJSON(path: "/api/compression", body: Body(enabled: enabled))
         switch res {
         case .ok(let payload):
+            consecutivePollTimeouts = 0
             phase = payload.compressionEnabled ? .live : .paused
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, let msg):
             lastError = "Compression toggle failed (\(status)): \(msg)"
+        case .timedOut(let reason):
+            consecutivePollTimeouts += 1
+            if (phase == .live || phase == .paused) && consecutivePollTimeouts < Self.maxTransientTimeoutsBeforeOffline {
+                lastError = "Compression toggle timed out (\(consecutivePollTimeouts)/\(Self.maxTransientTimeoutsBeforeOffline)): \(reason)"
+                showTransientNotice("Request timed out — daemon still busy")
+            } else {
+                consecutivePollTimeouts = 0
+                health = nil
+                stats = nil
+                lastTurn = nil
+                mmuStats = nil
+                lastError = "Daemon unreachable: \(reason)"
+                phase = .stopped
+            }
         case .unreachable(let reason):
+            consecutivePollTimeouts = 0
+            health = nil
+            stats = nil
+            lastTurn = nil
+            mmuStats = nil
             lastError = "Daemon unreachable: \(reason)"
             phase = .stopped
         }
@@ -754,6 +1079,7 @@ final class DaemonController: ObservableObject {
             let provider: String
             let on: Bool
         }
+        let previousProviders = providers
         providers = providers.map { item in
             guard item.id == id else { return item }
             var copy = item
@@ -770,12 +1096,16 @@ final class DaemonController: ObservableObject {
                 providers = payload.providers
             }
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, let msg):
+            providers = previousProviders
             lastError = "Provider update failed (\(status)): \(msg)"
-            await pollOnce()
-        case .unreachable(let reason):
+            showTransientNotice("Reverted provider update (HTTP \(status))")
+            await pollOnce(forceRefresh: true)
+        case .timedOut(let reason), .unreachable(let reason):
+            providers = previousProviders
             lastError = "Daemon unreachable: \(reason)"
+            showTransientNotice("Reverted provider update — daemon unreachable")
         }
     }
 
@@ -793,12 +1123,13 @@ final class DaemonController: ObservableObject {
                 providers = payload.providers
             }
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, let msg):
             lastError = "Provider scope update failed (\(status)): \(msg)"
-            await pollOnce()
-        case .unreachable(let reason):
+            await pollOnce(forceRefresh: true)
+        case .timedOut(let reason), .unreachable(let reason):
             lastError = "Daemon unreachable: \(reason)"
+            showTransientNotice("Provider scope update failed — daemon unreachable")
         }
     }
 
@@ -815,6 +1146,7 @@ final class DaemonController: ObservableObject {
             let on: Bool
         }
 
+        let previousAllowedModels = allowedModels
         var nextSet = Set(allowedModels)
         if on { nextSet.insert(model) } else { nextSet.remove(model) }
         allowedModels = Array(nextSet).sorted()
@@ -826,37 +1158,159 @@ final class DaemonController: ObservableObject {
                 allowedModels = payload.allowedModels
             }
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, _) where status == 404:
             // Back-compat fallback for daemons with /fragments/models only
             let fallback: HTTPResult<Data> = await postJSONRaw(path: "/fragments/models", body: ToggleBody(model: model, on: on))
-            if case .httpError(let fbStatus, let fbMsg) = fallback {
+            switch fallback {
+            case .ok:
+                lastError = nil
+                await pollOnce(forceRefresh: true)
+            case .httpError(let fbStatus, let fbMsg):
+                allowedModels = previousAllowedModels
                 lastError = "Model update failed (\(fbStatus)): \(fbMsg)"
-            } else {
-                await pollOnce()
+                showTransientNotice("Reverted model update (HTTP \(fbStatus))")
+            case .timedOut(let reason), .unreachable(let reason):
+                allowedModels = previousAllowedModels
+                lastError = "Daemon unreachable: \(reason)"
+                showTransientNotice("Reverted model update — daemon unreachable")
             }
         case .httpError(let status, let msg):
+            allowedModels = previousAllowedModels
             lastError = "Model update failed (\(status)): \(msg)"
-            await pollOnce()
-        case .unreachable(let reason):
+            showTransientNotice("Reverted model update (HTTP \(status))")
+            await pollOnce(forceRefresh: true)
+        case .timedOut(let reason), .unreachable(let reason):
+            allowedModels = previousAllowedModels
             lastError = "Daemon unreachable: \(reason)"
+            showTransientNotice("Reverted model update — daemon unreachable")
         }
     }
 
-    func setModels(_ models: [String]) async {
+    func setModels(_ models: [String], rollbackTo previousModels: [String]? = nil) async {
         guard !isPreview else { return }
         pollGeneration &+= 1
         struct ListBody: Encodable { let models: [String] }
+        let fallbackModels = previousModels ?? allowedModels
         let res: HTTPResult<ModelsResponse> = await postJSON(path: "/api/models", body: ListBody(models: models))
         switch res {
         case .ok(let payload):
             allowedModels = payload.allowedModels
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, let msg):
+            allowedModels = fallbackModels
             lastError = "Model scope update failed (\(status)): \(msg)"
-        case .unreachable(let reason):
+            showTransientNotice("Reverted model scope (HTTP \(status))")
+        case .timedOut(let reason), .unreachable(let reason):
+            allowedModels = fallbackModels
             lastError = "Daemon unreachable: \(reason)"
+            showTransientNotice("Reverted model scope — daemon unreachable")
+        }
+    }
+
+    func refreshKoshaStatus() {
+        guard !isPreview else { return }
+        koshaGeneration &+= 1
+        let gen = koshaGeneration
+        Task.detached(priority: .utility) { [weak self] in
+            let snapshot = Self.inspectKoshaEnvironment()
+            await MainActor.run { [weak self] in
+                guard let self, self.koshaGeneration == gen else { return }
+                self.hasKoshaCLI = snapshot.hasCLI
+                self.hasKoshaRegistry = snapshot.hasRegistry
+                self.koshaRegistryUpdatedAt = snapshot.updatedAt
+            }
+        }
+    }
+
+    func syncModelsFromKosha(updateFirst: Bool, allProviders: Bool) async {
+        guard !isPreview, !isSyncingKosha else { return }
+        isSyncingKosha = true
+        lastError = nil
+        defer {
+            isSyncingKosha = false
+            koshaSyncStage = nil
+        }
+
+        if updateFirst {
+            koshaSyncStage = "Running kosha update…"
+            let updateRes = await Task.detached(priority: .userInitiated) { () -> CommandOutput in
+                guard let koshaPath = Self.resolveKoshaBinary() else {
+                    return CommandOutput(
+                        exitCode: 127,
+                        stdout: "",
+                        stderr: "Could not locate `kosha` binary on PATH or Homebrew."
+                    )
+                }
+                let extraPrefix = (koshaPath as NSString).deletingLastPathComponent
+                return Self.runProcessSync(
+                    executable: koshaPath,
+                    arguments: ["update"],
+                    extraPathPrefix: extraPrefix,
+                    timeoutSeconds: 30
+                )
+            }.value
+
+            if updateRes.exitCode != 0 {
+                let err = updateRes.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let out = updateRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                lastError = !err.isEmpty
+                    ? "kosha update failed: \(err)"
+                    : (!out.isEmpty ? "kosha update failed: \(out)" : "`kosha update` exited with code \(updateRes.exitCode)")
+                return
+            }
+        }
+
+        koshaSyncStage = allProviders ? "Syncing all 21 providers…" : "Syncing enabled providers…"
+        let port = daemonPort
+        var args = ["models", "sync-kosha", "--apply", "--json"]
+        if allProviders {
+            args.append("--all-providers")
+        }
+        let syncArgs = args
+
+        let syncRes = await Task.detached(priority: .userInitiated) {
+            Self.runFicheCommand(arguments: syncArgs, port: port, timeoutSeconds: 20)
+        }.value
+
+        let snap = await Task.detached(priority: .utility) {
+            Self.inspectKoshaEnvironment()
+        }.value
+        hasKoshaCLI = snap.hasCLI
+        hasKoshaRegistry = snap.hasRegistry
+        koshaRegistryUpdatedAt = snap.updatedAt
+
+        guard syncRes.exitCode == 0 else {
+            let err = syncRes.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let out = syncRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            lastError = !err.isEmpty
+                ? err
+                : (!out.isEmpty ? out : "`fiche models sync-kosha` exited with code \(syncRes.exitCode)")
+            return
+        }
+
+        guard let data = syncRes.stdout.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(KoshaSyncResponse.self, from: data),
+              decoded.ok
+        else {
+            lastError = "Unexpected output from `fiche models sync-kosha --json`."
+            return
+        }
+
+        pollGeneration &+= 1
+        allowedModels = decoded.models
+        let delivery = decoded.synced ? " (live + config)" : (decoded.saved ? " (saved to config)" : "")
+        let summary: String
+        if decoded.added.isEmpty {
+            summary = "Up to date · \(decoded.models.count) active bases"
+        } else {
+            summary = "+\(decoded.added.count) added · \(decoded.models.count) bases\(delivery)"
+        }
+        lastKoshaSyncSummary = summary
+        showTransientNotice(summary)
+        if phase != .stopped {
+            await pollOnce(forceRefresh: true)
         }
     }
 
@@ -885,15 +1339,17 @@ final class DaemonController: ObservableObject {
     }
 
     func disableAllThirdPartyModels() {
+        let previous = allowedModels
         let filtered = allowedModels.filter { !Self.isThirdPartyModel($0) }
         allowedModels = filtered
         guard !isPreview else { return }
         Task { [weak self] in
-            await self?.setModels(filtered)
+            await self?.setModels(filtered, rollbackTo: previous)
         }
     }
 
     func enableAllThirdPartyModels() {
+        let previous = allowedModels
         var seen = Set(allowedModels)
         var merged = allowedModels
         for id in catalogThirdPartyModels where !seen.contains(id) {
@@ -903,7 +1359,7 @@ final class DaemonController: ObservableObject {
         allowedModels = merged
         guard !isPreview else { return }
         Task { [weak self] in
-            await self?.setModels(merged)
+            await self?.setModels(merged, rollbackTo: previous)
         }
     }
 
@@ -921,6 +1377,9 @@ final class DaemonController: ObservableObject {
         "toon-structured",
         "acdc-epochs",
         "casi-delta",
+        "lsm-context",
+        "context-mmu",
+        "skill-linker",
         "skill:fiche",
     ]
 
@@ -941,14 +1400,15 @@ final class DaemonController: ObservableObject {
     }
 
     func setAllThirdPartyPlugins(enabled: Bool) {
+        let previous = plugins
         plugins = plugins.map { Self.isThirdPartyPlugin($0) ? $0.withEnabled(enabled) : $0 }
         guard !isPreview else { return }
         Task { [weak self] in
-            await self?.postThirdPartyPlugins(enabled: enabled)
+            await self?.postThirdPartyPlugins(enabled: enabled, rollbackTo: previous)
         }
     }
 
-    private func postThirdPartyPlugins(enabled: Bool) async {
+    private func postThirdPartyPlugins(enabled: Bool, rollbackTo previousPlugins: [PluginDescriptor]) async {
         pollGeneration &+= 1
         struct ScopeBody: Encodable {
             let scope: String
@@ -962,19 +1422,23 @@ final class DaemonController: ObservableObject {
         switch res {
         case .ok:
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, let msg):
+            plugins = previousPlugins
             lastError = "3rd-party plugin update failed (\(status)): \(msg)"
-            await pollOnce()
-        case .unreachable(let reason):
+            await pollOnce(forceRefresh: true)
+        case .timedOut(let reason), .unreachable(let reason):
+            plugins = previousPlugins
             lastError = "Daemon unreachable: \(reason)"
-            await pollOnce()
+            showTransientNotice("Reverted plugin update — daemon unreachable")
         }
     }
 
     nonisolated static let supportedCLICatalog: [(command: String, name: String, provider: String)] = [
         ("claude", "Claude Code", "Anthropic"),
         ("codex", "OpenAI Codex", "OpenAI"),
+        ("ribhu", "Ribhu", "Multi"),
+        ("kimi", "Kimi Code", "Kimi / Moonshot"),
         ("agy", "Antigravity CLI", "Google / Multi"),
         ("gemini", "Gemini CLI", "Google"),
         ("opencode", "OpenCode", "Multi"),
@@ -1021,7 +1485,7 @@ final class DaemonController: ObservableObject {
     }
 
     nonisolated private static func findWarpCLITarget(tokens: [String]) -> String? {
-        // Match `<fiche> warp ... -- <cli>` (or `node .../cli.js warp ... -- <cli>`)
+        // Match `<fiche> warp ... [--] <cli>` (or `node .../cli.js warp ... [--] <cli>`)
         var warpIdx: Int?
         for (i, tok) in tokens.enumerated() {
             let base = URL(fileURLWithPath: tok).lastPathComponent
@@ -1033,9 +1497,25 @@ final class DaemonController: ObservableObject {
             }
         }
         guard let wIdx = warpIdx else { return nil }
-        guard let dashIdx = tokens[(wIdx + 1)...].firstIndex(of: "--"),
-              dashIdx + 1 < tokens.count else { return nil }
-        return URL(fileURLWithPath: tokens[dashIdx + 1]).lastPathComponent
+        if let dashIdx = tokens[(wIdx + 1)...].firstIndex(of: "--"),
+           dashIdx + 1 < tokens.count {
+            return URL(fileURLWithPath: tokens[dashIdx + 1]).lastPathComponent
+        }
+        // Also support `fiche warp [flags...] <cli>` when literal `--` is omitted
+        var i = wIdx + 1
+        while i < tokens.count {
+            let tok = tokens[i]
+            if tok == "--app" || tok == "--route" || tok == "--providers" || tok == "--provider" {
+                i += 2
+                continue
+            }
+            if tok.hasPrefix("-") {
+                i += 1
+                continue
+            }
+            return URL(fileURLWithPath: tok).lastPathComponent
+        }
+        return nil
     }
 
     nonisolated private static func isWarpProcess(tokens: [String]) -> Bool {
@@ -1054,6 +1534,7 @@ final class DaemonController: ObservableObject {
         apps: [DiscoveredDesktopApp],
         clis: [DiscoveredCLIAgent],
         shellRCName: String,
+        unsupportedShell: String?,
         autoWrap: Bool,
         loginAgent: Bool
     ) {
@@ -1063,6 +1544,8 @@ final class DaemonController: ObservableObject {
             "Cursor",
             "Claude",
             "Windsurf",
+            "Visual Studio Code",
+            "Visual Studio Code - Insiders",
             "Zed",
             "OpenCode",
             "ChatGPT",
@@ -1130,10 +1613,8 @@ final class DaemonController: ObservableObject {
                 guard exeTok.hasPrefix(mainPrefix) || proc.args.hasPrefix(mainPrefix) else { continue }
                 let hasProxyFlag = proc.args.contains("--proxy-server=http://127.0.0.1:")
                     || proc.args.contains("--proxy-server=http://localhost:")
-                if hasProxyFlag {
-                    attachedPIDs.append(Int32(proc.pid))
-                } else if hasWarpAncestor(proc.pid) {
-                    if isElectron {
+                if hasWarpAncestor(proc.pid) {
+                    if isElectron && !hasProxyFlag {
                         noFlagPIDs.append(Int32(proc.pid))
                     } else {
                         attachedPIDs.append(Int32(proc.pid))
@@ -1173,6 +1654,7 @@ final class DaemonController: ObservableObject {
         }
         searchDirs.append(contentsOf: [
             "\(home)/.local/bin",
+            "\(home)/.kimi-code/bin",
             "\(home)/.opencode/bin",
             "\(home)/.antigravity/antigravity/bin",
             "\(home)/.volta/bin",
@@ -1251,10 +1733,14 @@ final class DaemonController: ObservableObject {
             )
         }
 
-        let rc = resolveShellRCURL()
-        let autoWrap = checkShellAutoWrapInstalled(at: rc.url)
+        let rc = resolveShellRCInfo()
+        let autoWrap = rc.url.map { checkShellAutoWrapInstalled(at: $0) } ?? false
+        let unsupportedShell: String? = {
+            if case .unsupported(let name) = rc.kind { return name }
+            return nil
+        }()
         let loginAgent = checkLaunchAgentExists()
-        return (apps, clis, rc.displayName, autoWrap, loginAgent)
+        return (apps, clis, rc.displayName, unsupportedShell, autoWrap, loginAgent)
     }
 
     func refreshAgentDiscovery() {
@@ -1268,6 +1754,7 @@ final class DaemonController: ObservableObject {
                 self.discoveredDesktopApps = snapshot.apps
                 self.discoveredCLIAgents = snapshot.clis
                 self.shellRCDisplayName = snapshot.shellRCName
+                self.unsupportedShellName = snapshot.unsupportedShell
                 if !self.isUpdatingShellAutoWrap {
                     self.isShellAutoWrapInstalled = snapshot.autoWrap
                 }
@@ -1371,34 +1858,58 @@ final class DaemonController: ObservableObject {
         }
     }
 
-    nonisolated static func resolveShellRCURL() -> (url: URL, displayName: String) {
+    private enum DetectedShellKind: Sendable, Equatable {
+        case zsh
+        case bash
+        case unsupported(String)
+    }
+
+    private struct ShellRCInfo: Sendable, Equatable {
+        let kind: DetectedShellKind
+        let url: URL?
+        let displayName: String
+
+        var isSupported: Bool {
+            if case .unsupported = kind { return false }
+            return true
+        }
+    }
+
+    nonisolated private static func resolveShellRCInfo() -> ShellRCInfo {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
-        let shellName = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh")
-            .lastPathComponent
-            .lowercased()
+        let rawShell = ProcessInfo.processInfo.environment["SHELL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let shellPath = (rawShell?.isEmpty == false) ? rawShell! : "/bin/zsh"
+        let shellName = URL(fileURLWithPath: shellPath).lastPathComponent.lowercased()
+
         if shellName == "bash" {
             let bashrc = "\(home)/.bashrc"
             let bashProfile = "\(home)/.bash_profile"
             if fm.fileExists(atPath: bashrc) || !fm.fileExists(atPath: bashProfile) {
-                return (URL(fileURLWithPath: bashrc), "~/.bashrc")
+                return ShellRCInfo(kind: .bash, url: URL(fileURLWithPath: bashrc), displayName: "~/.bashrc")
             }
-            return (URL(fileURLWithPath: bashProfile), "~/.bash_profile")
+            return ShellRCInfo(kind: .bash, url: URL(fileURLWithPath: bashProfile), displayName: "~/.bash_profile")
         }
-        if let rawZdot = ProcessInfo.processInfo.environment["ZDOTDIR"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !rawZdot.isEmpty {
-            let expanded = rawZdot.hasPrefix("~/")
-                ? home + String(rawZdot.dropFirst())
-                : rawZdot
-            let display = expanded == home ? "~/.zshrc" : "\(rawZdot)/.zshrc"
-            return (URL(fileURLWithPath: "\(expanded)/.zshrc"), display)
+
+        if shellName == "zsh" || shellName.isEmpty {
+            if let rawZdot = ProcessInfo.processInfo.environment["ZDOTDIR"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !rawZdot.isEmpty {
+                let expanded = rawZdot.hasPrefix("~/")
+                    ? home + String(rawZdot.dropFirst())
+                    : rawZdot
+                let display = expanded == home ? "~/.zshrc" : "\(rawZdot)/.zshrc"
+                return ShellRCInfo(kind: .zsh, url: URL(fileURLWithPath: "\(expanded)/.zshrc"), displayName: display)
+            }
+            return ShellRCInfo(kind: .zsh, url: URL(fileURLWithPath: "\(home)/.zshrc"), displayName: "~/.zshrc")
         }
-        return (URL(fileURLWithPath: "\(home)/.zshrc"), "~/.zshrc")
+
+        return ShellRCInfo(kind: .unsupported(shellName), url: nil, displayName: shellName)
     }
 
     nonisolated private static func hasAutoWrapRule(in content: String) -> Bool {
-        let pattern = #"^[ \t]*[^#\r\n]*\bfiche[ \t]+shell-init\b[^\r\n]*--wrap\b"#
+        let pattern = #"^[ \t]*[^#\r\n]*\bfiche\b[^\r\n]*\bshell-init\b[^\r\n]*--wrap\b"#
         guard let re = try? NSRegularExpression(pattern: pattern, options: [.anchorsMatchLines]) else {
             return false
         }
@@ -1407,10 +1918,68 @@ final class DaemonController: ObservableObject {
     }
 
     nonisolated static func checkShellAutoWrapInstalled(at url: URL? = nil) -> Bool {
-        let rcURL = (url ?? resolveShellRCURL().url).resolvingSymlinksInPath()
+        guard let target = url ?? resolveShellRCInfo().url else { return false }
+        let rcURL = target.resolvingSymlinksInPath()
         guard let data = try? Data(contentsOf: rcURL) else { return false }
         let content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
         return hasAutoWrapRule(in: content)
+    }
+
+    nonisolated private static func buildAutoWrapSnippet(port: Int) -> String {
+        let nodePath = resolveNodeBinary()
+        let exe = resolveFicheExecutable(nodePath: nodePath)
+        var lines: [String] = ["# >>> fiche auto-wrap >>>"]
+        if port != 47_821 {
+            lines.append("export PORT=\(port)")
+        }
+        lines.append("if command -v fiche >/dev/null 2>&1; then")
+        lines.append("  eval \"$(fiche shell-init --wrap)\"")
+        if let exe {
+            switch exe {
+            case .binary(let bin) where !hasControlChars(bin):
+                let binDir = (bin as NSString).deletingLastPathComponent
+                let quotedBin = shellSingleQuote(bin)
+                let quotedDir = shellSingleQuote(binDir)
+                lines.append("elif [ -x \(quotedBin) ]; then")
+                if !binDir.isEmpty {
+                    lines.append("  export PATH=\(quotedDir):\"$PATH\"")
+                }
+                lines.append("  eval \"$(\(quotedBin) shell-init --wrap)\"")
+            case .nodeScript(let node, let script) where !hasControlChars(node) && !hasControlChars(script):
+                let quotedNode = shellSingleQuote(node)
+                let quotedScript = shellSingleQuote(script)
+                lines.append("elif [ -x \(quotedNode) ] && [ -f \(quotedScript) ]; then")
+                lines.append("  eval \"$(\(quotedNode) \(quotedScript) shell-init --wrap)\"")
+            default:
+                break
+            }
+        }
+        lines.append("elif [ -x \"$HOME/.local/bin/fiche\" ]; then")
+        lines.append("  export PATH=\"$HOME/.local/bin:$PATH\"")
+        lines.append("  eval \"$(fiche shell-init --wrap)\"")
+        lines.append("fi")
+        lines.append("# <<< fiche auto-wrap <<<")
+        return lines.joined(separator: "\n")
+    }
+
+    nonisolated private static func removeAutoWrapBlock(from content: String) -> String {
+        let pattern = #"[ \t]*# >>> fiche auto-wrap >>>[\s\S]*?# <<< fiche auto-wrap <<<[ \t]*\r?\n?"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return content
+        }
+        let ns = content as NSString
+        let stripped = re.stringByReplacingMatches(
+            in: content,
+            options: [],
+            range: NSRange(location: 0, length: ns.length),
+            withTemplate: ""
+        )
+        if stripped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return ""
+        }
+        return stripped
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .replacingOccurrences(of: #"\n+$"#, with: "\n", options: .regularExpression)
     }
 
     func installShellAutoWrap() {
@@ -1418,10 +1987,21 @@ final class DaemonController: ObservableObject {
         lastError = nil
         isUpdatingShellAutoWrap = true
         discoveryGeneration &+= 1
+        let port = daemonPort
         Task.detached(priority: .userInitiated) { [weak self] in
             let fm = FileManager.default
-            let rc = Self.resolveShellRCURL()
-            let targetURL = rc.url.resolvingSymlinksInPath()
+            let rc = Self.resolveShellRCInfo()
+            guard rc.isSupported, let rawURL = rc.url else {
+                await MainActor.run { [weak self] in
+                    self?.shellRCDisplayName = rc.displayName
+                    self?.unsupportedShellName = rc.displayName
+                    self?.isShellAutoWrapInstalled = false
+                    self?.isUpdatingShellAutoWrap = false
+                    self?.lastError = "Auto-wrap only supports zsh and bash (detected \(rc.displayName)). Use `fiche warp -- <cli>` instead."
+                }
+                return
+            }
+            let targetURL = rawURL.resolvingSymlinksInPath()
 
             var existingData = Data()
             let fileExists = fm.fileExists(atPath: targetURL.path)
@@ -1441,6 +2021,7 @@ final class DaemonController: ObservableObject {
                 if Self.hasAutoWrapRule(in: decoded) {
                     await MainActor.run { [weak self] in
                         self?.shellRCDisplayName = rc.displayName
+                        self?.unsupportedShellName = nil
                         self?.isShellAutoWrapInstalled = true
                         self?.isUpdatingShellAutoWrap = false
                         self?.showTransientNotice("Auto-wrap already enabled in \(rc.displayName)")
@@ -1449,16 +2030,7 @@ final class DaemonController: ObservableObject {
                 }
             }
 
-            let snippet = """
-            # >>> fiche auto-wrap >>>
-            if command -v fiche >/dev/null 2>&1; then
-              eval "$(fiche shell-init --wrap)"
-            elif [ -x "$HOME/.local/bin/fiche" ]; then
-              export PATH="$HOME/.local/bin:$PATH"
-              eval "$(fiche shell-init --wrap)"
-            fi
-            # <<< fiche auto-wrap <<<
-            """
+            let snippet = Self.buildAutoWrapSnippet(port: port)
             let needsLeadingNewline = !existingData.isEmpty && existingData.last != 0x0A
             let appendString = (needsLeadingNewline ? "\n\n" : "\n") + snippet + "\n"
             guard let appendData = appendString.data(using: .utf8) else {
@@ -1480,9 +2052,66 @@ final class DaemonController: ObservableObject {
                 }
                 await MainActor.run { [weak self] in
                     self?.shellRCDisplayName = rc.displayName
+                    self?.unsupportedShellName = nil
                     self?.isShellAutoWrapInstalled = true
                     self?.isUpdatingShellAutoWrap = false
                     self?.showTransientNotice("Added auto-wrap to \(rc.displayName) — open a new terminal to activate")
+                }
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.isUpdatingShellAutoWrap = false
+                    self?.lastError = "Failed to update \(rc.displayName): \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func uninstallShellAutoWrap() {
+        guard !isPreview, !isUpdatingShellAutoWrap else { return }
+        lastError = nil
+        isUpdatingShellAutoWrap = true
+        discoveryGeneration &+= 1
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let fm = FileManager.default
+            let rc = Self.resolveShellRCInfo()
+            guard rc.isSupported, let rawURL = rc.url else {
+                await MainActor.run { [weak self] in
+                    self?.isUpdatingShellAutoWrap = false
+                    self?.isShellAutoWrapInstalled = false
+                    self?.unsupportedShellName = rc.displayName
+                }
+                return
+            }
+            let targetURL = rawURL.resolvingSymlinksInPath()
+            guard fm.fileExists(atPath: targetURL.path) else {
+                await MainActor.run { [weak self] in
+                    self?.shellRCDisplayName = rc.displayName
+                    self?.isShellAutoWrapInstalled = false
+                    self?.isUpdatingShellAutoWrap = false
+                }
+                return
+            }
+
+            do {
+                let data = try Data(contentsOf: targetURL)
+                let decoded = String(data: data, encoding: .utf8)
+                    ?? String(data: data, encoding: .isoLatin1)
+                    ?? ""
+                let cleaned = Self.removeAutoWrapBlock(from: decoded)
+                if cleaned != decoded, let outData = cleaned.data(using: .utf8) {
+                    try outData.write(to: targetURL, options: .atomic)
+                }
+                let stillInstalled = Self.hasAutoWrapRule(in: cleaned)
+                await MainActor.run { [weak self] in
+                    self?.shellRCDisplayName = rc.displayName
+                    self?.unsupportedShellName = nil
+                    self?.isShellAutoWrapInstalled = stillInstalled
+                    self?.isUpdatingShellAutoWrap = false
+                    if stillInstalled {
+                        self?.lastError = "Removed managed block, but a manual `fiche shell-init --wrap` line remains in \(rc.displayName)."
+                    } else {
+                        self?.showTransientNotice("Removed auto-wrap from \(rc.displayName)")
+                    }
                 }
             } catch {
                 await MainActor.run { [weak self] in
@@ -1530,12 +2159,24 @@ final class DaemonController: ObservableObject {
             process.standardOutput = FileHandle.nullDevice
             let stderrPipe = Pipe()
             process.standardError = stderrPipe
+            let errBox = LockedDataBox()
+            let stderrHandle = stderrPipe.fileHandleForReading
+            stderrHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                } else {
+                    errBox.appendBounded(chunk, maxBytes: 16_384)
+                }
+            }
             let launchedAt = Date()
 
             process.terminationHandler = { [weak self] proc in
                 let status = proc.terminationStatus
                 let elapsed = Date().timeIntervalSince(launchedAt)
-                let errData = (try? stderrPipe.fileHandleForReading.readToEnd()) ?? Data()
+                stderrHandle.readabilityHandler = nil
+                try? stderrHandle.close()
+                let errData = errBox.snapshot()
                 let errText = String(data: errData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if status != 0 && elapsed < 5.0 {
@@ -1554,11 +2195,15 @@ final class DaemonController: ObservableObject {
 
             do {
                 try process.run()
+                try? stderrPipe.fileHandleForWriting.close()
                 try? await Task.sleep(for: .milliseconds(1_200))
                 await MainActor.run { [weak self] in
                     self?.refreshAgentDiscovery()
                 }
             } catch {
+                stderrHandle.readabilityHandler = nil
+                try? stderrPipe.fileHandleForWriting.close()
+                try? stderrHandle.close()
                 await MainActor.run { [weak self] in
                     self?.transientNotice = nil
                     self?.lastError = "Failed to launch \(appName): \(error.localizedDescription)"
@@ -1574,19 +2219,22 @@ final class DaemonController: ObservableObject {
             let enabled: Bool
         }
 
+        let previousPlugins = plugins
         plugins = plugins.map { $0.id == id ? $0.withEnabled(enabled) : $0 }
 
         let res: HTTPResult<Data> = await postJSONRaw(path: "/api/plugins", body: PluginBody(id: id, enabled: enabled))
         switch res {
         case .ok:
             lastError = nil
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         case .httpError(let status, let msg):
+            plugins = previousPlugins
             lastError = "Plugin toggle failed (\(status)): \(msg)"
-            await pollOnce()
-        case .unreachable(let reason):
+            await pollOnce(forceRefresh: true)
+        case .timedOut(let reason), .unreachable(let reason):
+            plugins = previousPlugins
             lastError = "Daemon unreachable: \(reason)"
-            await pollOnce()
+            showTransientNotice("Reverted plugin toggle — daemon unreachable")
         }
     }
 
@@ -1618,11 +2266,14 @@ final class DaemonController: ObservableObject {
         lastError = nil
         defer { isBusy = false }
 
-        let result = await Task.detached(priority: .userInitiated) {
-            Self.runFicheCommand(arguments: ["service", subcommand])
+        let port = daemonPort
+        let (result, installed) = await Task.detached(priority: .userInitiated) {
+            let cmdRes = Self.runFicheCommand(arguments: ["service", subcommand], port: port)
+            let exists = Self.checkLaunchAgentExists()
+            return (cmdRes, exists)
         }.value
 
-        isLoginAgentInstalled = Self.checkLaunchAgentExists()
+        isLoginAgentInstalled = installed
         if result.exitCode != 0 {
             let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             let fallback = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1630,7 +2281,7 @@ final class DaemonController: ObservableObject {
                 ? detail
                 : (!fallback.isEmpty ? fallback : "`fiche service \(subcommand)` exited with code \(result.exitCode)")
         } else {
-            await pollOnce()
+            await pollOnce(forceRefresh: true)
         }
     }
 
@@ -1707,7 +2358,7 @@ final class DaemonController: ObservableObject {
             let legacyProbe: HTTPResult<Data> = await getRaw(path: "/proxy-stats")
             if case .ok = legacyProbe { return true }
             return false
-        case .httpError, .unreachable:
+        case .httpError, .timedOut, .unreachable:
             return false
         }
     }
@@ -1734,6 +2385,8 @@ final class DaemonController: ObservableObject {
             }
         case .httpError(let status, let body):
             return .httpError(status: status, body: body)
+        case .timedOut(let reason):
+            return .timedOut(reason)
         case .unreachable(let reason):
             return .unreachable(reason)
         }
@@ -1778,6 +2431,8 @@ final class DaemonController: ObservableObject {
             }
         case .httpError(let status, let msg):
             return .httpError(status: status, body: msg)
+        case .timedOut(let reason):
+            return .timedOut(reason)
         case .unreachable(let reason):
             return .unreachable(reason)
         }
@@ -1794,6 +2449,8 @@ final class DaemonController: ObservableObject {
             }
             let snippet = String(data: data.prefix(240), encoding: .utf8) ?? ""
             return .httpError(status: http.statusCode, body: snippet)
+        } catch let urlError as URLError where urlError.code == .timedOut {
+            return .timedOut(urlError.localizedDescription)
         } catch {
             return .unreachable(error.localizedDescription)
         }
@@ -1821,6 +2478,40 @@ final class DaemonController: ObservableObject {
 
     nonisolated private static func checkLaunchAgentExists() -> Bool {
         FileManager.default.fileExists(atPath: launchAgentPlistURL.path)
+    }
+
+    nonisolated private static func installedLaunchAgentPort() -> Int? {
+        guard let data = try? Data(contentsOf: launchAgentPlistURL),
+              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+        else {
+            return nil
+        }
+        if let env = plist["EnvironmentVariables"] as? [String: Any] {
+            if let portStr = env["PORT"] as? String, let parsed = Int(portStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return parsed
+            }
+            if let portNum = env["PORT"] as? Int {
+                return portNum
+            }
+        }
+        if let sockets = plist["Sockets"] as? [String: Any],
+           let listeners = sockets["Listeners"] as? [String: Any]
+        {
+            if let sockStr = listeners["SockServiceName"] as? String, let parsed = Int(sockStr.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return parsed
+            }
+            if let sockNum = listeners["SockServiceName"] as? Int {
+                return sockNum
+            }
+        }
+        return 47_821
+    }
+
+    nonisolated private static func isLaunchAgentLoaded() -> Bool {
+        let uid = getuid()
+        let target = "gui/\(uid)/\(launchAgentLabel)"
+        let res = runProcessSync(executable: "/bin/launchctl", arguments: ["print", target])
+        return res.exitCode == 0
     }
 
     nonisolated private static func kickstartLaunchAgent() async -> String? {
@@ -1851,14 +2542,12 @@ final class DaemonController: ObservableObject {
         }.value
     }
 
-    nonisolated private static func bootoutLaunchAgent() async -> String? {
+    nonisolated private static func bootoutLaunchAgent() async -> (exitCode: Int32, stderr: String) {
         await Task.detached(priority: .userInitiated) {
             let uid = getuid()
             let target = "gui/\(uid)/\(launchAgentLabel)"
             let res = runProcessSync(executable: "/bin/launchctl", arguments: ["bootout", target])
-            if res.exitCode == 0 { return nil }
-            let err = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            return err.isEmpty ? nil : err
+            return (res.exitCode, res.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
         }.value
     }
 
@@ -2036,7 +2725,61 @@ final class DaemonController: ObservableObject {
         }
     }
 
-    nonisolated private static func runFicheCommand(arguments: [String]) -> CommandOutput {
+    private struct KoshaEnvSnapshot: Sendable {
+        let hasCLI: Bool
+        let hasRegistry: Bool
+        let updatedAt: Date?
+    }
+
+    nonisolated private static func resolveKoshaBinary() -> String? {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "\(home)/.local/bin/kosha",
+            "/opt/homebrew/bin/kosha",
+            "/usr/local/bin/kosha",
+            "\(home)/.bun/bin/kosha",
+            "\(home)/.volta/bin/kosha",
+        ]
+        for path in candidates where isExecutableRegularFile(path) {
+            return path
+        }
+        let whichRes = runProcessSync(
+            executable: "/usr/bin/which",
+            arguments: ["kosha"],
+            extraPathPrefix: "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:\(home)/.volta/bin:\(home)/.bun/bin"
+        )
+        let found = whichRes.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if whichRes.exitCode == 0, !found.isEmpty, isExecutableRegularFile(found) {
+            return found
+        }
+        return nil
+    }
+
+    nonisolated private static func inspectKoshaEnvironment() -> KoshaEnvSnapshot {
+        let fm = FileManager.default
+        let envReg = ProcessInfo.processInfo.environment["KOSHA_REGISTRY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultReg = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent(".kosha/registry.json")
+            .path
+        let candidatePaths = [envReg, defaultReg].compactMap { $0 }.filter { !$0.isEmpty }
+        let foundPath = candidatePaths.first { fm.fileExists(atPath: $0) }
+        let updatedAt: Date? = foundPath.flatMap { path in
+            try? fm.attributesOfItem(atPath: path)[.modificationDate] as? Date
+        }
+        return KoshaEnvSnapshot(
+            hasCLI: resolveKoshaBinary() != nil,
+            hasRegistry: foundPath != nil,
+            updatedAt: updatedAt
+        )
+    }
+
+    nonisolated private static func runFicheCommand(
+        arguments: [String],
+        port: Int? = nil,
+        timeoutSeconds: TimeInterval = 15
+    ) -> CommandOutput {
         let nodePath = resolveNodeBinary()
         guard let entry = resolveFicheExecutable(nodePath: nodePath) else {
             return CommandOutput(
@@ -2045,19 +2788,24 @@ final class DaemonController: ObservableObject {
                 stderr: "Could not locate `fiche` or `node` executable."
             )
         }
+        let extraEnv = port.map { ["PORT": String($0)] } ?? [:]
 
         switch entry {
         case .binary(let binPath):
             return runProcessSync(
                 executable: binPath,
                 arguments: arguments,
-                extraPathPrefix: nodePath.map { ($0 as NSString).deletingLastPathComponent }
+                extraPathPrefix: nodePath.map { ($0 as NSString).deletingLastPathComponent },
+                extraEnv: extraEnv,
+                timeoutSeconds: timeoutSeconds
             )
         case .nodeScript(let node, let script):
             return runProcessSync(
                 executable: node,
                 arguments: [script] + arguments,
-                extraPathPrefix: (node as NSString).deletingLastPathComponent
+                extraPathPrefix: (node as NSString).deletingLastPathComponent,
+                extraEnv: extraEnv,
+                timeoutSeconds: timeoutSeconds
             )
         }
     }
@@ -2072,16 +2820,27 @@ final class DaemonController: ObservableObject {
         return name == "node" || name == "fiche"
     }
 
+    nonisolated private static func isLiveFicheProcess(pid: Int) -> Bool {
+        guard pid > 1 else { return false }
+        let alive = Darwin.kill(pid_t(pid), 0) == 0 || Darwin.errno == EPERM
+        return alive && isFicheProcess(pid: pid)
+    }
+
     nonisolated private static func runProcessSync(
         executable: String,
         arguments: [String],
-        extraPathPrefix: String? = nil
+        extraPathPrefix: String? = nil,
+        extraEnv: [String: String] = [:],
+        timeoutSeconds: TimeInterval = 15
     ) -> CommandOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
 
         var env = ProcessInfo.processInfo.environment
+        for (k, v) in extraEnv {
+            env[k] = v
+        }
         env["PATH"] = buildAugmentedPath(existing: env["PATH"], extraPrefix: extraPathPrefix)
         process.environment = env
 
@@ -2098,31 +2857,40 @@ final class DaemonController: ObservableObject {
         }
 
         let group = DispatchGroup()
-        nonisolated(unsafe) var outData = Data()
-        nonisolated(unsafe) var errData = Data()
+        let outBox = LockedDataBox()
+        let errBox = LockedDataBox()
 
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            outBox.set(outPipe.fileHandleForReading.readDataToEndOfFile())
             group.leave()
         }
 
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
-            errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            errBox.set(errPipe.fileHandleForReading.readDataToEndOfFile())
             group.leave()
         }
 
-        let timedOut = group.wait(timeout: .now() + 15) == .timedOut
+        let clampedTimeout = max(1, timeoutSeconds)
+        let timedOut = group.wait(timeout: .now() + clampedTimeout) == .timedOut
         if timedOut {
             if process.isRunning {
                 process.terminate()
             }
-            _ = group.wait(timeout: .now() + 1)
+            if group.wait(timeout: .now() + 0.5) == .timedOut {
+                if process.isRunning && process.processIdentifier > 0 {
+                    _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                }
+                process.waitUntilExit()
+                _ = group.wait(timeout: .now() + 0.5)
+            } else {
+                process.waitUntilExit()
+            }
             return CommandOutput(
                 exitCode: 124,
-                stdout: String(data: outData, encoding: .utf8) ?? "",
-                stderr: "Subprocess timed out after 15s."
+                stdout: String(data: outBox.snapshot(), encoding: .utf8) ?? "",
+                stderr: "Subprocess timed out after \(Int(clampedTimeout))s."
             )
         }
 
@@ -2130,8 +2898,8 @@ final class DaemonController: ObservableObject {
 
         return CommandOutput(
             exitCode: process.terminationStatus,
-            stdout: String(data: outData, encoding: .utf8) ?? "",
-            stderr: String(data: errData, encoding: .utf8) ?? ""
+            stdout: String(data: outBox.snapshot(), encoding: .utf8) ?? "",
+            stderr: String(data: errBox.snapshot(), encoding: .utf8) ?? ""
         )
     }
 

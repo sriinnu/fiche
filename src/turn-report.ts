@@ -7,12 +7,30 @@
  * Node-only (`node:fs`, `node:os`, `node:path`).
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import {
+  computeActualInputEffWithCacheTier,
+  computeBaselineInputEffWithCacheTier,
+  deriveBaselineWarmth,
+  isUsableAnthropicBaselineProbe,
+  observedCacheTtlSec,
+  type BaselineWarmthPrev,
+} from './core/baseline.js';
 import { readBrandEnv } from './core/env.js';
+import {
+  computeOpenAIActualInputEff,
+  computeOpenAISessionBaselineInputEff,
+  deriveOpenAIBaselineWarmth,
+  OPENAI_CACHE_TTL_SEC,
+  type OpenAIWarmthPrev,
+} from './core/openai-savings.js';
 import type { TrackEvent } from './core/tracker.js';
-import { gateRatesFor, inputUsdPerMtok } from './core/pricing.js';
+import { anthropicReadRate, inputUsdPerMtok, priceMode, resolvePriceRates } from './core/pricing.js';
+
+const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
 
 export type TurnReportFormat = 'cli' | 'agy' | 'claude-statusline' | 'json';
 
@@ -89,53 +107,283 @@ function isInferenceEvent(ev: TrackEvent): boolean {
 
 interface CachedModelRates {
   readonly inUsd: number | undefined;
-  readonly readMult: number;
+}
+
+interface TurnWarmthState {
+  anthropic?: BaselineWarmthPrev;
+  anthropicObservedPrefix?: number;
+  openai?: OpenAIWarmthPrev;
+  google?: {
+    ts: number;
+    cachedTokens: number;
+    prefixSha?: string;
+    pxPrefixSha?: string;
+    model?: string;
+  };
 }
 
 function computeTurnSnapshotWithCache(
   ev: TrackEvent,
   rateCache?: Map<string, CachedModelRates>,
+  warmthState?: TurnWarmthState,
 ): TurnSavingsSnapshot {
-  const isOpenAI = ev.accounting_provider === 'openai' || ev.cached_tokens !== undefined;
-  const cachedTokens = isOpenAI ? (ev.cached_tokens ?? 0) : (ev.cache_read_tokens ?? 0);
-  const inputTokens = isOpenAI
-    ? (ev.input_tokens ?? 0)
-    : (ev.input_tokens ?? 0) + (ev.cache_create_tokens ?? 0) + (ev.cache_read_tokens ?? 0);
+  const isGoogle =
+    ev.accounting_provider === 'google' ||
+    (typeof ev.path === 'string' &&
+      (ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent')));
+  const isOpenAI =
+    ev.accounting_provider === 'openai' ||
+    (!isGoogle &&
+      typeof ev.path === 'string' &&
+      (ev.path.includes('responses') || ev.path.includes('chat/completions')));
+  const isInclusiveUsage =
+    isOpenAI ||
+    isGoogle ||
+    (ev.cached_tokens !== undefined && ev.cache_read_tokens === undefined);
+
+  const inp = ev.input_tokens ?? 0;
+  const cc = ev.cache_create_tokens ?? 0;
+  const cc5m = ev.cache_create_5m_tokens;
+  const cc1h = ev.cache_create_1h_tokens ?? 0;
+  const cr = ev.cache_read_tokens ?? 0;
+  const cacheWrite = ev.cache_write_tokens ?? 0;
+  const rawCached = ev.cached_tokens ?? ev.cache_read_tokens ?? 0;
+
+  const cachedTokens = isInclusiveUsage ? Math.max(0, Math.min(inp, rawCached)) : cr;
+  const inputTokens = isInclusiveUsage ? inp : inp + cc + cr;
+
+  const parsedMs = Date.parse(ev.ts);
+  const eventMs = Number.isFinite(parsedMs) ? parsedMs : Date.now();
+  const completionSec = eventMs / 1000;
+  const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
 
   const hasMeasuredBaseline =
     ev.compressed !== false &&
     ev.baseline_probe_status === 'ok' &&
     typeof ev.baseline_tokens === 'number' &&
-    inputTokens > 0;
+    ev.baseline_tokens > 0 &&
+    inputTokens > 0 &&
+    (isOpenAI ||
+      isGoogle ||
+      isUsableAnthropicBaselineProbe({
+        baselineTokens: ev.baseline_tokens,
+        probeStatus: ev.baseline_probe_status,
+        threadContinue: ev.thread_continue === true,
+        cacheReadTokens: cr,
+      }));
 
-  let savedTokens: number;
-  if (hasMeasuredBaseline) {
-    savedTokens = Math.round((ev.baseline_tokens ?? 0) - inputTokens);
+  const hygieneTok = Math.max(0, ev.text_hygiene_saved_tokens ?? 0);
+  const baselineImaged = ev.baseline_imaged_tokens ?? Math.round((ev.compressed_chars ?? 0) / 4);
+  const nativeTok = Math.max(0, ev.native_injected_tokens ?? 0);
+  const imageTok = ev.image_tokens ?? 0;
+  const imgSaved = ev.compressed ? baselineImaged - imageTok - nativeTok : 0;
+
+  const savedTokens = hasMeasuredBaseline
+    ? Math.round((ev.baseline_tokens ?? 0) - inputTokens)
+    : Math.round(hygieneTok + imgSaved);
+
+  let weightedSaved = 0;
+  if (isOpenAI) {
+    const pxSha = ev.cache_prefix_sha8 ?? ev.history_image_sha8;
+    const oPrev = warmthState?.openai;
+    const oWarmth = deriveOpenAIBaselineWarmth(
+      oPrev,
+      requestStartSec,
+      cachedTokens,
+      ev.system_sha8,
+      ev.model,
+      OPENAI_CACHE_TTL_SEC,
+      pxSha,
+    );
+    const priceCtx = { promptTokens: inp, at: eventMs };
+    const actualEff = inp > 0
+      ? computeOpenAIActualInputEff(inp, cachedTokens, ev.model, cacheWrite, priceCtx)
+      : 0;
+    if (hasMeasuredBaseline) {
+      const rates = resolvePriceRates(ev.model, priceCtx);
+      if (oWarmth.selfBusted) {
+        const unproxiedRaw = Math.max(0, ev.baseline_tokens!);
+        const reused = Math.min(unproxiedRaw, oWarmth.prevPrefixTokens);
+        const newRate = cacheWrite > 0 ? rates.write : 1;
+        const baselineEff = reused * rates.read + (unproxiedRaw - reused) * newRate;
+        weightedSaved = baselineEff - actualEff;
+      } else {
+        const deltaWeight = cachedTokens > 0 ? rates.read : cacheWrite > 0 ? rates.write : 1;
+        weightedSaved = (ev.baseline_tokens! - inp) * deltaWeight;
+      }
+    } else if (
+      inp > 0 &&
+      ((ev.compressed && (baselineImaged > 0 || (ev.compressed_chars ?? 0) > 0)) || hygieneTok > 0)
+    ) {
+      const baselineEff = computeOpenAISessionBaselineInputEff({
+        inputTokens: inp,
+        cachedTokens,
+        imageTokens: ev.compressed ? imageTok : 0,
+        baselineImagedTokens: ev.compressed ? baselineImaged : 0,
+        nativeInjectedTokens: ev.compressed ? nativeTok : 0,
+        textHygieneSavedTokens: hygieneTok,
+        cacheWriteTokens: cacheWrite,
+        model: ev.model,
+        warmth: oWarmth,
+      });
+      weightedSaved = baselineEff - actualEff;
+    } else if (hygieneTok > 0 || imgSaved !== 0) {
+      weightedSaved = savedTokens;
+    }
+    if (warmthState && inputTokens > 0) {
+      warmthState.openai = {
+        ts: completionSec,
+        cachedOrPrefixTokens: cachedTokens > 0 ? cachedTokens : Math.max(oPrev?.cachedOrPrefixTokens ?? 0, inp),
+        prefixSha: ev.system_sha8 ?? oPrev?.prefixSha,
+        pxPrefixSha: pxSha ?? oPrev?.pxPrefixSha,
+        model: ev.model ?? oPrev?.model,
+      };
+    }
+  } else if (isGoogle) {
+    const pxSha = ev.cache_prefix_sha8 ?? ev.history_image_sha8;
+    const gPrev = warmthState?.google;
+    const gWarmth = deriveOpenAIBaselineWarmth(
+      gPrev
+        ? {
+            ts: gPrev.ts,
+            cachedOrPrefixTokens: gPrev.cachedTokens,
+            prefixSha: gPrev.prefixSha,
+            pxPrefixSha: gPrev.pxPrefixSha,
+            model: gPrev.model,
+          }
+        : undefined,
+      requestStartSec,
+      cachedTokens,
+      ev.system_sha8,
+      ev.model,
+      300,
+      pxSha,
+    );
+    const priceCtx = { promptTokens: inp, at: eventMs };
+    const rates = resolvePriceRates(ev.model, priceCtx);
+    if (priceMode() === 'kosha') {
+      if (
+        gWarmth.selfBusted &&
+        inp > 0 &&
+        (hasMeasuredBaseline || (ev.compressed && baselineImaged > 0) || hygieneTok > 0)
+      ) {
+        const unproxiedRaw = Math.max(0, hasMeasuredBaseline ? ev.baseline_tokens! : inp + savedTokens);
+        const reused = Math.min(unproxiedRaw, gWarmth.prevPrefixTokens);
+        const baselineEff = reused * rates.read + (unproxiedRaw - reused) * 1.0;
+        const actualEff = (inp - cachedTokens) + cachedTokens * rates.read;
+        weightedSaved = baselineEff - actualEff;
+      } else {
+        weightedSaved = savedTokens * (cachedTokens > 0 ? rates.read : 1.0);
+      }
+    } else {
+      weightedSaved = savedTokens;
+    }
+    if (warmthState && inputTokens > 0) {
+      warmthState.google = {
+        ts: completionSec,
+        cachedTokens: cachedTokens > 0 ? cachedTokens : Math.max(gPrev?.cachedTokens ?? 0, inp),
+        prefixSha: ev.system_sha8 ?? gPrev?.prefixSha,
+        pxPrefixSha: pxSha ?? gPrev?.pxPrefixSha,
+        model: ev.model ?? gPrev?.model,
+      };
+    }
   } else {
-    const hygieneTok = ev.text_hygiene_saved_tokens ?? 0;
-    const baselineImaged = ev.baseline_imaged_tokens ?? Math.round((ev.compressed_chars ?? 0) / 4);
-    const nativeTok = Math.max(0, ev.native_injected_tokens ?? 0);
-    const imgSaved = ev.compressed ? baselineImaged - (ev.image_tokens ?? 0) - nativeTok : 0;
-    savedTokens = Math.round(hygieneTok + imgSaved);
+    const readRate = anthropicReadRate(ev.model, { promptTokens: inputTokens, at: eventMs });
+    const actualEff = inputTokens > 0
+      ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate)
+      : 0;
+    const cacheable = ev.baseline_cacheable_tokens ?? 0;
+    const aPrev = warmthState?.anthropic;
+    const { warm, prevCacheable } = deriveBaselineWarmth(
+      aPrev,
+      requestStartSec,
+      cacheable,
+      cr,
+      300,
+      ev.system_sha8,
+      ev.cache_prefix_tools_sha8,
+      { pxPrefixSha: ev.cache_prefix_sha8, model: ev.model },
+    );
+    if (hasMeasuredBaseline) {
+      if (cacheable > 0) {
+        const baselineEff = computeBaselineInputEffWithCacheTier(
+          ev.baseline_tokens!,
+          cacheable,
+          inp,
+          cc,
+          cr,
+          warm,
+          prevCacheable,
+          cc1h,
+          cc5m,
+          readRate,
+        );
+        weightedSaved = baselineEff - actualEff;
+      } else if (cc === 0 && cr === 0) {
+        weightedSaved = ev.baseline_tokens! - inp;
+      } else if (warm && cr === 0) {
+        const unproxiedRaw = ev.baseline_tokens!;
+        const reusedTarget = warmthState?.anthropicObservedPrefix ?? 0;
+        const reused = Math.min(unproxiedRaw, reusedTarget);
+        const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+        const baselineEff = reused * readRate + (unproxiedRaw - reused) * createRate;
+        weightedSaved = baselineEff - actualEff;
+      } else {
+        weightedSaved = 0;
+      }
+    } else if (savedTokens !== 0 && inputTokens > 0) {
+      if (warm && cr === 0) {
+        const unproxiedRaw = inp + cc + savedTokens;
+        const reusedTarget = prevCacheable > 0 ? prevCacheable : (warmthState?.anthropicObservedPrefix ?? 0);
+        if (reusedTarget > 0) {
+          const reused = Math.min(unproxiedRaw, reusedTarget);
+          const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          const baselineEff = reused * readRate + (unproxiedRaw - reused) * createRate;
+          weightedSaved = baselineEff - actualEff;
+        } else {
+          weightedSaved = savedTokens * readRate;
+        }
+      } else {
+        const deltaWeight = cr > 0
+          ? readRate
+          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+        weightedSaved = savedTokens * deltaWeight;
+      }
+    } else {
+      weightedSaved = savedTokens;
+    }
+    if (warmthState && inputTokens > 0) {
+      warmthState.anthropic = {
+        ts: completionSec,
+        cacheable: cacheable > 0 ? cacheable : (aPrev?.cacheable ?? 0),
+        prefixSha: ev.system_sha8 ?? aPrev?.prefixSha,
+        toolsSha: ev.cache_prefix_tools_sha8 ?? aPrev?.toolsSha,
+        pxPrefixSha: ev.cache_prefix_sha8 ?? aPrev?.pxPrefixSha,
+        model: ev.model ?? aPrev?.model,
+        ttlSec: observedCacheTtlSec(cc1h, aPrev?.ttlSec),
+      };
+      if (cr > 0 || cc > 0) {
+        warmthState.anthropicObservedPrefix = cr + cc;
+      }
+    }
   }
 
   const cacheHitPct = inputTokens > 0 ? round1((cachedTokens / inputTokens) * 100) : null;
 
-  const modelKey = `${ev.model ?? ''}:${inputTokens}`;
+  const mode = priceMode();
+  const modelKey = `${mode}:${isGoogle ? 'g' : 'o'}:${ev.model ?? ''}:${inputTokens}`;
   let rates = rateCache?.get(modelKey);
   if (!rates) {
     rates = {
-      inUsd: inputUsdPerMtok(ev.model, { promptTokens: inputTokens }),
-      readMult: gateRatesFor(ev.model, { promptTokens: inputTokens })?.read ?? 0.1,
+      inUsd: mode === 'kosha'
+        ? inputUsdPerMtok(ev.model, { promptTokens: inputTokens, at: eventMs })
+        : (!isGoogle ? ASSUMED_INPUT_USD_PER_MTOK : undefined),
     };
     rateCache?.set(modelKey, rates);
   }
-  const cacheShare = cacheHitPct !== null ? Math.min(1, Math.max(0, cacheHitPct / 100)) : 0;
-  const effRatePerMtok =
-    rates.inUsd !== undefined ? rates.inUsd * (1 - cacheShare + rates.readMult * cacheShare) : 0;
   const cliffUsd = ev.cliff_saved_usd ?? 0;
-  const tokUsd = (savedTokens * effRatePerMtok) / 1_000_000;
-  const savedUsd = round6(cliffUsd > 0 ? Math.max(tokUsd, cliffUsd) : tokUsd);
+  const tokUsd = rates.inUsd !== undefined ? (weightedSaved * rates.inUsd) / 1_000_000 : 0;
+  const savedUsd = round6(tokUsd < 0 ? tokUsd : (cliffUsd > 0 ? Math.max(tokUsd, cliffUsd) : tokUsd));
 
   const stageSet = new Set<string>();
   if (ev.compressed && (ev.image_count ?? 0) > 0) stageSet.add('image');
@@ -259,9 +507,41 @@ function readCursor(cursorFile: string): CursorState | null {
 function writeCursor(cursorFile: string, state: CursorState): void {
   const dir = path.dirname(cursorFile);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = `${cursorFile}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 });
-  fs.renameSync(tmp, cursorFile);
+  const nonce = crypto.randomBytes(6).toString('hex');
+  const tmp = `${cursorFile}.${process.pid}.${nonce}.tmp`;
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    (fs.constants.O_NOFOLLOW ?? 0);
+  const fd = fs.openSync(tmp, flags, 0o600);
+  let closed = false;
+  try {
+    fs.fchmodSync(fd, 0o600);
+    const payload = Buffer.from(JSON.stringify(state), 'utf8');
+    let written = 0;
+    while (written < payload.length) {
+      written += fs.writeSync(fd, payload, written, payload.length - written);
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    closed = true;
+    fs.renameSync(tmp, cursorFile);
+  } catch (err) {
+    if (!closed) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 }
 
 function parseJsonLine(lineBuf: Buffer): TrackEvent | null {
@@ -309,13 +589,12 @@ export function readTurnReport(eventsFile: string, opts: ReadTurnReportOptions =
   }
 
   const rateCache = new Map<string, CachedModelRates>();
-  const lastTurn = computeTurnSnapshotWithCache(lastEv, rateCache);
   const sessionId = lastEv.first_user_sha8 ?? null;
   const lastMs = Date.parse(lastEv.ts);
   const sessionNeedle = sessionId ? Buffer.from(sessionId, 'ascii') : null;
 
   // Pass 2: reverse scan prior lines, pre-filtering in native Buffer before JSON.parse.
-  const sessionSnapshots: TurnSavingsSnapshot[] = [lastTurn];
+  const sessionEvents: TrackEvent[] = [lastEv];
   let scanEnd = lastLineStart > 0 ? lastLineStart - 1 : 0;
   while (scanEnd > 0) {
     const nl = buf.lastIndexOf(0x0a, scanEnd - 1);
@@ -327,7 +606,7 @@ export function readTurnReport(eventsFile: string, opts: ReadTurnReportOptions =
       if (!slice.includes(sessionNeedle)) continue;
       const ev = parseJsonLine(slice);
       if (ev && ev.first_user_sha8 === sessionId) {
-        sessionSnapshots.push(computeTurnSnapshotWithCache(ev, rateCache));
+        sessionEvents.push(ev);
       }
     } else {
       const ev = parseJsonLine(slice);
@@ -337,9 +616,16 @@ export function readTurnReport(eventsFile: string, opts: ReadTurnReportOptions =
         if (!Number.isFinite(evMs)) continue;
         if (lastMs - evMs > SESSION_FALLBACK_WINDOW_MS) break;
       }
-      sessionSnapshots.push(computeTurnSnapshotWithCache(ev, rateCache));
+      sessionEvents.push(ev);
     }
   }
+
+  sessionEvents.reverse();
+  const warmthState: TurnWarmthState = {};
+  const sessionSnapshots: TurnSavingsSnapshot[] = sessionEvents.map((ev) =>
+    computeTurnSnapshotWithCache(ev, rateCache, warmthState),
+  );
+  const lastTurn = sessionSnapshots[sessionSnapshots.length - 1]!;
 
   let savedTokens = 0;
   let savedUsd = 0;

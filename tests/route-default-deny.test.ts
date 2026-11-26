@@ -99,4 +99,102 @@ describe('route families', () => {
     expect(status).toBe(200);
     expect(seen[0]!.url).toBe('https://gateway.test/deepseek/models');
   });
+
+  it('routes default /backend-api/codex/responses to https://chatgpt.com without breakpoint or host key', async () => {
+    const real = globalThis.fetch;
+    const prevModels = process.env.INKLING_MODELS;
+    process.env.INKLING_MODELS = 'gpt-5.6-sol';
+    const seen: { url: string; auth: string | null; capturedKeyHeader: string | null; body: string }[] = [];
+    globalThis.fetch = (async (req: Request | string | URL, init?: RequestInit) => {
+      const r = req instanceof Request ? req : new Request(String(req), init);
+      seen.push({
+        url: r.url,
+        auth: r.headers.get('authorization'),
+        capturedKeyHeader: r.headers.get('x-api-key'),
+        body: await r.text(),
+      });
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    try {
+      const proxyCfg: ProxyConfig = {
+        transform: { charsPerToken: 1, minCompressChars: 1 },
+      };
+      Reflect.set(proxyCfg, 'apiKey', ANTHROPIC_KEY);
+      Reflect.set(proxyCfg, 'openAIApiKey', ['sk', 'host', 'openai', 'fixture'].join('-'));
+      const proxy = createProxy(proxyCfg);
+      const res = await proxy(new Request('http://127.0.0.1:47821/backend-api/codex/responses', {
+        method: 'POST',
+        headers: {
+          host: 'chatgpt.com',
+          authorization: `Bearer ${CHATGPT_JWT}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'gpt-5.6-sol',
+          instructions: 'These are detailed instructions for the coding agent. '.repeat(400),
+          input: [{ role: 'user', content: [{ type: 'input_text', text: 'Reply with exactly: inkling OK' }] }],
+        }),
+      }));
+      await res.text();
+      expect(res.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.url).toBe('https://chatgpt.com/backend-api/codex/responses');
+      expect(seen[0]!.auth).toBe(`Bearer ${CHATGPT_JWT}`);
+      expect(seen[0]!.capturedKeyHeader).toBeNull();
+      expect(seen[0]!.body).toContain('input_image');
+      expect(seen[0]!.body).not.toContain('prompt_cache_breakpoint');
+    } finally {
+      globalThis.fetch = real;
+      if (prevModels === undefined) delete process.env.INKLING_MODELS;
+      else process.env.INKLING_MODELS = prevModels;
+    }
+  });
+
+  it('keeps default /v1/responses on https://api.openai.com', async () => {
+    const { status, seen } = await call(
+      'POST',
+      '/v1/responses',
+      {
+        host: 'api.openai.com',
+        authorization: `Bearer ${CHATGPT_JWT}`,
+        'content-type': 'application/json',
+      },
+      { apiKey: ANTHROPIC_KEY },
+    );
+    expect(status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toBe('https://api.openai.com/v1/responses');
+  });
+
+  it('honors explicit openAIUpstream on /backend-api/codex/responses', async () => {
+    const { status, seen } = await call(
+      'POST',
+      '/backend-api/codex/responses',
+      {
+        host: 'chatgpt.com',
+        authorization: `Bearer ${CHATGPT_JWT}`,
+        'content-type': 'application/json',
+      },
+      { openAIUpstream: 'https://custom.example' },
+    );
+    expect(status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toBe('https://custom.example/backend-api/codex/responses');
+  });
+
+  it('routes node-style openAIUpstream default api.openai.com to https://chatgpt.com for /backend-api/codex/responses', async () => {
+    const { status, seen } = await call(
+      'POST',
+      '/backend-api/codex/responses',
+      {
+        host: 'chatgpt.com',
+        authorization: `Bearer ${CHATGPT_JWT}`,
+        'content-type': 'application/json',
+      },
+      { openAIUpstream: 'https://api.openai.com' },
+    );
+    expect(status).toBe(200);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.url).toBe('https://chatgpt.com/backend-api/codex/responses');
+  });
 });

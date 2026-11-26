@@ -135,7 +135,7 @@ export async function* readEvents(
 export const UNKNOWN_SESSION = '<unknown>';
 
 function sessionIdOf(ev: TrackEvent): string {
-  return ev.first_user_sha8 ?? UNKNOWN_SESSION;
+  return ev.session_key ?? ev.first_user_sha8 ?? UNKNOWN_SESSION;
 }
 
 export interface AggregateResult {
@@ -155,8 +155,9 @@ export async function aggregateSessions(
   // same-prefix prior makes the text path warm, and sizes the reused/grown
   // split. Kept out of SessionSummary so it never leaks into the
   // /api/sessions.json shape.
-  const warmth = new Map<string, BaselineWarmthPrev>();
+  const warmth = new Map<string, BaselineWarmthPrev & { observedCachedTokens?: number }>();
   const openaiWarmth = new Map<string, OpenAIWarmthPrev>();
+  const googleWarmth = new Map<string, OpenAIWarmthPrev>();
   const CACHE_TTL_SEC = 300; // default; a 1h-tier prior carries 3600 s (observedCacheTtlSec)
 
   // Stat sidecar sizes once up front. Looking up size per event would be
@@ -212,6 +213,17 @@ export async function aggregateSessions(
     const baseline = ev.baseline_tokens;
 
     if (isGoogle) {
+      const gPrev = googleWarmth.get(id);
+      const pxShaG = ev.cache_prefix_sha8 ?? ev.history_image_sha8;
+      const gWarmth = deriveOpenAIBaselineWarmth(
+        gPrev,
+        requestStartSec,
+        cached,
+        ev.system_sha8,
+        ev.model,
+        CACHE_TTL_SEC,
+        pxShaG,
+      );
       const measured = ev.baseline_probe_status === 'ok' && typeof baseline === 'number' && baseline > 0
         ? baseline
         : 0;
@@ -228,13 +240,33 @@ export async function aggregateSessions(
           )
         : 0;
       const gBaseline = measured || estimated;
+      const clampedCached = Math.min(inp, Math.max(0, cached));
       if (ev.compressed === true && haveUsage && gBaseline > 0) {
-        const delta = gBaseline - inp;
-        const tokensSaved = priceMode() === 'kosha'
-          ? delta * (cached > 0 ? resolvePriceRates(ev.model, { promptTokens: inp }).read : 1)
-          : delta;
+        let tokensSaved: number;
+        if (priceMode() === 'kosha') {
+          const rates = resolvePriceRates(ev.model, { promptTokens: inp });
+          if (gWarmth.selfBusted) {
+            const reused = Math.min(gBaseline, gWarmth.prevPrefixTokens);
+            const baselineEff = reused * rates.read + (gBaseline - reused) * 1.0;
+            const actualEff = (inp - clampedCached) + clampedCached * rates.read;
+            tokensSaved = baselineEff - actualEff;
+          } else {
+            tokensSaved = (gBaseline - inp) * (clampedCached > 0 ? rates.read : 1);
+          }
+        } else {
+          tokensSaved = gBaseline - inp;
+        }
         s.tokensSavedEst += Math.round(tokensSaved);
         s.charsSaved += Math.round(tokensSaved * 4);
+      }
+      if (haveUsage) {
+        googleWarmth.set(id, {
+          ts: completionSec,
+          cachedOrPrefixTokens: clampedCached > 0 ? clampedCached : Math.max(gPrev?.cachedOrPrefixTokens ?? 0, inp),
+          prefixSha: ev.system_sha8 ?? gPrev?.prefixSha,
+          pxPrefixSha: pxShaG ?? gPrev?.pxPrefixSha,
+          model: ev.model ?? gPrev?.model,
+        });
       }
     } else if (isOpenAI) {
       const oPrev = openaiWarmth.get(id);
@@ -322,10 +354,37 @@ export async function aggregateSessions(
       (ev.image_count ?? 0) === 0
     ) {
       const hygieneTok = ev.text_hygiene_saved_tokens ?? 0;
-      const deltaWeight = cr > 0
-        ? anthropicReadRate(ev.model)
-        : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
-      const tokensSaved = hygieneTok * deltaWeight;
+      const readRate = anthropicReadRate(ev.model);
+      const prev = warmth.get(id);
+      const { warm, prevCacheable } = deriveBaselineWarmth(
+        prev,
+        requestStartSec,
+        ev.baseline_cacheable_tokens ?? 0,
+        cr,
+        CACHE_TTL_SEC,
+        ev.system_sha8,
+        ev.cache_prefix_tools_sha8,
+        { pxPrefixSha: ev.cache_prefix_sha8, model: ev.model },
+      );
+      let tokensSaved: number;
+      if (warm && cr === 0) {
+        const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate);
+        const unproxiedRaw = inp + cc + hygieneTok;
+        const reusedTarget = prevCacheable > 0 ? prevCacheable : (prev?.observedCachedTokens ?? 0);
+        if (reusedTarget > 0) {
+          const reused = Math.min(unproxiedRaw, reusedTarget);
+          const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          const baselineEff = reused * readRate + (unproxiedRaw - reused) * createRate;
+          tokensSaved = baselineEff - actualEff;
+        } else {
+          tokensSaved = hygieneTok * readRate;
+        }
+      } else {
+        const deltaWeight = cr > 0
+          ? readRate
+          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+        tokensSaved = hygieneTok * deltaWeight;
+      }
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);
     }
@@ -343,6 +402,7 @@ export async function aggregateSessions(
         pxPrefixSha: ev.cache_prefix_sha8 ?? prev?.pxPrefixSha,
         model: ev.model ?? prev?.model,
         ttlSec: observedCacheTtlSec(ev.cache_create_1h_tokens, prev?.ttlSec),
+        observedCachedTokens: cr > 0 || cc > 0 ? cr + cc : prev?.observedCachedTokens,
       });
     }
     const cacheReadEv = ev.cache_read_tokens ?? ev.cached_tokens;
@@ -624,8 +684,14 @@ async function rewriteEventsFile(
     ): Promise<void> => {
       if (!fs.existsSync(eventsFile)) return;
       const tmp = `${eventsFile}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
-      // Open with 'w' (truncate) and 0o600 permissions so pruned logs never expose prompts.
-      const outFd = fs.openSync(tmp, 'w', 0o600);
+      // Open with O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW and 0o600 permissions so pruned logs never expose prompts.
+      const openFlags =
+        fs.constants.O_WRONLY |
+        fs.constants.O_CREAT |
+        fs.constants.O_EXCL |
+        (fs.constants.O_NOFOLLOW ?? 0);
+      const outFd = fs.openSync(tmp, openFlags, 0o600);
+      fs.fchmodSync(outFd, 0o600);
       let outFdClosed = false;
       let renamed = false;
       try {
@@ -845,52 +911,139 @@ export function decodeClaudeProjectDir(name: string): string {
   return name.replaceAll('-', '/');
 }
 
+const CLAUDE_FILE_CACHE_CAP = 4096;
+const CLAUDE_DIR_CACHE_CAP = 16;
+const claudeFileCache = new Map<string, { sig: string; firstUser: string | undefined }>();
+const claudeDirCache = new Map<string, { sig: string; map: Map<string, ClaudeCodeSessionRef> }>();
+const claudeDirInFlight = new Map<string, Promise<Map<string, ClaudeCodeSessionRef>>>();
+
+function fileSig(st: fs.Stats): string {
+  return `${st.ino}:${st.size}:${st.mtimeMs}`;
+}
+
+async function scanClaudeCodeMap(
+  rootDir: string,
+  cacheKey: string,
+): Promise<Map<string, ClaudeCodeSessionRef>> {
+  const out = new Map<string, ClaudeCodeSessionRef>();
+  let rootStat: fs.Stats;
+  let projects: fs.Dirent[];
+  try {
+    rootStat = fs.statSync(rootDir);
+    projects = fs.readdirSync(rootDir, { withFileTypes: true });
+  } catch {
+    claudeDirCache.delete(cacheKey);
+    return out; // No Claude Code install or unreadable — that's fine.
+  }
+
+  const sigParts: string[] = [fileSig(rootStat)];
+  const candidates: Array<{
+    projName: string;
+    sess: string;
+    file: string;
+    fSig: string;
+  }> = [];
+
+  for (const proj of projects) {
+    if (!proj.isDirectory()) continue;
+    const projDir = path.join(rootDir, proj.name);
+    let projStat: fs.Stats;
+    let sessions: string[];
+    try {
+      projStat = fs.statSync(projDir);
+      sessions = fs.readdirSync(projDir);
+    } catch {
+      continue;
+    }
+    sigParts.push(`${proj.name}:${fileSig(projStat)}`);
+    for (const sess of sessions) {
+      if (!sess.endsWith('.jsonl')) continue;
+      const file = path.join(projDir, sess);
+      try {
+        const st = fs.statSync(file);
+        if (!st.isFile()) continue;
+        const fSig = fileSig(st);
+        sigParts.push(`${proj.name}/${sess}:${fSig}`);
+        candidates.push({ projName: proj.name, sess, file, fSig });
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  const dirSig = sigParts.join('|');
+  const cachedDir = claudeDirCache.get(cacheKey);
+  if (cachedDir && cachedDir.sig === dirSig) {
+    claudeDirCache.delete(cacheKey);
+    claudeDirCache.set(cacheKey, cachedDir);
+    return cachedDir.map;
+  }
+
+  for (const c of candidates) {
+    const cachedFile = claudeFileCache.get(c.file);
+    let firstUser: string | undefined;
+    if (cachedFile && cachedFile.sig === c.fSig) {
+      claudeFileCache.delete(c.file);
+      claudeFileCache.set(c.file, cachedFile);
+      firstUser = cachedFile.firstUser;
+    } else {
+      firstUser = await readFirstUserFromClaudeSession(c.file);
+      if (claudeFileCache.has(c.file)) claudeFileCache.delete(c.file);
+      claudeFileCache.set(c.file, { sig: c.fSig, firstUser });
+      while (claudeFileCache.size > CLAUDE_FILE_CACHE_CAP) {
+        const oldest = claudeFileCache.keys().next().value;
+        if (oldest === undefined) break;
+        claudeFileCache.delete(oldest);
+      }
+    }
+    if (!firstUser) continue;
+    const sha8 = fingerprintFirstUser(firstUser);
+    // First write wins. If two sessions in different projects start with
+    // the same user prompt (e.g. "hi"), the first one we read keeps the
+    // slot — at least the dashboard shows *some* CC ref rather than none.
+    if (!out.has(sha8)) {
+      out.set(sha8, {
+        sessionId: c.sess.replace(/\.jsonl$/, ''),
+        projectPath: decodeClaudeProjectDir(c.projName),
+        firstUserPreview: firstUser.slice(0, 120),
+      });
+    }
+  }
+
+  if (claudeDirCache.has(cacheKey)) claudeDirCache.delete(cacheKey);
+  claudeDirCache.set(cacheKey, { sig: dirSig, map: out });
+  while (claudeDirCache.size > CLAUDE_DIR_CACHE_CAP) {
+    const oldest = claudeDirCache.keys().next().value;
+    if (oldest === undefined) break;
+    claudeDirCache.delete(oldest);
+  }
+  return out;
+}
+
 /**
  * Best-effort scan of `~/.claude/projects/*.jsonl`. Returns a map keyed by
  * the same `first_user_sha8` the proxy emits. If `~/.claude/projects/` is
  * missing, returns an empty map without throwing — inkling must keep
  * working for non-Claude-Code clients.
  *
- * This is O(number_of_sessions) file opens. On a heavy user's machine
- * that's a few hundred small reads — well under a second on an SSD. We
- * don't poll continuously; the dashboard re-invokes this on each refresh.
+ * Cached by `(ino, size, mtimeMs)` with in-flight singleflight coalescing so
+ * repeated/concurrent dashboard polls avoid redundant disk scans.
  */
 export async function claudeCodeMap(
   rootDir: string = claudeProjectsDir(),
 ): Promise<Map<string, ClaudeCodeSessionRef>> {
-  const out = new Map<string, ClaudeCodeSessionRef>();
-  let projects: fs.Dirent[];
+  const key = path.resolve(rootDir);
+  const inFlight = claudeDirInFlight.get(key);
+  if (inFlight) {
+    return new Map(await inFlight);
+  }
+  const p = scanClaudeCodeMap(rootDir, key);
+  claudeDirInFlight.set(key, p);
   try {
-    projects = fs.readdirSync(rootDir, { withFileTypes: true });
-  } catch {
-    return out; // No Claude Code install or unreadable — that's fine.
-  }
-  for (const proj of projects) {
-    if (!proj.isDirectory()) continue;
-    const projDir = path.join(rootDir, proj.name);
-    let sessions: string[];
-    try {
-      sessions = fs.readdirSync(projDir);
-    } catch {
-      continue;
-    }
-    for (const sess of sessions) {
-      if (!sess.endsWith('.jsonl')) continue;
-      const file = path.join(projDir, sess);
-      const firstUser = await readFirstUserFromClaudeSession(file);
-      if (!firstUser) continue;
-      const sha8 = fingerprintFirstUser(firstUser);
-      // First write wins. If two sessions in different projects start with
-      // the same user prompt (e.g. "hi"), the first one we read keeps the
-      // slot — at least the dashboard shows *some* CC ref rather than none.
-      if (!out.has(sha8)) {
-        out.set(sha8, {
-          sessionId: sess.replace(/\.jsonl$/, ''),
-          projectPath: decodeClaudeProjectDir(proj.name),
-          firstUserPreview: firstUser.slice(0, 120),
-        });
-      }
+    return new Map(await p);
+  } finally {
+    if (claudeDirInFlight.get(key) === p) {
+      claudeDirInFlight.delete(key);
     }
   }
-  return out;
 }

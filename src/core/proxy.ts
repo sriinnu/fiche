@@ -16,8 +16,11 @@ import {
 import {
   buildBaselineCountTokensBody,
   buildCacheablePrefixCountTokensBody,
+  isThreadContinuation,
 } from './measurement.js';
 import type { Usage } from './types.js';
+import { redactSecrets } from './tracker.js';
+import type { DecodeRequestBodyResult } from '../request-decoding.js';
 import {
   anthropicMessagesToOpenAIResponses,
   openAIResponsesToAnthropicResponse,
@@ -28,6 +31,7 @@ import {
   openAIChatToAnthropicResponse,
 } from './messages-chat-bridge.js';
 import { pinCommandResponse, pinCommandResponseOpenAI } from './pin.js';
+import { withClientToolRoundShape } from './client-tool-round.js';
 import { isGoogleInferencePath, parseGoogleModelFromPath, transformGoogleGenerateContent } from './google.js';
 import { isGeminiModel } from './gemini-model-profiles.js';
 import { resolveGptProfile } from './gpt-model-profiles.js';
@@ -43,6 +47,12 @@ import {
 import { shouldImageModel } from './reader-tier.js';
 import { resolveTextHygieneMode } from './text-hygiene.js';
 
+export {
+  parseTrustAdjacentToolRounds,
+  resolveTrustAdjacentToolRoundsEnv,
+  withClientToolRoundShape,
+} from './client-tool-round.js';
+
 export interface ProxyConfig {
   /** 'cloudflare-ai-gateway': routes both families through gatewayBaseUrl;
    *  OpenAI paths drop the `/v1` prefix to match gateway shape. */
@@ -53,6 +63,10 @@ export interface ProxyConfig {
   gatewayHeaders?: Record<string, string>;
   /** Anthropic API base, no trailing slash. Defaults to api.anthropic.com. */
   upstream?: string;
+  /** Optional shared upstream base (FICHE_UPSTREAM) applied across families
+   *  when family-specific upstreams are not set; kept distinct from `upstream`
+   *  so `ANTHROPIC_UPSTREAM` never hijacks base-URL Gemini requests. */
+  sharedUpstream?: string;
   /** Override or supply an API key. If unset, we forward whatever the client sent. */
   apiKey?: string;
   /** Override the Anthropic `authorization` bearer. Pass a function to re-resolve
@@ -104,6 +118,12 @@ export interface ProxyConfig {
    *  negative value is ignored in favour of that default: an unusable limit must
    *  not silently become no limit. */
   maxRequestBytes?: number;
+  /** How transformable routes handle an inbound body larger than {@link maxRequestBytes}:
+   *  - `'reject'` (default): return provider-shaped 413 without calling upstream (Workers / non-loopback).
+   *  - `'passthrough'`: stop buffering at the ceiling and stream buffered chunks + remainder
+   *    straight to upstream, logging `body_too_large`. Fails closed with 413 on `/v1/messages`
+   *    when `openAIModels` / `cloudflareModels` bridging is configured. */
+  oversizedBodyPolicy?: 'reject' | 'passthrough';
   /** Undo a request `Content-Encoding` on transformable routes so the body can
    *  be read. Codex's built-in provider zstd-compresses its Responses POST; left
    *  encoded, the transform silently skips it. Return `undefined` when the coding
@@ -112,7 +132,11 @@ export interface ProxyConfig {
    *  forwarded as plain bytes without the header, since chatgpt.com has been seen
    *  to refuse zstd on image-heavy bodies. Core stays runtime-neutral, so the Node
    *  entry supplies this; without it, encoded bodies pass through as before. */
-  decodeRequestBody?: (bytes: Uint8Array, encoding: string, maxBytes: number) => Uint8Array<ArrayBuffer> | undefined;
+  decodeRequestBody?: (
+    bytes: Uint8Array,
+    encoding: string,
+    maxBytes: number,
+  ) => Uint8Array<ArrayBuffer> | DecodeRequestBodyResult | undefined;
   /** "Follow the agent": forward a request whose Host is a registered
    *  third-party provider (as under `inkling warp`), or whose path is
    *  `/to/<host>/...`, to that host over https instead of the configured
@@ -125,6 +149,9 @@ export interface ProxyConfig {
   upstreamRegistry?: UpstreamRegistry;
   /** Opted-in built-in providers (`anthropic`, `openai`, `google`, ...). */
   enabledProviders?: readonly ProviderId[] | (() => readonly ProviderId[]);
+  /** Custom `fetch` implementation for upstream requests and token probes (defaults to `globalThis.fetch`).
+   *  Node callers pass a keep-alive HTTP/1.1 transport to avoid Node 26 undici HTTP/2 idle-reaper crashes. */
+  fetch?: typeof globalThis.fetch;
   /** Optional Edge Runtime hook (`ctx.waitUntil`) to keep async telemetry alive past response return. */
   waitUntil?: (promise: Promise<unknown>) => void;
 }
@@ -198,6 +225,27 @@ const INFLIGHT_SWEEP_SIZE = 256;
 /** Floor between size-triggered sweeps so genuine high concurrency stays O(1)/request. */
 const INFLIGHT_SWEEP_MIN_INTERVAL_MS = 1_000;
 
+function combineAbortSignals(timeoutMs: number, parent?: AbortSignal): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  if (!parent) return timeoutSignal;
+  if (typeof AbortSignal.any === 'function') {
+    return AbortSignal.any([timeoutSignal, parent]);
+  }
+  if (parent.aborted) return parent;
+  const ac = new AbortController();
+  const onParent = () => {
+    timeoutSignal.removeEventListener('abort', onTimeout);
+    ac.abort(parent.reason);
+  };
+  const onTimeout = () => {
+    parent.removeEventListener('abort', onParent);
+    ac.abort(timeoutSignal.reason);
+  };
+  parent.addEventListener('abort', onParent, { once: true });
+  timeoutSignal.addEventListener('abort', onTimeout, { once: true });
+  return ac.signal;
+}
+
 /**
  * Abort the response if no chunk arrives for `ms`. Wraps the raw upstream stream so
  * the watchdog sees real network activity rather than post-transform output.
@@ -251,7 +299,29 @@ function withIdleTimeout(
       },
     }),
   );
-  return new Response(watched, {
+  // Wrap readable so consumer cancel() clears any pending idle watchdog immediately.
+  const watchedReader = watched.getReader();
+  const guardedBody = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await watchedReader.read();
+        if (done) {
+          clear();
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (err) {
+        clear();
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      clear();
+      return watchedReader.cancel(reason).catch(() => undefined);
+    },
+  });
+  return new Response(guardedBody, {
     status: res.status,
     statusText: res.statusText,
     headers: res.headers,
@@ -266,22 +336,33 @@ function withIdleTimeout(
 function withClientDisconnect(
   body: ReadableStream<Uint8Array>,
   onCancel: (reason: unknown) => void,
+  onDone?: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
+  let settled = false;
+  const finish = () => {
+    if (!settled) {
+      settled = true;
+      onDone?.();
+    }
+  };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const { done, value } = await reader.read();
         if (done) {
+          finish();
           controller.close();
           return;
         }
         controller.enqueue(value);
       } catch (e) {
+        finish();
         controller.error(e);
       }
     },
     cancel(reason) {
+      finish();
       onCancel(reason);
       void reader.cancel(reason).catch(() => undefined);
     },
@@ -323,27 +404,37 @@ function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array<
 
 type BoundedBody =
   | { ok: true; bytes: Uint8Array<ArrayBuffer> }
-  | { ok: false; observedBytes: number; declaredBytes?: number };
+  | { ok: false; observedBytes: number; declaredBytes?: number; restoredBody?: BodyInit | null };
 
 /**
- * Read a whole request body, refusing anything over `limit`.
+ * Read a whole request body, stopping once it exceeds `limit`.
  *
- * The declared `content-length` is used only as a shortcut to reject without
+ * The declared `content-length` is used only as a shortcut to act without
  * reading a byte. It is never the authority: chunked senders omit it, and a
  * wrong value costs the sender nothing. The streaming loop is what enforces the
  * cap, so a body that lies about its size is bounded by the same number as one
  * that declares nothing.
  *
- * Peak memory is the limit plus at most one chunk: the loop stops pulling the
- * moment the running total crosses the line and cancels the stream instead of
- * draining a body it has already refused.
+ * When `restoreOnOverflow` is true, the buffered chunks are replayed lazily ahead
+ * of the untouched remainder as a ReadableStream (dropping each chunk reference
+ * as handed off upstream), or `req.body` is returned untouched when `content-length`
+ * already proved overflow.
  */
-async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody> {
+async function readBodyBounded(
+  req: Request,
+  limit: number,
+  restoreOnOverflow = false,
+): Promise<BoundedBody> {
   const declaredRaw = req.headers.get('content-length');
   const declared = declaredRaw === null ? NaN : Number(declaredRaw);
   const declaredBytes = Number.isFinite(declared) && declared >= 0 ? declared : undefined;
   if (declaredBytes !== undefined && declaredBytes > limit) {
-    return { ok: false, observedBytes: 0, declaredBytes };
+    return {
+      ok: false,
+      observedBytes: 0,
+      declaredBytes,
+      ...(restoreOnOverflow ? { restoredBody: req.body } : {}),
+    };
   }
 
   const body = req.body;
@@ -359,8 +450,48 @@ async function readBodyBounded(req: Request, limit: number): Promise<BoundedBody
       if (!value || value.byteLength === 0) continue;
       total += value.byteLength;
       if (total > limit) {
-        await reader.cancel().catch(() => {});
-        return { ok: false, observedBytes: total, ...(declaredBytes !== undefined ? { declaredBytes } : {}) };
+        if (!restoreOnOverflow) {
+          await reader.cancel().catch(() => {});
+          return { ok: false, observedBytes: total, ...(declaredBytes !== undefined ? { declaredBytes } : {}) };
+        }
+        chunks.push(value);
+        let index = 0;
+        const restored = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (index < chunks.length) {
+              const chunk = chunks[index]!;
+              chunks[index] = undefined as unknown as Uint8Array;
+              index++;
+              controller.enqueue(chunk);
+              return;
+            }
+            try {
+              for (;;) {
+                const { done: nextDone, value: nextValue } = await reader.read();
+                if (nextDone) {
+                  controller.close();
+                  return;
+                }
+                if (nextValue && nextValue.byteLength > 0) {
+                  controller.enqueue(nextValue);
+                  return;
+                }
+              }
+            } catch (err) {
+              controller.error(err);
+            }
+          },
+          cancel(reason) {
+            chunks.length = 0;
+            return reader.cancel(reason);
+          },
+        });
+        return {
+          ok: false,
+          observedBytes: total,
+          ...(declaredBytes !== undefined ? { declaredBytes } : {}),
+          restoredBody: restored,
+        };
       }
       chunks.push(value);
     }
@@ -1010,16 +1141,178 @@ function readStopReasonFromJson(j: unknown): string | undefined {
   return undefined;
 }
 
+const MAX_TEE_BUFFER_BYTES = 256 * 1024;
+
+function createBoundedScannerStream(
+  source: ReadableStream<Uint8Array>,
+  onChunk: (value: Uint8Array) => void,
+  onEof: () => void,
+  onAbort: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  const queued: Uint8Array[] = [];
+  let bufferedBytes = 0;
+  let done = false;
+  let hasError = false;
+  let streamErr: unknown;
+  let canceled = false;
+  let settled = false;
+  let wakePump: (() => void) | undefined;
+  let wakePull: (() => void) | undefined;
+
+  const finishAbort = () => {
+    if (settled) return;
+    settled = true;
+    onAbort();
+  };
+  const finishEof = () => {
+    if (settled) return;
+    settled = true;
+    onEof();
+  };
+
+  void (async () => {
+    try {
+      while (!canceled) {
+        if (bufferedBytes >= MAX_TEE_BUFFER_BYTES) {
+          await new Promise<void>((r) => {
+            wakePump = r;
+          });
+          continue;
+        }
+        const { done: isDone, value } = await reader.read();
+        if (canceled) break;
+        if (isDone) {
+          done = true;
+          finishEof();
+          wakePull?.();
+          wakePull = undefined;
+          break;
+        }
+        if (value) {
+          onChunk(value);
+          queued.push(value);
+          bufferedBytes += value.byteLength;
+          wakePull?.();
+          wakePull = undefined;
+        }
+      }
+    } catch (err) {
+      hasError = true;
+      streamErr = err;
+      finishAbort();
+      wakePull?.();
+      wakePull = undefined;
+    } finally {
+      try { reader.releaseLock(); } catch { /* already released */ }
+    }
+  })();
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      while (true) {
+        if (queued.length > 0) {
+          const chunk = queued.shift()!;
+          bufferedBytes -= chunk.byteLength;
+          if (bufferedBytes < MAX_TEE_BUFFER_BYTES && wakePump) {
+            const wake = wakePump;
+            wakePump = undefined;
+            wake();
+          }
+          controller.enqueue(chunk);
+          return;
+        }
+        if (hasError) {
+          controller.error(streamErr);
+          return;
+        }
+        if (done) {
+          controller.close();
+          return;
+        }
+        await new Promise<void>((r) => {
+          wakePull = r;
+        });
+      }
+    },
+    cancel(reason) {
+      canceled = true;
+      queued.length = 0;
+      bufferedBytes = 0;
+      const pump = wakePump;
+      wakePump = undefined;
+      pump?.();
+      const pull = wakePull;
+      wakePull = undefined;
+      pull?.();
+      finishAbort();
+      return reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
+
 /**
- * Tee the response body to extract usage + output measurement without blocking the client.
- * Streams are scanned to EOF (final output_tokens is in message_delta; redacted_thinking
- * blocks can appear anywhere). 4xx bodies are capped at ERROR_BODY_MAX. 5xx is skipped.
+ * Pure pull-through scanner for streaming SSE responses: only reads from upstream
+ * when the downstream client pulls, preserving strict 1-chunk backpressure.
+ */
+function createPullThroughScannerStream(
+  source: ReadableStream<Uint8Array>,
+  onChunk: (value: Uint8Array) => void,
+  onEof: () => void,
+  onAbort: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  let settled = false;
+  const finishEof = () => {
+    if (settled) return;
+    settled = true;
+    onEof();
+  };
+  const finishAbort = () => {
+    if (settled) return;
+    settled = true;
+    onAbort();
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          finishEof();
+          try { reader.releaseLock(); } catch { /* already released */ }
+          controller.close();
+          return;
+        }
+        if (value) {
+          onChunk(value);
+          controller.enqueue(value);
+        }
+      } catch (err) {
+        finishAbort();
+        try { reader.releaseLock(); } catch { /* already released */ }
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      finishAbort();
+      return reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
+
+/**
+ * Inspect the response body inline with a bounded 256 KiB buffer: small JSON/4xx
+ * responses settle telemetry immediately even if a caller does not consume `res.body`,
+ * while large streams pause upstream once 256 KiB is buffered so slow clients exert
+ * strict backpressure. 5xx, undecoded compressed bodies, and unknown content-types
+ * are returned unwrapped.
  */
 function teeForUsage(
   res: Response,
   assumeResponsesSse = false,
   assumeResponsesJson = false,
   retainStreamReceipt = false,
+  skipBodyScan = false,
 ): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
@@ -1027,42 +1320,42 @@ function teeForUsage(
   measurementPromise: Promise<OutputMeasurement | undefined>;
   stopReasonPromise: Promise<string | undefined>;
 } {
-  // No body at all: nothing to extract on either path.
-  if (!res.body) {
-    return {
-      response: res,
-      usagePromise: Promise.resolve(undefined),
-      errorBodyPromise: Promise.resolve(undefined),
-      measurementPromise: Promise.resolve(undefined),
-      stopReasonPromise: Promise.resolve(undefined),
-    };
+  const emptyResult = {
+    response: res,
+    usagePromise: Promise.resolve(undefined),
+    errorBodyPromise: Promise.resolve(undefined),
+    measurementPromise: Promise.resolve(undefined),
+    stopReasonPromise: Promise.resolve(undefined),
+  };
+  if (!res.body || skipBodyScan || res.status >= 500) {
+    return emptyResult;
   }
-  // 4xx: tee for the error body but skip usage scanning entirely.
+
+  // 4xx: capture up to ERROR_BODY_MAX inline with bounded backpressure.
   if (res.status >= 400 && res.status < 500) {
-    const [forClient, forUs] = res.body.tee();
-    const errorBodyPromise = (async (): Promise<string | undefined> => {
-      const reader = forUs.getReader();
-      const decoder = new TextDecoder();
-      let out = '';
-      try {
-        while (out.length < ERROR_BODY_MAX) {
-          const { done, value } = await reader.read();
-          if (done) break;
+    const decoder = new TextDecoder();
+    let out = '';
+    let resolveErr!: (v: string | undefined) => void;
+    const errorBodyPromise = new Promise<string | undefined>((r) => {
+      resolveErr = r;
+    });
+    const passThrough = createBoundedScannerStream(
+      res.body,
+      (value) => {
+        if (out.length < ERROR_BODY_MAX) {
           out += decoder.decode(value, { stream: true });
         }
+      },
+      () => {
         out += decoder.decode();
-        // Drain the rest so the tee buffer doesn't hold the stream open.
-        while (true) {
-          const { done } = await reader.read();
-          if (done) break;
-        }
-      } catch {
-        /* client may have aborted */
-      }
-      return out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out;
-    })();
+        resolveErr(out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out);
+      },
+      () => {
+        resolveErr(out.length > 0 ? out.slice(0, ERROR_BODY_MAX) : undefined);
+      },
+    );
     return {
-      response: new Response(forClient, {
+      response: new Response(passThrough, {
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,
@@ -1073,151 +1366,125 @@ function teeForUsage(
       stopReasonPromise: Promise.resolve(undefined),
     };
   }
-  // 5xx: skip both (the host already synthesizes an error message).
-  if (res.status >= 500) {
-    return {
-      response: res,
-      usagePromise: Promise.resolve(undefined),
-      errorBodyPromise: Promise.resolve(undefined),
-      measurementPromise: Promise.resolve(undefined),
-      stopReasonPromise: Promise.resolve(undefined),
-    };
-  }
-  const ct = (res.headers.get('content-type') ?? '').toLowerCase();
-  const [forClient, forUs] = res.body.tee();
 
-  // Single read loop resolves all three; exposed as separate promises for call-site readability.
-  const scanResult = (async (): Promise<{
+  const ct = (res.headers.get('content-type') ?? '').toLowerCase();
+  const isSse = ct.includes('text/event-stream') || (ct === '' && assumeResponsesSse);
+  const isJson = !isSse && (ct.includes('application/json') || (ct === '' && assumeResponsesJson));
+  // Skip wrapping unknown content-types: zero scanner overhead, zero tee buffering.
+  if (!isSse && !isJson) {
+    return emptyResult;
+  }
+
+  const decoder = new TextDecoder();
+  let buf = '';
+  let overflow = false;
+  const MAX_SCAN_BYTES = 4 * 1024 * 1024;
+  const sseBoundaryRe = /\r\n\r\n|\n\n|\r\r/g;
+  const state: { usage: Usage | undefined; stopReason: string | undefined } = {
+    usage: undefined,
+    stopReason: undefined,
+  };
+  const streamedMeasurement: OutputMeasurement | undefined = isSse
+    ? { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 }
+    : undefined;
+
+  type ScanOutcome = {
     usage: Usage | undefined;
     measurement: OutputMeasurement | undefined;
     stopReason: string | undefined;
-  }> => {
-    const reader = forUs.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let streamedMeasurement: OutputMeasurement | undefined;
-    const state: { usage: Usage | undefined; stopReason: string | undefined } = {
-      usage: undefined,
-      stopReason: undefined,
-    };
+  };
+  let resolveScan!: (v: ScanOutcome) => void;
+  const scanResult = new Promise<ScanOutcome>((r) => {
+    resolveScan = r;
+  });
 
+  const finalizeOnEof = (): ScanOutcome => {
+    if (overflow) {
+      return { usage: undefined, measurement: undefined, stopReason: undefined };
+    }
+    buf += decoder.decode();
+    if (isSse && streamedMeasurement) {
+      if (buf.trim().length > 0) processSseEvent(buf, streamedMeasurement, state);
+      return { usage: state.usage, measurement: streamedMeasurement, stopReason: state.stopReason };
+    }
     try {
-      // ChatGPT's /backend-api/codex/responses currently omits Content-Type.
-      // The request's top-level `stream` field selects SSE vs JSON for that
-      // route; explicit unknown media types still fail closed.
-      if (ct.includes('text/event-stream') || (ct === '' && assumeResponsesSse)) {
-        // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
-        const m: OutputMeasurement = {
-          textChars: 0,
-          thinkingChars: 0,
-          toolUseChars: 0,
-          redactedBlockCount: 0,
-        };
-        streamedMeasurement = m;
-        const sseBoundaryRe = /\r\n\r\n|\n\n|\r\r/g;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const prevLen = buf.length;
-          buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line; start scanning at prevLen - 3 so
-          // a split delimiter is caught without rescanning the entire buffer O(N^2).
-          sseBoundaryRe.lastIndex = Math.max(0, prevLen - 3);
-          let consumedUntil = 0;
-          let boundary: RegExpExecArray | null;
-          while ((boundary = sseBoundaryRe.exec(buf)) !== null) {
-            const block = buf.slice(consumedUntil, boundary.index);
-            consumedUntil = boundary.index + boundary[0].length;
-            processSseEvent(block, m, state);
-          }
-          if (consumedUntil > 0) buf = buf.slice(consumedUntil);
-          // A malformed/headerless non-SSE response must not make the audit
-          // branch buffer without bound. Ordinary Responses events are far
-          // smaller; fail closed and drain if no delimiter arrives within 4 MiB.
-          if (buf.length > 4 * 1024 * 1024) {
-            while (true) {
-              const { done: drained } = await reader.read();
-              if (drained) break;
-            }
-            return { usage: undefined, measurement: undefined, stopReason: undefined };
-          }
-        }
-        buf += decoder.decode();
-        if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
-        return { usage: state.usage, measurement: m, stopReason: state.stopReason };
+      const objects = parseJsonObjects(buf);
+      if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
+      let usage: Usage | undefined;
+      let recognizedGoogle = false;
+      const measurement: OutputMeasurement = {
+        textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0,
+      };
+      const jsonState: { stopReason: string | undefined } = { stopReason: undefined };
+      for (const object of objects) {
+        const nextUsage = normalizeUsage(
+          object.usage
+            ?? object.usageMetadata
+            ?? (object.response as Record<string, unknown> | undefined)?.usageMetadata,
+        );
+        if (nextUsage) usage = nextUsage;
+        recognizedGoogle = measureGoogleCandidates(object, measurement, jsonState) || recognizedGoogle;
       }
-
-      if (ct.includes('application/json') || (ct === '' && assumeResponsesJson)) {
-        // Buffer up to 4 MiB for telemetry while still draining oversized
-        // streams to EOF so the client tee never stalls on backpressure.
-        const MAX = 4 * 1024 * 1024;
-        let overflow = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (!overflow) {
-            buf += decoder.decode(value, { stream: true });
-            if (buf.length > MAX) {
-              overflow = true;
-              buf = '';
-            }
-          }
-        }
-        if (overflow) {
-          return { usage: undefined, measurement: undefined, stopReason: undefined };
-        }
-        buf += decoder.decode();
-        try {
-          const objects = parseJsonObjects(buf);
-          if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
-          let usage: Usage | undefined;
-          let recognizedGoogle = false;
-          const measurement: OutputMeasurement = {
-            textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0,
-          };
-          const state: { stopReason: string | undefined } = { stopReason: undefined };
-          for (const object of objects) {
-            const nextUsage = normalizeUsage(
-              object.usage
-                ?? object.usageMetadata
-                ?? (object.response as Record<string, unknown> | undefined)?.usageMetadata,
-            );
-            if (nextUsage) usage = nextUsage;
-            recognizedGoogle = measureGoogleCandidates(object, measurement, state) || recognizedGoogle;
-          }
-          const last = objects[objects.length - 1];
-          return {
-            usage,
-            measurement: recognizedGoogle ? measurement : measureFromMessageJson(last),
-            stopReason: state.stopReason ?? readStopReasonFromJson(last),
-          };
-        } catch {
-          return { usage: undefined, measurement: undefined, stopReason: undefined };
-        }
-      }
+      const last = objects[objects.length - 1];
+      return {
+        usage,
+        measurement: recognizedGoogle ? measurement : measureFromMessageJson(last),
+        stopReason: jsonState.stopReason ?? readStopReasonFromJson(last),
+      };
     } catch {
+      return { usage: undefined, measurement: undefined, stopReason: undefined };
+    }
+  };
+
+  const scanner = isSse ? createPullThroughScannerStream : createBoundedScannerStream;
+  const passThrough = scanner(
+    res.body,
+    (value) => {
+      if (overflow) return;
+      if (isSse && streamedMeasurement) {
+        const prevLen = buf.length;
+        buf += decoder.decode(value, { stream: true });
+        sseBoundaryRe.lastIndex = Math.max(0, prevLen - 3);
+        let consumedUntil = 0;
+        let boundary: RegExpExecArray | null;
+        while ((boundary = sseBoundaryRe.exec(buf)) !== null) {
+          const block = buf.slice(consumedUntil, boundary.index);
+          consumedUntil = boundary.index + boundary[0].length;
+          processSseEvent(block, streamedMeasurement, state);
+        }
+        if (consumedUntil > 0) buf = buf.slice(consumedUntil);
+        if (buf.length > MAX_SCAN_BYTES) {
+          overflow = true;
+          buf = '';
+        }
+      } else {
+        buf += decoder.decode(value, { stream: true });
+        if (buf.length > MAX_SCAN_BYTES) {
+          overflow = true;
+          buf = '';
+        }
+      }
+    },
+    () => {
+      resolveScan(finalizeOnEof());
+      buf = '';
+    },
+    () => {
       if (retainStreamReceipt) {
-        return {
+        resolveScan({
           usage: state.usage,
           measurement: streamedMeasurement,
           stopReason: state.stopReason ?? 'stream_error',
-        };
+        });
+      } else {
+        resolveScan({ usage: undefined, measurement: undefined, stopReason: undefined });
       }
-    }
-    // Unknown content-type: drain to release the tee buffer.
-    try {
-      while (true) {
-        const { done } = await reader.read();
-        if (done) break;
-      }
-    } catch {
-      /* ignore */
-    }
-    return { usage: undefined, measurement: undefined, stopReason: undefined };
-  })();
+      buf = '';
+    },
+  );
 
   return {
-    response: new Response(forClient, {
+    response: new Response(passThrough, {
       status: res.status,
       statusText: res.statusText,
       headers: res.headers,
@@ -1231,6 +1498,7 @@ function teeForUsage(
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
+const DEFAULT_CHATGPT_UPSTREAM = 'https://chatgpt.com';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1245,6 +1513,9 @@ const STRIP_REQ_HEADERS = new Set([
   'accept-encoding', // let upstream choose
   'x-fiche-bypass', // fiche-only opt-out signal; never forwarded upstream
   'x-inkling-bypass', // legacy opt-out alias; never forwarded upstream
+  'x-fiche-session-id', // fiche-only swarm/session isolation key; never forwarded upstream
+  'x-inkling-session-id', // legacy session isolation alias; never forwarded upstream
+  'x-fiche-warp-auth', // loopback warp->daemon auth token; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -1253,6 +1524,14 @@ const STRIP_RES_HEADERS = new Set([
   'transfer-encoding',
   'content-encoding', // we don't re-encode
   'content-length',   // body may differ after streaming
+  'x-fiche-undecoded-encoding', // internal node-fetch signal
+]);
+
+const STRIP_RES_HEADERS_KEEP_ENCODING = new Set([
+  'connection',
+  'keep-alive',
+  'transfer-encoding',
+  'x-fiche-undecoded-encoding', // internal node-fetch signal
 ]);
 
 function filterHeaders(src: Headers, strip: Set<string>): Headers {
@@ -1298,7 +1577,9 @@ const OPENAI_CHAT_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/chat\\/completions$`
 const OPENAI_RESPONSES_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/responses$`);
 
 function isOpenAIChatPath(pathname: string): boolean {
-  return OPENAI_CHAT_PATH.test(pathname);
+  return OPENAI_CHAT_PATH.test(pathname)
+    || pathname === '/v1beta/openai/chat/completions'
+    || pathname === '/v1/openai/chat/completions';
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
@@ -1317,9 +1598,11 @@ function isChatGPTBackendPath(pathname: string): boolean {
 }
 
 /** Google API shapes that are not inference (countTokens, model listing,
- *  Code Assist control calls). They go to the Google upstream untransformed. */
+ *  Code Assist control calls, and Gemini OpenAI-compat chat). They go to the
+ *  Google upstream. */
 function isGoogleFamilyPath(pathname: string): boolean {
   return /^\/(?:upload\/)?v1(?:beta|alpha)\//.test(pathname)
+    || pathname === '/v1/openai/chat/completions'
     || pathname.startsWith('/v1internal:')
     || /^\/v1\/models\/[^/]+:[A-Za-z]+$/.test(pathname);
 }
@@ -1353,7 +1636,7 @@ export type InboundCredential =
   /** A bearer of unrecognised shape. Gateways and self-hosted upstreams use these. */
   | 'opaque-bearer';
 
-const ANTHROPIC_BEARER_RE = /(?:^|,\s*)Bearer\s+sk-ant-/i;
+const ANTHROPIC_BEARER_RE = /\bsk-ant-/i;
 const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
 /** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
 const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
@@ -1417,21 +1700,84 @@ export function resolveOpenAIRouteAuth(
     : { action: 'keep-inbound', reason: 'caller-credential-forwarded' };
 }
 
+function isNonChatOpenAIPath(pathname: string): boolean {
+  return pathname === '/v1/embeddings'
+    || pathname.startsWith('/v1/embeddings/')
+    || pathname === '/v1/files'
+    || pathname.startsWith('/v1/files/')
+    || pathname === '/v1/batches'
+    || pathname.startsWith('/v1/batches/')
+    || pathname === '/v1/audio'
+    || pathname.startsWith('/v1/audio/')
+    || pathname === '/v1/images'
+    || pathname.startsWith('/v1/images/');
+}
+
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
-  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
-  // `sk-ant-…` bearer is Anthropic by construction (Claude Code subscription
-  // auth sends `authorization: Bearer sk-ant-oat01-…` with no x-api-key).
-  // Without this check that OAuth token would be forwarded to the OpenAI
-  // upstream: a credential leak, and a guaranteed 401.
-  const bearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '');
-  const looksOpenAIAuth =
-    hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key') && !bearerIsAnthropic);
-  return pathname === '/v1/chat/completions'
+  if (
+    pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
     || isChatGPTBackendPath(pathname)
-    || (isModelsPath && looksOpenAIAuth);
+  ) {
+    return true;
+  }
+  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
+  const isOtherOpenAI = isNonChatOpenAIPath(pathname);
+  if (!isModelsPath && !isOtherOpenAI) return false;
+
+  // Check Host first so explicit first-party Hosts never cross-route.
+  const host = extractHostname(headers.get('host'));
+  if (host === 'api.openai.com' || host === 'chatgpt.com') return true;
+  if (host === 'api.anthropic.com') return false;
+
+  // Check !isAnthropicAuth BEFORE hasOpenAIKey so setting OPENAI_API_KEY
+  // never hijacks Anthropic /v1/models or /v1/files requests.
+  const inbound = classifyInboundCredential(headers);
+  const isAnthropicAuth =
+    inbound === 'anthropic-key'
+    || inbound === 'anthropic-bearer'
+    || headers.has('x-api-key')
+    || /\bsk-ant-/i.test(headers.get('authorization') ?? '');
+  if (isAnthropicAuth) return false;
+
+  if (isModelsPath) {
+    return hasOpenAIKey || inbound !== 'none';
+  }
+  // Non-chat OpenAI /v1/* paths (/v1/embeddings, /v1/files, /v1/batches, /v1/audio/*, /v1/images/*)
+  return hasOpenAIKey || inbound === 'oauth-jwt' || inbound === 'api-key-bearer' || inbound === 'opaque-bearer';
+}
+
+/** anthropic-beta values count_tokens has rejected in this process. Clients
+ *  (e.g. Claude Code) may send betas that /v1/messages accepts but
+ *  /v1/messages/count_tokens does not; we learn them from the 400 and drop them. */
+const COUNT_TOKENS_REJECTED_BETAS_MAX = 64;
+const countTokensRejectedBetas = new Set<string>();
+const REJECTED_BETA_RE = /Unexpected value\(s\) (.+?) for the `anthropic-beta` header/;
+
+/** Extract beta names a count_tokens 400 complained about (backtick-quoted). */
+export function parseRejectedBetas(errorBody: string): string[] {
+  let msg = errorBody;
+  try {
+    const j = JSON.parse(errorBody) as { error?: { message?: unknown } };
+    if (typeof j?.error?.message === 'string') msg = j.error.message;
+  } catch { /* not JSON — scan raw text */ }
+  const m = REJECTED_BETA_RE.exec(msg);
+  if (!m) return [];
+  return [...(m[1] ?? '').matchAll(/`([^`]+)`/g)].map((x) => (x[1] ?? '').trim()).filter(Boolean);
+}
+
+function dropRejectedBetas(headers: Headers): void {
+  const raw = headers.get('anthropic-beta');
+  if (!raw || countTokensRejectedBetas.size === 0) return;
+  const kept = raw.split(',').map((b) => b.trim()).filter((b) => b && !countTokensRejectedBetas.has(b));
+  if (kept.length) headers.set('anthropic-beta', kept.join(','));
+  else headers.delete('anthropic-beta');
+}
+
+/** Test hook. */
+export function resetCountTokensRejectedBetasForTests(): void {
+  countTokensRejectedBetas.clear();
 }
 
 /** POST /v1/messages/count_tokens with the given body. Returns the upstream's
@@ -1440,30 +1786,84 @@ function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey:
  *  on the PRE-COMPRESSION body to get the ground-truth baseline. Actual
  *  post-compression tokens already come back free in the /v1/messages usage
  *  block (input_tokens + cache_create + cache_read), so no second probe. */
+const COUNT_TOKENS_ERROR_MAX_BYTES = 4096;
+
+async function readBoundedErrorText(res: Response, maxBytes = COUNT_TOKENS_ERROR_MAX_BYTES): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      const take = Math.min(value.byteLength, maxBytes - total);
+      chunks.push(take === value.byteLength ? value : value.subarray(0, take));
+      total += take;
+    }
+  } catch {
+    // Ignore read errors on error path.
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  return new TextDecoder().decode(concatChunks(chunks, total));
+}
+
 async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
   headers: Headers,
+  onError?: (reason: string) => void,
+  retried = false,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  parentSignal?: AbortSignal,
 ): Promise<number | null> {
+  let res: Response | undefined;
   try {
-    const res = await fetch(countTokensUrl, {
+    if (parentSignal?.aborted) return null;
+    const reqHeaders = new Headers(headers);
+    dropRejectedBetas(reqHeaders);
+    res = await fetchImpl(countTokensUrl, {
       method: 'POST',
-      headers,
+      headers: reqHeaders,
       body: body as unknown as BodyInit,
       redirect: 'manual',
-      signal: AbortSignal.timeout(COUNT_TOKENS_TIMEOUT_MS),
+      signal: combineAbortSignals(COUNT_TOKENS_TIMEOUT_MS, parentSignal),
     });
+    if (res.status === 400 && !retried) {
+      const text = await readBoundedErrorText(res, COUNT_TOKENS_ERROR_MAX_BYTES);
+      const rejected = parseRejectedBetas(text);
+      if (rejected.length > 0 && rejected.some((b) => !countTokensRejectedBetas.has(b))) {
+        for (const b of rejected) {
+          if (countTokensRejectedBetas.size >= COUNT_TOKENS_REJECTED_BETAS_MAX) break;
+          countTokensRejectedBetas.add(b);
+        }
+        return countTokensUpstream(countTokensUrl, body, reqHeaders, onError, true, fetchImpl, parentSignal);
+      }
+      const redacted = redactSecrets(text);
+      onError?.(`http_400${redacted ? ` ${redacted.slice(0, 300)}` : ''}`);
+      return null;
+    }
     if (!res.ok) {
-      await res.body?.cancel().catch(() => {});
+      const detail = redactSecrets(await readBoundedErrorText(res, COUNT_TOKENS_ERROR_MAX_BYTES)).slice(0, 300);
+      onError?.(`http_${res.status}${detail ? ` ${detail}` : ''}`);
       return null;
     }
     const json = (await res.json()) as { input_tokens?: unknown };
-    return typeof json.input_tokens === 'number' ? json.input_tokens : null;
-  } catch {
+    if (typeof json.input_tokens === 'number') return json.input_tokens;
+    onError?.('no_input_tokens_in_response');
+    return null;
+  } catch (e) {
+    await res?.body?.cancel().catch(() => undefined);
+    const msg = redactSecrets(String((e as Error)?.message ?? e)).slice(0, 200);
+    onError?.(`fetch_error ${(e as Error)?.name ?? ''}: ${msg}`);
     return null;
   }
 }
 
+const PREFERRED_GOOGLE_COUNT_SHAPE_MAX = 64;
 const preferredGoogleCountShapeByHost = new Map<string, 0 | 1>();
 
 export function resetGoogleCountShapePreferenceForTests(): void {
@@ -1475,6 +1875,8 @@ async function countGoogleTokensUpstream(
   body: Uint8Array,
   headers: Headers,
   model: string,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+  parentSignal?: AbortSignal,
 ): Promise<number | null> {
   try {
     const rawParsed = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
@@ -1487,33 +1889,48 @@ async function countGoogleTokensUpstream(
     try {
       host = new URL(countTokensUrl).host;
     } catch {}
-    const preferred = (host ? preferredGoogleCountShapeByHost.get(host) : undefined) ?? 0;
+    const cachedShape = host ? preferredGoogleCountShapeByHost.get(host) : undefined;
+    if (host && cachedShape !== undefined) {
+      preferredGoogleCountShapeByHost.delete(host);
+      preferredGoogleCountShapeByHost.set(host, cachedShape);
+    }
+    const preferred = cachedShape ?? 0;
     const orderedShapes: readonly string[] = preferred === 1
       ? [shapeWrapped, shapeBare]
       : [shapeBare, shapeWrapped];
     const deadline = Date.now() + COUNT_TOKENS_TIMEOUT_MS;
     const perShapeTimeout = Math.floor(COUNT_TOKENS_TIMEOUT_MS / orderedShapes.length);
     for (const countBody of orderedShapes) {
+      if (parentSignal?.aborted) break;
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) break;
+      let res: Response | undefined;
       try {
-        const res = await fetch(countTokensUrl, {
+        res = await fetchImpl(countTokensUrl, {
           method: 'POST',
           headers,
           body: countBody,
           redirect: 'manual',
-          signal: AbortSignal.timeout(Math.min(remainingMs, perShapeTimeout)),
+          signal: combineAbortSignals(Math.min(remainingMs, perShapeTimeout), parentSignal),
         });
         if (res.ok) {
           const json = (await res.json()) as { totalTokens?: unknown };
           if (typeof json.totalTokens === 'number') {
-            if (host) preferredGoogleCountShapeByHost.set(host, countBody === shapeWrapped ? 1 : 0);
+            if (host) {
+              preferredGoogleCountShapeByHost.delete(host);
+              preferredGoogleCountShapeByHost.set(host, countBody === shapeWrapped ? 1 : 0);
+              if (preferredGoogleCountShapeByHost.size > PREFERRED_GOOGLE_COUNT_SHAPE_MAX) {
+                const oldest = preferredGoogleCountShapeByHost.keys().next().value;
+                if (oldest !== undefined) preferredGoogleCountShapeByHost.delete(oldest);
+              }
+            }
             return json.totalTokens;
           }
         } else {
           await res.body?.cancel().catch(() => {});
         }
       } catch {
+        await res?.body?.cancel().catch(() => {});
         // try next payload shape
       }
     }
@@ -1552,8 +1969,8 @@ export function resolveUpstreams(config: ProxyConfig): {
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
   }
   return {
-    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
-    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
+    anthropic: (config.upstream ?? config.sharedUpstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
+    openai: (config.openAIUpstream ?? config.sharedUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
     stripOpenAIV1: false,
   };
 }
@@ -1585,7 +2002,7 @@ function extractHostname(hostHeader: string | null): string {
     return end !== -1 ? trimmed.slice(1, end) : trimmed;
   }
   const colon = trimmed.indexOf(':');
-  return colon !== -1 ? trimmed.slice(0, colon) : trimmed;
+  return (colon !== -1 ? trimmed.slice(0, colon) : trimmed).replace(/\.$/, '');
 }
 
 function stripTrailingSlashes(str: string): string {
@@ -1623,17 +2040,41 @@ function resolveGoogleUpstream(
   }
   const host = extractHostname(req.headers.get('host'));
   if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {
-    return host === 'cloudcode-pa.googleapis.com'
-      ? 'https://cloudcode-pa.googleapis.com'
-      : 'https://daily-cloudcode-pa.googleapis.com';
+    return host === 'daily-cloudcode-pa.googleapis.com'
+      ? 'https://daily-cloudcode-pa.googleapis.com'
+      : 'https://cloudcode-pa.googleapis.com';
   }
   if (host === 'generativelanguage.googleapis.com') {
     return 'https://generativelanguage.googleapis.com';
   }
-  if (passthroughUpstream !== DEFAULT_UPSTREAM && !passthroughUpstream.endsWith('/anthropic')) {
+  if (config.sharedUpstream) {
+    const shared = stripTrailingSlashes(config.sharedUpstream.trim());
+    if (shared && !shared.endsWith('/anthropic')) {
+      return shared;
+    }
+  }
+  if (isProviderPrefixedPath(pathname) && passthroughUpstream !== DEFAULT_UPSTREAM && !passthroughUpstream.endsWith('/anthropic')) {
     return passthroughUpstream;
   }
   return 'https://generativelanguage.googleapis.com';
+}
+
+function resolveOpenAIUpstream(
+  req: Request,
+  pathname: string,
+  openAIUpstream: string,
+  config: ProxyConfig,
+): string {
+  if (config.provider === 'cloudflare-ai-gateway') {
+    return openAIUpstream;
+  }
+  if (
+    openAIUpstream === DEFAULT_OPENAI_UPSTREAM &&
+    (isChatGPTBackendPath(pathname) || extractHostname(req.headers.get('host')) === 'chatgpt.com')
+  ) {
+    return DEFAULT_CHATGPT_UPSTREAM;
+  }
+  return openAIUpstream;
 }
 
 /** Build the proxy fetch handler. */
@@ -1650,6 +2091,7 @@ export function createProxy(config: ProxyConfig = {}) {
   const idleTimeoutMs = config.upstreamIdleTimeoutMs ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
   const duplicateHoldMs = config.duplicateHoldMs ?? DEFAULT_DUPLICATE_HOLD_MS;
   const maxRequestBytes = resolveMaxRequestBytes(config.maxRequestBytes);
+  const oversizedBodyPolicy = config.oversizedBodyPolicy ?? 'reject';
   // Explicit precedence: Cloudflare > OpenAI > normal family routing.
   for (const model of config.openAIModels ?? []) {
     const id = model.trim();
@@ -1724,6 +2166,28 @@ let responseContentType: string | undefined;
     let reqBodySha256: string | undefined;
     // Set once the transform returns; read by fire() at event time.
     let transformMs: number | undefined;
+    // Why the baseline count_tokens probe failed (status + upstream error), if it did.
+    let baselineProbeError: string | undefined;
+    const fetchImpl = config.fetch ?? globalThis.fetch;
+    const upstreamAbort = new AbortController();
+    const clientSignal = req.signal;
+    let clientAbortWired = false;
+    const onClientAbort = (): void => {
+      if (!upstreamAbort.signal.aborted) {
+        upstreamAbort.abort(clientSignal?.reason ?? new Error('fiche: client disconnected'));
+      }
+    };
+    const ensureClientAbortWired = (): void => {
+      if (clientAbortWired || !clientSignal) return;
+      clientAbortWired = true;
+      if (clientSignal.aborted) onClientAbort();
+      else clientSignal.addEventListener('abort', onClientAbort, { once: true });
+    };
+    const detachClientAbort = (): void => {
+      if (!clientAbortWired || !clientSignal) return;
+      clientAbortWired = false;
+      clientSignal.removeEventListener('abort', onClientAbort);
+    };
 
     const fire = (
       status: number,
@@ -1773,11 +2237,16 @@ let responseContentType: string | undefined;
           }
           if (baselineResolved === null) {
             info.baselineProbeStatus = 'failed';
+            if (baselineProbeError) info.baselineProbeError = baselineProbeError;
           } else if (cacheableExpected && cacheableResolved === null) {
             info.baselineProbeStatus = 'partial'; // dashboard excludes row; must not treat as cacheable=0
+          } else if (threadContinue) {
+            // Delta-only baseline vs full-thread usage: rollups must exclude the row.
+            info.baselineProbeStatus = 'partial';
           } else {
             info.baselineProbeStatus = 'ok';
           }
+          if (threadContinue) info.threadContinue = true;
         }
         // The Messages compatibility response exposes Anthropic's disjoint
         // usage buckets to the client. Dashboard accounting still needs the
@@ -1824,7 +2293,7 @@ let responseContentType: string | undefined;
       return finalize();
     };
     const fireWait = (...args: Parameters<typeof fire>): void => {
-      const p = fire(...args);
+      const p = fire(...args).catch(() => undefined);
       config.waitUntil?.(p);
     };
 
@@ -1835,6 +2304,23 @@ let responseContentType: string | undefined;
     // to have its traffic forwarded byte-for-byte untouched.
     const bypassHeader = req.headers.get('x-fiche-bypass') ?? req.headers.get('x-inkling-bypass');
     const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
+    const ficheSessionRaw = (req.headers.get('x-fiche-session-id') ?? req.headers.get('x-inkling-session-id'))?.trim() ?? null;
+    const ccSessionRaw = req.headers.get('x-claude-code-session-id')?.trim() ?? null;
+    const validatedFicheSessionId =
+      ficheSessionRaw !== null && /^[A-Za-z0-9._:-]{4,128}$/.test(ficheSessionRaw)
+        ? ficheSessionRaw
+        : undefined;
+    const validatedCcSessionId =
+      ccSessionRaw !== null && /^[A-Za-z0-9_-]{8,128}$/.test(ccSessionRaw)
+        ? ccSessionRaw
+        : undefined;
+    const validatedClientSessionId = validatedFicheSessionId ?? validatedCcSessionId;
+    const validatedClientSessionSource: 'fiche-header' | 'claude-code-header' | undefined =
+      validatedFicheSessionId
+        ? 'fiche-header'
+        : validatedCcSessionId
+          ? 'claude-code-header'
+          : undefined;
     const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
     const rawProviders = typeof config.enabledProviders === 'function'
       ? config.enabledProviders()
@@ -1853,32 +2339,52 @@ let responseContentType: string | undefined;
     // Wire-shape detection stays independent from transform eligibility. A
     // bypassed Codex request is still an OpenAI Responses request for routing,
     // accounting, and response scanning; only its body transformation is off.
-    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(wirePathname);
+    const isMessagesWire =
+      req.method === 'POST'
+      && (isAnthropicMessagesPath(wirePathname) || (Boolean(follow) && wirePathname === '/messages'));
     const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(wirePathname);
     const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(wirePathname);
-    const isMessages = !bypass && isMessagesWire;
-    const isOpenAIChat = !bypass && isOpenAIChatWire;
-    const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
     const googleModelFromPath = req.method === 'POST' && !follow
       ? parseGoogleModelFromPath(url.pathname)
       : null;
     const isGoogleInference = req.method === 'POST' && !follow && isGoogleInferencePath(url.pathname);
     const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
-    const isGoogle = isGoogleRoute && !bypass;
     const isGoogleFamily = !follow && (isGoogleRoute || isGoogleFamilyPath(url.pathname));
     const isOpenAIPath = !follow && isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
+    const isAnthropicCredentialRoute =
+      !isGoogleFamily
+      && !isOpenAIChatWire
+      && !isOpenAIResponsesWire
+      && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))
+      && (isAnthropicFamilyPath(url.pathname) || url.pathname.startsWith('/anthropic/') || isMessagesWire);
+    const firstPartyProvider: 'anthropic' | 'openai' | 'google' | undefined = !follow
+      ? isGoogleFamily
+        ? 'google'
+        : (isOpenAIPath || isOpenAIChatWire || isOpenAIResponsesWire || url.pathname.startsWith('/openai/'))
+          ? 'openai'
+          : (isAnthropicCredentialRoute || isMessagesWire || url.pathname.startsWith('/anthropic/'))
+            ? 'anthropic'
+            : undefined
+      : undefined;
+    const firstPartyDisabled =
+      firstPartyProvider !== undefined && activeProviderSet !== undefined && !activeProviderSet.has(firstPartyProvider);
+    const isMessages = !bypass && !firstPartyDisabled && isMessagesWire;
+    const isOpenAIChat = !bypass && !firstPartyDisabled && isOpenAIChatWire;
+    const isOpenAIResponses = !bypass && !firstPartyDisabled && isOpenAIResponsesWire;
+    const isGoogle = isGoogleRoute && !bypass && !firstPartyDisabled;
     const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
+    const resolvedOpenAIUpstream = resolveOpenAIUpstream(req, url.pathname, openAIUpstream, config);
     const upstreamBase = follow
       ? follow.origin
       : isGoogleFamily
-      ? googleUpstream
-      : providerPrefixed
-        ? passthroughUpstream
-        : isOpenAIPath ? openAIUpstream : upstream;
+        ? googleUpstream
+        : providerPrefixed
+          ? passthroughUpstream
+          : isOpenAIPath ? resolvedOpenAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     /** Set when `decodeRequestBody` undid the request Content-Encoding. */
@@ -1896,6 +2402,8 @@ let responseContentType: string | undefined;
     let baselinePromise: Promise<number | null> | undefined;
     let baselineCacheablePromise: Promise<number | null> | undefined;
     let baselineStatusApplies = false;
+    // Server-side thread continuation: probe sees only delta while provider bills full thread.
+    let threadContinue = false;
     let responsesStreaming = false;
     let isAnthropicMessagesRoute = false;
 
@@ -1923,335 +2431,480 @@ let responseContentType: string | undefined;
       }), { status: 404, headers: { 'content-type': 'application/json' } });
     }
 
-    if (bypass && isOpenAIResponsesWire
+    if ((bypass || firstPartyDisabled) && isOpenAIResponsesWire
       && (req.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
       responsesStreaming = await readStreamFieldFromClone(req);
     }
 
-    if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
-      // Transformable routes have to hold the whole body, so this is the one
-      // place a client could otherwise choose how much the proxy allocates.
-      // Refuse past the ceiling before any allocation the caller controls, and
-      // before any upstream call: a 413 the provider would have sent anyway is
-      // cheaper for everyone than an out-of-memory host.
-      const bounded = await readBodyBounded(req, maxRequestBytes);
-      if (!bounded.ok) {
-        const message =
-          `request body exceeds the ${maxRequestBytes}-byte fiche limit ` +
-          `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
-          `read ${bounded.observedBytes})`;
+    let releaseInFlight = (): void => {};
+    const acquireInFlightLease = async (bodyBytesForKey: Uint8Array): Promise<Response | null> => {
+      if (bodyBytesForKey.byteLength === 0 || duplicateHoldMs <= 0) return null;
+      const rawHash = await sha256Bytes(bodyBytesForKey);
+      const keyHeaders: [string, string][] = [];
+      filterHeaders(req.headers, STRIP_REQ_HEADERS).forEach((value, name) => {
+        keyHeaders.push([name, value]);
+      });
+      const hostVal = req.headers.get('host');
+      if (hostVal) keyHeaders.push(['host', hostVal]);
+      keyHeaders.sort(([a, av], [b, bv]) => a.localeCompare(b) || av.localeCompare(bv));
+      const key = await sha256Text(JSON.stringify([
+        req.method,
+        upstreamBase,
+        path,
+        keyHeaders,
+        rawHash,
+        validatedClientSessionId ?? '',
+      ]));
+      const now = Date.now();
+      const sinceSweep = now - lastSweptAt;
+      if (
+        sinceSweep >= duplicateHoldMs
+        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
+      ) {
+        for (const [k, v] of inFlight) {
+          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
+        }
+        lastSweptAt = now;
+      }
+      const existing = inFlight.get(key);
+      if (existing && now - existing.startedAt < duplicateHoldMs) {
+        detachClientAbort();
+        if (!upstreamAbort.signal.aborted) {
+          upstreamAbort.abort(new Error('fiche: duplicate request rejected'));
+        }
+        const message = 'An identical request is already in progress';
+        fireWait(409, undefined, 'duplicate_request_in_flight');
         const error = isMessages
-          ? { type: 'error', error: { type: 'request_too_large', message } }
-          : { error: { type: 'request_too_large', message } };
-        // Emit like the serialized-size 413 below: a rejected request is still a
-        // dashboard row, otherwise over-limit clients are invisible.
-        fireWait(413, undefined, message);
+          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
+          : { error: { type: 'duplicate_request_in_flight', message } };
         return new Response(JSON.stringify(error), {
-          status: 413,
+          status: 409,
           headers: { 'content-type': 'application/json' },
         });
       }
-      let bodyIn = bounded.bytes;
-      const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
-      if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
-        const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
-        if (decoded) {
-          bodyIn = decoded;
-          requestBodyDecoded = true;
+      const lease = Symbol();
+      inFlight.set(key, { lease, startedAt: now });
+      releaseInFlight = () => {
+        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
+      };
+      return null;
+    };
+
+    if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
+      // Transformable routes have to hold the whole body to rewrite it, so this
+      // is the one place a caller could otherwise choose how much memory fiche
+      // allocates. Bound the read before allocating past `maxRequestBytes`.
+      //
+      // Under `'passthrough'` (loopback Node), a body past the ceiling streams
+      // straight upstream untouched so multimodal payloads are never broken by
+      // a local cap — except when `/v1/messages` model-bridging is configured,
+      // where forwarding unparsed Anthropic JSON could cross provider boundaries.
+      const canStreamOversized =
+        oversizedBodyPolicy === 'passthrough' && !(isMessages && modelRoutes.size > 0);
+      const bounded = await readBodyBounded(req, maxRequestBytes, canStreamOversized);
+      if (!bounded.ok) {
+        if (canStreamOversized) {
+          bodyOut = bounded.restoredBody ?? null;
+          info = {
+            compressed: false,
+            reason: 'body_too_large',
+            origChars: 0,
+            compressedChars: 0,
+            imageCount: 0,
+            imageBytes: 0,
+            staticChars: 0,
+            dynamicChars: 0,
+            dynamicBlockCount: 0,
+          };
+        } else {
+          const message =
+            `request body exceeds the ${maxRequestBytes}-byte fiche limit ` +
+            `(${bounded.declaredBytes !== undefined ? `declared ${bounded.declaredBytes}, ` : ''}` +
+            `read ${bounded.observedBytes})`;
+          const error = isMessages
+            ? { type: 'error', error: { type: 'request_too_large', message } }
+            : { error: { type: 'request_too_large', message } };
+          // Emit like the serialized-size 413 below: a rejected request is still a
+          // dashboard row, otherwise over-limit clients are invisible.
+          fireWait(413, undefined, message);
+          return new Response(JSON.stringify(error), {
+            status: 413,
+            headers: { 'content-type': 'application/json' },
+          });
         }
-      }
-      const encodedUndecoded =
-        contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
-      try {
-        const baseTransformOpts =
-          typeof config.transform === 'function' ? config.transform() : config.transform;
-        // Bytes still under a coding we did not undo must not be rewritten: the
-        // header would go out unchanged and the upstream would try to decompress
-        // whatever the transform produced. Forward them as they came.
-        const transformOpts = encodedUndecoded
-          ? { ...baseTransformOpts, compress: false }
-          : baseTransformOpts;
-        // Fail-closed: unreadable model → no compression, not a risky guess.
-        const model = googleModelFromPath ?? readModelField(bodyIn);
-        if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
-        requestModel = model ?? undefined;
-        // A turn whose only content is `@inkling pin` / `@inkling unpin` is
-        // configuration, not a question. Answer it here unless compression is
-        // paused/disabled: passthrough mode must forward `@fiche pin` untouched.
-        if (transformOpts?.compress !== false && (isMessages || isOpenAIChat || isOpenAIResponses)) {
-          try {
-            const pinReply = isMessages
-              ? pinCommandResponse(bodyIn)
-              : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
-            if (pinReply) {
-              return new Response(pinReply.body, {
-                status: 200,
-                headers: {
-                  'content-type': pinReply.contentType,
-                  'cache-control': 'no-cache',
-                },
-              });
+      } else {
+        let bodyIn = bounded.bytes;
+        const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
+        let decodeTooLarge = false;
+        if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
+          const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
+          if (decoded instanceof Uint8Array) {
+            bodyIn = decoded;
+            requestBodyDecoded = true;
+          } else if (decoded && typeof decoded === 'object') {
+            if (decoded.status === 'ok') {
+              bodyIn = decoded.bytes;
+              requestBodyDecoded = true;
+            } else if (decoded.status === 'too_large') {
+              decodeTooLarge = true;
             }
-          } catch {
-            // Fail open: malformed pin parsing must never abort a live agent request.
           }
         }
-        // /v1/messages is only a wire schema: Claude Code can target a non-
-        // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
-        // renderer or Anthropic count_tokens merely because the route is
-        // Messages-shaped. Enabled GPT models take the standalone
-        // Messages→Responses bridge; unsupported models still fail closed.
-        // Claude Code model aliases decode back to exact Cloudflare model IDs.
-        const decodedByAlias = [...modelRoutes.keys()]
-          .find((candidate) => claudeGatewayModelId(candidate) === model);
-        const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
-        const routedModel = decodedChatModel ?? model;
-        // A followed host answers for its own models; never bridge them elsewhere.
-        const modelRoute = routedModel && !follow ? modelRoutes.get(routedModel) : undefined;
-        modelRouteForRequest = modelRoute;
-        const forceChat = isMessages && modelRoute === 'cloudflare';
-        const messagesAnthropic = isMessages
-          && modelRoute === undefined && !forceChat && (Boolean(follow) || isClaudeModel(model));
-        isAnthropicMessagesRoute = messagesAnthropic;
-        // Provider routing is explicit. Unlisted Messages models use the
-        // default Anthropic route, regardless of how their id is shaped.
-        bridgedGptMessages =
-          isMessages && !messagesAnthropic && !forceChat
-          && modelRoute === 'openai';
-        // Messages → Chat Completions bridge toward Cloudflare Workers AI.
-        bridgedChatMessages = forceChat;
-        const chatStamp = bridgedChatMessages ? routedModel : undefined;
-        const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
-        // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
-        // allowlist gates it so INKLING_MODELS / the chip can opt out.
-        const modelOk = isGoogle
-          ? (isGeminiModel(model) && isInklingSupportedModel(model))
-          : isMessages
-            ? (messagesAnthropic && isInklingSupportedModel(model))
-              || (bridgedGptMessages && isInklingSupportedGptModel(effectiveModel))
-              || (bridgedChatMessages && isInklingSupportedGptModel(effectiveModel))
-            : isInklingSupportedGptModel(model);
-        // Compression eligibility and telemetry follow the model that actually
-        // receives the request, not Claude Code's local gateway alias.
-        if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
-          requestModel = effectiveModel;
-        }
-        const bridgeBody = bridgedGptMessages
-          ? (() => {
-              const bridged = JSON.parse(new TextDecoder().decode(
-                anthropicMessagesToOpenAIResponses(bodyIn),
-              )) as Record<string, unknown>;
-              bridged.model = effectiveModel;
-              return new TextEncoder().encode(JSON.stringify(bridged));
-            })()
-          : bridgedChatMessages
-            ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
-            : bodyIn;
-        const routeModel = effectiveModel ?? model ?? undefined;
-        // Third-party hosts never get the OpenAI-only breakpoint field.
-        const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
-          pathname: url.pathname,
-          upstream: openAIUpstream,
-        });
-        // Allowlisted models image, except weak or unmeasured readers (Claude
-        // 5.5, Grok, Gemini 4 hydrogen/carbon, DeepSeek, Kimi, GLM, MiniMax),
-        // which stay text unless INKLING_FORCE_IMAGES=1. When compression is not
-        // switched off, weak/text-only/third-party models still receive
-        // prefix-safe deterministic text hygiene (`imageCompress: false`).
-        const imageThisRequest =
-          transformOpts?.stageToggles?.optical !== false &&
-          shouldImageModel(routeModel, modelOk);
-        const hygieneForcedOn = resolveTextHygieneMode(transformOpts?.textHygiene) === 'on';
-        const familyInScope = modelOk || isInConfiguredModelBases(routeModel);
-        const killSwitchOff = transformOpts?.compress === false || (!familyInScope && !hygieneForcedOn);
-        const effectiveOpts = killSwitchOff
-          ? { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints }
-          : imageThisRequest
-            ? { ...transformOpts, imageCompress: true, explicitPromptCacheBreakpoints: allowBreakpoints }
-            : { ...transformOpts, imageCompress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
-        // Local render+encode cost only. The Google branch below issues upstream
-        // count_tokens probes, so the timer closes here rather than after them —
-        // otherwise network latency would be charged to our own CPU.
-        const tTransform = Date.now();
-        // Fail open: a renderer or transform bug must never cost the user a
-        // turn. The request goes out as it arrived (after any wire bridge, which
-        // the upstream needs), and the event row records why.
-        let r: { body: Uint8Array; info: TransformInfo };
-        try {
-          r = isGoogle
-            ? await transformGoogleGenerateContent(bridgeBody, model!, effectiveOpts)
-            : isMessages
-              ? bridgedGptMessages
-                ? await transformOpenAIResponses(bridgeBody, effectiveOpts)
-                : bridgedChatMessages
-                  ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                  : await transformRequest(bridgeBody, { ...effectiveOpts, model: effectiveModel ?? undefined })
-              : isOpenAIChat
-                ? await transformOpenAIChatCompletions(bridgeBody, effectiveOpts)
-                : await transformOpenAIResponses(bridgeBody, effectiveOpts);
-        } catch (e) {
-          r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
-        }
-        if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
-          try {
-            r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
-          } catch {
-            // Fail open if response/body scrubbing encounters an unexpected shape.
-          }
-        }
-        transformMs = Date.now() - tTransform;
-        // CloudCode PA (`/v1internal:*`) has no `:countTokens` endpoint, and
-        // text-hygiene-only turns already have exact local token deltas.
-        if (
-          isGoogle &&
-          r.info.compressed &&
-          (r.info.imageCount ?? 0) > 0 &&
-          !url.pathname.startsWith('/v1internal:')
-        ) {
-          try {
-            const countUrl = new URL(
-              (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
-                /:(?:generateContent|streamGenerateContent)$/,
-                ':countTokens',
-              ),
-            );
-            for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
-            countUrl.searchParams.delete('alt');
-            const countHeaders = applyGatewayHeadersIfTargeted(
-              filterHeaders(req.headers, STRIP_REQ_HEADERS),
-              countUrl.toString(),
-            );
-            stripAnthropicCredentials(countHeaders);
-            countHeaders.delete('content-encoding');
-            countHeaders.set('content-type', 'application/json');
-            const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
-            const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
-            if (googleSyncProbe) {
-              const [baseline, transformed] = await Promise.all([
-                countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!),
-                countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!),
-              ]);
-              if (baseline !== null && transformed !== null) {
-                if (transformed >= baseline) {
-                  r = {
-                    body: bodyIn,
-                    info: revertedGoogleInfo(
-                      r.info,
-                      `not_profitable (${transformed} >= ${baseline} tokens)`,
-                      'ok',
-                    ),
-                  };
-                } else {
-                  r.info.baselineTokens = baseline;
-                  r.info.baselineProbeStatus = 'ok';
-                }
-              } else {
-                // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
-                // Retain local profitability decision computed by transformGoogleGenerateContent.
-                r.info.baselineProbeStatus = 'failed';
-              }
-            } else {
-              baselineStatusApplies = true;
-              baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!);
-            }
-          } catch {
-            r.info.baselineProbeStatus = 'failed';
-          }
-        }
-        if (!modelOk && !r.info.compressed) r.info.reason = 'unsupported_model';
-        bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
-        info = r.info;
-        reqBodyBytes = r.body;
-        r.info.serializedRequestBytes = r.body.byteLength;
-        if (r.body.byteLength > 0) {
-          reqBodySha256 = await sha256Bytes(r.body);
-          reqBodySha8 = reqBodySha256.slice(0, 8);
-        }
-        let requestByteLimit: number | undefined;
-        try {
-          requestByteLimit = requestModel
-            ? resolveGptProfile(requestModel).maxSerializedRequestBytes
-            : undefined;
-        } catch {
-          requestByteLimit = undefined;
-        }
-        if (r.info.compressed && requestByteLimit !== undefined) {
-          if (r.body.byteLength > requestByteLimit) {
-            r.info.sizeLimitOutcome = 'rejected';
-            const message = `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
-            fireWait(413, r.info, message);
+        if (decodeTooLarge) {
+          if (!canStreamOversized) {
+            const message = `decoded request body exceeds the ${maxRequestBytes}-byte fiche limit`;
             const error = isMessages
               ? { type: 'error', error: { type: 'request_too_large', message } }
               : { error: { type: 'request_too_large', message } };
+            fireWait(413, undefined, message);
             return new Response(JSON.stringify(error), {
               status: 413,
               headers: { 'content-type': 'application/json' },
             });
-          } else {
-            r.info.sizeLimitOutcome = 'within_limit';
           }
-        }
-
-        // Probes go to the configured Anthropic upstream with the host's keys; a
-        // followed request's prompt must not be copied there.
-        if (isMessages && messagesAnthropic && !follow) {
-          try {
-            baselineStatusApplies = true;
-            // Probes fire on the ORIGINAL body before the main forward so all three overlap.
-            // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
-            const ctBody = buildBaselineCountTokensBody(bodyIn);
-            if (ctBody) {
-              // Mirror the actual outbound request base+path: count_tokens lives at
-              // `<messages-path>/count_tokens`, so provider-prefixed routes like
-              // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
-              // joined like the main forward so a `…/anthropic` base isn't doubled.
-              const ctUrl = providerPrefixed
-                ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
-                : upstream + url.pathname + '/count_tokens';
-              const ctHeaders = applyGatewayHeadersIfTargeted(
-                filterHeaders(req.headers, STRIP_REQ_HEADERS),
-                ctUrl,
-              );
-              ctHeaders.delete('content-encoding');
-              ctHeaders.set('content-type', 'application/json');
-              const ctAuth = resolveAuthToken(config);
-              if (config.apiKey) ctHeaders.delete('authorization');
-              if (ctAuth) ctHeaders.delete('x-api-key');
-              if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
-              // The probe carries the client's frozen bearer otherwise, so it 401s
-              // exactly when the main forward starts succeeding on the fresh one.
-              if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
-              baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders);
-              // Null = no markers → cacheable=0 by definition, no probe needed.
-              const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
-              if (ctCacheableBody) {
-                baselineCacheablePromise = countTokensUpstream(
-                  ctUrl,
-                  ctCacheableBody,
-                  new Headers(ctHeaders),
-                );
+          bodyOut = bodyIn as unknown as BodyInit;
+          info = {
+            compressed: false,
+            reason: 'body_too_large',
+            origChars: 0,
+            compressedChars: 0,
+            imageCount: 0,
+            imageBytes: 0,
+            staticChars: 0,
+            dynamicChars: 0,
+            dynamicBlockCount: 0,
+          };
+        } else {
+        const dupRes = await acquireInFlightLease(bodyIn);
+        if (dupRes) return dupRes;
+        const encodedUndecoded =
+          contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
+        try {
+          const baseTransformOpts = withClientToolRoundShape(
+            typeof config.transform === 'function' ? config.transform() : config.transform,
+            req.headers,
+          );
+          // Bytes still under a coding we did not undo must not be rewritten: the
+          // header would go out unchanged and the upstream would try to decompress
+          // whatever the transform produced. Forward them as they came.
+          const transformOpts = encodedUndecoded
+            ? { ...baseTransformOpts, compress: false }
+            : baseTransformOpts;
+          // Fail-closed: unreadable model → no compression, not a risky guess.
+          const model = googleModelFromPath ?? readModelField(bodyIn);
+          if (isOpenAIResponses) responsesStreaming = readStreamField(bodyIn);
+          requestModel = model ?? undefined;
+          // A turn whose only content is `@inkling pin` / `@inkling unpin` is
+          // configuration, not a question. Answer it here unless compression is
+          // paused/disabled: passthrough mode must forward `@fiche pin` untouched.
+          if (transformOpts?.compress !== false && (isMessages || isOpenAIChat || isOpenAIResponses)) {
+            try {
+              const pinReply = isMessages
+                ? pinCommandResponse(bodyIn)
+                : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
+              if (pinReply) {
+                releaseInFlight();
+                return new Response(pinReply.body, {
+                  status: 200,
+                  headers: {
+                    'content-type': pinReply.contentType,
+                    'cache-control': 'no-cache',
+                  },
+                });
               }
+            } catch {
+              // Fail open: malformed pin parsing must never abort a live agent request.
             }
-          } catch {
-            // Telemetry-only count_tokens probes must never abort the live request.
           }
+          // /v1/messages is only a wire schema: Claude Code can target a non-
+          // Anthropic model (for example GPT-5.6 Sol). Do not apply Claude's
+          // renderer or Anthropic count_tokens merely because the route is
+          // Messages-shaped. Enabled GPT models take the standalone
+          // Messages→Responses bridge; unsupported models still fail closed.
+          // Claude Code model aliases decode back to exact Cloudflare model IDs.
+          const decodedByAlias = [...modelRoutes.keys()]
+            .find((candidate) => claudeGatewayModelId(candidate) === model);
+          const decodedChatModel = decodedByAlias ?? resolveClaudeGatewayModelId(model);
+          const routedModel = decodedChatModel ?? model;
+          // A followed host answers for its own models; never bridge them elsewhere.
+          const modelRoute = routedModel && !follow ? modelRoutes.get(routedModel) : undefined;
+          modelRouteForRequest = modelRoute;
+          const forceChat = isMessages && modelRoute === 'cloudflare';
+          const messagesAnthropic = isMessages
+            && modelRoute === undefined && !forceChat && (Boolean(follow) || isClaudeModel(model));
+          isAnthropicMessagesRoute = messagesAnthropic;
+          // Provider routing is explicit. Unlisted Messages models use the
+          // default Anthropic route, regardless of how their id is shaped.
+          bridgedGptMessages =
+            isMessages && !messagesAnthropic && !forceChat
+            && modelRoute === 'openai';
+          // Messages → Chat Completions bridge toward Cloudflare Workers AI.
+          bridgedChatMessages = forceChat;
+          const chatStamp = bridgedChatMessages ? routedModel : undefined;
+          const effectiveModel = (bridgedGptMessages || bridgedChatMessages) ? routedModel : model;
+          // Gemini is in DEFAULT_MODEL_BASES as the family base `gemini`; the same
+          // allowlist gates it so INKLING_MODELS / the chip can opt out.
+          const modelOk = isGoogle
+            ? (isGeminiModel(model) && isInklingSupportedModel(model))
+            : isMessages
+              ? (messagesAnthropic && isInklingSupportedModel(model))
+                || (bridgedGptMessages && isInklingSupportedGptModel(effectiveModel))
+                || (bridgedChatMessages && isInklingSupportedGptModel(effectiveModel))
+              : isInklingSupportedGptModel(model);
+          // Compression eligibility and telemetry follow the model that actually
+          // receives the request, not Claude Code's local gateway alias.
+          if ((bridgedGptMessages || bridgedChatMessages) && effectiveModel) {
+            requestModel = effectiveModel;
+          }
+          const bridgeBody = bridgedGptMessages
+            ? (() => {
+                const bridged = JSON.parse(new TextDecoder().decode(
+                  anthropicMessagesToOpenAIResponses(bodyIn),
+                )) as Record<string, unknown>;
+                bridged.model = effectiveModel;
+                return new TextEncoder().encode(JSON.stringify(bridged));
+              })()
+            : bridgedChatMessages
+              ? anthropicMessagesToOpenAIChat(bodyIn, chatStamp ?? undefined)
+              : bodyIn;
+          const routeModel = effectiveModel ?? model ?? undefined;
+          // Third-party hosts never get the OpenAI-only breakpoint field.
+          const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
+            pathname: url.pathname,
+            upstream: resolvedOpenAIUpstream,
+          });
+          // Allowlisted models image, except weak or unmeasured readers (Claude
+          // 5.5, Grok, Gemini 4 hydrogen/carbon, DeepSeek, Kimi, GLM, MiniMax),
+          // which stay text unless INKLING_FORCE_IMAGES=1. When compression is not
+          // switched off, weak/text-only/third-party models still receive
+          // prefix-safe deterministic text hygiene (`imageCompress: false`).
+          const imageThisRequest =
+            transformOpts?.stageToggles?.optical !== false &&
+            shouldImageModel(routeModel, modelOk);
+          const hygieneForcedOn = resolveTextHygieneMode(transformOpts?.textHygiene) === 'on';
+          const familyInScope = modelOk || isInConfiguredModelBases(routeModel);
+          const killSwitchOff = transformOpts?.compress === false || (!familyInScope && !hygieneForcedOn);
+          const effectiveOpts = killSwitchOff
+            ? { ...transformOpts, compress: false, explicitPromptCacheBreakpoints: allowBreakpoints }
+            : imageThisRequest
+              ? { ...transformOpts, imageCompress: true, explicitPromptCacheBreakpoints: allowBreakpoints }
+              : { ...transformOpts, imageCompress: false, explicitPromptCacheBreakpoints: allowBreakpoints };
+          // Local render+encode cost only. The Google branch below issues upstream
+          // count_tokens probes, so the timer closes here rather than after them —
+          // otherwise network latency would be charged to our own CPU.
+          const tTransform = Date.now();
+          // Fail open: a renderer or transform bug must never cost the user a
+          // turn. The request goes out as it arrived (after any wire bridge, which
+          // the upstream needs), and the event row records why.
+          const sessionTransformOpts = validatedClientSessionId && validatedClientSessionSource
+            ? {
+                clientSessionId: validatedClientSessionId,
+                clientSessionSource: validatedClientSessionSource,
+              }
+            : undefined;
+          const optsWithSession = sessionTransformOpts
+            ? { ...effectiveOpts, ...sessionTransformOpts }
+            : effectiveOpts;
+          let r: { body: Uint8Array; info: TransformInfo };
+          try {
+            r = isGoogle
+              ? await transformGoogleGenerateContent(bridgeBody, model!, optsWithSession)
+              : isMessages
+                ? bridgedGptMessages
+                  ? await transformOpenAIResponses(bridgeBody, optsWithSession)
+                  : bridgedChatMessages
+                    ? await transformOpenAIChatCompletions(bridgeBody, optsWithSession)
+                    : await transformRequest(bridgeBody, {
+                        ...optsWithSession,
+                        model: effectiveModel ?? undefined,
+                      })
+                : isOpenAIChat
+                  ? await transformOpenAIChatCompletions(bridgeBody, optsWithSession)
+                  : await transformOpenAIResponses(bridgeBody, optsWithSession);
+          } catch (e) {
+            r = { body: bridgeBody, info: failOpenInfo(bridgeBody, (e as Error).message) };
+          }
+          if (!allowBreakpoints && (isOpenAIResponses || isOpenAIChat || bridgedGptMessages || bridgedChatMessages)) {
+            try {
+              r = { ...r, body: scrubPromptCacheBreakpoint(r.body) };
+            } catch {
+              // Fail open if response/body scrubbing encounters an unexpected shape.
+            }
+          }
+          transformMs = Date.now() - tTransform;
+          // CloudCode PA (`/v1internal:*`) has no `:countTokens` endpoint, and
+          // text-hygiene-only turns already have exact local token deltas.
+          if (
+            isGoogle &&
+            r.info.compressed &&
+            (r.info.imageCount ?? 0) > 0 &&
+            !url.pathname.startsWith('/v1internal:')
+          ) {
+            try {
+              const countUrl = new URL(
+                (isGoogleRoute ? googleUpstream : passthroughUpstream) + url.pathname.replace(
+                  /:(?:generateContent|streamGenerateContent)$/,
+                  ':countTokens',
+                ),
+              );
+              for (const [key, value] of url.searchParams) countUrl.searchParams.append(key, value);
+              countUrl.searchParams.delete('alt');
+              const countHeaders = applyGatewayHeadersIfTargeted(
+                filterHeaders(req.headers, STRIP_REQ_HEADERS),
+                countUrl.toString(),
+              );
+              stripAnthropicCredentials(countHeaders);
+              countHeaders.delete('content-encoding');
+              countHeaders.set('content-type', 'application/json');
+              const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
+              const googleSyncProbe = !/^(0|false|no|off)$/i.test(syncProbeEnv.trim());
+              ensureClientAbortWired();
+              if (googleSyncProbe) {
+                const [baseline, transformed] = await Promise.all([
+                  countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!, fetchImpl, upstreamAbort.signal),
+                  countGoogleTokensUpstream(countUrl.toString(), r.body, countHeaders, model!, fetchImpl, upstreamAbort.signal),
+                ]);
+                if (baseline !== null && transformed !== null) {
+                  if (transformed >= baseline) {
+                    r = {
+                      body: bodyIn,
+                      info: revertedGoogleInfo(
+                        r.info,
+                        `not_profitable (${transformed} >= ${baseline} tokens)`,
+                        'ok',
+                      ),
+                    };
+                  } else {
+                    r.info.baselineTokens = baseline;
+                    r.info.baselineProbeStatus = 'ok';
+                  }
+                } else {
+                  // Upstream gateway does not route :countTokens (e.g. Cloudflare AI Gateway).
+                  // Retain local profitability decision computed by transformGoogleGenerateContent.
+                  r.info.baselineProbeStatus = 'failed';
+                }
+              } else {
+                baselineStatusApplies = true;
+                baselinePromise = countGoogleTokensUpstream(countUrl.toString(), bodyIn, countHeaders, model!, fetchImpl, upstreamAbort.signal);
+              }
+            } catch {
+              r.info.baselineProbeStatus = 'failed';
+            }
+          }
+          if (!modelOk && !r.info.compressed && r.info.reason !== 'mmu_hydrate') r.info.reason = 'unsupported_model';
+          bodyOut = r.body as unknown as BodyInit; // TS narrows Uint8Array away from BodyInit
+          info = r.info;
+          reqBodyBytes = r.body;
+          r.info.serializedRequestBytes = r.body.byteLength;
+          if (r.body.byteLength > 0) {
+            reqBodySha256 = await sha256Bytes(r.body);
+            reqBodySha8 = reqBodySha256.slice(0, 8);
+          }
+          let requestByteLimit: number | undefined;
+          try {
+            requestByteLimit = requestModel
+              ? resolveGptProfile(requestModel).maxSerializedRequestBytes
+              : undefined;
+          } catch {
+            requestByteLimit = undefined;
+          }
+          if ((r.info.compressed || r.body !== bridgeBody) && requestByteLimit !== undefined) {
+            if (r.body.byteLength > requestByteLimit) {
+              r.info.sizeLimitOutcome = 'rejected';
+              const message = `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+              fireWait(413, r.info, message);
+              const error = isMessages
+                ? { type: 'error', error: { type: 'request_too_large', message } }
+                : { error: { type: 'request_too_large', message } };
+              detachClientAbort();
+              releaseInFlight();
+              return new Response(JSON.stringify(error), {
+                status: 413,
+                headers: { 'content-type': 'application/json' },
+              });
+            } else {
+              r.info.sizeLimitOutcome = 'within_limit';
+            }
+          }
+
+          // Probes go to the configured Anthropic upstream with the host's keys; a
+          // followed request's prompt must not be copied there.
+          if (isMessages && messagesAnthropic && !follow) {
+            try {
+              baselineStatusApplies = true;
+              threadContinue = isThreadContinuation(bodyIn);
+              // Probes fire on the ORIGINAL body before the main forward so all three overlap.
+              // count_tokens is not billed; ~30-80ms latency is hidden by the main forward.
+              const ctBody = buildBaselineCountTokensBody(bodyIn);
+              if (ctBody) {
+                // Mirror the actual outbound request base+path: count_tokens lives at
+                // `<messages-path>/count_tokens`, so provider-prefixed routes like
+                // `/anthropic/messages` probe `/anthropic/messages/count_tokens`,
+                // joined like the main forward so a `…/anthropic` base isn't doubled.
+                const ctUrl = providerPrefixed
+                  ? joinProviderPath(passthroughUpstream, url.pathname + '/count_tokens')
+                  : upstream + url.pathname + '/count_tokens';
+                const ctHeaders = applyGatewayHeadersIfTargeted(
+                  filterHeaders(req.headers, STRIP_REQ_HEADERS),
+                  ctUrl,
+                );
+                ctHeaders.delete('content-encoding');
+                ctHeaders.set('content-type', 'application/json');
+                const ctAuth = resolveAuthToken(config);
+                if (config.apiKey) ctHeaders.delete('authorization');
+                if (ctAuth) ctHeaders.delete('x-api-key');
+                if (config.apiKey) ctHeaders.set('x-api-key', config.apiKey);
+                // The probe carries the client's frozen bearer otherwise, so it 401s
+                // exactly when the main forward starts succeeding on the fresh one.
+                if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
+                ensureClientAbortWired();
+                baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders, (reason) => {
+                  if (config.captureErrorReqBody) {
+                    baselineProbeError = redactSecrets(reason);
+                  } else {
+                    const httpMatch = /^(http_\d+)/.exec(reason);
+                    baselineProbeError = httpMatch ? httpMatch[1] : reason.split(' ', 1)[0];
+                  }
+                }, false, fetchImpl, upstreamAbort.signal);
+                // Null = no markers → cacheable=0 by definition, no probe needed.
+                const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
+                if (ctCacheableBody) {
+                  baselineCacheablePromise = countTokensUpstream(
+                    ctUrl,
+                    ctCacheableBody,
+                    new Headers(ctHeaders),
+                    undefined,
+                    false,
+                    fetchImpl,
+                    upstreamAbort.signal,
+                  );
+                }
+              }
+            } catch {
+              // Telemetry-only count_tokens probes must never abort the live request.
+            }
+          }
+        } catch (e) {
+          releaseInFlight();
+          if (
+            (bridgedGptMessages || bridgedChatMessages) &&
+            ((e as Error).name === 'MessagesBridgeInvalidRequest' || e instanceof SyntaxError)
+          ) {
+            detachClientAbort();
+            fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
+            return new Response(JSON.stringify({
+              type: 'error',
+              error: { type: 'invalid_request_error', message: (e as Error).message },
+            }), { status: 400, headers: { 'content-type': 'application/json' } });
+          }
+          detachClientAbort();
+          fireWait(502, undefined, `transform_error: ${(e as Error).message}`);
+          return new Response(JSON.stringify({ error: 'fiche transform failed' }), {
+            status: 502,
+            headers: { 'content-type': 'application/json' },
+          });
         }
-      } catch (e) {
-        if (
-          (bridgedGptMessages || bridgedChatMessages) &&
-          ((e as Error).name === 'MessagesBridgeInvalidRequest' || e instanceof SyntaxError)
-        ) {
-          fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
-          return new Response(JSON.stringify({
-            type: 'error',
-            error: { type: 'invalid_request_error', message: (e as Error).message },
-          }), { status: 400, headers: { 'content-type': 'application/json' } });
         }
-        fireWait(502, undefined, `transform_error: ${(e as Error).message}`);
-        return new Response(JSON.stringify({ error: 'fiche transform failed' }), {
-          status: 502,
-          headers: { 'content-type': 'application/json' },
-        });
       }
     } else if (req.method === 'POST') {
       // The model lives in the body, not the path, so read it here too or the
@@ -2316,12 +2969,6 @@ let responseContentType: string | undefined;
     // The body now travels as plain bytes; a stale coding header would make
     // the upstream try to decompress JSON.
     if (requestBodyDecoded) outHeaders.delete('content-encoding');
-    const isAnthropicCredentialRoute =
-      !isGoogleFamily
-      && !isOpenAIChatWire
-      && !isOpenAIResponsesWire
-      && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))
-      && (isAnthropicFamilyPath(url.pathname) || url.pathname.startsWith('/anthropic/') || isMessagesWire);
     if (follow) {
       // The agent addressed this host with this credential; it is the only one
       // that may travel. No configured key, no gateway header, and never an
@@ -2396,53 +3043,9 @@ let responseContentType: string | undefined;
         }
       }
     }
-    let releaseInFlight = (): void => {};
-    if (reqBodySha256 && duplicateHoldMs > 0) {
-      const headers: [string, string][] = [];
-      outHeaders.forEach((value, name) => { headers.push([name, value]); });
-      headers.sort(([a], [b]) => a.localeCompare(b));
-      const key = await sha256Text(JSON.stringify([
-        req.method,
-        upstreamUrl,
-        headers,
-        reqBodySha256,
-      ]));
-      const now = Date.now();
-      // Time trigger keeps steady state clean; size trigger reclaims promptly if entries
-      // ever strand faster than the window. Both are throttled, so cost stays amortized.
-      const sinceSweep = now - lastSweptAt;
-      if (
-        sinceSweep >= duplicateHoldMs
-        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
-      ) {
-        for (const [k, v] of inFlight) {
-          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
-        }
-        lastSweptAt = now;
-      }
-      const existing = inFlight.get(key);
-      // Fail open once the holder is older than the window: a retry that arrives this
-      // late is the client recovering from a stall, not an accidental double-send.
-      if (existing && now - existing.startedAt < duplicateHoldMs) {
-        const message = 'An identical request is already in progress';
-        fireWait(409, undefined, 'duplicate_request_in_flight');
-        const error = isMessages
-          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
-          : { error: { type: 'duplicate_request_in_flight', message } };
-        return new Response(JSON.stringify(error), {
-          status: 409,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      const lease = Symbol();
-      inFlight.set(key, { lease, startedAt: now });
-      releaseInFlight = () => {
-        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
-      };
-    }
     // One controller for the whole exchange: headers timeout, stall watchdog and client
     // disconnect all abort through it, so nothing can hold the socket open indefinitely.
-    const upstreamAbort = new AbortController();
+    ensureClientAbortWired();
     let timeoutKind: 'headers' | 'idle' | undefined;
     let headersTimer: ReturnType<typeof setTimeout> | undefined;
     // Raced explicitly rather than trusting the fetch implementation to reject on
@@ -2464,9 +3067,9 @@ let responseContentType: string | undefined;
       }
     };
 
-    let upstreamRes: Response;
+    let upstreamRes: Response | undefined;
     try {
-      const upstreamFetch = fetch(upstreamUrl, {
+      const upstreamFetch = fetchImpl(upstreamUrl, {
         method: req.method,
         headers: outHeaders,
         // Never auto-follow 3xx redirects upstream: cross-origin redirects could
@@ -2481,8 +3084,11 @@ let responseContentType: string | undefined;
         headersTimeoutMs > 0 ? await Promise.race([upstreamFetch, headersDeadline]) : await upstreamFetch;
       clearHeadersTimer();
       if (raced === HEADERS_TIMEOUT) {
-        // Abandoned: keep its eventual rejection from surfacing as unhandled.
-        void upstreamFetch.catch(() => undefined);
+        // Abandoned: cancel any late response body so streams never linger unconsumed.
+        void upstreamFetch.then(
+          (lateRes) => lateRes.body?.cancel().catch(() => undefined),
+          () => undefined,
+        );
         throw new Error('fiche: upstream headers timeout');
       }
       upstreamRes = raced;
@@ -2498,6 +3104,13 @@ let responseContentType: string | undefined;
       }
     } catch (e) {
       clearHeadersTimer();
+      if (upstreamRes?.body && !upstreamRes.body.locked) {
+        void upstreamRes.body.cancel().catch(() => undefined);
+      }
+      if (!upstreamAbort.signal.aborted) {
+        upstreamAbort.abort(e instanceof Error ? e : new Error(String(e)));
+      }
+      detachClientAbort();
       releaseInFlight();
       if (timeoutKind) {
         const detail = timeoutKind === 'headers'
@@ -2516,12 +3129,14 @@ let responseContentType: string | undefined;
       });
     }
 
+    const finalUpstreamRes = upstreamRes;
     const firstByteMs = Date.now() - t0;
-    responseContentType = upstreamRes.headers.get('content-type') ?? undefined;
-    responseContentEncoding = upstreamRes.headers.get('content-encoding') ?? undefined;
+    const keepUndecodedEncoding = finalUpstreamRes.headers.has('x-fiche-undecoded-encoding');
+    responseContentType = finalUpstreamRes.headers.get('content-type') ?? undefined;
+    responseContentEncoding = finalUpstreamRes.headers.get('content-encoding') ?? undefined;
 
-    // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
-let teed: Response;
+    // Inline pull-through scanner: client gets backpressure directly; 5xx/unknown/undecoded skip wrapping.
+    let teed: Response;
     let usagePromise: Promise<Usage | undefined>;
     let errorBodyPromise: Promise<string | undefined>;
     let measurementPromise: Promise<OutputMeasurement | undefined>;
@@ -2529,70 +3144,107 @@ let teed: Response;
     try {
       ({ response: teed, usagePromise, errorBodyPromise, measurementPromise, stopReasonPromise } =
         teeForUsage(
-          upstreamRes,
+          finalUpstreamRes,
           isOpenAIResponsesWire && responsesStreaming,
           isOpenAIResponsesWire && !responsesStreaming,
           isMessages || isGoogle || isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages,
+          keepUndecodedEncoding,
         ));
     } catch (e) {
+      if (finalUpstreamRes.body && !finalUpstreamRes.body.locked) {
+        void finalUpstreamRes.body.cancel().catch(() => undefined);
+      }
+      if (!upstreamAbort.signal.aborted) {
+        upstreamAbort.abort(e instanceof Error ? e : new Error(String(e)));
+      }
+      detachClientAbort();
       releaseInFlight();
       throw e;
     }
 
-    // Fire event in background once all four resolve (all share the same stream read).
+    // Client disconnect: drop the lease immediately and abort upstream, rather than
+    // waiting on scanner promises that a wedged connection would never settle.
+    let settleStreamDone = (): void => {};
+    const streamDonePromise =
+      finalUpstreamRes.status >= 500 && Boolean(teed.body)
+        ? new Promise<void>((resolve) => {
+            let done = false;
+            settleStreamDone = () => {
+              if (!done) {
+                done = true;
+                resolve();
+              }
+            };
+          })
+        : Promise.resolve();
+    const clientBody = teed.body
+      ? withClientDisconnect(
+          teed.body,
+          () => {
+            settleStreamDone();
+            clearHeadersTimer();
+            detachClientAbort();
+            releaseInFlight();
+            if (!upstreamAbort.signal.aborted) {
+              upstreamAbort.abort(new Error('fiche: client disconnected'));
+            }
+          },
+          () => {
+            settleStreamDone();
+          },
+        )
+      : null;
+
+    // Fire event in background once all scanner promises (and any 5xx body stream) resolve.
     const bgTask = Promise.all([
       usagePromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
+      streamDonePromise,
     ]).then(([usage, errorBody, measurement, stopReason]) => {
       // A rejected request never populated a prefix cache, so the append-only
       // freeze this session was protecting protects nothing: let the next turn
       // re-cut the grid for density instead of preserving dead bytes.
-      if (responseLeftNoCache(upstreamRes.status, errorBody)) {
-        markCacheDead(info?.firstUserSha8);
+      const sessionKey = info?.sessionKey ?? info?.firstUserSha8;
+      if (responseLeftNoCache(finalUpstreamRes.status, errorBody)) {
+        markCacheDead(sessionKey, requestModel ? { model: requestModel } : undefined);
       }
       // Feed the provider's own cache accounting back into the session store. A
       // read proves the prefix was live; a create proves one was just written.
-      // Either way the next turn must not re-cut the grid — which the wall clock
-      // alone could not tell, and got wrong on most gaps that mattered.
-      if (upstreamRes.ok && usage !== undefined && isAnthropicMessagesRoute) {
+      // Either way the next turn must not re-cut the grid or assume cold cache.
+      if (finalUpstreamRes.ok && usage !== undefined && (isAnthropicMessagesRoute || isGoogle || isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages)) {
         noteCacheOutcome(
-          info?.firstUserSha8,
-          usage.cache_read_input_tokens,
-          usage.cache_creation_input_tokens,
+          sessionKey,
+          usage.cache_read_input_tokens ?? usage.cached_tokens,
+          bridgedGptMessages || bridgedChatMessages
+            ? undefined
+            : (usage.cache_creation_input_tokens ?? usage.cache_write_tokens),
+          requestModel ? { model: requestModel } : undefined,
         );
       }
       return fire(
-        upstreamRes.status,
+        finalUpstreamRes.status,
         info,
         timeoutKind === 'idle' ? `upstream_timeout: no upstream bytes for ${idleTimeoutMs}ms` : undefined,
         firstByteMs,
         usage,
-        config.captureErrorReqBody ? errorBody : undefined,
+        config.captureErrorReqBody && errorBody ? redactSecrets(errorBody) : undefined,
         measurement,
         stopReason,
       );
     }).finally(() => {
       clearHeadersTimer();
+      detachClientAbort();
       releaseInFlight();
-    });
+    }).catch(() => undefined);
     config.waitUntil?.(bgTask);
 
-    // Client disconnect: drop the lease immediately and abort upstream, rather than
-    // waiting on scanner promises that a wedged connection would never settle.
-    const clientBody = teed.body
-      ? withClientDisconnect(teed.body, () => {
-          clearHeadersTimer();
-          releaseInFlight();
-          if (!upstreamAbort.signal.aborted) {
-            upstreamAbort.abort(new Error('fiche: client disconnected'));
-          }
-        })
-      : null;
-
-    const resHeaders = filterHeaders(upstreamRes.headers, STRIP_RES_HEADERS);
-    if (info && (info.compressed || (info.textHygieneSavedTokens ?? 0) > 0)) {
+    const resHeaders = filterHeaders(
+      finalUpstreamRes.headers,
+      keepUndecodedEncoding ? STRIP_RES_HEADERS_KEEP_ENCODING : STRIP_RES_HEADERS,
+    );
+    if (info && (info.compressed || (info.textHygieneSavedTokens ?? 0) > 0 || (info.textHygieneStages?.length ?? 0) > 0)) {
       const imagedSaved = info.compressed
         ? Math.max(
             0,
@@ -2612,9 +3264,10 @@ let teed: Response;
       }
     }
 
+    if (!clientBody) detachClientAbort();
     return new Response(clientBody, {
-      status: upstreamRes.status,
-      statusText: upstreamRes.statusText,
+      status: finalUpstreamRes.status,
+      statusText: finalUpstreamRes.statusText,
       headers: resHeaders,
     });
   };

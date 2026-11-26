@@ -2,9 +2,12 @@ import {
   MAX_HEIGHT_PX as ANTHROPIC_MAX_HEIGHT_PX,
   ANTHROPIC_SLAB_COLS as ANTHROPIC_STRIP_COLS,
 } from './render.js';
+import { calibratedBandToProfile, getCalibratedProfile } from './calibration.js';
 import { BASE_PRICING } from './profile-base.js';
 import { visionTokens } from './vision-cost.js';
 import type { GptModelProfile } from './gpt-model-profiles.js';
+
+export { calibratedBandToProfile };
 
 /** Legacy Gemini 3.x Flash profile (1568×728, 312×90 at 5×8 = 49×22 = 1,078 ViT patches). */
 export const GEMINI_LEGACY_PROFILE: GptModelProfile = {
@@ -91,6 +94,10 @@ export function isGeminiModel(model: string | null | undefined): boolean {
 export function hasGeminiMeasuredProfile(model: string | null | undefined): boolean {
   const id = normalizeGeminiId(model);
   if (!id) return false;
+  if (isGeminiModel(id)) {
+    const cal = getCalibratedProfile(model);
+    if (cal && cal.scores.passed && cal.band !== 'text-only') return true;
+  }
   if (id in GEMINI_MEASURED_PROFILES) return true;
   if (id === 'gemini-pro' || id === 'gemini-flash' || id === 'gemini') return true;
   const m = id.match(/^gemini-(\d+)(?:\.(\d+))?/);
@@ -104,13 +111,18 @@ export function hasGeminiMeasuredProfile(model: string | null | undefined): bool
 }
 
 export function resolveGeminiProfile(model?: string | null): GptModelProfile {
+  let base: GptModelProfile = GEMINI_PROFILE;
   if (model) {
     const id = normalizeGeminiId(model);
     const prof = GEMINI_MEASURED_PROFILES[id];
-    if (prof) return prof;
-    if (id.startsWith('gemini-3.') || id === 'gemini-3') return GEMINI_LEGACY_PROFILE;
+    if (prof) base = prof;
+    else if (id.startsWith('gemini-3.') || id === 'gemini-3') base = GEMINI_LEGACY_PROFILE;
   }
-  return GEMINI_PROFILE;
+  const cal = model ? getCalibratedProfile(model) : undefined;
+  if (cal && cal.scores.passed && cal.band !== 'text-only') {
+    return calibratedBandToProfile(cal.band, base, { cols: cal.cols, maxHeightPx: cal.maxHeightPx });
+  }
+  return base;
 }
 
 /** Gemini image tokens for any supported Gemini model using the validated
