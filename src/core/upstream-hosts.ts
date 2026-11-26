@@ -103,7 +103,7 @@ const COMPAT: readonly UpstreamHost[] = [
   { host: 'api.moonshot.cn', family: 'compat', provider: 'kimi', prefixes: ['/anthropic', ''] },
   { host: 'api.kimi.com', family: 'compat', provider: 'kimi', prefixes: ['/coding', ''] },
   { host: 'api.z.ai', family: 'compat', provider: 'glm', prefixes: ['/api/anthropic', '/api/coding/paas/v4', '/api/paas/v4'] },
-  { host: 'open.bigmodel.cn', family: 'compat', provider: 'glm', prefixes: ['/api/anthropic', '/api/paas/v4'] },
+  { host: 'open.bigmodel.cn', family: 'compat', provider: 'glm', prefixes: ['/api/anthropic', '/api/coding/paas/v4', '/api/paas/v4'] },
   { host: 'api.minimax.io', family: 'compat', provider: 'minimax', prefixes: ['/anthropic', ''] },
   { host: 'api.minimaxi.com', family: 'compat', provider: 'minimax', prefixes: ['/anthropic', ''] },
   { host: 'dashscope-intl.aliyuncs.com', family: 'compat', provider: 'qwen', prefixes: ['/apps/anthropic', '/compatible-mode'] },
@@ -329,7 +329,13 @@ export function buildUpstreamRegistry(extra: readonly UpstreamHost[] = []): Upst
     const existing = map.get(entry.host);
     if (existing && existing.family !== 'compat') continue;
     const prefixes = new Set([...(existing?.prefixes ?? []), ...entry.prefixes]);
-    map.set(entry.host, { host: entry.host, family: 'compat', prefixes: [...prefixes] });
+    const provider = existing?.provider ?? entry.provider;
+    map.set(entry.host, {
+      host: entry.host,
+      family: 'compat',
+      ...(provider !== undefined ? { provider } : {}),
+      prefixes: [...prefixes],
+    });
   }
   return map;
 }

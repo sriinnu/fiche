@@ -214,7 +214,7 @@ struct DailySavingsPoint: Decodable, Identifiable, Sendable, Equatable {
         let actual = c.firstDouble("actual_input_weighted", "actualInputWeighted") ?? 0
         self.baselineInputWeighted = baseline
         self.actualInputWeighted = actual
-        self.savedTokens = c.firstDouble("saved_tokens", "savedTokens", "saved_input_tokens") ?? max(0, baseline - actual)
+        self.savedTokens = c.firstDouble("saved_tokens", "savedTokens", "saved_input_tokens") ?? (baseline - actual)
         self.rawSavedTokens = c.firstDouble("raw_saved_tokens", "rawSavedTokens") ?? 0
         self.savedPct = c.firstDouble("saved_pct", "savedPct") ?? 0
         self.savedUsd = c.firstDouble("saved_usd", "savedUsd") ?? 0
@@ -275,7 +275,7 @@ struct ModelStats: Decodable, Sendable, Equatable {
         let baseline = c.firstDouble("baseline_input_weighted", "baselineInputWeighted", "baseline_tokens", "baselineTokens") ?? 0
         let actual = c.firstDouble("actual_input_weighted", "actualInputWeighted", "actual_tokens", "actualTokens") ?? 0
         let saved = c.firstDouble("saved_input_tokens", "savedInputTokens", "saved_tokens", "savedTokens")
-            ?? max(0, baseline - actual)
+            ?? (baseline - actual)
         self.baselineInputWeighted = baseline
         self.actualInputWeighted = actual
         self.savedInputTokens = saved
@@ -367,7 +367,7 @@ struct LastTurnSnapshot: Decodable, Sendable, Equatable {
     var effectiveSavedPct: Double? {
         if let savedPct { return savedPct }
         let raw = rawInputTokens ?? inputTokens ?? 0
-        if raw > 0, savedTokens > 0 {
+        if raw > 0, savedTokens != 0 {
             let baseline = rawInputTokens != nil ? raw : (raw + savedTokens)
             if baseline > 0 {
                 return (savedTokens / baseline) * 100.0
@@ -453,12 +453,14 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
     let label: String
     let family: String
     let hint: String?
+    let engineMode: String?
 
-    init(id: String, label: String, family: String, hint: String? = nil) {
+    init(id: String, label: String, family: String, hint: String? = nil, engineMode: String? = nil) {
         self.id = id
         self.label = label
         self.family = family
         self.hint = hint
+        self.engineMode = engineMode
     }
 
     init(from decoder: Decoder) throws {
@@ -467,6 +469,7 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
             self.label = idStr
             self.family = ModelCatalogItem.inferFamily(for: idStr)
             self.hint = nil
+            self.engineMode = nil
             return
         }
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -475,6 +478,7 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
         self.label = c.firstString("label", "name", "displayName") ?? id
         self.family = c.firstString("family", "provider") ?? ModelCatalogItem.inferFamily(for: id)
         self.hint = c.firstString("hint", "mode", "description")
+        self.engineMode = c.firstString("engine_mode", "engineMode")
     }
 
     static func inferFamily(for id: String) -> String {
@@ -514,8 +518,11 @@ struct ModelCatalogItem: Decodable, Identifiable, Sendable, Equatable {
         ModelCatalogItem(id: "gemini", label: "Gemini (all)", family: "Google", hint: "Optical + 4-layer"),
         ModelCatalogItem(id: "gpt-6-astra", label: "GPT-6 Astra", family: "OpenAI", hint: "4-layer text"),
         ModelCatalogItem(id: "gpt-6.2-astra", label: "GPT-6.2 Astra", family: "OpenAI", hint: "4-layer text"),
-        ModelCatalogItem(id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "OpenAI", hint: "4-layer text"),
-        ModelCatalogItem(id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "OpenAI", hint: "4-layer text"),
+        ModelCatalogItem(id: "gpt-6-sol", label: "GPT-6 Sol", family: "OpenAI", hint: "14px optical"),
+        ModelCatalogItem(id: "gpt-6.1-sol", label: "GPT-6.1 Sol", family: "OpenAI", hint: "14px optical"),
+        ModelCatalogItem(id: "gpt-6.2-sol", label: "GPT-6.2 Sol", family: "OpenAI", hint: "14px optical"),
+        ModelCatalogItem(id: "gpt-6.1-terra", label: "GPT-6.1 Terra", family: "OpenAI", hint: "Optical + 4-layer"),
+        ModelCatalogItem(id: "gpt-6-luna", label: "GPT-6 Luna", family: "OpenAI", hint: "Optical + 4-layer"),
         ModelCatalogItem(id: "deepseek", label: "DeepSeek", family: "DeepSeek", hint: "4-layer text"),
         ModelCatalogItem(id: "kimi", label: "Kimi", family: "Moonshot", hint: "4-layer text"),
         ModelCatalogItem(id: "glm", label: "GLM", family: "Zhipu", hint: "4-layer text"),
@@ -975,6 +982,10 @@ enum Fmt {
         switch stage.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "image", "optical", "microfiche": return "OPTICAL"
         case "hybrid_slab_optical": return "HYBRID"
+        case "hybrid_tool_optical": return "TOOL OPTICAL"
+        case "hybrid_user_optical": return "USER OPTICAL"
+        case "dir_tree": return "DIR TREE"
+        case "json", "json_compact": return "JSON"
         case "tscg": return "TSCG"
         case "schema_dag": return "DAG"
         case "toon": return "TOON"

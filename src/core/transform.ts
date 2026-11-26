@@ -37,6 +37,8 @@ import {
   renderCellWidth,
   LINES_PER_IMAGE,
   maxCharsPerImage,
+  countVisualRows,
+  estimateImageCount,
   type RenderStyle,
 } from './render.js';
 import {
@@ -54,7 +56,16 @@ import {
   ANTHROPIC_MAX_IMAGES,
   ANTHROPIC_HISTORY_IMAGE_BUDGET,
 } from './history.js';
-import { noteHistoryRequest, recordFreezeStep, sessionAnchorText, type HistorySessionState } from './session-state.js';
+import {
+  getPinnedOpticalHistoryPolicy,
+  hasStage2SealKey,
+  noteHistoryRequest,
+  recordFreezeStep,
+  recordStage2SealKey,
+  sessionAnchorText,
+  setPinnedOpticalHistoryPolicy,
+  type HistorySessionState,
+} from './session-state.js';
 import type { GptHistoryOptions } from './openai-history.js';
 import { readBrandEnv } from './env.js';
 import {
@@ -67,10 +78,15 @@ import {
 } from './pricing.js';
 import {
   applyAnthropicTextHygiene,
+  coveringBreakpointInfo,
+  estimateMessageTokens,
   isTextHygieneActive,
+  markerTtlSeconds,
   resolveTextHygieneMode,
   type TextHygieneMode,
 } from './text-hygiene.js';
+import type { CacheBreakpointMarker } from './text-history.js';
+import { tapeHash64Hex } from './prefix-tape.js';
 import type { StageToggles } from './stage-plugins.js';
 
 /** Gate rates for one request, priced once: the cache TTL its markers ask for
@@ -471,7 +487,7 @@ function denseGateGeometry(o?: Required<TransformOptions>): GateGeometry {
 /** Re-exported from render.ts, which owns the cell geometry these derive from.
  *  Kept exported here because the eval harnesses and gpt paths import them from
  *  transform. Single implementation, so the page-capacity math can't fork. */
-export { LINES_PER_IMAGE, maxCharsPerImage };
+export { LINES_PER_IMAGE, maxCharsPerImage, countVisualRows, estimateImageCount };
 
 /** Lossless pre-render whitespace compactor (each `\n` costs ≥1 visual row):
  *  1. Strip trailing whitespace per line (preserves leading indent).
@@ -1107,7 +1123,7 @@ function isTagSpace(c: number): boolean {
   );
 }
 
-function splitStaticDynamic(text: string): {
+export function splitStaticDynamic(text: string): {
   staticText: string;
   dynamicText: string;
   blockCount: number;
@@ -1313,29 +1329,76 @@ async function historyImageSha8(
  * Pure relocation: it acts only when a slab image already carries the anchor, so
  * the total marker count never increases (inkling never *adds* — only moves).
  */
-function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrdinal?: number): void {
+function hasEarlierShorterTtlMarker(
+  messages: Message[],
+  targetMsgIdx: number,
+  targetBlockIdx: number,
+  ignoreBlock: object,
+  system?: SystemField,
+  tools?: unknown[],
+): boolean {
+  const is5mMarker = (cc: unknown): boolean =>
+    Boolean(cc && typeof cc === 'object' && (cc as { ttl?: unknown }).ttl !== '1h');
+  if (Array.isArray(tools)) {
+    for (const t of tools) {
+      if (t && typeof t === 'object' && is5mMarker((t as { cache_control?: unknown }).cache_control)) {
+        return true;
+      }
+    }
+  }
+  if (Array.isArray(system)) {
+    for (const b of system) {
+      if (b && typeof b === 'object' && is5mMarker((b as { cache_control?: unknown }).cache_control)) {
+        return true;
+      }
+    }
+  }
+  for (let mIdx = 0; mIdx <= targetMsgIdx && mIdx < messages.length; mIdx++) {
+    const content = messages[mIdx]?.content;
+    if (!Array.isArray(content)) continue;
+    const bLimit = mIdx === targetMsgIdx ? targetBlockIdx : content.length;
+    for (let bIdx = 0; bIdx < bLimit; bIdx++) {
+      const b = content[bIdx];
+      if (!b || typeof b !== 'object' || b === ignoreBlock) continue;
+      if (is5mMarker((b as { cache_control?: unknown }).cache_control)) return true;
+    }
+  }
+  return false;
+}
+
+function relocateAnchorToHistoryImage(
+  messages: Message[] | undefined,
+  anchorOrdinal?: number,
+  system?: SystemField,
+  tools?: unknown[],
+): void {
   if (!Array.isArray(messages)) return;
 
   // The synthetic history message is identified by its banner text block.
   let historyImg: (ImageBlock & { cache_control?: unknown }) | undefined;
-  for (const m of messages) {
+  let historyMsgIdx = -1;
+  let historyBlockIdx = -1;
+  for (let mIdx = 0; mIdx < messages.length; mIdx++) {
+    const m = messages[mIdx]!;
     if (!Array.isArray(m.content)) continue;
     const first = m.content[0] as TextBlock | undefined;
     if (!first || first.type !== 'text' || first.text !== HISTORY_SYNTHETIC_INTRO) continue;
-    // Collect this message's images in order, then pin the carry-over anchor (the last
-    // byte-stable history image) when collapseHistory provided its ordinal; otherwise
-    // fall back to the last image. Pinning the LAST image is the #11 bust: it's the
-    // newest, still-growing chunk and its bytes change on every window advance.
-    const imgsInMsg: Array<ImageBlock & { cache_control?: unknown }> = [];
-    for (const b of m.content) {
+    const imgsInMsg: Array<{ block: ImageBlock & { cache_control?: unknown }; bIdx: number }> = [];
+    for (let bIdx = 0; bIdx < m.content.length; bIdx++) {
+      const b = m.content[bIdx];
       if (b && (b as ImageBlock).type === 'image') {
-        imgsInMsg.push(b as ImageBlock & { cache_control?: unknown });
+        imgsInMsg.push({ block: b as ImageBlock & { cache_control?: unknown }, bIdx });
       }
     }
-    historyImg =
+    const picked =
       anchorOrdinal !== undefined && anchorOrdinal >= 0 && anchorOrdinal < imgsInMsg.length
         ? imgsInMsg[anchorOrdinal]
         : imgsInMsg[imgsInMsg.length - 1];
+    if (picked) {
+      historyImg = picked.block;
+      historyMsgIdx = mIdx;
+      historyBlockIdx = picked.bIdx;
+    }
     break;
   }
   if (!historyImg) return;
@@ -1360,7 +1423,18 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
   }
   if (!slabAnchor) return; // nothing to relocate → never add a marker
 
-  historyImg.cache_control = demoteRelocatedCacheControl(slabAnchor.cache_control);
+  let relocatedCc = demoteRelocatedCacheControl(slabAnchor.cache_control);
+  if (
+    relocatedCc &&
+    typeof relocatedCc === 'object' &&
+    (relocatedCc as { ttl?: unknown }).ttl === '1h' &&
+    hasEarlierShorterTtlMarker(messages, historyMsgIdx, historyBlockIdx, slabAnchor, system, tools)
+  ) {
+    // Anthropic requires monotonically non-increasing cache TTLs: never place 1h after an earlier 5m marker.
+    const { ttl: _ttl, ...clamped } = relocatedCc as unknown as Record<string, unknown>;
+    relocatedCc = clamped as unknown as typeof relocatedCc;
+  }
+  historyImg.cache_control = relocatedCc;
   delete slabAnchor.cache_control;
 }
 
@@ -1696,62 +1770,7 @@ function lineRows(line: string, cols: number): number {
   return Math.max(1, Math.ceil(line.length / cols));
 }
 
-/** Visual row count after soft-wrap at `cols`.
- *
- *  Only hard `\n` starts a new row. The reflow ↵ sentinel is an inline glyph
- *  (see wrapLines in render.ts: "never forces a row break"), so packing many
- *  original newlines into one soft-wrapped stream must NOT inflate the row
- *  count. Treating ↵ as a break overstated image pages ~6× on reflowed
- *  history and flipped profitable collapses to not_profitable.
- *
- *  Each ↵ is laid out with NL_SENTINEL_PAD_CELLS blank cells on either side
- *  (padNewlineMarkers in render.ts), so it counts as that many extra cells. */
-export function countVisualRows(text: string, cols: number): number {
-  const sentinel = NL_SENTINEL.charCodeAt(0);
-  let rows = 0;
-  let lineStart = 0;
-  let padCells = 0;
-  const len = text.length;
-  for (let i = 0; i <= len; i++) {
-    const cc = i < len ? text.charCodeAt(i) : -1;
-    if (cc === sentinel) padCells += 2 * NL_SENTINEL_PAD_CELLS;
-    if (i === len || cc === 10 /* \n */) {
-      const lineLen = i - lineStart + padCells;
-      // Empty line (consecutive \n) still costs one visual row.
-      rows += lineLen === 0 ? 1 : Math.ceil(lineLen / Math.max(1, cols));
-      lineStart = i + 1;
-      padCells = 0;
-    }
-  }
-  return rows;
-}
-
-/** Estimate how many images `text` will render to at the given column width.
- *  Counts soft-wrapped visual rows, which is what render.ts actually budgets
- *  against. Exported for tests + the paging gate.
- *
- */
-export function estimateImageCount(
-  textOrLen: string | number,
-  cols: number,
-  maxCharsPerImage: number = READABLE_CHARS_PER_IMAGE,
-  maxLinesPerColumn: number = LINES_PER_IMAGE,
-): number {
-  const readableLinesPerCol = Math.max(1, Math.floor(maxCharsPerImage / Math.max(1, cols)));
-  const hardLinesPerCol = Math.max(1, Math.floor(maxLinesPerColumn));
-  const linesPerImage = Math.min(hardLinesPerCol, readableLinesPerCol);
-  const charBudget = Math.max(1, maxCharsPerImage);
-  if (typeof textOrLen === 'number') {
-    // Back-compat shim — numeric arg gets the looser chars-based estimate.
-    return Math.max(1, Math.ceil(textOrLen / charBudget));
-  }
-  const rows = countVisualRows(textOrLen, cols);
-  return Math.max(
-    1,
-    Math.ceil(rows / linesPerImage),
-    Math.ceil(textOrLen.length / charBudget),
-  );
-}
+// Removed duplicate countVisualRows / estimateImageCount — now imported & re-exported from render.ts.
 
 /** Classify content so we can pick a truncation strategy. Cheap heuristics on
  *  the first ~4 KiB. Returns:
@@ -2154,20 +2173,115 @@ function historyGridTuning(
  * the delta (no tools, system = billing line), so this is where its tool_results live.
  * Must run AFTER history collapse; see the ORDERING INVARIANT at the main-path call.
  */
+interface HybridToolOpticalGuard {
+  readonly cacheBreakpoints: readonly CacheBreakpointMarker[];
+  readonly msgTotalTokens: readonly number[];
+  readonly totalMessages: number;
+  readonly sessionKey?: string;
+  readonly sessionCold: boolean;
+}
+
+function buildHybridToolOpticalGuard(
+  req: MessagesRequest,
+  sessionKey: string | undefined,
+  sessionCold: boolean,
+): HybridToolOpticalGuard {
+  const cacheBreakpoints: CacheBreakpointMarker[] = [];
+  if (Array.isArray(req.tools)) {
+    for (const rawTool of req.tools) {
+      if (!rawTool || typeof rawTool !== 'object') continue;
+      const ttl = markerTtlSeconds((rawTool as { cache_control?: unknown }).cache_control);
+      if (ttl !== undefined) cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+    }
+  }
+  if (Array.isArray(req.system)) {
+    for (const rawBlk of req.system) {
+      if (!rawBlk || typeof rawBlk !== 'object') continue;
+      const ttl = markerTtlSeconds((rawBlk as { cache_control?: unknown }).cache_control);
+      if (ttl !== undefined) cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+    }
+  }
+  const messages = Array.isArray(req.messages) ? req.messages : [];
+  const msgTotalTokens: number[] = new Array<number>(messages.length).fill(0);
+  for (let mIdx = 0; mIdx < messages.length; mIdx++) {
+    const msg = messages[mIdx];
+    msgTotalTokens[mIdx] = estimateMessageTokens(msg);
+    if (!msg || typeof msg !== 'object') continue;
+    const msgTtl = markerTtlSeconds((msg as { cache_control?: unknown }).cache_control);
+    if (msgTtl !== undefined) {
+      cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: Number.MAX_SAFE_INTEGER, ttlSec: msgTtl });
+    }
+    if (!Array.isArray(msg.content)) continue;
+    for (let bIdx = 0; bIdx < msg.content.length; bIdx++) {
+      const blk = msg.content[bIdx];
+      if (!blk || typeof blk !== 'object') continue;
+      const blkTtl = markerTtlSeconds((blk as { cache_control?: unknown }).cache_control);
+      if (blkTtl !== undefined) cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: bIdx, ttlSec: blkTtl });
+      if ((blk as { type?: unknown }).type === 'tool_result' && Array.isArray((blk as { content?: unknown }).content)) {
+        for (const sub of (blk as { content: unknown[] }).content) {
+          if (!sub || typeof sub !== 'object') continue;
+          const partTtl = markerTtlSeconds((sub as { cache_control?: unknown }).cache_control);
+          if (partTtl !== undefined) cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: bIdx, ttlSec: partTtl });
+        }
+      }
+    }
+  }
+  return {
+    cacheBreakpoints,
+    msgTotalTokens,
+    totalMessages: messages.length,
+    sessionKey,
+    sessionCold,
+  };
+}
+
+function checkHybridToolOpticalBlock(
+  mIdx: number,
+  bIdx: number,
+  slotSig: string,
+  guard: HybridToolOpticalGuard | undefined,
+): { skip: boolean; seal?: () => void } {
+  if (!guard) return { skip: false };
+  const slotKey = `opt_tr:${slotSig}`;
+  const alreadySealed = Boolean(guard.sessionKey && hasStage2SealKey(guard.sessionKey, slotKey));
+  if (!alreadySealed && !guard.sessionCold) {
+    const { coveringTtlSec, downstreamTokens } = coveringBreakpointInfo(
+      mIdx,
+      bIdx,
+      guard.cacheBreakpoints,
+      guard.msgTotalTokens,
+      guard.totalMessages,
+    );
+    if (coveringTtlSec > 0 && downstreamTokens > 0) {
+      return { skip: true };
+    }
+  }
+  return {
+    skip: false,
+    seal: () => {
+      if (guard.sessionKey) recordStage2SealKey(guard.sessionKey, slotKey);
+    },
+  };
+}
+
 async function compressToolResultsInPlace(
   req: MessagesRequest,
   info: TransformInfo,
   o: Required<TransformOptions>,
   denseGeo: ReturnType<typeof denseGateGeometry>,
   droppedCodepoints: Map<number, number>,
+  hybridGuard?: HybridToolOpticalGuard,
 ): Promise<boolean> {
   let anyChanged = false;
   if (o.compressToolResults) {
-    for (const msg of req.messages ?? []) {
+    const messages = req.messages ?? [];
+    for (let mIdx = 0; mIdx < messages.length; mIdx++) {
+      const msg = messages[mIdx]!;
       if (msg.role !== 'user' || !Array.isArray(msg.content)) continue;
       const rewritten: ContentBlock[] = [];
       let changed = false;
-      for (const blk of msg.content) {
+      for (let bIdx = 0; bIdx < msg.content.length; bIdx++) {
+        const blk = msg.content[bIdx]!;
         if (blk && (blk as ToolResultBlock).type === 'tool_result') {
           const tr = blk as ToolResultBlock;
           // Anthropic rejects images inside is_error tool_results — leave alone.
@@ -2181,6 +2295,18 @@ async function compressToolResultsInPlace(
             if (callerKeepsSharp(o.keepSharp, { kind: 'tool_result', text: innerRaw, toolUseId: tr.tool_use_id })) {
               bumpPassthrough(info, 'kept_sharp');
               info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
+              rewritten.push(blk);
+              continue;
+            }
+            const guardDecision = hybridGuard
+              ? checkHybridToolOpticalBlock(
+                  mIdx,
+                  bIdx,
+                  `${tr.tool_use_id ?? `${mIdx}_${bIdx}`}\0${innerRaw.length}:${tapeHash64Hex(innerRaw)}`,
+                  hybridGuard,
+                )
+              : undefined;
+            if (guardDecision?.skip) {
               rewritten.push(blk);
               continue;
             }
@@ -2277,12 +2403,14 @@ async function compressToolResultsInPlace(
                 content: trFactSheet ? [...imgs, { type: 'text' as const, text: trFactSheet }] : imgs,
               });
               changed = true;
+              guardDecision?.seal?.();
               bumpBucket(info, toolResultBucket(classifyContent(inner)), innerRaw.length);
             }
           } else if (Array.isArray(innerRaw)) {
             const newInner: Array<TextBlock | ImageBlock> = [];
             let innerChanged = false;
-            for (const ib of innerRaw) {
+            for (let pIdx = 0; pIdx < innerRaw.length; pIdx++) {
+              const ib = innerRaw[pIdx];
               const isTextBlock =
                 ib &&
                 (ib as TextBlock).type === 'text' &&
@@ -2296,6 +2424,18 @@ async function compressToolResultsInPlace(
               if (callerKeepsSharp(o.keepSharp, { kind: 'tool_result_part', text: innerTextRaw, toolUseId: tr.tool_use_id })) {
                 bumpPassthrough(info, 'kept_sharp');
                 info.keptSharpBlocks = (info.keptSharpBlocks ?? 0) + 1;
+                newInner.push(ib as TextBlock | ImageBlock);
+                continue;
+              }
+              const partGuardDecision = hybridGuard
+                ? checkHybridToolOpticalBlock(
+                    mIdx,
+                    bIdx,
+                    `${tr.tool_use_id ?? `${mIdx}_${bIdx}`}#${pIdx}\0${innerTextRaw.length}:${tapeHash64Hex(innerTextRaw)}`,
+                    hybridGuard,
+                  )
+                : undefined;
+              if (partGuardDecision?.skip) {
                 newInner.push(ib as TextBlock | ImageBlock);
                 continue;
               }
@@ -2392,6 +2532,7 @@ async function compressToolResultsInPlace(
                 droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
               }
               bumpBucket(info, toolResultBucket(classifyContent(innerText)), innerTextRaw.length);
+              partGuardDecision?.seal?.();
               innerChanged = true;
             }
             if (innerChanged) {
@@ -2410,14 +2551,33 @@ async function compressToolResultsInPlace(
       if (changed) { msg.content = rewritten; anyChanged = true; }
     }
   }
+  if (anyChanged && hybridGuard) {
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_tool_optical')) stages.push('hybrid_tool_optical');
+    info.textHygieneStages = stages;
+  }
   return anyChanged;
 }
 
 const ANTHROPIC_CLIFF_STICKY_MAX = 512;
 const anthropicCliffSticky = new Map<string, number>();
 
+function getAnthropicCliffSticky(key: string): number | undefined {
+  const hit = anthropicCliffSticky.get(key);
+  if (hit !== undefined) {
+    anthropicCliffSticky.delete(key);
+    anthropicCliffSticky.set(key, hit);
+  }
+  return hit;
+}
+
 function recordAnthropicCliffSticky(key: string, cliffAt: number): void {
-  if (anthropicCliffSticky.size >= ANTHROPIC_CLIFF_STICKY_MAX) anthropicCliffSticky.clear();
+  if (anthropicCliffSticky.has(key)) {
+    anthropicCliffSticky.delete(key);
+  } else if (anthropicCliffSticky.size >= ANTHROPIC_CLIFF_STICKY_MAX) {
+    const oldest = anthropicCliffSticky.keys().next().value;
+    if (oldest !== undefined) anthropicCliffSticky.delete(oldest);
+  }
   anthropicCliffSticky.set(key, cliffAt);
 }
 
@@ -2438,6 +2598,8 @@ export function resolveOpticalHistoryPolicy(opts: {
   readonly model?: string;
   readonly estPromptTokens?: number;
   readonly textHygieneActive: boolean;
+  readonly sessionKey?: string;
+  readonly sessionCold?: boolean;
 }): 'hybrid' | 'full' {
   const rawEnv = readBrandEnv('OPTICAL_MODE');
   const normEnv = rawEnv ? rawEnv.trim().toLowerCase() : undefined;
@@ -2457,15 +2619,22 @@ export function resolveOpticalHistoryPolicy(opts: {
   if (opts.opticalMode === 'hybrid' || envMode === 'hybrid') {
     return 'hybrid';
   }
-  if (priceMode() !== 'kosha') {
-    return 'full';
+  if (opts.sessionKey && !opts.sessionCold) {
+    const pinned = getPinnedOpticalHistoryPolicy(opts.sessionKey, { model: opts.model });
+    if (pinned !== undefined) return pinned;
   }
   const promptTokens = opts.estPromptTokens ?? 0;
-  if (promptTokens >= 160_000) {
-    return 'full';
+  let computed: 'hybrid' | 'full';
+  if (priceMode() !== 'kosha' || promptTokens >= 160_000) {
+    computed = 'full';
+  } else {
+    const rates = resolvePriceRates(opts.model, { promptTokens: opts.estPromptTokens });
+    computed = rates.read <= 0.10 ? 'hybrid' : 'full';
   }
-  const rates = resolvePriceRates(opts.model, { promptTokens: opts.estPromptTokens });
-  return rates.read <= 0.10 ? 'hybrid' : 'full';
+  if (opts.sessionKey) {
+    setPinnedOpticalHistoryPolicy(opts.sessionKey, computed, { model: opts.model });
+  }
+  return computed;
 }
 
 async function runHistoryCollapseAndFinalize(
@@ -2516,7 +2685,7 @@ async function runHistoryCollapseAndFinalize(
         const imgTok = imageTokensCost(text, historyGeometry.cols, undefined, true, historyGeometry.maxChars, historyGeometry);
         if (imgTok < textTok) {
           const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0history`;
-          const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(histCliffKey) : undefined;
+          const stickyCliffAt = priceMode() === 'kosha' ? getAnthropicCliffSticky(histCliffKey) : undefined;
           if (stickyCliffAt !== undefined && reqPromptTokensEst > stickyCliffAt) return true;
           const upstreamSysTok = Math.ceil((info.origChars ?? 0) / Math.max(1, o.charsPerToken));
           const tailTok = estimateTailMsgTokens(req.messages, o.charsPerToken);
@@ -2579,7 +2748,7 @@ async function runHistoryCollapseAndFinalize(
       info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
       info.historyReason = 'image_bytes';
     } else if (histInfo.collapsedTurns > 0) {
-      recordFreezeStep(info.sessionKey ?? info.firstUserSha8, histInfo.freezeStep);
+      recordFreezeStep(info.sessionKey ?? info.firstUserSha8, histInfo.freezeStep, o.model ? { model: o.model } : undefined);
       if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
       if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
       if (tuning.packFill) info.historyPackFill = true;
@@ -2617,9 +2786,21 @@ async function runHistoryCollapseAndFinalize(
   // tool_results are imaged on their own merits, not only when the slab is: a
   // tiny system with a large tool_result (e.g. a server-side thread continuation)
   // is exactly the request that needs it. After the collapse, per the invariant.
-  const toolResultsImaged = !hybridTextMmu && o.compressToolResults
-    ? await compressToolResultsInPlace(req, info, o, denseGateGeometry(o), droppedCodepoints)
+  const toolResultsImaged = o.compressToolResults
+    ? await compressToolResultsInPlace(
+        req,
+        info,
+        o,
+        denseGateGeometry(o),
+        droppedCodepoints,
+        hybridTextMmu
+          ? buildHybridToolOpticalGuard(req, info.sessionKey ?? info.firstUserSha8, sessionState?.cold ?? false)
+          : undefined,
+      )
     : false;
+  if (toolResultsImaged && !collapsedFlag && hybridTextMmu && info.imageCount > 0) {
+    info.reason = 'hybrid_tool_optical';
+  }
   applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
   // Ground truth, counted from the bytes we are about to send. The provider only
@@ -2869,6 +3050,11 @@ export async function transformRequest(
 
   const effectiveImageCompress = o.imageCompress && o.stageToggles?.optical !== false;
   const textHygieneActive = isTextHygieneActive(o.textHygiene);
+  const earlyFirstUser = firstUserText(req);
+  const resolvedSessionKey = await applyClientSessionIdentity(info, earlyFirstUser, o);
+  const sessionState = resolvedSessionKey
+    ? noteHistoryRequest(resolvedSessionKey, { model: o.model })
+    : { cold: false, minFreezeStep: 0 };
   const opticalHistoryPolicy: 'hybrid' | 'full' = effectiveImageCompress
     ? resolveOpticalHistoryPolicy({
         opticalMode: o.opticalMode,
@@ -2879,14 +3065,11 @@ export async function transformRequest(
             Math.max(1, o.charsPerToken),
         ),
         textHygieneActive,
+        sessionKey: resolvedSessionKey,
+        sessionCold: sessionState.cold,
       })
     : 'full';
   const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
-  const earlyFirstUser = firstUserText(req);
-  const resolvedSessionKey = await applyClientSessionIdentity(info, earlyFirstUser, o);
-  const sessionState = resolvedSessionKey
-    ? noteHistoryRequest(resolvedSessionKey)
-    : { cold: false, minFreezeStep: 0 };
   const hygieneStats = textHygieneActive
     ? applyAnthropicTextHygiene(req, {
         foldLogs: !effectiveImageCompress || hybridTextMmu,
@@ -3219,7 +3402,7 @@ export async function transformRequest(
   if (slabGateEval && !slabProfitable && slabRates !== null) {
     const promptBefore = Math.max(slabGateEval.textTokens, reqPromptTokensEst);
     const slabCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0${info.systemSha8 ?? ''}`;
-    const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(slabCliffKey) : undefined;
+    const stickyCliffAt = priceMode() === 'kosha' ? getAnthropicCliffSticky(slabCliffKey) : undefined;
     if (stickyCliffAt !== undefined && promptBefore > stickyCliffAt) {
       slabProfitable = true;
     } else {
@@ -3441,7 +3624,7 @@ export async function transformRequest(
         const imgTok = imageTokensCost(text, historyGeometry.cols, undefined, true, historyGeometry.maxChars, historyGeometry);
         if (imgTok < textTok) {
           const histCliffKey = `${o.model ?? ''}\0${reqTtlSec ?? ''}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0history`;
-          const stickyCliffAt = priceMode() === 'kosha' ? anthropicCliffSticky.get(histCliffKey) : undefined;
+          const stickyCliffAt = priceMode() === 'kosha' ? getAnthropicCliffSticky(histCliffKey) : undefined;
           if (stickyCliffAt !== undefined && reqPromptTokensEst > stickyCliffAt) return true;
           const tailTok = estimateTailMsgTokens(req.messages, o.charsPerToken);
           const downstreamCachedTokens = Math.max(0, reqPromptTokensEst - (info.imageTokens ?? 0) - textTok - tailTok);
@@ -3495,7 +3678,7 @@ export async function transformRequest(
       info.imageByteSkips = (info.imageByteSkips ?? 0) + 1;
       info.historyReason = 'image_bytes';
     } else if (histInfo.collapsedTurns > 0) {
-      recordFreezeStep(info.sessionKey ?? info.firstUserSha8, histInfo.freezeStep);
+      recordFreezeStep(info.sessionKey ?? info.firstUserSha8, histInfo.freezeStep, o.model ? { model: o.model } : undefined);
       if (histInfo.freezeStep !== undefined) info.historyFreezeStep = histInfo.freezeStep;
       if (histInfo.budgetTrimmed) info.historyBudgetTrimmed = true;
       if (tuning.packFill) info.historyPackFill = true;
@@ -3536,7 +3719,7 @@ export async function transformRequest(
       // one-time full-prefix rewrite (~53k tokens/session). Leave the anchor on
       // the byte-stable slab image until a frozen chunk exists to pin to.
       if (histInfo.carryOverImageOrdinal !== undefined) {
-        relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal);
+        relocateAnchorToHistoryImage(req.messages, histInfo.carryOverImageOrdinal, req.system, req.tools);
       }
     } else if (histInfo.reason) {
       info.historyReason = histInfo.reason;
@@ -3560,9 +3743,16 @@ export async function transformRequest(
   // history images are already counted in `info` by the time we get here, so
   // `imageHeadroom(info)` is the headroom left after the collapse spent its
   // share. Out of headroom degrades to sharp text, which is the safe direction.
-  if (!hybridTextMmu) {
-    await compressToolResultsInPlace(req, info, o, denseGeo, droppedCodepoints);
-  }
+  await compressToolResultsInPlace(
+    req,
+    info,
+    o,
+    denseGeo,
+    droppedCodepoints,
+    hybridTextMmu
+      ? buildHybridToolOpticalGuard(req, info.sessionKey ?? info.firstUserSha8, sessionState.cold)
+      : undefined,
+  );
 
   // The volatile billing line is NOT re-emitted into the body at all. There is
   // no safe body position: req.system precedes the last cache_control marker

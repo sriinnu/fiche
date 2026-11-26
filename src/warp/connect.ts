@@ -41,6 +41,46 @@ function normalizeHostKey(host: string): string {
   return isIP(stripped) !== 0 ? stripped : stripped.toLowerCase();
 }
 
+function isLoopbackHost(host: string): boolean {
+  const norm = normalizeHostKey(host);
+  return norm === 'localhost' || norm === '::1' || norm.startsWith('127.');
+}
+
+const FAIL_OPEN_ERRNO = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT']);
+const FAIL_OPEN_CONNECT_TIMEOUT_MS = 1500;
+const FAIL_OPEN_REPLAY_CAP_BYTES = 4 * 1024 * 1024;
+
+function isFailOpenError(err: unknown): boolean {
+  if (err instanceof AggregateError) {
+    return err.errors.length > 0 && err.errors.every((inner) => isFailOpenError(inner));
+  }
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === 'string' && FAIL_OPEN_ERRNO.has(code);
+}
+
+/** Canonical Host header value for `protocol` (`https:` omits `:443`, `http:` omits `:80`). */
+function canonicalHostHeader(host: string, port: string, protocol: string): string {
+  const normHost = normalizeHostKey(host);
+  const bracketed = normHost.includes(':') && !normHost.startsWith('[') ? `[${normHost}]` : normHost;
+  const isDefaultPort =
+    (protocol === 'https:' && port === '443') || (protocol === 'http:' && port === '80');
+  return isDefaultPort ? bracketed : `${bracketed}:${port}`;
+}
+
+/** Validate client-supplied `Host` header against expected `host:port` (when present). */
+function hostHeaderMatches(
+  rawHostHeader: string | string[] | undefined,
+  expectedHost: string,
+  expectedPort: string,
+): boolean {
+  if (rawHostHeader === undefined) return true;
+  if (Array.isArray(rawHostHeader)) return false;
+  const trimmed = rawHostHeader.trim();
+  if (!trimmed) return false;
+  const parsed = splitHostPort(trimmed, expectedPort);
+  return normalizeHostKey(parsed.host) === normalizeHostKey(expectedHost) && parsed.port === expectedPort;
+}
+
 /**
  * Hop-by-hop headers are meaningful only on a single connection, so they must
  * not be copied onto the re-originated request (RFC 9110 7.6.1).
@@ -58,16 +98,20 @@ const HOP_HEADERS = new Set([
 ]);
 
 export interface WarpHandlerOptions {
-  routes: readonly Route[];
+  routes: readonly Route[] | (() => readonly Route[]);
   ca: CertificateAuthority;
   /** Called the first time each route diverts a request, for the log. */
   onDivert?: (host: string, path: string, target: string) => void;
   /**
-   * When true, a diverted route whose target refuses the TCP connection
-   * (`ECONNREFUSED` before any request bytes are flushed) transparently retries
-   * once directly against the original upstream origin. Defaults to `false`.
+   * When true, a diverted route whose target refuses or resets the TCP connection
+   * before response headers arrive transparently retries once directly against
+   * the original upstream origin. Defaults to `false`.
    */
   failOpenOnDivertRefused?: boolean;
+  /** Per-user loopback token injected as `x-fiche-warp-auth` ONLY on diverted requests to Fiche. */
+  warpAuthToken?: string;
+  /** Warp proxy's own bound port, used to reject self-proxy loops. */
+  selfPort?: number | (() => number | undefined);
 }
 
 export interface WarpHandlers {
@@ -116,11 +160,19 @@ function authority(host: string, port: string): string {
   return host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
 }
 
-function forwardHeaders(headers: IncomingHttpHeaders): Record<string, string | string[]> {
+function forwardHeaders(
+  headers: IncomingHttpHeaders,
+  canonicalHost?: string,
+): Record<string, string | string[]> {
   const out: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(headers)) {
-    if (value === undefined || HOP_HEADERS.has(key.toLowerCase())) continue;
+    const lower = key.toLowerCase();
+    if (value === undefined || HOP_HEADERS.has(lower) || lower === 'x-fiche-warp-auth') continue;
+    if (canonicalHost !== undefined && lower === 'host') continue;
     out[key] = value;
+  }
+  if (canonicalHost !== undefined) {
+    out.host = canonicalHost;
   }
   return out;
 }
@@ -149,7 +201,17 @@ const httpAgent = new HttpAgent({ keepAlive: true });
 const httpsAgent = new HttpsAgent({ keepAlive: true });
 
 export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
-  const { routes, ca, onDivert } = options;
+  const { ca, onDivert } = options;
+  const getRoutes = (): readonly Route[] =>
+    typeof options.routes === 'function' ? options.routes() : options.routes;
+  const isSelfLoop = (host: string, portNum: number, socketLocalPort?: number): boolean => {
+    if (!isLoopbackHost(host)) return false;
+    const configuredSelf =
+      typeof options.selfPort === 'function' ? options.selfPort() : options.selfPort;
+    if (configuredSelf !== undefined && portNum === configuredSelf) return true;
+    if (socketLocalPort !== undefined && portNum === socketLocalPort) return true;
+    return false;
+  };
   const announced = new Set<string>();
 
   /** Re-originate one request, to a route target or to the real host. */
@@ -180,7 +242,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       }
       path = normalizeRoutePath(resolvedReq.pathname);
       normalizedUri = path + resolvedReq.search;
-      const route = matchRoute(routes, hostPort, path);
+      const route = matchRoute(getRoutes(), hostPort, path);
       directTarget = new URL(`${origin}${normalizedUri}`);
       if (route) {
         divertTarget = new URL(rewriteUrl(route, normalizedUri));
@@ -197,9 +259,46 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
 
+    const expectedHost = normalizedOrigin.hostname.startsWith('[') && normalizedOrigin.hostname.endsWith(']')
+      ? normalizedOrigin.hostname.slice(1, -1)
+      : normalizedOrigin.hostname;
+    const expectedPort =
+      normalizedOrigin.port || (normalizedOrigin.protocol === 'https:' ? '443' : '80');
+    if (!hostHeaderMatches(req.headers.host, expectedHost, expectedPort)) {
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.writeHead(421, { 'content-type': 'text/plain' });
+        res.end('fiche warp: Misdirected Request');
+      }
+      return;
+    }
+    const targetPortNum = parsePort(expectedPort);
+    if (targetPortNum !== null && isSelfLoop(expectedHost, targetPortNum, req.socket?.localPort)) {
+      if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+        res.writeHead(508, { 'content-type': 'text/plain' });
+        res.end('fiche warp: proxy loop detected');
+      }
+      return;
+    }
+    if (divertTarget) {
+      const divHost = divertTarget.hostname.startsWith('[') && divertTarget.hostname.endsWith(']')
+        ? divertTarget.hostname.slice(1, -1)
+        : divertTarget.hostname;
+      const divPort = Number(divertTarget.port || (divertTarget.protocol === 'https:' ? 443 : 80));
+      if (isSelfLoop(divHost, divPort, req.socket?.localPort)) {
+        if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+          res.writeHead(508, { 'content-type': 'text/plain' });
+          res.end('fiche warp: route self-loop detected');
+        }
+        return;
+      }
+    }
+
+    const authoritativeHost = canonicalHostHeader(expectedHost, expectedPort, normalizedOrigin.protocol);
+
     let activeOutbound: ReturnType<typeof httpRequest> | undefined;
     let activeUpstreamRes: IncomingMessage | undefined;
     let downstreamClosed = false;
+    let responseStarted = false;
 
     const cleanupActive = () => {
       downstreamClosed = true;
@@ -222,12 +321,48 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       }
     };
 
-    const sendToTarget = (target: URL, allowFailOpen: boolean): void => {
+    const allowInitialFailOpen = Boolean(divertTarget && options.failOpenOnDivertRefused);
+    const bufferedChunks: Buffer[] = [];
+    let bufferedBytes = 0;
+    let bufferOverflowed = false;
+    let reqStreamEnded = Boolean(req.readableEnded);
+    let activeSink: ReturnType<typeof httpRequest> | undefined;
+
+    if (allowInitialFailOpen) {
+      req.on('data', (chunk: Buffer) => {
+        if (downstreamClosed) return;
+        if (!responseStarted && !bufferOverflowed) {
+          if (bufferedBytes + chunk.byteLength <= FAIL_OPEN_REPLAY_CAP_BYTES) {
+            bufferedChunks.push(chunk);
+            bufferedBytes += chunk.byteLength;
+          } else {
+            bufferOverflowed = true;
+            bufferedChunks.length = 0;
+          }
+        }
+        if (activeSink && !activeSink.destroyed && !activeSink.writableEnded) {
+          const ok = activeSink.write(chunk);
+          if (!ok && bufferOverflowed) req.pause?.();
+        }
+      });
+      req.on('end', () => {
+        reqStreamEnded = true;
+        if (activeSink && !activeSink.destroyed && !activeSink.writableEnded) {
+          activeSink.end();
+        }
+      });
+    }
+
+    const sendToTarget = (target: URL, allowFailOpen: boolean, isDivert: boolean): void => {
       const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
       const hostname =
         target.hostname.startsWith('[') && target.hostname.endsWith(']')
           ? target.hostname.slice(1, -1)
           : target.hostname;
+      const outHeaders = forwardHeaders(req.headers, authoritativeHost);
+      if (isDivert && options.warpAuthToken) {
+        outHeaders['x-fiche-warp-auth'] = options.warpAuthToken;
+      }
       if (allowFailOpen) {
         req.pause?.();
       }
@@ -237,25 +372,53 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
         port: target.port || (target.protocol === 'https:' ? 443 : 80),
         method: req.method,
         path: target.pathname + target.search,
-        // Keep the agent's original Host: the downstream routes (and an upstream
-        // may sign) on the vhost, not on wherever we happened to send the bytes.
-        headers: forwardHeaders(req.headers),
+        // Keep the authoritative Host (stripped of default :443/:80) so downstream
+        // routes on the vhost rather than the divert loopback port.
+        headers: outHeaders,
         setHost: false,
-        agent: target.protocol === 'https:' ? httpsAgent : httpAgent,
+        agent: allowFailOpen ? false : (target.protocol === 'https:' ? httpsAgent : httpAgent),
       });
       activeOutbound = outbound;
       outbound.setNoDelay?.(true);
 
       let piped = false;
       let retried = false;
+      let connectTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearConnectTimer = () => {
+        if (connectTimer !== undefined) {
+          clearTimeout(connectTimer);
+          connectTimer = undefined;
+        }
+      };
+
       const startPipe = () => {
+        clearConnectTimer();
         if (piped || downstreamClosed || outbound.destroyed) return;
         piped = true;
+        if (allowInitialFailOpen) {
+          activeSink = outbound;
+          for (const chunk of bufferedChunks) {
+            if (outbound.destroyed || outbound.writableEnded) break;
+            outbound.write(chunk);
+          }
+          if (reqStreamEnded) {
+            if (!outbound.destroyed && !outbound.writableEnded) outbound.end();
+          } else {
+            outbound.on('drain', () => {
+              if (!downstreamClosed) req.resume?.();
+            });
+            req.resume?.();
+          }
+          return;
+        }
         if (req.readableEnded) outbound.end();
         else req.pipe(outbound);
       };
 
       const onResponse = (upstream: IncomingMessage) => {
+        clearConnectTimer();
+        responseStarted = true;
+        bufferedChunks.length = 0;
         activeUpstreamRes = upstream;
         upstream.socket?.setNoDelay?.(true);
         upstream.on('error', abortDownstream);
@@ -271,17 +434,20 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       };
 
       const onError = (err: Error) => {
+        clearConnectTimer();
         if (
           allowFailOpen
-          && !piped
           && !retried
+          && !responseStarted
+          && !bufferOverflowed
           && !downstreamClosed
           && !res.headersSent
           && !res.writableEnded
           && !res.destroyed
-          && (err as NodeJS.ErrnoException).code === 'ECONNREFUSED'
+          && isFailOpenError(err)
         ) {
           retried = true;
+          if (activeSink === outbound) activeSink = undefined;
           outbound.off('response', onResponse);
           outbound.off('error', onError);
           outbound.on('error', () => {});
@@ -290,12 +456,13 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
           if (!announced.has(failKey)) {
             announced.add(failKey);
             if (!process.stdout.isTTY) {
-              console.error(`[fiche] warp: ${target.origin} refused (${hostPort}${path}) — failing open direct`);
+              console.error(`[fiche] warp: ${target.origin} failed (${hostPort}${path}) — failing open direct`);
             }
           }
-          sendToTarget(directTarget, false);
+          sendToTarget(directTarget, false, false);
           return;
         }
+        bufferedChunks.length = 0;
         if (!req.destroyed) req.destroy?.();
         // Our own teardown below surfaces here as ECONNRESET; the client is
         // already gone, so writing a 502 into it would throw.
@@ -305,16 +472,26 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
           return;
         }
         res.writeHead(502, { 'content-type': 'text/plain' });
-        res.end(`fiche warp: upstream error: ${err.message}`);
+        res.end('fiche warp: upstream error');
       };
 
       outbound.on('response', onResponse);
       outbound.on('error', onError);
+      outbound.once('close', clearConnectTimer);
 
       if (allowFailOpen) {
         outbound.once('socket', (sock) => {
-          if (!sock.connecting) startPipe();
-          else sock.once('connect', startPipe);
+          if (!sock.connecting) {
+            startPipe();
+          } else {
+            connectTimer = setTimeout(() => {
+              connectTimer = undefined;
+              const timeoutErr = Object.assign(new Error('connect timeout'), { code: 'ETIMEDOUT' });
+              outbound.destroy(timeoutErr);
+            }, FAIL_OPEN_CONNECT_TIMEOUT_MS);
+            connectTimer.unref?.();
+            sock.once('connect', startPipe);
+          }
         });
       } else {
         startPipe();
@@ -322,8 +499,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     };
 
     const initialTarget = divertTarget ?? directTarget;
-    const allowInitialFailOpen = Boolean(divertTarget && options.failOpenOnDivertRefused);
-    sendToTarget(initialTarget, allowInitialFailOpen);
+    sendToTarget(initialTarget, allowInitialFailOpen, Boolean(divertTarget));
   };
 
   const connectTargets = new WeakMap<Socket, { host: string; port: string }>();
@@ -343,11 +519,12 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   };
 
   /**
-   * Upgrades always go to the real host, never to a route. Route targets speak
-   * HTTP, and the control plane behind /remote-control pairing is exactly the
-   * traffic that has to stay first-party, so this splices raw TLS instead of
-   * re-originating through an HTTP client (which would drop the Upgrade and can
-   * never produce a 101).
+   * Unmatched upgrades (such as Claude Code `/remote-control` or ChatGPT UI
+   * sockets) splice directly to the real host so first-party pairing stays
+   * intact. WebSocket upgrades on a *matched* HTTP-diverted route (such as
+   * `chatgpt.com/backend-api/codex/responses*` or `api.openai.com/v1/responses*`)
+   * return `426 Upgrade Required` (`websocket_unsupported`, matching `proxy.ts`),
+   * telling Codex to switch immediately to HTTP POST through Fiche.
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
     const bound = connectTargets.get(req.socket) ?? connectTargets.get(clientSocket);
@@ -357,6 +534,36 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     if (!host || portNum === null) {
       clientSocket.destroy();
       return;
+    }
+    if (String(req.headers.upgrade ?? '').toLowerCase().includes('websocket')) {
+      try {
+        const hostPort = authority(host, port);
+        if (!hostHeaderMatches(req.headers.host, host, port)) {
+          clientSocket.end('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n');
+          return;
+        }
+        const resolved = new URL(req.url ?? '/', `https://${hostPort}`);
+        const reqPath = normalizeRoutePath(resolved.pathname);
+        if (matchRoute(getRoutes(), hostPort, reqPath)) {
+          const body = JSON.stringify({
+            error: {
+              type: 'websocket_unsupported',
+              message: 'fiche proxies HTTP only; retry over HTTP',
+            },
+          });
+          clientSocket.end(
+            'HTTP/1.1 426 Upgrade Required\r\n' +
+            'Content-Type: application/json\r\n' +
+            `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+            'Connection: close\r\n\r\n' +
+            body,
+          );
+          return;
+        }
+      } catch {
+        clientSocket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+        return;
+      }
     }
     const upstream = tlsConnect(
       { host, port: portNum, servername: isIP(host) !== 0 ? undefined : host },
@@ -401,8 +608,12 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
       return;
     }
+    if (isSelfLoop(host, portNum, req.socket?.localPort)) {
+      clientSocket.end('HTTP/1.1 508 Loop Detected\r\n\r\n');
+      return;
+    }
 
-    if (!hostCouldMatch(routes, authority(host, port))) {
+    if (!hostCouldMatch(getRoutes(), authority(host, port))) {
       const upstream = netConnect({ host, port: portNum }, () => {
         if (clientSocket.destroyed) {
           upstream.destroy();
@@ -453,7 +664,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
               cb(new Error('SNI mismatch with CONNECT target'));
               return;
             }
-          } else if (sniNorm !== hostNorm && !hostCouldMatch(routes, authority(sniNorm, port))) {
+          } else if (sniNorm !== hostNorm && !hostCouldMatch(getRoutes(), authority(sniNorm, port))) {
             cb(new Error('SNI not permitted for IP CONNECT target'));
             return;
           }

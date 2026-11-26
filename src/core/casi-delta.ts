@@ -77,6 +77,7 @@ const HUNK_CONTEXT = 2;
 const HISTOGRAM_MAX_DEPTH = 16;
 const HISTOGRAM_MAX_OCCURRENCES = 64;
 const PREPARED_CACHE_MAX_ENTRIES = 192;
+const PREPARED_CACHE_MAX_CHARS = 16 * 1024 * 1024;
 const PREPARED_CACHE_MIN_CHARS = 256;
 const CDC_MIN_LINES = 8;
 const CDC_AVG_LINES = 20;
@@ -178,10 +179,8 @@ function dualHash64Hex(s: string): string {
   let h2 = 0x9e3779b1 >>> 0;
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
-    h1 ^= c;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= c;
-    h2 = Math.imul(h2, 0x01000193);
+    h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
+    h2 = Math.imul((h2 ^ ((c + (i & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
   }
   return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
 }
@@ -237,15 +236,16 @@ function chunkHash64(canonLines: readonly string[], start: number, end: number):
   let h1 = 0x811c9dc5 >>> 0;
   let h2 = 0x9e3779b1 >>> 0;
   for (let i = start; i < end; i++) {
+    const rel = i - start;
     if (i > start) {
       h1 = Math.imul((h1 ^ 10) >>> 0, 0x01000193) >>> 0;
-      h2 = Math.imul((h2 ^ 10) >>> 0, 0x01000193) >>> 0;
+      h2 = Math.imul((h2 ^ (10 + (rel & 0xff))) >>> 0, 0x85ebca6b) >>> 0;
     }
     const line = canonLines[i]!;
     for (let j = 0; j < line.length; j++) {
       const c = line.charCodeAt(j);
       h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
-      h2 = Math.imul((h2 ^ c) >>> 0, 0x01000193) >>> 0;
+      h2 = Math.imul((h2 ^ ((c + (j & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
     }
   }
   return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
@@ -311,16 +311,21 @@ interface PreparedCacheEntry {
 }
 
 const PREPARED_LINES_CACHE = new Map<string, PreparedCacheEntry>();
+let preparedCacheChars = 0;
 
 export function clearCasiPreparedCacheForTests(): void {
   PREPARED_LINES_CACHE.clear();
+  preparedCacheChars = 0;
 }
 
 function getPreparedAndChunks(
   rawText: string,
   hash64?: string,
 ): { readonly prep: PreparedLines; readonly chunks: readonly FastCdcChunk[] } {
-  const canCache = rawText.length >= PREPARED_CACHE_MIN_CHARS && rawText.length <= MAX_INPUT_CHARS;
+  const canCache =
+    rawText.length >= PREPARED_CACHE_MIN_CHARS &&
+    rawText.length <= MAX_INPUT_CHARS &&
+    rawText.length <= PREPARED_CACHE_MAX_CHARS;
   const cacheKey = canCache ? `${rawText.length}:${hash64 ?? dualHash64Hex(rawText)}` : '';
   if (canCache) {
     const cached = PREPARED_LINES_CACHE.get(cacheKey);
@@ -333,15 +338,24 @@ function getPreparedAndChunks(
   const prep = prepareLines(rawText);
   const chunks = computeFastCdcChunks(prep.canonLines, prep.canonHashes);
   if (canCache) {
-    if (PREPARED_LINES_CACHE.has(cacheKey)) {
+    const existing = PREPARED_LINES_CACHE.get(cacheKey);
+    if (existing) {
+      preparedCacheChars -= existing.rawText.length;
       PREPARED_LINES_CACHE.delete(cacheKey);
-    } else if (PREPARED_LINES_CACHE.size >= PREPARED_CACHE_MAX_ENTRIES) {
+    }
+    while (
+      (PREPARED_LINES_CACHE.size >= PREPARED_CACHE_MAX_ENTRIES ||
+        preparedCacheChars + rawText.length > PREPARED_CACHE_MAX_CHARS) &&
+      PREPARED_LINES_CACHE.size > 0
+    ) {
       const oldestKey = PREPARED_LINES_CACHE.keys().next().value;
-      if (oldestKey !== undefined) {
-        PREPARED_LINES_CACHE.delete(oldestKey);
-      }
+      if (oldestKey === undefined) break;
+      const oldest = PREPARED_LINES_CACHE.get(oldestKey);
+      PREPARED_LINES_CACHE.delete(oldestKey);
+      if (oldest) preparedCacheChars -= oldest.rawText.length;
     }
     PREPARED_LINES_CACHE.set(cacheKey, { rawText, prep, chunks });
+    preparedCacheChars += rawText.length;
   }
   return { prep, chunks };
 }
@@ -1061,6 +1075,24 @@ export class CasiIndex {
     if (this.seedHashes.has(hash64)) return;
     this.seedHashes.add(hash64);
     this.seedCount++;
+    const { prep, chunks } = getPreparedAndChunks(rawText, hash64);
+    this.indexEntry(rawText, refId, hash64, prep, turnGroup, chunks);
+  }
+
+  /**
+   * Warm-replay counterpart of an unmatched `ingest()` base, bounded by `MAX_CASI_ENTRIES`
+   * (128) and independent of `MAX_SEED_ENTRIES` / `seedHashes`.
+   */
+  replayIndexedBase(rawText: string, refId: string, turnGroup?: number): void {
+    if (
+      typeof rawText !== 'string' ||
+      rawText.length < MIN_EXACT_DUP_CHARS ||
+      rawText.length > MAX_INPUT_CHARS ||
+      this.entries.length >= MAX_CASI_ENTRIES
+    ) {
+      return;
+    }
+    const hash64 = dualHash64Hex(rawText);
     const { prep, chunks } = getPreparedAndChunks(rawText, hash64);
     this.indexEntry(rawText, refId, hash64, prep, turnGroup, chunks);
   }

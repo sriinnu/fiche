@@ -20,11 +20,21 @@ import { computeHorizonPaybackLimit, fnv64Hex } from './context-mmu.js';
 import { factSheetText } from './factsheet.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
 import { resetGlobalPrefixTape } from './prefix-tape.js';
-import { evaluateCliffAvoidance, priceMode, resolvePriceRates } from './pricing.js';
+import { evaluateCliffAvoidance, isAutoCacheOpenAIModel, priceMode, resolvePriceRates } from './pricing.js';
 import { hasSealedEpochKey, recordSealedEpochKey } from './session-state.js';
+
+export interface CacheBreakpointMarker {
+  /** Message index in `messages`, or `-1` for tools/system. */
+  readonly msgIndex: number;
+  /** Block index within `messages[msgIndex].content`, or `Number.MAX_SAFE_INTEGER` for message-level. */
+  readonly blockIndex: number;
+  /** Cache TTL in seconds (`3600` for `1h`, `300` for `5m`). */
+  readonly ttlSec: number;
+}
 
 export interface TextEpochBlock {
   readonly msgIndex: number;
+  readonly blockIndex?: number;
   readonly refId: string;
   readonly toolName?: string;
   readonly getText: () => string;
@@ -38,6 +48,8 @@ export interface TextEpochPlanArgs {
   readonly totalPromptTokens: number;
   readonly expectedOutputTokens?: number;
   readonly ttlSec?: number;
+  readonly msgTotalTokens?: readonly number[];
+  readonly cacheBreakpoints?: readonly CacheBreakpointMarker[];
   readonly keepTailMessages?: number;
   readonly epochTokenTarget?: number;
   readonly maxPaybackReads?: number;
@@ -197,16 +209,28 @@ function looksLikeDiff(text: string, lines: readonly string[]): boolean {
  * Deterministic extractive structural digest for aged tool outputs.
  */
 export function extractStructuralDigest(text: string, refId = 'prior'): string {
-  const cacheKey = `${refId}\0${text}`;
+  const cacheKey = `${refId}\0${text.length}:${fnv64Hex(text)}`;
   const hit = digestCache.get(cacheKey);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined) {
+    digestCache.delete(cacheKey);
+    digestCache.set(cacheKey, hit);
+    return hit;
+  }
 
   const store = (digest: string): string => {
     const cost = cacheKey.length + digest.length;
     if (cost <= DIGEST_CACHE_MAX_CHARS) {
-      if (digestCacheChars + cost > DIGEST_CACHE_MAX_CHARS) {
-        digestCache.clear();
-        digestCacheChars = 0;
+      const existing = digestCache.get(cacheKey);
+      if (existing !== undefined) {
+        digestCacheChars -= cacheKey.length + existing.length;
+        digestCache.delete(cacheKey);
+      }
+      while (digestCacheChars + cost > DIGEST_CACHE_MAX_CHARS && digestCache.size > 0) {
+        const oldestKey = digestCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        const oldestVal = digestCache.get(oldestKey);
+        digestCache.delete(oldestKey);
+        if (oldestVal !== undefined) digestCacheChars -= oldestKey.length + oldestVal.length;
       }
       digestCache.set(cacheKey, digest);
       digestCacheChars += cost;
@@ -316,6 +340,10 @@ function isAlreadyCompactedMarker(raw: string): boolean {
 
 export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanResult {
   const keepTail = args.keepTailMessages ?? 6;
+  const isAutoCacheOpenAI =
+    !(args.cacheBreakpoints && args.cacheBreakpoints.length > 0) &&
+    args.ttlSec === undefined &&
+    isAutoCacheOpenAIModel(args.model);
   const epochTarget = args.epochTokenTarget ?? 4_000;
   const maxPayback = args.maxPaybackReads ?? 12;
   const lsmActive =
@@ -327,7 +355,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
       args.lsmEditTailMessages !== undefined ||
       args.lsmMinLargeBlockTokens !== undefined);
   const lsmEditTail = Math.max(0, args.lsmEditTailMessages ?? 2);
-  const lsmMinLargeTokens = Math.max(1, args.lsmMinLargeBlockTokens ?? 1_500);
+  const lsmMinLargeTokens = Math.max(1, args.lsmMinLargeBlockTokens ?? 600);
 
   const cutoffMsg = args.totalMessages - keepTail;
   const cutoffL1 = args.totalMessages - lsmEditTail;
@@ -382,7 +410,10 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
   }
 
   const mode = priceMode();
-  const keyPrefix = `${args.sessionKey ?? ''}\0${mode}\0${args.model ?? ''}\0${args.ttlSec ?? ''}\0${maxPayback}\0`;
+  const hasSession = Boolean(args.sessionKey);
+  const keyPrefix = hasSession
+    ? `${args.sessionKey ?? ''}\0${mode}\0${args.model ?? ''}\0${maxPayback}\0`
+    : `${mode}\0${args.model ?? ''}\0${args.ttlSec ?? ''}\0${maxPayback}\0`;
   const buildStickyKey = (epoch: readonly Candidate[]): string =>
     `${keyPrefix}${epoch.map((e) => e.sig).join('|')}`;
 
@@ -510,27 +541,65 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     const epochDigestTokens = proposals.reduce((sum, p) => sum + p.digestTokPaired, 0);
     if (!alreadySealed && epochDigestTokens >= epochRawTokens * 0.55) continue;
 
-    const epochLastMsg = epoch[epoch.length - 1]!.block.msgIndex;
+    const epochLastBlock = epoch[epoch.length - 1]!.block;
+    const epochLastMsg = epochLastBlock.msgIndex;
+    const epochLastBlockIdx = epochLastBlock.blockIndex ?? 0;
+
+    let coveringTtlSec = 0;
+    const hasBreakpoints = Boolean(args.cacheBreakpoints && args.cacheBreakpoints.length > 0);
+    let horizonEndMsg = args.totalMessages - 3;
+    if (args.cacheBreakpoints && args.cacheBreakpoints.length > 0) {
+      let maxBpMsg = -1;
+      for (const bp of args.cacheBreakpoints) {
+        if (bp.msgIndex > epochLastMsg || (bp.msgIndex === epochLastMsg && bp.blockIndex >= epochLastBlockIdx)) {
+          if (bp.ttlSec > coveringTtlSec) coveringTtlSec = bp.ttlSec;
+          if (bp.msgIndex > maxBpMsg) maxBpMsg = bp.msgIndex;
+        }
+      }
+      if (maxBpMsg >= 0) {
+        horizonEndMsg = Math.max(horizonEndMsg, Math.min(args.totalMessages - 1, maxBpMsg));
+      }
+    }
+    const effectiveTtlSec = Math.max(args.ttlSec ?? 0, coveringTtlSec) || undefined;
+    const epochRates = effectiveTtlSec !== args.ttlSec
+      ? resolvePriceRates(args.model, { promptTokens: 0, ttlSec: effectiveTtlSec })
+      : rates;
+
     let downstreamCachedTokens = 0;
     let midPrefixDownstreamTokens = 0;
     if (!coldRepack) {
+      let blockSum = 0;
       for (const b of args.blocks) {
-        if (b.msgIndex > epochLastMsg && b.msgIndex < args.totalMessages - 2) {
+        if (b.msgIndex > epochLastMsg && b.msgIndex <= horizonEndMsg) {
           const tok = blockTokensByBlock.get(b) ?? 0;
-          downstreamCachedTokens += tok;
+          blockSum += tok;
           if (b.msgIndex < cutoffMsg) {
             midPrefixDownstreamTokens += tok;
           }
         }
       }
+      let msgSum = 0;
+      if (hasBreakpoints && args.msgTotalTokens && args.msgTotalTokens.length > 0) {
+        const limit = Math.min(args.msgTotalTokens.length - 1, horizonEndMsg);
+        for (let m = epochLastMsg + 1; m <= limit; m++) {
+          msgSum += args.msgTotalTokens[m] ?? 0;
+        }
+      }
+      downstreamCachedTokens = Math.max(blockSum, msgSum);
+      if (hasBreakpoints) {
+        midPrefixDownstreamTokens = downstreamCachedTokens;
+      }
     }
 
+    const effectiveWriteRate = isAutoCacheOpenAI
+      ? Math.min(epochRates.write, 1)
+      : epochRates.write;
     const savedTok = epochRawTokens - epochDigestTokens;
-    const savedPerRead = savedTok * rates.read;
+    const savedPerRead = savedTok * epochRates.read;
     const transitionCost =
-      epochDigestTokens * rates.write -
-      epochRawTokens * rates.read +
-      downstreamCachedTokens * (rates.write - rates.read);
+      epochDigestTokens * effectiveWriteRate -
+      epochRawTokens * epochRates.read +
+      downstreamCachedTokens * (effectiveWriteRate - epochRates.read);
     const paybackReads =
       savedPerRead > 0 ? Math.ceil(Math.max(0, transitionCost) / savedPerRead) : Infinity;
 
@@ -544,7 +613,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
       collapsedActualTokens: epochDigestTokens,
       downstreamCachedTokens,
       expectedOutputTokens: expectedOut,
-      ttlSec: args.ttlSec,
+      ttlSec: effectiveTtlSec,
     });
 
     const turnsObserved = Math.max(1, Math.floor(args.totalMessages / 2));
@@ -552,19 +621,11 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     const effectiveMaxPayback =
       args.maxPaybackReads !== undefined
         ? maxPayback
-        : downstreamCachedTokens <= 0
-          ? computeHorizonPaybackLimit({
-              turnsObserved,
-              baseMaxPayback: maxPayback,
-              downstreamCachedTokens: 0,
-            })
-          : midPrefixDownstreamTokens <= 0
-            ? maxPayback
-            : computeHorizonPaybackLimit({
-                turnsObserved,
-                baseMaxPayback: maxPayback,
-                downstreamCachedTokens: midPrefixDownstreamTokens,
-              });
+        : computeHorizonPaybackLimit({
+            turnsObserved,
+            baseMaxPayback: maxPayback,
+            downstreamCachedTokens: midPrefixDownstreamTokens,
+          });
     if (!alreadySealed && paybackReads > effectiveMaxPayback && !cliffWins) continue;
 
     let epochSavedChars = 0;

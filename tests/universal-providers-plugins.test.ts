@@ -225,11 +225,11 @@ describe('CLI wrappers & macOS desktop app launcher', () => {
 
     const wrapped = renderShellInitScript({ wrap: true, ficheBin: '/opt/fiche/bin/fiche' });
     expect(wrapped).toContain(`export FICHE_BIN='/opt/fiche/bin/fiche'`);
-    expect(wrapped).toContain('claude() { if [ "${FICHE_BYPASS:-0}" = "1" ]; then command claude "$@"; else "$FICHE_BIN" warp -- claude "$@"; fi; }');
-    expect(wrapped).toContain('codex()');
-    expect(wrapped).toContain('ribhu()');
-    expect(wrapped).toContain('kimi()');
-    expect(wrapped).toContain('agy()');
+    expect(wrapped).toContain('function claude { if [ "${FICHE_BYPASS:-0}" = "1" ] || [ "${FICHE_WARP_ACTIVE:-0}" = "1" ]');
+    expect(wrapped).toContain('function codex {');
+    expect(wrapped).toContain('function ribhu {');
+    expect(wrapped).toContain('function kimi {');
+    expect(wrapped).toContain('function agy {');
   });
 });
 

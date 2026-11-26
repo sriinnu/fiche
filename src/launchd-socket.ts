@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -108,8 +108,36 @@ export interface LaunchdShimResult {
 
 const MACOS_CC = '/usr/bin/cc';
 
-function sha256Hex(text: string): string {
-  return createHash('sha256').update(text).digest('hex');
+function sha256Hex(data: string | Uint8Array): string {
+  return createHash('sha256').update(data).digest('hex');
+}
+
+function isOwnedRegularFile(filePath: string): boolean {
+  try {
+    const st = fs.lstatSync(filePath);
+    if (!st.isFile()) return false;
+    if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseStampHashes(raw: string): { sourceSha256: string; binarySha256: string } | null {
+  try {
+    const parsed = JSON.parse(raw) as { sourceSha256?: unknown; binarySha256?: unknown };
+    if (
+      typeof parsed?.sourceSha256 === 'string' &&
+      /^[0-9a-f]{64}$/i.test(parsed.sourceSha256) &&
+      typeof parsed?.binarySha256 === 'string' &&
+      /^[0-9a-f]{64}$/i.test(parsed.binarySha256)
+    ) {
+      return { sourceSha256: parsed.sourceSha256.toLowerCase(), binarySha256: parsed.binarySha256.toLowerCase() };
+    }
+  } catch {
+    // Legacy or malformed stamp — force clean rebuild.
+  }
+  return null;
 }
 
 function safeUnlink(filePath: string): void {
@@ -136,13 +164,16 @@ export function ensureLaunchdSocketShim(
   const binDir = path.join(ficheDir, 'bin');
   const shimPath = path.join(binDir, 'fiche-launchd-exec');
   const stampPath = path.join(binDir, 'fiche-launchd-exec.sha256');
-  const expectedHash = sha256Hex(LAUNCHD_SOCKET_EXEC_C);
+  const expectedSourceHash = sha256Hex(LAUNCHD_SOCKET_EXEC_C);
 
   let cachedValid = false;
-  if (fs.existsSync(shimPath) && fs.existsSync(stampPath)) {
+  if (isOwnedRegularFile(shimPath) && isOwnedRegularFile(stampPath)) {
     try {
-      const currentHash = fs.readFileSync(stampPath, 'utf8').trim();
-      cachedValid = currentHash === expectedHash;
+      const stamp = parseStampHashes(fs.readFileSync(stampPath, 'utf8'));
+      if (stamp && stamp.sourceSha256 === expectedSourceHash) {
+        const binBytes = fs.readFileSync(shimPath);
+        cachedValid = sha256Hex(binBytes) === stamp.binarySha256;
+      }
     } catch {
       cachedValid = false;
     }
@@ -163,22 +194,30 @@ export function ensureLaunchdSocketShim(
     return { supported: true, shimPath, rebuilt: true };
   }
 
+  const dirExisted = fs.existsSync(binDir);
   fs.mkdirSync(binDir, { recursive: true, mode: 0o700 });
-  const suffix = `${process.pid}.${Date.now()}`;
+  if (!dirExisted) fs.chmodSync(binDir, 0o700);
+  const suffix = `${process.pid}.${Date.now()}.${randomBytes(8).toString('hex')}`;
   const srcTmp = path.join(binDir, `fiche-launchd-exec.${suffix}.c`);
   const binTmp = path.join(binDir, `fiche-launchd-exec.${suffix}.bin`);
   const stampTmp = path.join(binDir, `fiche-launchd-exec.${suffix}.sha256`);
 
   try {
-    fs.writeFileSync(srcTmp, LAUNCHD_SOCKET_EXEC_C, { mode: 0o600 });
+    fs.writeFileSync(srcTmp, LAUNCHD_SOCKET_EXEC_C, { flag: 'wx', mode: 0o600 });
     execFileSync(
       MACOS_CC,
       ['-O2', '-Wall', '-Wextra', '-Werror', '-x', 'c', srcTmp, '-o', binTmp],
       { stdio: 'pipe' },
     );
-    fs.chmodSync(binTmp, 0o755);
+    fs.chmodSync(binTmp, 0o700);
+    const binBytes = fs.readFileSync(binTmp);
+    const binaryHash = sha256Hex(binBytes);
     fs.renameSync(binTmp, shimPath);
-    fs.writeFileSync(stampTmp, `${expectedHash}\n`, { mode: 0o600 });
+    fs.writeFileSync(
+      stampTmp,
+      `${JSON.stringify({ sourceSha256: expectedSourceHash, binarySha256: binaryHash })}\n`,
+      { flag: 'wx', mode: 0o600 },
+    );
     fs.renameSync(stampTmp, stampPath);
     return { supported: true, shimPath, rebuilt: true };
   } catch (err) {

@@ -6,9 +6,12 @@
  */
 
 import {
+  PAD_Y,
   READABLE_CHARS_PER_IMAGE,
+  estimateImageCount,
   neutralizeSentinel,
   reflow,
+  renderCellHeight,
   renderTextToPngs,
   shrinkColsToContent,
   type RenderedImage,
@@ -593,6 +596,13 @@ async function compressGoogleToolResults(
         packed,
         false,
       );
+      const cellH = renderCellHeight(profile.style);
+      const maxLines = Math.max(1, Math.floor((profile.maxHeightPx - 2 * PAD_Y) / cellH));
+      const maxCharsPerImg = Math.min(READABLE_CHARS_PER_IMAGE, Math.max(1, profile.stripCols) * maxLines);
+      if (estimateImageCount(rendered, profile.stripCols, maxCharsPerImg, maxLines) > perResultCap) {
+        rewrittenParts.push(rawPart);
+        continue;
+      }
       const images = await renderTextToPngs(
         rendered,
         profile.stripCols,
@@ -691,22 +701,20 @@ async function planGoogleHistory(
   const profile = resolveGeminiProfile(modelName);
   const units = contents.map(googleHistoryUnit);
   const cutoff = Math.max(0, units.length - profile.history.keepTail);
-  // If there's only 1 user turn in the entire session (autonomous single-prompt agent),
-  // keep turn 0 native so the prompt stays visible outside the image. In multi-turn
-  // chat, collapse from turn 0, while anchoring tool chunk boundaries at turn 1 so
-  // sealed tool chunks NEVER shift when user turn #2 arrives.
+  // Keep Turn 0 anchored as native (`start = 1`) permanently whenever Turn 0 is a
+  // user turn, so Turn 2+ never flips `start` from 1 -> 0 or retroactively seeds
+  // `coveredTokens` into already-sealed segments.
   const userTurns: number[] = [];
   for (let i = 0; i < units.length; i++) {
     if (units[i]?.userText !== undefined) {
       userTurns.push(i);
     }
   }
-  let start = userTurns.length === 1 && userTurns[0] === 0 ? 1 : 0;
-  const anchorStart = userTurns[0] === 0 ? 1 : 0;
-  let boundary = googleClosedBoundary(units, start, cutoff);
+  const start = userTurns[0] === 0 ? 1 : 0;
+  const boundary = googleClosedBoundary(units, start, cutoff);
   if (boundary < start || boundary + 1 - start < 4) return null;
-  let selected = units.slice(start, boundary + 1);
-  let eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
+  const selected = units.slice(start, boundary + 1);
+  const eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
   if (eligibleTokens < profile.history.minCollapseTokens) return null;
 
   const admitted: GoogleHistoryUnit[] = [];
@@ -717,55 +725,9 @@ async function planGoogleHistory(
   const minChunkTurns = 8;
   let cursor = 0;
 
-  // When turn 0 becomes part of collapsed history (`start === 0` & `anchorStart === 1`),
-  // skip rendering only when it is a short (<500 chars) pure user prompt (emitted verbatim/preview
-  // in `pinnedUserText`). If Turn 0 carries non-userText parts or >= 500 chars, render it into
-  // segment 0 so sealed chunks [1..k] still align at `anchorStart`; if budget is exhausted, fall
-  // back to keeping Turn 0 native (`start = 1`).
-  if (start === 0 && anchorStart === 1 && selected.length > 0) {
-    const headUnit = selected[0]!;
-    if (headUnit.userText !== undefined && headUnit.text.length < 500) {
-      admitted.push(headUnit);
-      cursor = 1;
-    } else if (!headUnit.text) {
-      admitted.push(headUnit);
-      cursor = 1;
-    } else {
-      const safe = neutralizeSentinel(headUnit.text);
-      const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
-      const headImages = await renderTextToPngs(
-        renderedText,
-        profile.stripCols,
-        profile.style,
-        profile.maxHeightPx,
-      );
-      if (headImages.length > 0 && headImages.length <= profile.history.maxImages) {
-        const segSheet = prepareFactSheet(headUnit.text, profile.factSheetFormat)(coveredTokens);
-        if (segSheet) {
-          for (const tok of extractFactSheetTokens(segSheet)) coveredTokens.add(tok);
-        }
-        const headSources = headImages.map(() => headUnit.text);
-        segments.push({
-          images: headImages,
-          imageSources: headSources,
-          text: headUnit.text,
-          factSheet: segSheet,
-        });
-        admitted.push(headUnit);
-        images.push(...headImages);
-        imageSources.push(...headSources);
-        cursor = 1;
-      } else {
-        start = 1;
-        boundary = googleClosedBoundary(units, start, cutoff);
-        if (boundary < start || boundary + 1 - start < 4) return null;
-        selected = units.slice(start, boundary + 1);
-        eligibleTokens = selected.reduce((sum, unit) => sum + unit.baselineTokens, 0);
-        if (eligibleTokens < profile.history.minCollapseTokens) return null;
-        cursor = 0;
-      }
-    }
-  }
+  const cellH = renderCellHeight(profile.style);
+  const maxLines = Math.max(1, Math.floor((profile.maxHeightPx - 2 * PAD_Y) / cellH));
+  const maxCharsPerImg = Math.min(READABLE_CHARS_PER_IMAGE, Math.max(1, profile.stripCols) * maxLines);
 
   const maxPaybackReads = profile.history.maxCachePaybackReads ?? 10;
   const rates = resolvePriceRates(modelName);
@@ -810,6 +772,10 @@ async function planGoogleHistory(
       }
       const safe = neutralizeSentinel(chunkText);
       const renderedText = reflowEnabled ? reflow(safe) ?? safe : safe;
+      if (estimateImageCount(renderedText, profile.stripCols, maxCharsPerImg, maxLines) > remaining) {
+        candidateEnd = googleClosedBoundary(selected, cursor, candidateEnd - 1) + 1;
+        continue;
+      }
       const chunkImages = await renderTextToPngs(
         renderedText,
         profile.stripCols,
@@ -893,9 +859,21 @@ async function planGoogleHistory(
   const collapsedPriorIndices = collapsedUserIndices.filter(
     (i) => !activeUserSet.has(i),
   );
+  // If Turn 0 remained anchored at index 0 (`start === 1`) and has been superseded
+  // by a later user turn, keep a prior-turn breadcrumb in the live tail without
+  // mutating contents[0] or any sealed segment.
+  if (
+    start === 1 &&
+    userTurns[0] === 0 &&
+    userTurns.length > 1 &&
+    !activeUserSet.has(0) &&
+    !collapsedPriorIndices.includes(0)
+  ) {
+    collapsedPriorIndices.unshift(0);
+  }
 
   let pinnedUserText: string | undefined;
-  if (collapsedUserIndices.length > 0) {
+  if (collapsedUserIndices.length > 0 || collapsedPriorIndices.length > 0) {
     const blocks: string[] = [];
     if (collapsedPriorIndices.length > 0) {
       // Never drop Turn 0 from prior-turn breadcrumbs when there are >6 user turns.
@@ -1174,7 +1152,7 @@ export async function transformGoogleGenerateContent(
   }
 
   const sessionState = resolvedSessionKey
-    ? noteHistoryRequest(resolvedSessionKey)
+    ? noteHistoryRequest(resolvedSessionKey, { model: modelName })
     : { cold: false, minFreezeStep: 0 };
 
   const pinChars = relocateGooglePins(req);
@@ -1313,6 +1291,8 @@ export async function transformGoogleGenerateContent(
     model: modelName,
     estPromptTokens,
     textHygieneActive,
+    sessionKey: resolvedSessionKey,
+    sessionCold: sessionState.cold,
   });
   const hybridTextMmu = opticalHistoryPolicy === 'hybrid';
 

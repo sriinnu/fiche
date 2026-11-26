@@ -5,6 +5,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as tls from 'node:tls';
 import { fileURLToPath } from 'node:url';
 import { CertificateAuthority } from '../src/warp/ca.js';
 import { createWarpHandlers } from '../src/warp/connect.js';
@@ -150,11 +151,94 @@ describe('fiche warp daemon-down bypass & mid-session fail-open', () => {
     expect(result.stderr).toContain(`daemon on 127.0.0.1:${closedPort} is not running`);
     expect(result.stderr).toContain('directly (unwrapped)');
     expect(JSON.parse(result.stdout.trim())).toEqual({
-      bypass: '1',
+      bypass: null,
       httpsProxy: null,
       sslCertFile: null,
       nodeExtraCa: null,
     });
     expect(fs.existsSync(path.join(tmpHome, '.fiche', 'warp-ca.pem'))).toBe(false);
+  });
+
+  it('answers 426 websocket_unsupported on matched Codex/OpenAI routes while dialing upstream for unmatched WS paths', async () => {
+    const caDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fiche-warp-ws426-ca-'));
+    const ca = CertificateAuthority.loadOrCreate(caDir);
+    const caCert = fs.readFileSync(ca.certPath);
+
+    let dialedUpstream = 0;
+    const dummyOrigin = net.createServer((sock) => {
+      dialedUpstream += 1;
+      sock.destroy();
+    });
+    await new Promise<void>((resolve) => dummyOrigin.listen(0, '127.0.0.1', resolve));
+    const originPort = (dummyOrigin.address() as net.AddressInfo).port;
+    const daemonPort = await freePort();
+
+    const handlers = createWarpHandlers({
+      routes: [parseRoute(`127.0.0.1:${originPort}/backend-api/codex/responses*=http://127.0.0.1:${daemonPort}`)],
+      ca,
+    });
+    const proxyServer = createServer(handlers.handleAbsoluteForm);
+    proxyServer.on('connect', handlers.handleConnect);
+    await new Promise<void>((resolve) => proxyServer.listen(0, '127.0.0.1', resolve));
+    const proxyPort = (proxyServer.address() as net.AddressInfo).port;
+
+    cleanups.push(async () => {
+      proxyServer.closeAllConnections?.();
+      await new Promise<void>((resolve) => proxyServer.close(() => resolve()));
+      await new Promise<void>((resolve) => dummyOrigin.close(() => resolve()));
+      fs.rmSync(caDir, { recursive: true, force: true });
+    });
+
+    const sendUpgradeOverConnect = (reqPath: string): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const req = httpRequest({
+          host: '127.0.0.1',
+          port: proxyPort,
+          method: 'CONNECT',
+          path: `127.0.0.1:${originPort}`,
+        });
+        req.on('connect', (res, socket) => {
+          if (res.statusCode !== 200) {
+            socket.destroy();
+            reject(new Error(`CONNECT failed: ${res.statusCode}`));
+            return;
+          }
+          const tlsSock = tls.connect({ socket, host: '127.0.0.1', ca: caCert }, () => {
+            tlsSock.write(
+              `GET ${reqPath} HTTP/1.1\r\n` +
+              `Host: 127.0.0.1:${originPort}\r\n` +
+              'Upgrade: websocket\r\n' +
+              'Connection: Upgrade\r\n' +
+              'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+              'Sec-WebSocket-Version: 13\r\n\r\n',
+            );
+          });
+          let raw = '';
+          const finish = () => {
+            if (!tlsSock.destroyed) tlsSock.destroy();
+            if (!socket.destroyed) socket.destroy();
+            resolve(raw);
+          };
+          tlsSock.on('data', (chunk) => {
+            raw += chunk.toString('utf8');
+          });
+          tlsSock.on('end', finish);
+          tlsSock.on('close', finish);
+          tlsSock.on('error', finish);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+    // 1. Matched route (/backend-api/codex/responses) returns 426 locally without dialing upstream.
+    const matchedRaw = await sendUpgradeOverConnect('/backend-api/codex/responses');
+    expect(matchedRaw).toContain('HTTP/1.1 426 Upgrade Required');
+    expect(matchedRaw).toContain('websocket_unsupported');
+    expect(dialedUpstream).toBe(0);
+
+    // 2. Unmatched path (/v1/sessions/ws) on the same host attempts upstream splice instead of 426.
+    const unmatchedRaw = await sendUpgradeOverConnect('/v1/sessions/ws');
+    expect(unmatchedRaw).not.toContain('426 Upgrade Required');
+    expect(dialedUpstream).toBe(1);
   });
 });

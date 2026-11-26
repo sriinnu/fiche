@@ -31,11 +31,11 @@ describe('gptTokenCount', () => {
     expect(gptTokenCount(b)).toBe(countTokens(b));
   });
 
-  it('stays exact after the memo fills and clears', () => {
+  it('stays exact after the memo fills and evicts within the BPE ceiling', () => {
     clearGptTokenMemo();
-    // Words, not one long run: BPE on a single million-char piece is quadratic.
-    const big = (k: number) => `${k} `.padEnd(1_100_000, ' lorem ipsum dolor');
-    for (let k = 0; k < 9; k++) {
+    // Stay below EXACT_BPE_MAX_CHARS (256_000) so real BPE runs while still churning the 8 MiB LRU memo.
+    const big = (k: number) => `${k} `.padEnd(240_000, ' lorem ipsum dolor');
+    for (let k = 0; k < 40; k++) {
       expect(gptTokenCount(big(k))).toBe(countTokens(big(k)));
       expect(gptTokenMemoChars()).toBeLessThanOrEqual(8 * 1024 * 1024);
     }

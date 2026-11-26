@@ -31,6 +31,9 @@ export interface RequestGuardOptions {
   /** Provider hosts to trust as Host names; defaults to the built-in registry.
    *  The Node entry passes the registry extended by INKLING_UPSTREAM_HOSTS. */
   providerHosts?: ReadonlySet<string>;
+  /** True when the caller presented a verified per-user loopback `x-fiche-warp-auth`
+   *  secret from `fiche warp`, allowing warped desktop app Origins / Sec-Fetch-Site. */
+  warpAuthenticated?: boolean;
 }
 
 export interface RequestGuardDenial {
@@ -95,30 +98,39 @@ export function guardProxyRequest(
 ): RequestGuardDenial | null {
   const allowed = options.allowedHosts ?? [];
   if (allowed.includes('*')) return null;
-  if (typeof headers.secFetchSite === 'string' && headers.secFetchSite.trim().toLowerCase() === 'cross-site') {
-    return {
-      status: 403,
-      reason: 'cross_origin',
-      message: 'fiche: cross-site browser request refused; set FICHE_ALLOWED_HOSTS=* to allow it',
-    };
-  }
-  const origin = headers.origin;
-  if (origin !== undefined && origin !== null) {
-    let originHost: string | undefined;
-    try {
-      originHost = new URL(origin).hostname.replace(/^\[|\]$/g, '').toLowerCase();
-    } catch {
-      originHost = undefined; // `Origin: null` (sandboxed iframe, file://) lands here
-    }
-    // A page origin must be loopback: an attacker can serve a page from a raw
-    // public IP or any name, and a provider is never a page.
-    const ok = originHost !== undefined && (isLoopbackHostname(originHost) || allowed.includes(originHost));
-    if (!ok) {
+  if (!options.warpAuthenticated) {
+    const fetchSite = typeof headers.secFetchSite === 'string'
+      ? headers.secFetchSite.trim().toLowerCase()
+      : '';
+    if (fetchSite === 'cross-site') {
       return {
         status: 403,
         reason: 'cross_origin',
-        message: `fiche: browser request from ${origin} refused; set FICHE_ALLOWED_HOSTS to allow it`,
+        message: 'fiche: cross-site browser request refused; set FICHE_ALLOWED_HOSTS=* to allow it',
       };
+    }
+    const origin = headers.origin;
+    if (origin !== undefined && origin !== null) {
+      let originHost: string | undefined;
+      try {
+        const parsedOrigin = new URL(origin);
+        if (parsedOrigin.protocol === 'http:' || parsedOrigin.protocol === 'https:') {
+          originHost = parsedOrigin.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+        }
+      } catch {
+        originHost = undefined; // `Origin: null` (sandboxed iframe, file://) lands here
+      }
+      // A page origin must be loopback: an attacker can serve a page from a raw
+      // public IP or any name, and a provider is never a page. Non-http(s) desktop
+      // origins (e.g. vscode-file://) require warpAuthenticated.
+      const ok = originHost !== undefined && (isLoopbackHostname(originHost) || allowed.includes(originHost));
+      if (!ok) {
+        return {
+          status: 403,
+          reason: 'cross_origin',
+          message: `fiche: browser request from ${origin} refused; set FICHE_ALLOWED_HOSTS to allow it`,
+        };
+      }
     }
   }
   const host = hostnameOf(headers.host ?? '');

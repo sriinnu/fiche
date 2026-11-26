@@ -229,6 +229,13 @@ export interface Tracker {
   flush?(): void | Promise<void>;
 }
 
+/** Redact Bearer and `sk-*` API tokens from error/telemetry snippets before persisting or logging. */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi, '$1[REDACTED]')
+    .replace(/\bsk-(?:ant-[A-Za-z0-9._-]+|proj-[A-Za-z0-9._-]+|[A-Za-z0-9._-]{8,})/gi, '[REDACTED]');
+}
+
 /** Convert a ProxyEvent to its flat persisted shape. Shared in core so Node/Worker hosts stay in sync. */
 export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   const info = ev.info;
@@ -245,8 +252,8 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
   if (ev.accountingProvider) out.accounting_provider = ev.accountingProvider;
   if (ev.firstByteMs !== undefined) out.first_byte_ms = ev.firstByteMs;
   if (ev.transformMs !== undefined) out.transform_ms = ev.transformMs;
-  if (ev.error) out.error = ev.error;
-  if (ev.errorBody) out.error_body = ev.errorBody;
+  if (ev.error) out.error = redactSecrets(ev.error);
+  if (ev.errorBody) out.error_body = redactSecrets(ev.errorBody);
   if (ev.reqBodySha8) out.req_body_sha8 = ev.reqBodySha8;
   // Body sample: sidecar path (Node) > inline base64 if it fits > drop (Workers, oversized).
   if (ev.reqBodySamplePath) {
@@ -393,7 +400,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.baseline_probe_status = info.baselineProbeStatus;
     }
     if (info.baselineProbeError !== undefined) {
-      out.baseline_probe_error = info.baselineProbeError;
+      out.baseline_probe_error = redactSecrets(info.baselineProbeError);
     }
     if (info.threadContinue) out.thread_continue = true;
   }

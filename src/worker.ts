@@ -211,9 +211,10 @@ export default {
       : undefined;
     const maxRequestBytes = positiveInt(env.FICHE_MAX_REQUEST_BYTES ?? env.INKLING_MAX_REQUEST_BYTES);
     const config: ProxyConfig = {
-      upstream: env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
+      upstream: env.ANTHROPIC_UPSTREAM?.trim() || sharedUpstream?.trim() || 'https://api.anthropic.com',
+      sharedUpstream: sharedUpstream?.trim() || undefined,
       apiKey: env.ANTHROPIC_API_KEY?.trim() || undefined,
-      openAIUpstream: env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
+      openAIUpstream: env.OPENAI_UPSTREAM?.trim() || sharedUpstream?.trim() || 'https://api.openai.com',
       openAIApiKey: env.OPENAI_API_KEY?.trim() || undefined,
       cloudflareUpstream,
       cloudflareApiKey: cfToken,
@@ -234,7 +235,7 @@ export default {
               ? `skip(unsupported=${e.model})`
               : `skip(${e.info.reason})`
             : '';
-        const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
+        const cacheRead = e.usage?.cache_read_input_tokens ?? e.usage?.cached_tokens ?? 0;
         console.log(`${e.method} ${e.path} → ${e.status} (${e.durationMs}ms) ${tag} cache_read=${cacheRead}`);
 
         if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {

@@ -62,6 +62,14 @@ fi
 
 REPO="${REPO:-sriinnu/fiche}"
 TAP="${TAP:-sriinnu/homebrew-tap}"
+if [[ ! "$REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || [[ "$REPO" == *".."* ]]; then
+  echo "Invalid REPO (expected owner/repo): $REPO" >&2
+  exit 2
+fi
+if [[ ! "$TAP" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || [[ "$TAP" == *".."* ]]; then
+  echo "Invalid TAP (expected owner/repo): $TAP" >&2
+  exit 2
+fi
 TAG="v${VERSION}"
 NPM_TARBALL_URL="https://registry.npmjs.org/@sriinnu/fiche/-/fiche-${VERSION}.tgz"
 CASK_ZIP_NAME="FicheBar-${VERSION}.zip"
@@ -81,10 +89,15 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "    formula sha256: ${FORMULA_SHA}"
   fi
   if [[ "$DO_CASK" -eq 1 ]]; then
-    echo "==> Downloading ${CASK_ZIP_NAME} from ${REPO} release ${TAG} to compute sha256..."
-    gh release download "$TAG" --repo "$REPO" --pattern "$CASK_ZIP_NAME" --dir "$tmp"
-    CASK_SHA="$(shasum -a 256 "$tmp/$CASK_ZIP_NAME" | awk '{print $1}')"
-    echo "    cask sha256:    ${CASK_SHA}"
+    echo "==> Downloading ${CASK_ZIP_NAME} and ${CASK_ZIP_NAME}.sha256 from ${REPO} release ${TAG}..."
+    gh release download "$TAG" --repo "$REPO" --pattern "$CASK_ZIP_NAME" --pattern "${CASK_ZIP_NAME}.sha256" --dir "$tmp"
+    CASK_SHA="$(shasum -a 256 "$tmp/$CASK_ZIP_NAME" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+    EXPECTED_SHA="$(awk '{print $1}' "$tmp/${CASK_ZIP_NAME}.sha256" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || [[ "$CASK_SHA" != "$EXPECTED_SHA" ]]; then
+      echo "Checksum verification failed for ${CASK_ZIP_NAME}: computed=${CASK_SHA} expected=${EXPECTED_SHA}" >&2
+      exit 1
+    fi
+    echo "    cask sha256:    ${CASK_SHA} (verified)"
   fi
 fi
 
@@ -136,6 +149,8 @@ cask "fichebar" do
 
   app "FicheBar.app"
 
+  uninstall quit: "dev.srinivas.fichebar"
+
   zap trash: [
     "~/.config/fiche",
     "~/.fiche",
@@ -164,6 +179,16 @@ fi
 
 echo "==> Cloning tap ${TAP}..."
 gh repo clone "$TAP" "$tmp/tap" -- --depth 1 >/dev/null 2>&1
+
+branch="chore/fiche-${VERSION}"
+pr_state="$(gh pr view "$branch" --repo "$TAP" --json state -q .state 2>/dev/null || true)"
+if [[ "$pr_state" == "OPEN" ]]; then
+  echo "==> Updating existing OPEN PR branch ${branch}..."
+  git -C "$tmp/tap" fetch -q origin "$branch"
+  git -C "$tmp/tap" checkout -q -B "$branch" "origin/$branch"
+else
+  git -C "$tmp/tap" switch -q -c "$branch"
+fi
 
 mkdir -p "$tmp/tap/Formula" "$tmp/tap/Casks"
 if [[ "$DO_FORMULA" -eq 1 ]]; then
@@ -214,19 +239,20 @@ PY
 fi
 
 if git -C "$tmp/tap" diff --quiet && [[ -z "$(git -C "$tmp/tap" status --porcelain)" ]]; then
-  echo "==> Tap already matches fiche/fichebar ${VERSION} — nothing to push."
-  exit 0
-fi
-
-branch="chore/fiche-${VERSION}"
-if [[ "$(gh pr view "$branch" --repo "$TAP" --json state -q .state 2>/dev/null || true)" != "OPEN" ]]; then
-  git -C "$tmp/tap" switch -q -c "$branch"
+  if [[ "$pr_state" != "OPEN" ]]; then
+    echo "==> Tap already matches fiche/fichebar ${VERSION} — nothing to push."
+    exit 0
+  fi
+  echo "==> Open PR ${branch} already matches requested updates."
+else
   git -C "$tmp/tap" add -A
   git -C "$tmp/tap" commit -q -S -m "fiche / fichebar ${VERSION}"
   git -C "$tmp/tap" push -q -u origin "$branch"
-  gh pr create --repo "$TAP" --base main --head "$branch" \
-    --title "fiche / fichebar ${VERSION}" \
-    --body "Updates Formula/fiche.rb and Casks/fichebar.rb to ${VERSION} with verified sha256 checksums from published npm and GitHub Release assets."
+  if [[ "$pr_state" != "OPEN" ]]; then
+    gh pr create --repo "$TAP" --base main --head "$branch" \
+      --title "fiche / fichebar ${VERSION}" \
+      --body "Updates Formula/fiche.rb and Casks/fichebar.rb to ${VERSION} with verified sha256 checksums from published npm and GitHub Release assets."
+  fi
 fi
 
 if [[ "$MERGE_PR" -eq 1 ]]; then

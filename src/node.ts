@@ -8,7 +8,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { ensureLaunchdSocketShim, resolveInheritedListenFd } from './launchd-socket.js';
-import { createWarpRuntime } from './warp/index.js';
+import { createWarpRuntime, loadOrCreateWarpToken } from './warp/index.js';
 import { createNodeUpstreamFetch } from './node-fetch.js';
 import {
   renderShellInitScript,
@@ -17,6 +17,7 @@ import {
 } from './warp/app-launch.js';
 import { runMcpCommand } from './mcp/cli.js';
 import { once } from 'node:events';
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -66,8 +67,9 @@ import {
   type ExportResult,
 } from './core/export.js';
 import { readExportTextFile } from './export-collect.js';
-import { decodeRequestBody } from './request-decoding.js';
+import { decodeRequestBodyWithStatus } from './request-decoding.js';
 import {
+  redactSecrets,
   toTrackEvent,
   TRACK_BODY_INLINE_MAX,
   type Tracker,
@@ -115,6 +117,7 @@ interface RuntimeConfig {
    *  only the proxy API because dashboard routes remain loopback-only. */
   host: string;
   upstream: string;
+  sharedUpstream?: string;
   openAIUpstream: string;
   openAIApiKey?: string;
   googleUpstream?: string;
@@ -151,6 +154,50 @@ function resolveSessionStateFile(): string | undefined {
   return raw;
 }
 
+function atomicWriteFileSync(
+  filePath: string,
+  data: string | Uint8Array,
+  opts: { mode?: number; dirMode?: number; fsync?: boolean } = {},
+): void {
+  const mode = opts.mode ?? 0o600;
+  const dirMode = opts.dirMode ?? 0o700;
+  const fsync = opts.fsync ?? true;
+  const dir = path.dirname(filePath);
+  const parentExists = fs.existsSync(dir);
+  fs.mkdirSync(dir, { recursive: true, mode: dirMode });
+  if (!parentExists) fs.chmodSync(dir, dirMode);
+  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(
+      tmp,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0),
+      mode,
+    );
+    const buf =
+      typeof data === 'string'
+        ? Buffer.from(data, 'utf8')
+        : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    let offset = 0;
+    while (offset < buf.length) {
+      const n = fs.writeSync(fd, buf, offset, buf.length - offset);
+      if (n <= 0) throw new Error('short write returned 0 bytes');
+      offset += n;
+    }
+    fs.fchmodSync(fd, mode);
+    if (fsync) fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    throw err;
+  }
+}
+
 /**
  * File-backed {@link SessionStateStore}. Same write-then-rename discipline as the
  * config writer above: a crash mid-write leaves the previous file intact. Mode
@@ -168,24 +215,7 @@ function fileSessionStateStore(file: string): SessionStateStore {
       }
     },
     save(text: string): void {
-      const dir = path.dirname(file);
-      const parentExists = fs.existsSync(dir);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      if (!parentExists) fs.chmodSync(dir, 0o700);
-      const tmp = `${file}.${process.pid}.tmp`;
-      try {
-        fs.writeFileSync(tmp, text, { mode: 0o600 });
-        fs.chmodSync(tmp, 0o600);
-        fs.renameSync(tmp, file);
-        fs.chmodSync(file, 0o600);
-      } catch (err) {
-        try {
-          fs.unlinkSync(tmp);
-        } catch {
-          /* nothing to clean */
-        }
-        throw err;
-      }
+      atomicWriteFileSync(file, text, { mode: 0o600, dirMode: 0o700, fsync: true });
     },
   };
 }
@@ -287,22 +317,14 @@ function persistConfigPatch(patch: Record<string, unknown>): boolean {
     }
   }
   Object.assign(cfg, patch);
-  const tmp = `${file}.tmp-${process.pid}`;
   try {
-    const parentExists = fs.existsSync(path.dirname(file));
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    if (!parentExists) fs.chmodSync(path.dirname(file), 0o700);
-    // Write-then-rename so a crash mid-write can't corrupt the config.
-    fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`, { mode: 0o600 });
-    fs.renameSync(tmp, file);
-    fs.chmodSync(file, 0o600);
+    atomicWriteFileSync(file, `${JSON.stringify(cfg, null, 2)}\n`, {
+      mode: 0o600,
+      dirMode: 0o700,
+      fsync: true,
+    });
     return true;
   } catch (e) {
-    try {
-      fs.unlinkSync(tmp);
-    } catch {
-      // The write may have failed before the temporary file was created.
-    }
     console.warn(`[fiche] could not persist config to ${file}: ${(e as Error).message}`);
     return false;
   }
@@ -377,27 +399,18 @@ function getActivePluginOverrides(file = resolvePluginsConfigFile()): PluginOver
 }
 
 function savePluginOverrides(overrides: PluginOverrides, file = resolvePluginsConfigFile()): void {
-  const dir = path.dirname(file);
-  const parentExists = fs.existsSync(dir);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (!parentExists) fs.chmodSync(dir, 0o700);
   const sanitized = Object.create(null) as PluginOverrides;
   for (const [k, v] of Object.entries(overrides)) {
     if (!FORBIDDEN_OVERRIDE_KEYS.has(k) && typeof v === 'boolean') {
       sanitized[k] = v;
     }
   }
-  const tmp = `${file}.tmp-${process.pid}`;
-  try {
-    fs.writeFileSync(tmp, `${JSON.stringify(sanitized, null, 2)}\n`, { mode: 0o600 });
-    fs.chmodSync(tmp, 0o600);
-    fs.renameSync(tmp, file);
-    fs.chmodSync(file, 0o600);
-    pluginOverridesCache = undefined;
-  } catch (err) {
-    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
-    throw err;
-  }
+  atomicWriteFileSync(file, `${JSON.stringify(sanitized, null, 2)}\n`, {
+    mode: 0o600,
+    dirMode: 0o700,
+    fsync: true,
+  });
+  pluginOverridesCache = undefined;
 }
 
 function discoverCustomPlugins(pluginsRoot: string, out: StagePluginDescriptor[]): void {
@@ -542,14 +555,16 @@ function parseCli(argv: string[]): RuntimeConfig {
   const cloudflareUpstream = cfAccount && cfToken
     ? `https://api.cloudflare.com/client/v4/accounts/${cfAccount}/ai/v1`
     : undefined;
+  const trimmedShared = sharedUpstream?.trim() || undefined;
   return {
     port: parseEnvPort(process.env.PORT),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
     host: process.env.HOST?.trim() || '127.0.0.1',
-    upstream: process.env.ANTHROPIC_UPSTREAM ?? sharedUpstream ?? 'https://api.anthropic.com',
-    openAIUpstream: process.env.OPENAI_UPSTREAM ?? sharedUpstream ?? 'https://api.openai.com',
-    openAIApiKey: process.env.OPENAI_API_KEY,
-    googleUpstream: process.env.GOOGLE_UPSTREAM,
+    upstream: process.env.ANTHROPIC_UPSTREAM?.trim() || trimmedShared || 'https://api.anthropic.com',
+    sharedUpstream: trimmedShared,
+    openAIUpstream: process.env.OPENAI_UPSTREAM?.trim() || trimmedShared || 'https://api.openai.com',
+    openAIApiKey: process.env.OPENAI_API_KEY?.trim() || undefined,
+    googleUpstream: process.env.GOOGLE_UPSTREAM?.trim() || undefined,
     cloudflareUpstream,
     cloudflareApiKey: cfToken,
     openAIModels: parseModels(process.env.OPENAI_MODELS),
@@ -772,11 +787,13 @@ function toWebRequest(req: IncomingMessage, signal?: AbortSignal): Request {
     let onEnd: (() => void) | undefined;
     let onError: ((err: Error) => void) | undefined;
     let onAborted: (() => void) | undefined;
+    let onClose: (() => void) | undefined;
     const detach = () => {
       if (onData) req.off('data', onData);
       if (onEnd) req.off('end', onEnd);
       if (onError) req.off('error', onError);
       if (onAborted) req.off('aborted', onAborted);
+      if (onClose) req.off('close', onClose);
     };
     body = new ReadableStream<Uint8Array>(
       {
@@ -785,7 +802,8 @@ function toWebRequest(req: IncomingMessage, signal?: AbortSignal): Request {
           onData = (chunk: Buffer) => {
             if (closed) return;
             try {
-              controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+              // Copy out of Node's shared Buffer slab pool before enqueuing.
+              controller.enqueue(new Uint8Array(chunk));
               if ((controller.desiredSize ?? 0) <= 0) req.pause();
             } catch {
               closed = true;
@@ -823,10 +841,21 @@ function toWebRequest(req: IncomingMessage, signal?: AbortSignal): Request {
               /* stream already closed */
             }
           };
+          onClose = () => {
+            if (closed || req.complete) return;
+            closed = true;
+            detach();
+            try {
+              controller.error(new Error('client request closed'));
+            } catch {
+              /* stream already closed */
+            }
+          };
           req.on('data', onData);
           req.on('end', onEnd);
           req.on('error', onError);
           req.on('aborted', onAborted);
+          req.on('close', onClose);
           req.pause();
         },
         pull() {
@@ -881,6 +910,9 @@ function isConnectionAbort(err: unknown): boolean {
 }
 
 function waitForDrain(out: ServerResponse): Promise<void> {
+  if (out.destroyed || out.writableEnded || out.closed) {
+    return Promise.reject(new Error('client response closed'));
+  }
   // Do NOT use Promise.race([once(out,'drain'), once(out,'close')]): the losing
   // once() never detaches its listener, and events.once() also attaches an
   // implicit 'error' listener. On a long streamed response every backpressure
@@ -915,7 +947,7 @@ function waitForDrain(out: ServerResponse): Promise<void> {
 }
 
 async function writeWebResponse(res: Response, out: ServerResponse): Promise<void> {
-  if (out.destroyed || out.writableEnded) {
+  if (out.destroyed || out.writableEnded || out.closed) {
     await res.body?.cancel().catch(() => undefined);
     return;
   }
@@ -951,11 +983,14 @@ async function writeWebResponse(res: Response, out: ServerResponse): Promise<voi
         completed = true;
         break;
       }
+      if (out.destroyed || out.writableEnded || out.closed) {
+        throw new Error('client response closed');
+      }
       if (value && !out.write(value)) await waitForDrain(out);
     }
     if (!out.writableEnded) out.end();
   } catch (err) {
-    if (isConnectionAbort(err) || out.destroyed || out.writableEnded) {
+    if (isConnectionAbort(err) || out.destroyed || out.writableEnded || out.closed) {
       if (!out.destroyed && !out.writableEnded) out.destroy(err instanceof Error ? err : undefined);
       return;
     }
@@ -1029,10 +1064,15 @@ function isLoopbackHostname(hostname: string): boolean {
     || (isIP(host) === 4 && host.split('.')[0] === '127');
 }
 
-/** Reject browser cross-site writes to the unauthenticated loopback dashboard. */
+function normalizedSecFetchSite(req: IncomingMessage): string {
+  const raw = req.headers['sec-fetch-site'];
+  return typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+}
+
+/** Reject browser cross-site / same-site writes to the unauthenticated loopback dashboard. */
 function isSameOriginDashboardRequest(req: IncomingMessage, url: URL): boolean {
-  const fetchSite = req.headers['sec-fetch-site'];
-  if (fetchSite === 'cross-site') return false;
+  const fetchSite = normalizedSecFetchSite(req);
+  if (fetchSite === 'cross-site' || fetchSite === 'same-site') return false;
   const origin = req.headers.origin;
   if (origin === undefined) return true; // local CLI/curl clients do not send Origin
   try {
@@ -1086,8 +1126,7 @@ async function maybeWriteBodySidecar(
   const tag = sha8 ?? 'nohash';
   const filePath = path.join(dir, `${ts}-${tag}.json.gz`);
   try {
-    await fs.promises.writeFile(filePath, bytesGz, { mode: 0o600 });
-    await fs.promises.chmod(filePath, 0o600);
+    atomicWriteFileSync(filePath, bytesGz, { mode: 0o600, dirMode: 0o700, fsync: true });
     return filePath;
   } catch {
     return undefined;
@@ -1391,8 +1430,16 @@ const SERVICE_PASSTHROUGH_ENV_KEYS = [
   'FICHE_MMU_MAX_PAGES',
   'FICHE_MMU_MAX_MB',
   'FICHE_MAX_SESSIONS',
+  'FICHE_UPSTREAM',
   'ANTHROPIC_UPSTREAM',
+  'OPENAI_UPSTREAM',
+  'GOOGLE_UPSTREAM',
+  'FICHE_PROVIDERS',
+  'FICHE_UPSTREAM_HOSTS',
+  'FICHE_ALLOWED_HOSTS',
+  'FICHE_FOLLOW_HOSTS',
   'FICHE_MODELS',
+  'FICHE_FORCE_IMAGES',
 ] as const;
 
 function resolveServiceLabel(): string {
@@ -1699,7 +1746,7 @@ Usage:
     if (!dryRun) {
       fs.mkdirSync(ficheDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-      fs.writeFileSync(plistPath, plistXml, { mode: 0o600 });
+      atomicWriteFileSync(plistPath, plistXml, { mode: 0o600, dirMode: 0o755, fsync: true });
     }
     runLaunchctl(['bootout', serviceTarget], dryRun);
     const boot = await bootstrapWithRetry(dryRun);
@@ -1781,7 +1828,7 @@ Usage:
       const { plistXml } = buildServicePlist();
       fs.mkdirSync(ficheDir, { recursive: true, mode: 0o700 });
       fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-      fs.writeFileSync(plistPath, plistXml, { mode: 0o600 });
+      atomicWriteFileSync(plistPath, plistXml, { mode: 0o600, dirMode: 0o755, fsync: true });
     }
     let boot = runLaunchctl(['kickstart', '-k', serviceTarget], dryRun);
     if (boot.status !== 0) {
@@ -1808,7 +1855,7 @@ Usage:
     const { plistXml } = buildServicePlist();
     fs.mkdirSync(ficheDir, { recursive: true, mode: 0o700 });
     fs.mkdirSync(path.dirname(plistPath), { recursive: true });
-    fs.writeFileSync(plistPath, plistXml, { mode: 0o600 });
+    atomicWriteFileSync(plistPath, plistXml, { mode: 0o600, dirMode: 0o755, fsync: true });
   }
   let boot = runLaunchctl(['kickstart', '-k', serviceTarget], dryRun);
   if (boot.status !== 0 && !dryRun) {
@@ -1871,6 +1918,7 @@ function detectLocalProviderSignals(): Map<ProviderId, string[]> {
     { id: 'anthropic', clis: ['claude'], apps: ['Claude'] },
     { id: 'openai', clis: ['codex'], apps: ['ChatGPT'] },
     { id: 'google', clis: ['gemini', 'agy'], apps: ['Antigravity'] },
+    { id: 'kimi', clis: ['kimi'], apps: [] },
   ];
   for (const c of checks) {
     for (const cli of c.clis) {
@@ -2269,7 +2317,7 @@ function applyMmuLimitsFromEnv(): { maxPages: number; maxBytes: number } {
 }
 
 function scaledMmuFileMaxBytes(maxBytes: number): number {
-  return Math.min(512 * 1024 * 1024, Math.max(32 * 1024 * 1024, maxBytes * 2));
+  return Math.min(512 * 1024 * 1024, Math.max(32 * 1024 * 1024, maxBytes * 4));
 }
 
 // ---- main ----------------------------------------------------------------
@@ -2672,6 +2720,39 @@ async function main(): Promise<void> {
   const allowPrivateDashboard = /^(1|true|yes|on)$/i.test(
     (readBrandEnv('DASHBOARD_ALLOW_PRIVATE') ?? '').trim(),
   );
+  const ficheHomeDir = path.join(os.homedir(), '.fiche');
+  const legacyHomeDir = path.join(os.homedir(), '.inkling');
+  const warpTokenDir =
+    fs.existsSync(ficheHomeDir) || !fs.existsSync(legacyHomeDir) ? ficheHomeDir : legacyHomeDir;
+  let cachedWarpTokenDigest: Buffer | undefined;
+  let cachedWarpTokenMtimeMs = -1;
+  const verifyWarpAuthHeader = (presented: string | string[] | undefined): boolean => {
+    if (typeof presented !== 'string') return false;
+    const trimmed = presented.trim();
+    if (!trimmed) return false;
+    const tokenPath = path.join(warpTokenDir, 'warp-token');
+    try {
+      let currentMtime = -1;
+      try {
+        currentMtime = fs.statSync(tokenPath).mtimeMs;
+      } catch {
+        currentMtime = -1;
+      }
+      if (!cachedWarpTokenDigest || currentMtime !== cachedWarpTokenMtimeMs) {
+        const expected = loadOrCreateWarpToken(warpTokenDir);
+        cachedWarpTokenDigest = crypto.createHash('sha256').update(expected, 'utf8').digest();
+        try {
+          cachedWarpTokenMtimeMs = fs.statSync(tokenPath).mtimeMs;
+        } catch {
+          cachedWarpTokenMtimeMs = Date.now();
+        }
+      }
+      const actualDigest = crypto.createHash('sha256').update(trimmed, 'utf8').digest();
+      return crypto.timingSafeEqual(actualDigest, cachedWarpTokenDigest);
+    } catch {
+      return false;
+    }
+  };
 
   let shutdownHandler: ((sig: string) => void) | undefined;
   let activeProxyRequests = 0;
@@ -2750,6 +2831,10 @@ async function main(): Promise<void> {
         }
         const route = dashboardPath(url.pathname);
         if (route) {
+          const fetchSite = normalizedSecFetchSite(req);
+          const isMutation = isDashboardMutation(route, req.method ?? 'GET');
+          const isSensitiveRead =
+            route.kind !== 'html' && route.kind !== 'favicon' && route.kind !== 'api-health';
           const remoteAllowed =
             isLoopbackAddress(req.socket.remoteAddress) ||
             (allowPrivateDashboard && isPrivateAddress(req.socket.remoteAddress));
@@ -2757,13 +2842,14 @@ async function main(): Promise<void> {
             !remoteAllowed
             || !isLoopbackHostname(rawHostHostname)
             || !isLoopbackHostname(url.hostname)
-            || req.headers['sec-fetch-site'] === 'cross-site'
+            || fetchSite === 'cross-site'
+            || ((isMutation || isSensitiveRead) && fetchSite === 'same-site')
           ) {
             await writeWebResponse(new Response('dashboard is loopback-only', { status: 403 }), res);
             return;
           }
           if (
-            (isDashboardMutation(route, req.method ?? 'GET') || req.headers.origin !== undefined)
+            (isMutation || req.headers.origin !== undefined)
             && !isSameOriginDashboardRequest(req, url)
           ) {
             await writeWebResponse(new Response('cross-origin dashboard request denied', { status: 403 }), res);
@@ -2792,7 +2878,11 @@ async function main(): Promise<void> {
               ? req.headers['sec-fetch-site']
               : undefined,
           },
-          { allowedHosts, providerHosts: new Set(upstreamRegistry.keys()) },
+          {
+            allowedHosts,
+            providerHosts: new Set(upstreamRegistry.keys()),
+            warpAuthenticated: verifyWarpAuthHeader(req.headers['x-fiche-warp-auth']),
+          },
         );
         if (denial) {
           await writeWebResponse(new Response(JSON.stringify({ error: denial.reason, message: denial.message }), {
@@ -3078,6 +3168,7 @@ async function main(): Promise<void> {
     gatewayBaseUrl: opts.gatewayBaseUrl,
     gatewayHeaders: opts.gatewayHeaders,
     upstream: opts.upstream,
+    sharedUpstream: opts.sharedUpstream,
     openAIUpstream: opts.openAIUpstream,
     openAIApiKey: opts.openAIApiKey,
     googleUpstream: opts.googleUpstream,
@@ -3088,7 +3179,7 @@ async function main(): Promise<void> {
     captureErrorReqBody: opts.captureErrorReqBody,
     maxRequestBytes: opts.maxRequestBytes ?? (isLoopbackHost ? DEFAULT_NODE_MAX_REQUEST_BYTES : undefined),
     oversizedBodyPolicy: isLoopbackHost ? 'passthrough' : 'reject',
-    decodeRequestBody,
+    decodeRequestBody: decodeRequestBodyWithStatus,
     followHosts,
     upstreamRegistry,
     enabledProviders: () => getEnabledProviders(),
@@ -3128,109 +3219,116 @@ async function main(): Promise<void> {
     },
     onRequest: (e) => {
       const task = (async () => {
-        // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
-        // info.firstImagePng, so capturing has to happen on the raw event.
-        dashboard.update(e);
-        // Debug: persist this request's rendered PNGs (see INKLING_DUMP_DIR above).
-        // Filenames sort by request order: <stamp>_reqNNN_<model>_pNN.png.
-        if (imageDumpDir && e.info?.imagePngs && e.info.imagePngs.length > 0) {
-          const seq = ++imageDumpSeq;
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const modelTag = (e.model ?? 'model').replace(/[^A-Za-z0-9._-]+/g, '_');
-          const pngs = e.info.imagePngs;
-          for (let i = 0; i < pngs.length; i++) {
-            const name = `${stamp}_req${String(seq).padStart(3, '0')}_${modelTag}_p${String(i + 1).padStart(2, '0')}.png`;
-            try {
-              fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!, { mode: 0o600 });
-            } catch (err) {
-              console.warn(`[fiche] PNG dump write failed: ${(err as Error).message}`);
-              break; // dir vanished / full — stop hammering it this request
+        try {
+          // Feed the dashboard BEFORE tracker.emit — toTrackEvent strips
+          // info.firstImagePng, so capturing has to happen on the raw event.
+          dashboard.update(e);
+          // Debug: persist this request's rendered PNGs (see INKLING_DUMP_DIR above).
+          // Filenames sort by request order: <stamp>_reqNNN_<model>_pNN.png.
+          if (imageDumpDir && e.info?.imagePngs && e.info.imagePngs.length > 0) {
+            const seq = ++imageDumpSeq;
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const modelTag = (e.model ?? 'model').replace(/[^A-Za-z0-9._-]+/g, '_');
+            const pngs = e.info.imagePngs;
+            for (let i = 0; i < pngs.length; i++) {
+              const name = `${stamp}_req${String(seq).padStart(3, '0')}_${modelTag}_p${String(i + 1).padStart(2, '0')}.png`;
+              try {
+                fs.writeFileSync(path.join(imageDumpDir, name), pngs[i]!, { mode: 0o600 });
+              } catch (err) {
+                console.warn(`[fiche] PNG dump write failed: ${(err as Error).message}`);
+                break; // dir vanished / full — stop hammering it this request
+              }
             }
+            console.log(`  ↳ dumped ${pngs.length} rendered png(s) → ${imageDumpDir}`);
           }
-          console.log(`  ↳ dumped ${pngs.length} rendered png(s) → ${imageDumpDir}`);
-        }
-        // Terse human-readable console line.
-        const extra: string[] = [];
-        if (e.info?.toolResultImgs) extra.push(`tr+${e.info.toolResultImgs}`);
-        if ((e.info?.textHygieneSavedTokens ?? 0) > 0) {
-          const stagesLabel = (e.info?.textHygieneStages ?? []).length > 0
-            ? `[${e.info!.textHygieneStages!.join('+')}]`
-            : '';
-          extra.push(`text=-${e.info!.textHygieneSavedTokens}tok${stagesLabel}`);
-        }
-        const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
-        const baseTag = e.info?.compressed
-          ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
-          : e.info?.reason
-            ? e.info.reason === 'unsupported_model' && e.model
-              ? `skip(unsupported=${e.model})${extraTag}`
-              : `skip(${e.info.reason})${extraTag}`
-            : extraTag.trim();
-        const tag = baseTag;
-        const cacheRead = e.usage?.cache_read_input_tokens ?? 0;
-        const inputTokens = e.usage?.input_tokens ?? 0;
-        const usageTag =
-          e.usage !== undefined
-            ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
-            : '';
-        // Split the wall clock into the half we control and the half we don't:
-        // `tx` is local render+encode, the remainder is upstream. Without this the
-        // duration alone can't distinguish our CPU from a slow provider.
-        //
-        // `fb` further splits the upstream half: request start → response headers,
-        // so it covers upload + provider queue/processing but NOT generation. With
-        // all three, `fb - tx` isolates how much a large image payload costs to put
-        // on the wire, which is the number that decides whether shrinking IDATs pays.
-        const timingParts = [`${e.durationMs}ms`];
-        if (e.transformMs !== undefined) {
-          timingParts.push(
-            `tx=${e.transformMs}ms`,
-            `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
+          // Terse human-readable console line.
+          const extra: string[] = [];
+          if (e.info?.toolResultImgs) extra.push(`tr+${e.info.toolResultImgs}`);
+          if ((e.info?.textHygieneSavedTokens ?? 0) > 0) {
+            const stagesLabel = (e.info?.textHygieneStages ?? []).length > 0
+              ? `[${e.info!.textHygieneStages!.join('+')}]`
+              : '';
+            extra.push(`text=-${e.info!.textHygieneSavedTokens}tok${stagesLabel}`);
+          }
+          const extraTag = extra.length > 0 ? ` (${extra.join(' ')})` : '';
+          const baseTag = e.info?.compressed
+            ? `compressed ${e.info.origChars}ch → ${e.info.imageCount}img/${e.info.imageBytes}B${extraTag}`
+            : e.info?.reason
+              ? e.info.reason === 'unsupported_model' && e.model
+                ? `skip(unsupported=${e.model})${extraTag}`
+                : `skip(${e.info.reason})${extraTag}`
+              : extraTag.trim();
+          const tag = baseTag;
+          const cacheRead = e.usage?.cache_read_input_tokens ?? e.usage?.cached_tokens ?? 0;
+          const inputTokens = e.usage?.input_tokens ?? 0;
+          const usageTag =
+            e.usage !== undefined
+              ? ` tokens=${inputTokens}+${e.usage.output_tokens ?? 0} cache_read=${cacheRead}`
+              : '';
+          // Split the wall clock into the half we control and the half we don't:
+          // `tx` is local render+encode, the remainder is upstream. Without this the
+          // duration alone can't distinguish our CPU from a slow provider.
+          //
+          // `fb` further splits the upstream half: request start → response headers,
+          // so it covers upload + provider queue/processing but NOT generation. With
+          // all three, `fb - tx` isolates how much a large image payload costs to put
+          // on the wire, which is the number that decides whether shrinking IDATs pays.
+          const timingParts = [`${e.durationMs}ms`];
+          if (e.transformMs !== undefined) {
+            timingParts.push(
+              `tx=${e.transformMs}ms`,
+              `up=${Math.max(0, e.durationMs - e.transformMs)}ms`,
+            );
+          }
+          if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
+          const timing = timingParts.join(' ');
+          console.log(
+            `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
           );
-        }
-        if (e.firstByteMs !== undefined) timingParts.push(`fb=${e.firstByteMs}ms`);
-        const timing = timingParts.join(' ');
-        console.log(
-          `[${new Date().toISOString()}] ${e.method} ${e.path} → ${e.status} (${timing}) ${tag}${usageTag}`,
-        );
 
-        // Upstream error bodies are present only under INKLING_DEBUG_CAPTURE_4XX;
-        // custom gateways may echo prompt fragments or credentials in them.
-        if (e.errorBody) {
-          const trimmed = e.errorBody.length > 400
-            ? e.errorBody.slice(0, 400) + '…'
-            : e.errorBody;
-          console.warn(`[fiche ${e.status}] upstream body: ${trimmed}`);
-        }
+          // Upstream error bodies are present only under INKLING_DEBUG_CAPTURE_4XX;
+          // custom gateways may echo prompt fragments or credentials in them.
+          if (e.errorBody) {
+            const redacted = redactSecrets(e.errorBody);
+            const trimmed = redacted.length > 400
+              ? redacted.slice(0, 400) + '…'
+              : redacted;
+            console.warn(`[fiche ${e.status}] upstream body: ${trimmed}`);
+          }
 
-        // Canary: surface unknown tag-shaped blocks so a Claude Code release
-        // that adds a new dynamic tag is caught within hours.
-        if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
+          // Canary: surface unknown tag-shaped blocks so a Claude Code release
+          // that adds a new dynamic tag is caught within hours.
+          if (e.info?.unknownStaticTags && e.info.unknownStaticTags.length > 0) {
+            console.warn(
+              `[fiche warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
+                `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
+            );
+          }
+
+          // If the proxy captured a gzipped 4xx body that won't fit inline in
+          // the JSONL row, write it to a sidecar file and put the path on the
+          // event instead. Threshold: gz_bytes * 4/3 > inline cap (b64 expansion).
+          if (e.reqBodyGz && e.reqBodyGz.byteLength * 4 > TRACK_BODY_INLINE_MAX * 3) {
+            const writtenPath = await maybeWriteBodySidecar(
+              e.reqBodyGz,
+              e.reqBodySha8,
+              bodySidecarDir,
+            );
+            if (writtenPath) {
+              e.reqBodySamplePath = writtenPath;
+              e.reqBodyGz = undefined; // tracker will pick up the path instead
+            }
+            // If write failed: leave reqBodyGz; the tracker will silently drop
+            // it (still too big to inline). We never lose the sha8 / error_body.
+          }
+
+          // Persistent JSONL event for offline analysis (inkling stats etc.).
+          tracker.emit(toTrackEvent(e));
+        } catch (err) {
           console.warn(
-            `[fiche warn] unknown tag(s) in static slab: ${e.info.unknownStaticTags.join(', ')}  ` +
-              `— may need to add to DYNAMIC_BLOCK_TAGS (per-turn) or KNOWN_STATIC_TAGS (static) in src/core/transform.ts`,
+            `[fiche] onRequest telemetry failed: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-
-        // If the proxy captured a gzipped 4xx body that won't fit inline in
-        // the JSONL row, write it to a sidecar file and put the path on the
-        // event instead. Threshold: gz_bytes * 4/3 > inline cap (b64 expansion).
-        if (e.reqBodyGz && e.reqBodyGz.byteLength * 4 > TRACK_BODY_INLINE_MAX * 3) {
-          const writtenPath = await maybeWriteBodySidecar(
-            e.reqBodyGz,
-            e.reqBodySha8,
-            bodySidecarDir,
-          );
-          if (writtenPath) {
-            e.reqBodySamplePath = writtenPath;
-            e.reqBodyGz = undefined; // tracker will pick up the path instead
-          }
-          // If write failed: leave reqBodyGz; the tracker will silently drop
-          // it (still too big to inline). We never lose the sha8 / error_body.
-        }
-
-        // Persistent JSONL event for offline analysis (inkling stats etc.).
-        tracker.emit(toTrackEvent(e));
       })();
       pendingOnRequests.add(task);
       void task.finally(() => {

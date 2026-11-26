@@ -22,6 +22,10 @@
  */
 
 import {
+  PAD_Y,
+  READABLE_CHARS_PER_IMAGE,
+  estimateImageCount,
+  renderCellHeight,
   renderTextToPngs,
   measureContentCols,
   reflow,
@@ -520,8 +524,22 @@ function responseCallText(item: Record<string, unknown>): string {
   return `[tool_use ${qualifiedName}]\n${args}`;
 }
 
+function extractTextOutput(output: unknown): string {
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) {
+    const texts: string[] = [];
+    for (const part of output) {
+      if (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string') {
+        texts.push((part as { text: string }).text);
+      }
+    }
+    return texts.join('\n\n');
+  }
+  return safeJson(output);
+}
+
 function responseOutputText(item: Record<string, unknown>): string {
-  const output = typeof item.output === 'string' ? item.output : safeJson(item.output);
+  const output = extractTextOutput(item.output);
   return `[tool_result]\n${output}`;
 }
 
@@ -563,20 +581,33 @@ export function isResponsesToolOutput(item: unknown): boolean {
   return type === 'function_call_output' || type === 'custom_tool_call_output';
 }
 
+function isRenderableTextOutput(output: unknown): boolean {
+  if (typeof output === 'string') return true;
+  if (!Array.isArray(output)) return false;
+  return output.every(
+    (part) =>
+      part !== null &&
+      typeof part === 'object' &&
+      ((part as { type?: unknown }).type === 'input_text' ||
+        (part as { type?: unknown }).type === 'output_text' ||
+        (part as { type?: unknown }).type === 'text') &&
+      typeof (part as { text?: unknown }).text === 'string',
+  );
+}
+
 function isRenderableResponsesPair(call: Record<string, unknown>, output: Record<string, unknown>): boolean {
   // A matching id alone is insufficient: cross-kind, partial and unknown state
   // must remain native, even if an output happens to be present already.
   if (output.type !== `${call.type}_output`) return false;
   if (call.status !== undefined && call.status !== 'completed') return false;
   if (output.status !== undefined && output.status !== 'completed') return false;
+  // Tool outputs can contain input_image / input_file parts for BOTH function_call
+  // and custom_tool_call; never JSON-stringify non-text parts into PNGs.
+  if (!isRenderableTextOutput(output.output)) return false;
   if (call.type !== 'custom_tool_call') return true;
   if (typeof call.name !== 'string' || !call.name || typeof call.input !== 'string') return false;
   if (call.namespace !== undefined && typeof call.namespace !== 'string') return false;
-  // Custom tools take raw text, NOT JSON arguments. Their outputs can also
-  // contain images/files; never flatten those into an image of their JSON/URL.
-  return typeof output.output === 'string'
-    || (Array.isArray(output.output) && output.output.every(part =>
-      part && typeof part === 'object' && part.type === 'input_text' && typeof part.text === 'string'));
+  return true;
 }
 
 function responseCallId(item: unknown): string {
@@ -716,9 +747,7 @@ function classifyResponsesPairs(
         // Match measureResponsesComposition exactly so the share is comparable
         // to its functionCalls/functionOutputs buckets.
         callTokens: gptCountTokens(JSON.stringify(call)),
-        outputTokens: gptCountTokens(
-          typeof output.output === 'string' ? output.output : safeJson(output.output),
-        ),
+        outputTokens: gptCountTokens(extractTextOutput(output.output)),
       });
     } else if (cs.length > 0 && os.length === 0) openCalls += cs.length;
     else if (os.length > 0 && cs.length === 0) orphanOutputs += os.length;
@@ -981,13 +1010,20 @@ async function planResponsesMixedCollapse(
     return { ...base, reason: 'too_many_images', collapsedChars: allText.length };
   }
 
-  const renderUnits = async (units: ResponsesMixedUnit[]) => {
+  const style = o.style ?? DEFAULT_GPT_PROFILE.style;
+  const maxLines = Math.max(1, Math.floor((o.maxHeightPx - 2 * PAD_Y) / renderCellHeight(style)));
+  const prepareUnits = (units: ResponsesMixedUnit[]) => {
     const source = units.map((unit) => unit.text).join('\n\n');
     const safe = neutralizeSentinel(source);
     const renderedText = o.reflow ? reflow(safe) ?? safe : safe;
-    const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, o.style?.markerScale, o.style?.font);
-    const images = await renderTextToPngs(renderedText, cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx);
-    return { source, renderedText, images, cols };
+    const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, style.markerScale, style.font);
+    const maxCharsPerImg = Math.min(READABLE_CHARS_PER_IMAGE, Math.max(1, cols) * maxLines);
+    const estImages = estimateImageCount(renderedText, cols, maxCharsPerImg, maxLines);
+    return { source, renderedText, cols, estImages };
+  };
+  const renderPreparedUnits = async (prep: ReturnType<typeof prepareUnits>) => {
+    const images = await renderTextToPngs(prep.renderedText, prep.cols, style, o.maxHeightPx);
+    return { source: prep.source, renderedText: prep.renderedText, images, cols: prep.cols };
   };
 
   const segments: ResponsesPairCollapseSegment[] = [];
@@ -998,23 +1034,65 @@ async function planResponsesMixedCollapse(
   for (const run of frozenRuns) {
     if (remainingImages === 0) { hitImageCap = true; break; }
     let low = 0;
-    let best: Awaited<ReturnType<typeof renderUnits>> | undefined;
-    // Fast path: render the full frozen run once before binary-searching, avoiding
-    // ceil(log2(N)) wasted intermediate PNG renders & cache evictions in the common case.
-    const full = await renderUnits(run);
-    if (full.images.length > 0 && full.images.length <= remainingImages) {
-      low = run.length;
-      best = full;
+    let best: Awaited<ReturnType<typeof renderPreparedUnits>> | undefined;
+    const fullPrep = prepareUnits(run);
+    if (fullPrep.estImages <= remainingImages) {
+      const full = await renderPreparedUnits(fullPrep);
+      if (full.images.length > 0 && full.images.length <= remainingImages) {
+        low = run.length;
+        best = full;
+      } else if (run.length > 1) {
+        let high = run.length;
+        while (low + 1 < high) {
+          const count = Math.floor((low + high) / 2);
+          const prep = prepareUnits(run.slice(0, count));
+          if (prep.estImages > remainingImages) {
+            high = count;
+            continue;
+          }
+          const rendered = await renderPreparedUnits(prep);
+          if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+            low = count;
+            best = rendered;
+          } else {
+            high = count;
+          }
+        }
+      }
     } else if (run.length > 1) {
-      let high = run.length;
-      while (low + 1 < high) {
-        const count = Math.floor((low + high) / 2);
-        const rendered = await renderUnits(run.slice(0, count));
-        if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
-          low = count;
-          best = rendered;
+      // Pre-shrink run length by estimateImageCount BEFORE calling renderTextToPngs.
+      let estLow = 0;
+      let estHigh = run.length;
+      while (estLow + 1 < estHigh) {
+        const mid = Math.floor((estLow + estHigh) / 2);
+        if (prepareUnits(run.slice(0, mid)).estImages <= remainingImages) {
+          estLow = mid;
         } else {
-          high = count;
+          estHigh = mid;
+        }
+      }
+      if (estLow > 0) {
+        const cand = await renderPreparedUnits(prepareUnits(run.slice(0, estLow)));
+        if (cand.images.length > 0 && cand.images.length <= remainingImages) {
+          low = estLow;
+          best = cand;
+        } else if (estLow > 1) {
+          let high = estLow;
+          while (low + 1 < high) {
+            const count = Math.floor((low + high) / 2);
+            const prep = prepareUnits(run.slice(0, count));
+            if (prep.estImages > remainingImages) {
+              high = count;
+              continue;
+            }
+            const rendered = await renderPreparedUnits(prep);
+            if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+              low = count;
+              best = rendered;
+            } else {
+              high = count;
+            }
+          }
         }
       }
     }
@@ -1121,15 +1199,22 @@ export async function planResponsesPairCollapse(
     else runs.push([round]);
   }
 
-  const renderPairs = async (rounds: ResponsesCompletedRound[]) => {
+  const style = o.style ?? DEFAULT_GPT_PROFILE.style;
+  const maxLines = Math.max(1, Math.floor((o.maxHeightPx - 2 * PAD_Y) / renderCellHeight(style)));
+  const preparePairs = (rounds: ResponsesCompletedRound[]) => {
     const source = rounds.map((round) => round.text).join('\n\n');
     const safe = neutralizeSentinel(source);
-    let renderedText = o.reflow ? reflow(safe) ?? safe : safe;
-    const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, o.style?.markerScale, o.style?.font);
+    const renderedText = o.reflow ? reflow(safe) ?? safe : safe;
+    const cols = o.reflow ? o.cols : measureContentCols(renderedText, o.cols, style.markerScale, style.font);
+    const maxCharsPerImg = Math.min(READABLE_CHARS_PER_IMAGE, Math.max(1, cols) * maxLines);
+    const estImages = estimateImageCount(renderedText, cols, maxCharsPerImg, maxLines);
+    return { source, renderedText, cols, estImages };
+  };
+  const renderPreparedPairs = async (prep: ReturnType<typeof preparePairs>) => {
     const images = await renderTextToPngs(
-      renderedText, cols, o.style ?? DEFAULT_GPT_PROFILE.style, o.maxHeightPx,
+      prep.renderedText, prep.cols, style, o.maxHeightPx,
     );
-    return { source, renderedText, images, cols };
+    return { source: prep.source, renderedText: prep.renderedText, images, cols: prep.cols };
   };
 
   const segments: ResponsesPairCollapseSegment[] = [];
@@ -1141,21 +1226,64 @@ export async function planResponsesPairCollapse(
     if (remainingImages === 0) { hitImageCap = true; break; }
 
     let low = 0;
-    let best: Awaited<ReturnType<typeof renderPairs>> | undefined;
-    const full = await renderPairs(run);
-    if (full.images.length > 0 && full.images.length <= remainingImages) {
-      low = run.length;
-      best = full;
+    let best: Awaited<ReturnType<typeof renderPreparedPairs>> | undefined;
+    const fullPrep = preparePairs(run);
+    if (fullPrep.estImages <= remainingImages) {
+      const full = await renderPreparedPairs(fullPrep);
+      if (full.images.length > 0 && full.images.length <= remainingImages) {
+        low = run.length;
+        best = full;
+      } else if (run.length > 1) {
+        let high = run.length;
+        while (low + 1 < high) {
+          const count = Math.floor((low + high) / 2);
+          const prep = preparePairs(run.slice(0, count));
+          if (prep.estImages > remainingImages) {
+            high = count;
+            continue;
+          }
+          const rendered = await renderPreparedPairs(prep);
+          if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+            low = count;
+            best = rendered;
+          } else {
+            high = count;
+          }
+        }
+      }
     } else if (run.length > 1) {
-      let high = run.length;
-      while (low + 1 < high) {
-        const count = Math.floor((low + high) / 2);
-        const rendered = await renderPairs(run.slice(0, count));
-        if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
-          low = count;
-          best = rendered;
+      let estLow = 0;
+      let estHigh = run.length;
+      while (estLow + 1 < estHigh) {
+        const mid = Math.floor((estLow + estHigh) / 2);
+        if (preparePairs(run.slice(0, mid)).estImages <= remainingImages) {
+          estLow = mid;
         } else {
-          high = count;
+          estHigh = mid;
+        }
+      }
+      if (estLow > 0) {
+        const cand = await renderPreparedPairs(preparePairs(run.slice(0, estLow)));
+        if (cand.images.length > 0 && cand.images.length <= remainingImages) {
+          low = estLow;
+          best = cand;
+        } else if (estLow > 1) {
+          let high = estLow;
+          while (low + 1 < high) {
+            const count = Math.floor((low + high) / 2);
+            const prep = preparePairs(run.slice(0, count));
+            if (prep.estImages > remainingImages) {
+              high = count;
+              continue;
+            }
+            const rendered = await renderPreparedPairs(prep);
+            if (rendered.images.length > 0 && rendered.images.length <= remainingImages) {
+              low = count;
+              best = rendered;
+            } else {
+              high = count;
+            }
+          }
         }
       }
     }

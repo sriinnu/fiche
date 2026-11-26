@@ -165,11 +165,19 @@ export function ratesFromRow(row: PriceRow | undefined, ttlSec?: number): PriceR
   return { read, write, output: row.out / row.in };
 }
 
-function profileRates(model: string | undefined): PriceRates {
+function legacyTtlWriteRate(profileWrite: number | undefined, ttlSec: number | undefined): number {
+  const baseWrite = profileWrite ?? 1;
+  if (ttlSec === undefined) return baseWrite;
+  if (ttlSec === 3600 || ttlSec > 300) return 2;
+  if (ttlSec > 0) return Math.max(baseWrite, CACHE_CREATE_RATE);
+  return baseWrite;
+}
+
+function profileRates(model: string | undefined, ttlSec?: number): PriceRates {
   const profile = resolveGptProfile(model);
   return {
     read: profile.cacheReadRate,
-    write: profile.cacheWriteRate ?? 1,
+    write: legacyTtlWriteRate(profile.cacheWriteRate, ttlSec),
     output: profile.outputRate,
   };
 }
@@ -222,7 +230,7 @@ export function resolvePriceRates(model: string | undefined, ctx?: PriceContext)
     const k = koshaRates(model, ctx);
     if (k) return k.rates;
   }
-  return profileRates(model);
+  return profileRates(model, ctx?.ttlSec);
 }
 
 /** Ratios the image/text gate in transform.ts prices with, or null when the
@@ -248,6 +256,12 @@ export function inputUsdPerMtok(model: string | undefined, ctx?: PriceContext): 
   if (priceMode() === 'legacy' || !koshaRates(model, ctx)) return undefined;
   const row = effectiveRow(priceRowFor(model), ctx);
   return row && row.in > 0 ? row.in : undefined;
+}
+
+/** True for OpenAI GPT/o-series models whose standard prompt cache bills uncached writes at 1.0x. */
+export function isAutoCacheOpenAIModel(model: string | null | undefined): boolean {
+  if (!model) return false;
+  return /^(?:(?:[^/]+\/)?(?:gpt-|o[134](?=[-.0-9]|$)))/i.test(model.trim());
 }
 
 export interface CliffSavingsEval {

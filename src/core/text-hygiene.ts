@@ -18,10 +18,12 @@
  */
 
 import {
+  computeHorizonPaybackLimit,
   computeTailHydration,
   foldMarkovianEpisodes,
   getGlobalMmuStore,
   hasAnyStickyMarkovEpisode,
+  isFileReadToolName,
   linkSessionSkills,
   pruneLowDensityBlob,
   type PinnedSkillStore,
@@ -31,6 +33,7 @@ import { readBrandEnv } from './env.js';
 import { createCasiIndex } from './casi-delta.js';
 import { getGlobalPrefixTape, INITIAL_PREFIX_HASH, tapeHash64Hex } from './prefix-tape.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
+import { resolvePriceRates } from './pricing.js';
 import {
   compileSegmentedStaticText,
   compileToolSchemas,
@@ -39,11 +42,19 @@ import {
 } from './schema-compiler.js';
 import {
   getPinnedSessionSkills,
+  hasStage2SealKey,
   isSessionCacheCold,
+  recordStage2SealKey,
   setPinnedSessionSkills,
 } from './session-state.js';
-import { planAndApplyTextEpochs, type TextEpochBlock } from './text-history.js';
+import {
+  planAndApplyTextEpochs,
+  type CacheBreakpointMarker,
+  type TextEpochBlock,
+} from './text-history.js';
 import { encodeToon } from './toon.js';
+
+export { isFileReadToolName };
 
 export type TextHygieneMode = 'auto' | 'on' | 'off';
 
@@ -144,16 +155,6 @@ const DIFF_FILE_PAIR_RE = /^--- [^\n]+\n\+\+\+ [^\n]+/m;
 const CODE_DECL_LINE_RE =
   /^\s*(?:(?:(?:export(?:\s+default)?|pub(?:\([^)]*\))?|public|private|protected|internal|static|final|abstract|override|readonly|sealed|open|suspend|async)\s+){0,4}(?:function\s+\w+|class\s+\w+|interface\s+\w+|record\s+\w+|protocol\s+\w+|actor\s+\w+|extension\s+\w+|namespace\s+[\w.]+|type\s+\w+\s*(?:=|struct\b|interface\b)|enum\s+\w+|struct\s+\w+|trait\s+\w+|impl\b|fn\s+\w+|func\s+(?:\([^)]*\)\s*)?\w+|def\s+\w+|(?:const|let|var|val)\s+\w+\s*(?::[^=\n]+)?=\s*(?:async\s+)?(?:\([^)]*\)\s*=>|function\b|class\b|\{|\[)|import\s+(?:\{|\*|"|\(|\w)|from\s+\S+\s+import\b|package\s+[\w.]+|using\s+[\w.]+\s*;|#include\s*[<"]|template\s*<)|(?:public|private|protected|internal)\s+(?:static\s+)?(?:final\s+)?(?:async\s+)?[A-Za-z_][\w.<>,[\]?]*\s+[A-Za-z_]\w*\s*\()/;
 
-const FILE_READ_TOOL_RE =
-  /^(?:read|read_?file|view_?file|view_?file_?outline|view_?code_?item|cat|get_?file_?contents|get_?file|read_?text_?file|read_?resource|open_?file|fs_?read|file_?read|show_?file|inspect_?file)$/i;
-
-/** True when a tool name represents a file/resource read whose exact whitespace/JSON keys must stay untouched for Edit/apply_patch. */
-export function isFileReadToolName(name: string | undefined): boolean {
-  if (!name) return false;
-  const trimmed = name.trim();
-  const bare = trimmed.split(/(?:__|[.:/])/).pop() ?? trimmed;
-  return FILE_READ_TOOL_RE.test(bare);
-}
 const STACK_PREFIX_RE =
   /^\s*(?:at\s+\S+\s*\(|Caused by:|File "|Traceback \(most recent call last\))/i;
 const FILE_EXT_LOC_RE =
@@ -468,12 +469,100 @@ function encodeStructuredJson(
     if (!hasNewline) return null;
     const min = minJsonBox.json ?? JSON.stringify(parsed);
     if (!min) return null;
-    if (text.length - min.length < 128) return null;
+    if (text.length - min.length < 120) return null;
     if (min.length > text.length * 0.85) return null;
     return { text: min, stage: 'json' };
   } catch {
     return null;
   }
+}
+
+const DIR_ENTRY_RE = /^((?:[MADRCU?!]{1,2}\s+)?)(?:\.\/)?((?:[A-Za-z0-9_@.~-]+\/)+)([A-Za-z0-9_@.~-]+\/?)$/;
+const DIR_LEAF_RE = /^((?:[MADRCU?!]{1,2}\s+)?)[A-Za-z0-9_@.~-]+\.[A-Za-z0-9]{1,12}$/;
+
+/**
+ * Losslessly group repetitive directory/file-tree listings (`>= 12` entries, `>= 600` chars)
+ * that share parent directories into `<dir>/: fileA, fileB, ...`. Preserves git status
+ * prefixes per group and never triggers on code, diffs, logs, or prose.
+ */
+function compactDirectoryListing(text: string): string | null {
+  if (text.length < 600 || text.length > MAX_HYGIENE_BLOCK_CHARS) return null;
+  if (isJsonWrappedFast(text)) return null;
+  const lines = text.split('\n');
+  const nonEmpty: string[] = [];
+  for (const l of lines) {
+    const t = l.trim();
+    if (t) nonEmpty.push(t);
+  }
+  if (nonEmpty.length < 12) return null;
+
+  let pathHits = 0;
+  let slashHits = 0;
+  type ParsedDirEntry = { kind: 'dir'; key: string; prefix: string; dir: string; leaf: string; raw: string };
+  const parsed: Array<ParsedDirEntry | { kind: 'raw'; raw: string }> = [];
+
+  for (const entry of nonEmpty) {
+    if (
+      /^(?:diff --git |@@ -\d|\*\*\* (?:Begin Patch|Update File|Add File))/.test(entry) ||
+      STACK_PREFIX_RE.test(entry) ||
+      entry.length > 260
+    ) {
+      return null;
+    }
+    const m = DIR_ENTRY_RE.exec(entry);
+    if (m) {
+      pathHits += 1;
+      slashHits += 1;
+      const prefix = m[1] ?? '';
+      const dir = m[2]!.replace(/\/+$/, '');
+      const leaf = m[3]!;
+      parsed.push({ kind: 'dir', key: `${prefix}\0${dir}`, prefix, dir, leaf, raw: entry });
+      continue;
+    }
+    if (DIR_LEAF_RE.test(entry)) {
+      pathHits += 1;
+    }
+    parsed.push({ kind: 'raw', raw: entry });
+  }
+
+  if (pathHits / nonEmpty.length < 0.8 || slashHits / nonEmpty.length < 0.6) return null;
+
+  const groupLeaves = new Map<string, { prefix: string; dir: string; leaves: string[] }>();
+  for (const item of parsed) {
+    if (item.kind !== 'dir') continue;
+    let g = groupLeaves.get(item.key);
+    if (!g) {
+      g = { prefix: item.prefix, dir: item.dir, leaves: [] };
+      groupLeaves.set(item.key, g);
+    }
+    g.leaves.push(item.leaf);
+  }
+
+  const emittedGroup = new Set<string>();
+  const out: string[] = [];
+  let hasGrouped = false;
+  for (const item of parsed) {
+    if (item.kind === 'raw') {
+      out.push(item.raw);
+      continue;
+    }
+    const g = groupLeaves.get(item.key)!;
+    if (g.leaves.length < 2) {
+      out.push(item.raw);
+      continue;
+    }
+    if (emittedGroup.has(item.key)) continue;
+    emittedGroup.add(item.key);
+    hasGrouped = true;
+    out.push(`${g.prefix}${g.dir}/: ${g.leaves.join(', ')}`);
+  }
+
+  if (!hasGrouped) return null;
+  const candidate = out.join('\n');
+  if (text.length - candidate.length < 150 || candidate.length > text.length * 0.82) {
+    return null;
+  }
+  return candidate;
 }
 
 /** Parameterize variable tokens into a Drain-style structural template for repetition detection. */
@@ -501,7 +590,9 @@ const LOG_ISO_TS_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/;
 const LOG_CLOCK_TS_RE = /(?:^|[\s\[])\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\]|[\s,:])/;
 const LOG_LEVEL_RE = /\b(?:INFO|DEBUG|TRACE|VERBOSE|NOTICE|LOG)\b/;
 const LOG_HTTP_RE = /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\/\S*/;
-const LOG_RUNNER_RE = /^\s*(?:✓|✔|PASS|OK|RUN|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling|Built|Transformed|Rendered)\b/;
+const LOG_RUNNER_RE = /^\s*(?:[✓✔]\s|(?:PASS|OK|RUN|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling|Built|Transformed|Rendered)\b|\[\d+\/\d+\]\s|·+$)|(?:\.\.\.\s*ok\s*(?:\([^)\n]+\))?$|\bok\s+\S+\s+\d+(?:\.\d+)?(?:ms|s)\s*$)/;
+const PASSING_PROGRESS_RE = /^\s*(?:[✓✔]\s|(?:PASS|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling)\b|\[\d+\/\d+\]\s|·+$)|(?:\.\.\.\s*ok\s*(?:\([^)\n]+\))?$|\bok\s+\S+\s+\d+(?:\.\d+)?(?:ms|s)\s*$)/;
+const FAIL_OR_SUMMARY_RE = /\b(?:error|err|warn|warning|fail|failed|failure|fatal|panic|exception|traceback|assertion|assert|denied|forbidden|timeout|timed out|refused|oom|killed|segfault|abort|aborted|skipped|summary|Tests?\s+\d|Test Files\s+\d)\b/i;
 
 function isLogShapedLine(line: string): boolean {
   return (
@@ -616,6 +707,37 @@ function foldRepetitiveLogs(text: string): string | null {
     }
   }
 
+  // Pass B2: fold contiguous passing/progress runs (>= 8 lines: keep first 2 + last 2)
+  // even when individual test names vary, while preserving every error/warning/summary line.
+  const isPassingProgress = new Uint8Array(total);
+  for (let i = 0; i < total; i++) {
+    const line = lines[i]!;
+    if (PASSING_PROGRESS_RE.test(line) && !FAIL_OR_SUMMARY_RE.test(line)) {
+      isPassingProgress[i] = 1;
+    }
+  }
+  let pIdx = 0;
+  while (pIdx < total) {
+    if (!isPassingProgress[pIdx]) {
+      pIdx++;
+      continue;
+    }
+    const runIndices: number[] = [pIdx];
+    let pEnd = pIdx + 1;
+    while (pEnd < total && (isPassingProgress[pEnd] || templates[pEnd] === '<EMPTY>')) {
+      if (isPassingProgress[pEnd]) runIndices.push(pEnd);
+      pEnd++;
+    }
+    if (runIndices.length >= 8) {
+      const keepHeadEnd = runIndices[1]!;
+      const keepTailStart = runIndices[runIndices.length - 2]!;
+      for (let k = keepHeadEnd + 1; k < keepTailStart; k++) {
+        keep[k] = 0;
+      }
+    }
+    pIdx = runIndices[runIndices.length - 1]! + 1;
+  }
+
   // Pass C: collapse <EMPTY> blank lines sandwiched inside any folded span.
   let prevNonEmptyKept = true;
   for (let i = 0; i < total; i++) {
@@ -648,7 +770,9 @@ function foldRepetitiveLogs(text: string): string | null {
       out.push(lines[i]!);
     } else {
       // Collapse blank lines engulfed inside a folded region cleanly.
-      if (templates[i] !== '<EMPTY>') foldedCount++;
+      if (templates[i] !== '<EMPTY>') {
+        foldedCount++;
+      }
     }
   }
   flushFolded();
@@ -930,26 +1054,33 @@ function cleanToolOutputCore(
       if (structured !== null) {
         current = structured.text;
         stages.push(structured.stage);
-      } else if (foldLogs) {
-        const folded = foldRepetitiveLogs(current);
-        if (folded !== null) {
-          current = folded;
-          stages.push('log_fold');
-        } else if (
-          opts?.enableDensityPrune !== false &&
-          opts?.enableMmu !== false &&
-          (opts?.enableMmu === true || opts?.deepTextCompact === true) &&
-          current.length >= 4000
-        ) {
-          const pruned = pruneLowDensityBlob(current, {
-            store: getGlobalMmuStore(),
-            sessionKey: opts?.sessionKey,
-            refId: opts?.refId,
-            toolName: opts?.toolName,
-          });
-          if (pruned.changed && pruned.text.length < current.length) {
-            current = pruned.text;
-            stages.push('density_prune');
+      } else {
+        const dirTree = compactDirectoryListing(current);
+        if (dirTree !== null) {
+          current = dirTree;
+          stages.push('dir_tree');
+        } else {
+          const folded = foldLogs ? foldRepetitiveLogs(current) : null;
+          if (folded !== null) {
+            current = folded;
+            stages.push('log_fold');
+          } else if (
+            opts?.enableDensityPrune !== false &&
+            opts?.enableMmu !== false &&
+            (opts?.enableMmu === true || opts?.deepTextCompact === true) &&
+            current.length >= 2400
+          ) {
+            const pruned = pruneLowDensityBlob(current, {
+              store: getGlobalMmuStore(),
+              sessionKey: opts?.sessionKey,
+              refId: opts?.refId,
+              toolName: opts?.toolName,
+              minChars: 2400,
+            });
+            if (pruned.changed && pruned.text.length < current.length) {
+              current = pruned.text;
+              stages.push('density_prune');
+            }
           }
         }
       }
@@ -1046,7 +1177,11 @@ function cleanUserBlockPreservingXml(
   raw: string,
   opts?: TextHygieneOptions,
 ): { text: string; changed: boolean; stages: string[] } {
-  if (raw.length < MIN_USER_CLEAN_CHARS || isCodeOrDiffProtected(raw)) {
+  if (
+    raw.length < MIN_USER_CLEAN_CHARS ||
+    raw.includes('[End of rendered') ||
+    isCodeOrDiffProtected(raw)
+  ) {
     return { text: raw, changed: false, stages: [] };
   }
   const islands = splitVolatileXmlIslands(raw);
@@ -1101,6 +1236,114 @@ const SESSION_PINNED_SKILL_STORE: PinnedSkillStore = {
   set: (sessionKey, catalogHash, skills) => setPinnedSessionSkills(sessionKey, catalogHash, skills),
 };
 
+function estimateMessageBlockTokens(rawBlk: unknown): number {
+  if (!rawBlk || typeof rawBlk !== 'object') return 0;
+  const blk = rawBlk as Record<string, unknown>;
+  if (typeof blk.text === 'string') return Math.ceil(blk.text.length / 3.5);
+  if (typeof blk.thinking === 'string') return Math.ceil(blk.thinking.length / 3.5);
+  if (typeof blk.content === 'string') return Math.ceil(blk.content.length / 3.5);
+  if (Array.isArray(blk.content)) {
+    let sum = 0;
+    for (const part of blk.content) sum += estimateMessageBlockTokens(part);
+    return sum;
+  }
+  if (blk.type === 'tool_use' && blk.input !== undefined) {
+    try {
+      return Math.ceil((JSON.stringify(blk.input)?.length ?? 0) / 3.5);
+    } catch {
+      return 0;
+    }
+  }
+  return 0;
+}
+
+export function estimateMessageTokens(rawMsg: unknown): number {
+  if (!rawMsg || typeof rawMsg !== 'object') return 0;
+  const msg = rawMsg as { content?: unknown };
+  if (typeof msg.content === 'string') return Math.ceil(msg.content.length / 3.5);
+  if (!Array.isArray(msg.content)) return 0;
+  let sum = 0;
+  for (const blk of msg.content) sum += estimateMessageBlockTokens(blk);
+  return sum;
+}
+
+export function markerTtlSeconds(cc: unknown): number | undefined {
+  if (!cc || typeof cc !== 'object') return undefined;
+  const ttl = (cc as { ttl?: unknown }).ttl;
+  return ttl === '1h' ? 3600 : 300;
+}
+
+export function coveringBreakpointInfo(
+  msgIndex: number,
+  blockIndex: number,
+  cacheBreakpoints: readonly CacheBreakpointMarker[] | undefined,
+  msgTotalTokens: readonly number[] | undefined,
+  totalMessages: number,
+): { coveringTtlSec: number; downstreamTokens: number } {
+  if (!cacheBreakpoints || cacheBreakpoints.length === 0) {
+    return { coveringTtlSec: 0, downstreamTokens: 0 };
+  }
+  let coveringTtlSec = 0;
+  let maxBpMsg = -1;
+  for (const bp of cacheBreakpoints) {
+    if (bp.msgIndex > msgIndex || (bp.msgIndex === msgIndex && bp.blockIndex >= blockIndex)) {
+      if (bp.ttlSec > coveringTtlSec) coveringTtlSec = bp.ttlSec;
+      if (bp.msgIndex > maxBpMsg) maxBpMsg = bp.msgIndex;
+    }
+  }
+  if (coveringTtlSec === 0 || !msgTotalTokens || maxBpMsg < 0) {
+    return { coveringTtlSec, downstreamTokens: 0 };
+  }
+  const limit = Math.min(msgTotalTokens.length - 1, Math.min(totalMessages - 1, maxBpMsg));
+  let downstreamTokens = 0;
+  for (let m = msgIndex + 1; m <= limit; m++) {
+    downstreamTokens += msgTotalTokens[m] ?? 0;
+  }
+  return { coveringTtlSec, downstreamTokens };
+}
+
+function stage2RewritePaybackBlocked(
+  orig: string,
+  candidate: string,
+  slot: TextEpochBlock,
+  opts: TextHygieneOptions | undefined,
+  cacheBreakpoints: readonly CacheBreakpointMarker[] | undefined,
+  msgTotalTokens: readonly number[] | undefined,
+  totalMessages: number,
+): boolean {
+  const { coveringTtlSec, downstreamTokens } = coveringBreakpointInfo(
+    slot.msgIndex,
+    slot.blockIndex ?? 0,
+    cacheBreakpoints,
+    msgTotalTokens,
+    totalMessages,
+  );
+  if (coveringTtlSec <= 0 || downstreamTokens <= 0) return false;
+  const actualSavedTok = estimateTokensSaved(orig, candidate);
+  if (!(actualSavedTok > 0)) return true;
+  const rawTok = Math.max(actualSavedTok + 1, Math.ceil(orig.length / 3.5));
+  const keptTok = Math.max(1, rawTok - actualSavedTok);
+  const rates = resolvePriceRates(opts?.model, { promptTokens: 0, ttlSec: coveringTtlSec });
+  const savedPerRead = actualSavedTok * rates.read;
+  if (!(savedPerRead > 0)) return true;
+  const transitionCost =
+    keptTok * rates.write -
+    rawTok * rates.read +
+    downstreamTokens * (rates.write - rates.read);
+  const paybackReads = Math.ceil(Math.max(0, transitionCost) / savedPerRead);
+  const maxAllowed = computeHorizonPaybackLimit({
+    turnsObserved: Math.max(1, Math.floor(totalMessages / 2)),
+    baseMaxPayback: coveringTtlSec >= 3600 ? 8 : 12,
+    downstreamCachedTokens: downstreamTokens,
+  });
+  return paybackReads > maxAllowed;
+}
+
+/** Deterministic session seal key protecting optically rendered Responses tool outputs from re-mutation. */
+export function buildOpticalToolSealKey(refId: string, rawText: string): string {
+  return `oai_opt_tr:${refId}\0${rawText.length}:${tapeHash64Hex(rawText)}`;
+}
+
 function runWireTextEngine(args: {
   tools?: unknown[];
   wire: ToolSchemaWire;
@@ -1109,13 +1352,19 @@ function runWireTextEngine(args: {
   userSlots?: readonly TextEpochBlock[];
   seedBlocks?: readonly SeedBlock[];
   totalMessages: number;
+  msgTotalTokens?: readonly number[];
+  cacheBreakpoints?: readonly CacheBreakpointMarker[];
   rawReq: unknown;
   opts?: TextHygieneOptions;
 }): WireHygieneStats {
-  const { tools, wire, staticSlots, toolSlots, userSlots, seedBlocks, totalMessages, opts } = args;
+  const { tools, wire, staticSlots, toolSlots: rawToolSlots, userSlots, seedBlocks, totalMessages, msgTotalTokens, cacheBreakpoints, opts } = args;
   const effectiveOpts: TextHygieneOptions | undefined = opts?.aggressiveToon !== undefined
     ? opts
     : { ...opts, aggressiveToon: resolveTextHygieneMode(undefined) === 'on' };
+  const initialSessionKey = effectiveOpts?.sessionKey;
+  const toolSlots = initialSessionKey
+    ? rawToolSlots.filter((s) => !hasStage2SealKey(initialSessionKey, buildOpticalToolSealKey(s.refId, s.getText())))
+    : rawToolSlots;
   let staticSavedChars = 0;
   let staticSavedTokens = 0;
   let staticBlocks = 0;
@@ -1128,7 +1377,8 @@ function runWireTextEngine(args: {
   );
   const mmuStore = mmuActive ? getGlobalMmuStore() : undefined;
   const sessionCold =
-    effectiveOpts?.sessionCacheCold ?? (sessionKey ? isSessionCacheCold(sessionKey) : false);
+    effectiveOpts?.sessionCacheCold ??
+    (sessionKey ? isSessionCacheCold(sessionKey, { model: effectiveOpts?.model }) : false);
 
   if (effectiveOpts?.deepTextCompact) {
     if (effectiveOpts.enableSkillLinker !== false && mmuStore && effectiveOpts.firstUserText) {
@@ -1189,24 +1439,25 @@ function runWireTextEngine(args: {
   const slotStages: string[][] = toolSlots.map(() => []);
   let stage2SavedChars = staticSavedChars;
 
-  // Stage 2: per-block deterministic cleaning (ANSI / CR / WS / JSON-unwrap / TOON / JSON / log / density prune)
+  // Stage 2: per-block deterministic cleaning (ANSI / CR / WS / JSON-unwrap / TOON / JSON / dir_tree / log / density prune).
+  // Frontier-first + monotonic: a block compressed at the frontier seals into session state so it
+  // replays bit-identically behind later cache_control breakpoints (zero self-bust), while an
+  // unsealed mid-prefix block covered by a live breakpoint only mutates if rewrite payback beats horizon.
   for (let i = 0; i < toolSlots.length; i++) {
     const tSlot = toolSlots[i]!;
     const cur = origToolTexts[i]!;
+    const stage2SlotSig = `${tSlot.refId}\0${cur.length}:${tapeHash64Hex(cur)}`;
+    const alreadySealedStage2 = Boolean(sessionKey && hasStage2SealKey(sessionKey, stage2SlotSig));
+    const allowDensityPrune = effectiveOpts?.enableDensityPrune !== false;
     const memoKey =
-      cur.length >= 64
-        ? `${stage2PolicyKey}\0${tSlot.refId}\0${tSlot.toolName ?? ''}\0${cur.length}:${tapeHash64Hex(cur)}`
+      cur.length >= 64 && cur.length <= MAX_HYGIENE_BLOCK_CHARS
+        ? `${stage2PolicyKey}:${allowDensityPrune ? '1' : '0'}\0${tSlot.refId}\0${tSlot.toolName ?? ''}\0${cur.length}:${tapeHash64Hex(cur)}`
         : undefined;
     let cleaned = memoKey ? tape.getStage2(memoKey) : undefined;
-    if (cleaned && mmuStore && cleaned.stages.includes('density_prune')) {
-      const pgMatch = cleaned.text.match(/\[fiche vm-page (pg_[0-9a-f]+)/);
-      if (!pgMatch || !mmuStore.getPage(pgMatch[1]!, sessionKey)) {
-        cleaned = undefined;
-      }
-    }
     if (!cleaned) {
       const slotOpts: TextHygieneOptions = {
         ...effectiveOpts,
+        enableDensityPrune: allowDensityPrune,
         refId: tSlot.refId,
         ...(tSlot.toolName ? { toolName: tSlot.toolName } : {}),
       };
@@ -1216,11 +1467,26 @@ function runWireTextEngine(args: {
         tape.setStage2(memoKey, cleaned);
       }
     }
-    if (cleaned.changed) {
-      tSlot.setText(cleaned.text);
-      stage2SavedChars += cur.length - cleaned.text.length;
-      for (const s of cleaned.stages) slotStages[i]!.push(s);
+    if (!cleaned.changed || cleaned.text.length >= cur.length) continue;
+    if (
+      !alreadySealedStage2 &&
+      !sessionCold &&
+      stage2RewritePaybackBlocked(
+        cur,
+        cleaned.text,
+        tSlot,
+        effectiveOpts,
+        cacheBreakpoints,
+        msgTotalTokens,
+        totalMessages,
+      )
+    ) {
+      continue;
     }
+    tSlot.setText(cleaned.text);
+    if (sessionKey) recordStage2SealKey(sessionKey, stage2SlotSig);
+    stage2SavedChars += cur.length - cleaned.text.length;
+    for (const s of cleaned.stages) slotStages[i]!.push(s);
   }
 
   // Opt-in Stage 2 cleaning on bulky user payloads (>= 1500 chars, non-code/diff, XML-safe).
@@ -1298,6 +1564,8 @@ function runWireTextEngine(args: {
       totalPromptTokens: estimateRemainingPromptTokens(),
       expectedOutputTokens: effectiveOpts.expectedOutputTokens,
       ttlSec: effectiveOpts.ttlSec,
+      msgTotalTokens,
+      cacheBreakpoints,
       sessionKey,
       sessionCacheCold: sessionCold,
       enableLsm: lsmActive,
@@ -1335,6 +1603,8 @@ function runWireTextEngine(args: {
       store: mmuStore,
       expectedOutputTokens: effectiveOpts.expectedOutputTokens,
       ttlSec: effectiveOpts.ttlSec,
+      msgTotalTokens,
+      cacheBreakpoints,
       totalPromptTokens: estimateRemainingPromptTokens(),
       stickyOnly,
     });
@@ -1428,9 +1698,8 @@ function runWireTextEngine(args: {
   }
 
   // Stage 4: CASI cross-turn deduplication / delta / FastCDC slice encoding.
-  // Seeds compacted bases read-only from preCompactTexts (preserving pg_* IDs
-  // when paged out) and uses Merkle prefix-state memoization so warm turns skip
-  // re-hashing unchanged prefixes while preserving exact base visibility on misses.
+  // Never seeds compacted preCompactTexts (whose bodies are gone from the prompt),
+  // and replays warm indexed bases via replayIndexedBase (128-cap, independent of seedHashes).
   const casi = effectiveOpts?.enableCasi === false ? undefined : createCasiIndex();
   if (casi) {
     const sortedSeeds =
@@ -1440,11 +1709,15 @@ function runWireTextEngine(args: {
     let seedCursor = 0;
     let seedPrefixHash = INITIAL_PREFIX_HASH;
     let prefixHash = INITIAL_PREFIX_HASH;
-    const deferredBases: Array<{ text: string; refId: string; msgIndex: number }> = [];
+    const deferredBases: Array<{ kind: 'seed' | 'indexed'; text: string; refId: string; msgIndex: number }> = [];
     const flushDeferredBases = (): void => {
       if (deferredBases.length === 0) return;
       for (const base of deferredBases) {
-        casi.seedBase(base.text, base.refId, base.msgIndex);
+        if (base.kind === 'seed') {
+          casi.seedBase(base.text, base.refId, base.msgIndex);
+        } else {
+          casi.replayIndexedBase(base.text, base.refId, base.msgIndex);
+        }
       }
       deferredBases.length = 0;
     };
@@ -1457,7 +1730,7 @@ function runWireTextEngine(args: {
           seedPrefixHash,
           `${seed.refId}\0${seed.msgIndex}\0${seed.text.length}:${tapeHash64Hex(seed.text)}`,
         );
-        deferredBases.push({ text: seed.text, refId: seed.refId, msgIndex: seed.msgIndex });
+        deferredBases.push({ kind: 'seed', text: seed.text, refId: seed.refId, msgIndex: seed.msgIndex });
       }
       const cur = tSlot.getText();
       if (
@@ -1473,12 +1746,6 @@ function runWireTextEngine(args: {
           prefixHash,
           `compact\0${tSlot.refId}\0${tSlot.msgIndex}\0${cur.length}:${tapeHash64Hex(cur)}`,
         );
-        const preText = preCompactTexts[i]!;
-        if (preText && preText !== cur && preText.length >= 400) {
-          const pgMatch = cur.match(/(?:^|\n)\[fiche vm-page (pg_[0-9a-f]+)/);
-          const seedRef = pgMatch ? `${tSlot.refId}|${pgMatch[1]!}` : tSlot.refId;
-          deferredBases.push({ text: preText, refId: seedRef, msgIndex: tSlot.msgIndex });
-        }
         continue;
       }
 
@@ -1499,7 +1766,7 @@ function runWireTextEngine(args: {
         };
         tape.setCasiMemo(casiKey, memo);
       } else if (!memo.changed && cur.length >= 400) {
-        deferredBases.push({ text: cur, refId: tSlot.refId, msgIndex: tSlot.msgIndex });
+        deferredBases.push({ kind: 'indexed', text: cur, refId: tSlot.refId, msgIndex: tSlot.msgIndex });
       }
 
       if (memo.changed) {
@@ -1630,14 +1897,41 @@ export function applyAnthropicTextHygiene(
   const userSlots: TextEpochBlock[] = [];
   const seedBlocks: SeedBlock[] = [];
   const toolNameById = new Map<string, string>();
+  const cacheBreakpoints: CacheBreakpointMarker[] = [];
+  if (Array.isArray(req.tools)) {
+    for (const rawTool of req.tools) {
+      if (!rawTool || typeof rawTool !== 'object') continue;
+      const ttl = markerTtlSeconds((rawTool as { cache_control?: unknown }).cache_control);
+      if (ttl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+      }
+    }
+  }
+  if (Array.isArray(req.system)) {
+    for (const rawBlk of req.system) {
+      if (!rawBlk || typeof rawBlk !== 'object') continue;
+      const ttl = markerTtlSeconds((rawBlk as { cache_control?: unknown }).cache_control);
+      if (ttl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+      }
+    }
+  }
+
   const messages = Array.isArray(req.messages) ? req.messages : [];
+  const msgTotalTokens: number[] = new Array<number>(messages.length).fill(0);
   for (let mIdx = 0; mIdx < messages.length; mIdx++) {
     const rawMsg = messages[mIdx];
     if (!rawMsg || typeof rawMsg !== 'object') continue;
-    const msg = rawMsg as { role?: unknown; content?: unknown };
+    msgTotalTokens[mIdx] = estimateMessageTokens(rawMsg);
+    const msg = rawMsg as { role?: unknown; content?: unknown; cache_control?: unknown };
+    const msgTtl = markerTtlSeconds(msg.cache_control);
+    if (msgTtl !== undefined) {
+      cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: Number.MAX_SAFE_INTEGER, ttlSec: msgTtl });
+    }
     if (msg.role === 'user' && typeof msg.content === 'string') {
       userSlots.push({
         msgIndex: mIdx,
+        blockIndex: 0,
         refId: `user_${mIdx}`,
         getText: () => msg.content as string,
         setText: (next: string) => {
@@ -1658,7 +1952,12 @@ export function applyAnthropicTextHygiene(
         text?: unknown;
         tool_use_id?: unknown;
         content?: unknown;
+        cache_control?: unknown;
       };
+      const blkTtl = markerTtlSeconds(blk.cache_control);
+      if (blkTtl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: bIdx, ttlSec: blkTtl });
+      }
       if (blk.type === 'tool_use') {
         if (typeof blk.id === 'string' && typeof blk.name === 'string') {
           toolNameById.set(blk.id, blk.name);
@@ -1671,6 +1970,7 @@ export function applyAnthropicTextHygiene(
       if (msg.role === 'user' && blk.type === 'text' && typeof blk.text === 'string') {
         userSlots.push({
           msgIndex: mIdx,
+          blockIndex: bIdx,
           refId: `user_${mIdx}_${bIdx}`,
           getText: () => blk.text as string,
           setText: (next: string) => {
@@ -1685,6 +1985,7 @@ export function applyAnthropicTextHygiene(
       if (typeof blk.content === 'string') {
         toolSlots.push({
           msgIndex: mIdx,
+          blockIndex: bIdx,
           refId: baseRef,
           toolName,
           getText: () => blk.content as string,
@@ -1696,10 +1997,15 @@ export function applyAnthropicTextHygiene(
         for (let pIdx = 0; pIdx < blk.content.length; pIdx++) {
           const rawPart = blk.content[pIdx];
           if (!rawPart || typeof rawPart !== 'object') continue;
-          const part = rawPart as { type?: unknown; text?: unknown };
+          const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown };
+          const partTtl = markerTtlSeconds(part.cache_control);
+          if (partTtl !== undefined) {
+            cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: bIdx, ttlSec: partTtl });
+          }
           if (part.type === 'text' && typeof part.text === 'string') {
             toolSlots.push({
               msgIndex: mIdx,
+              blockIndex: bIdx,
               refId: `${baseRef}#${pIdx}`,
               toolName,
               getText: () => part.text as string,
@@ -1729,6 +2035,8 @@ export function applyAnthropicTextHygiene(
     userSlots,
     seedBlocks,
     totalMessages: messages.length,
+    msgTotalTokens,
+    cacheBreakpoints,
     rawReq: req,
     opts,
   });

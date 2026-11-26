@@ -7,7 +7,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 
 export interface ResolvedMacApp {
   readonly appPath: string;
@@ -47,7 +47,7 @@ export function parseXmlBundleExecutable(infoPlistPath: string): string | null {
 }
 
 function readBundleExecutable(infoPlistPath: string): string | null {
-  const pl = spawnSync('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', infoPlistPath], {
+  const pl = spawnSync('plutil', ['-extract', 'CFBundleExecutable', 'raw', '-o', '-', '--', resolve(infoPlistPath)], {
     encoding: 'utf8',
   });
   if (pl.status === 0) {
@@ -164,9 +164,15 @@ export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string 
     lines.push('');
     lines.push('# Transparent CLI wrappers (set FICHE_BYPASS=1 to skip proxy for one invocation)');
     for (const cli of CLI_WRAPPERS) {
-      lines.push(
-        `${cli}() { if [ "\${FICHE_BYPASS:-0}" = "1" ]; then command ${cli} "$@"; else "$FICHE_BIN" warp -- ${cli} "$@"; fi; }`,
-      );
+      if (cli === 'codex') {
+        lines.push(
+          'function codex { if [ "${FICHE_BYPASS:-0}" = "1" ]; then command codex "$@"; elif [ "${FICHE_WARP_ACTIVE:-0}" = "1" ] || ! command -v "$FICHE_BIN" >/dev/null 2>&1; then case "${FICHE_CODEX_KEEP_DAEMON:-}" in 1|true|TRUE|yes|YES|on|ON) command codex "$@"; return ;; esac; case "${1:-}" in app-server|remote-control|completion|update|help|--help|-h|--version|-V) command codex "$@"; return ;; esac; local _arg _has_daemon=0; for _arg in "$@"; do case "$_arg" in *daemon_auto_start*) _has_daemon=1; break ;; esac; done; if [ "$_has_daemon" -eq 1 ]; then command codex "$@"; else command codex -c features.daemon_auto_start=false "$@"; fi; else "$FICHE_BIN" warp -- codex "$@"; fi; }',
+        );
+      } else {
+        lines.push(
+          `function ${cli} { if [ "\${FICHE_BYPASS:-0}" = "1" ] || [ "\${FICHE_WARP_ACTIVE:-0}" = "1" ] || ! command -v "$FICHE_BIN" >/dev/null 2>&1; then command ${cli} "$@"; else "$FICHE_BIN" warp -- ${cli} "$@"; fi; }`,
+        );
+      }
     }
   }
   return `${lines.join('\n')}\n`;

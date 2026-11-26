@@ -32,18 +32,21 @@ import {
   estimateImageCount,
   resolveOpticalHistoryPolicy,
   sha8,
+  splitStaticDynamic,
   type ClientSessionSource,
   type OpticalMode,
   type TransformInfo,
   type TransformOptions,
 } from './transform.js';
+import { splitVolatileXmlIslands } from './schema-compiler.js';
 import { visionTokens } from './vision-cost.js';
 import { computeOpenAICollapsePaybackReads } from './openai-savings.js';
-import { extractFaultSignalSnippet } from './context-mmu.js';
+import { extractFaultSignalSnippet, isFileReadToolName } from './context-mmu.js';
 import { evaluateCliffAvoidance, gateRatesFor, priceMode } from './pricing.js';
 import {
   applyOpenAIChatTextHygiene,
   applyOpenAIResponsesTextHygiene,
+  buildOpticalToolSealKey,
   isTextHygieneActive,
   resolveTextHygieneMode,
   type TextHygieneMode,
@@ -64,7 +67,12 @@ import { HISTORY_SYNTHETIC_INTRO, HISTORY_SYNTHETIC_OUTRO } from './history.js';
 import { extractFactSheetTokens, factSheetText, prepareFactSheet } from './factsheet.js';
 import { relocateOpenAIPins } from './pin.js';
 import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
-import { noteHistoryRequest, sessionAnchorText } from './session-state.js';
+import {
+  hasStage2SealKey,
+  noteHistoryRequest,
+  recordStage2SealKey,
+  sessionAnchorText,
+} from './session-state.js';
 
 // Per-model GPT rendering + vision-cost profiles (portrait-strip width, image-token
 // cost model, max image height) live in ./gpt-model-profiles.ts so a new model is a
@@ -320,6 +328,7 @@ interface OpenAIResolvedOptions {
   textHygiene: boolean | TextHygieneMode;
   expectedOutputTokens: number;
   compressTools: boolean;
+  compressToolResults: boolean;
   minCompressChars: number;
   cols?: number;
   charsPerToken: number;
@@ -343,6 +352,7 @@ const DEFAULTS: OpenAIResolvedOptions = {
   textHygiene: 'auto',
   expectedOutputTokens: 1000,
   compressTools: true,
+  compressToolResults: true,
   minCompressChars: 2000,
   cols: undefined,
   charsPerToken: 4, // conservative OpenAI default; override after calibration
@@ -362,6 +372,7 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     textHygiene: opts.textHygiene ?? DEFAULTS.textHygiene,
     expectedOutputTokens: opts.expectedOutputTokens ?? DEFAULTS.expectedOutputTokens,
     compressTools: opts.compressTools ?? DEFAULTS.compressTools,
+    compressToolResults: opts.compressToolResults ?? DEFAULTS.compressToolResults,
     minCompressChars: opts.minCompressChars ?? DEFAULTS.minCompressChars,
     cols: opts.cols,
     charsPerToken: opts.charsPerToken ?? DEFAULTS.charsPerToken,
@@ -371,7 +382,10 @@ function resolveOptions(opts: TransformOptions): OpenAIResolvedOptions {
     gptHistory: opts.gptHistory,
     explicitPromptCacheBreakpoints: opts.explicitPromptCacheBreakpoints !== false,
     stageToggles: opts.stageToggles ?? {},
-    cleanUserPayloads: opts.cleanUserPayloads === true,
+    cleanUserPayloads:
+      opts.cleanUserPayloads !== undefined
+        ? opts.cleanUserPayloads === true
+        : resolveTextHygieneMode(opts.textHygiene ?? DEFAULTS.textHygiene) === 'on',
     clientSessionId: opts.clientSessionId,
     clientSessionSource: opts.clientSessionSource,
     claudeCodeSessionId: opts.claudeCodeSessionId,
@@ -410,15 +424,17 @@ function gptHistoryOpts(
   model: string,
   o: OpenAIResolvedOptions,
   profile: ReturnType<typeof resolveGptProfile>,
-  existingImages = 0,
+  slabImages = 0,
+  clientImages = 0,
 ): Partial<GptHistoryOptions> {
   const configuredMax = o.gptHistory?.maxImages ?? configuredHistoryMaxImages(model);
-  // Providers with a hard total-image cap budget against the remaining headroom
-  // (client-attached images included) instead of subtracting from the history
-  // cap, which would starve history once the request already carries images.
+  // Separate fiche's history-image budget from late client screenshots so adding a
+  // user/tool screenshot never shrinks the history budget and un-collapses sealed segments.
+  // Only providers with a hard total-image cap subtract clientImages from headroom.
+  const historyBudget = Math.max(0, configuredMax - slabImages);
   const remainingMax = profile.providerImageCap !== undefined
-    ? Math.max(0, Math.min(configuredMax, profile.providerImageCap - existingImages))
-    : Math.max(0, configuredMax - existingImages);
+    ? Math.max(0, Math.min(historyBudget, profile.providerImageCap - slabImages - clientImages))
+    : historyBudget;
   return {
     ...o.gptHistory,
     reflow: o.gptHistory?.reflow ?? profile.history.reflow ?? o.reflow,
@@ -514,7 +530,11 @@ function responsesContentText(content: ResponsesInputItem['content']): string {
     .filter((p): p is ResponsesInputTextPart =>
       typeof p === 'object'
       && p !== null
-      && ((p as { type?: unknown }).type === 'input_text' || (p as { type?: unknown }).type === 'text')
+      && (
+        (p as { type?: unknown }).type === 'input_text' ||
+        (p as { type?: unknown }).type === 'output_text' ||
+        (p as { type?: unknown }).type === 'text'
+      )
       && typeof (p as { text?: unknown }).text === 'string')
     .map((p) => p.text)
     .join('\n\n');
@@ -907,12 +927,24 @@ type ResponsesComposition = NonNullable<TransformInfo['responsesComposition']>;
 const OPAQUE_ITEM_TOKEN_CACHE = new Map<string, number>();
 const OPAQUE_ITEM_CACHE_MAX = 256;
 
+function dualDigest64Hex(s: string): string {
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x9e3779b1 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
+    h2 = Math.imul((h2 ^ ((c + (i & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
+  }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
 function cachedOpaqueItemTokens(o: Record<string, unknown>): number {
   const enc = typeof o.encrypted_content === 'string' ? o.encrypted_content : undefined;
   const keyCount = Object.keys(o).length;
   if (enc && enc.length >= 256 && keyCount <= 6) {
+    const itemType = typeof o.type === 'string' ? o.type : '';
     const id = typeof o.id === 'string' ? o.id : '';
-    const cacheKey = `${id}\0${enc}`;
+    const cacheKey = `${itemType}:${id}:${keyCount}:${enc.length}:${dualDigest64Hex(enc)}`;
     const hit = OPAQUE_ITEM_TOKEN_CACHE.get(cacheKey);
     if (hit !== undefined) {
       OPAQUE_ITEM_TOKEN_CACHE.delete(cacheKey);
@@ -928,6 +960,33 @@ function cachedOpaqueItemTokens(o: Record<string, unknown>): number {
     return tokens;
   }
   return gptTextTokens(JSON.stringify(o));
+}
+
+function responsesOutputTextOnly(output: unknown): string {
+  if (typeof output === 'string') return output;
+  if (Array.isArray(output)) {
+    const texts: string[] = [];
+    for (const part of output) {
+      if (!part || typeof part !== 'object') continue;
+      const p = part as Record<string, unknown>;
+      const t = typeof p.type === 'string' ? p.type : '';
+      if (t === 'input_image' || t === 'image' || t === 'output_image' || t === 'image_url') continue;
+      if ((t === 'input_text' || t === 'output_text' || t === 'text' || !t) && typeof p.text === 'string') {
+        texts.push(p.text);
+      } else if (typeof p.content === 'string') {
+        texts.push(p.content);
+      }
+    }
+    return texts.join('\n\n');
+  }
+  if (output !== undefined && output !== null) {
+    try {
+      return JSON.stringify(output) ?? '';
+    } catch {
+      return '';
+    }
+  }
+  return '';
 }
 
 /** Local o200k decomposition of the original Responses request. This is
@@ -973,7 +1032,7 @@ function measureResponsesComposition(
     } else if (isResponsesToolCall(o)) {
       c.functionCalls += gptTextTokens(JSON.stringify(o));
     } else if (isResponsesToolOutput(o)) {
-      c.functionOutputs += gptTextTokens(typeof o.output === 'string' ? o.output : JSON.stringify(o.output ?? ''));
+      c.functionOutputs += gptTextTokens(responsesOutputTextOnly(o.output));
       c.imageParts += countImages(o.output);
     } else if (type === 'reasoning') {
       // Includes encrypted_content when present; this is often a large Codex-native bucket.
@@ -1226,12 +1285,13 @@ async function applyChatHistoryCollapse(
   // images are inserted into req.messages before this runs, so walking the
   // messages (instead of also adding info.imageCount) avoids double-counting
   // the slab and matches the Responses path's budget math.
-  const existingImages = countRequestImages(req.messages);
+  const slabImages = info.imageCount ?? 0;
+  const clientImages = Math.max(0, countRequestImages(req.messages) - slabImages);
   const plan = await planGptCollapse(
     chatMessagesToTurns(req.messages),
     protectedPrefix,
     profitable,
-    gptHistoryOpts(req.model, o, profile, existingImages),
+    gptHistoryOpts(req.model, o, profile, slabImages, clientImages),
   );
   foldGptHistory(info, req.model, plan);
   const allImages = [...plan.images, ...plan.imagesAfter];
@@ -1274,8 +1334,22 @@ async function applyChatHistoryCollapse(
 const OPENAI_CLIFF_STICKY_MAX = 512;
 const openaiCliffSticky = new Map<string, number>();
 
+function getOpenAICliffSticky(key: string): number | undefined {
+  const hit = openaiCliffSticky.get(key);
+  if (hit !== undefined) {
+    openaiCliffSticky.delete(key);
+    openaiCliffSticky.set(key, hit);
+  }
+  return hit;
+}
+
 function recordOpenAICliffSticky(key: string, cliffAt: number): void {
-  if (openaiCliffSticky.size >= OPENAI_CLIFF_STICKY_MAX) openaiCliffSticky.clear();
+  if (openaiCliffSticky.has(key)) {
+    openaiCliffSticky.delete(key);
+  } else if (openaiCliffSticky.size >= OPENAI_CLIFF_STICKY_MAX) {
+    const oldest = openaiCliffSticky.keys().next().value;
+    if (oldest !== undefined) openaiCliffSticky.delete(oldest);
+  }
   openaiCliffSticky.set(key, cliffAt);
 }
 
@@ -1343,7 +1417,7 @@ async function applyResponsesHistoryCollapse(
       || computeOpenAICollapsePaybackReads(gate.textTokens, collapsedTokens, req.model) <= maxReads;
     const cliffStickyKey = `${req.model}\0${info.sessionKey ?? info.firstUserSha8 ?? ''}\0${sourceText.length}:${sourceText.slice(0, 128)}`;
     if (!accepted && remainingPromptTokens > gate.textTokens) {
-      const stickyCliffAt = priceMode() === 'kosha' ? openaiCliffSticky.get(cliffStickyKey) : undefined;
+      const stickyCliffAt = priceMode() === 'kosha' ? getOpenAICliffSticky(cliffStickyKey) : undefined;
       if (stickyCliffAt !== undefined && remainingPromptTokens > stickyCliffAt) {
         accepted = true;
       } else {
@@ -1378,11 +1452,12 @@ async function applyResponsesHistoryCollapse(
     }
     return accepted;
   };
-  const existingImages = (info.imageCount ?? 0) + (info.responsesComposition?.imageParts ?? 0);
+  const slabImages = info.imageCount ?? 0;
+  const clientImages = info.responsesComposition?.imageParts ?? 0;
   const plan = await planResponsesPairCollapse(
     inputItems,
     profitable,
-    gptHistoryOpts(req.model, o, profile, existingImages),
+    gptHistoryOpts(req.model, o, profile, slabImages, clientImages),
   );
   historySheets.beginEmission();
   const ps = plan.pairState;
@@ -1470,6 +1545,303 @@ async function applyResponsesHistoryCollapse(
   return true;
 }
 
+const HYBRID_TOOL_OPTICAL_MIN_CHARS = 2_500;
+const HYBRID_TOOL_OPTICAL_MAX_IMAGES = 8;
+const LARGE_USER_OPTICAL_MIN_CHARS = 24_000;
+const USER_HEAD_KEEP_CHARS = 1_000;
+const USER_TAIL_KEEP_CHARS = 1_500;
+const LARGE_USER_OPTICAL_MAX_IMAGES = 24;
+
+async function compressResponsesToolOutputsOptically(
+  req: ResponsesRequest,
+  inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
+  info: TransformInfo,
+  o: OpenAIResolvedOptions,
+  profile: GptModelProfile,
+  droppedCodepoints?: Map<number, number>,
+  sessionKey?: string,
+  sessionCacheCold?: boolean,
+  rawIndexOffset = 0,
+): Promise<boolean> {
+  let addedImagesCount = 0;
+  let addedBase64Bytes = 0;
+  let changed = false;
+  const maxSerialized = profile.maxSerializedRequestBytes;
+  const reflowNote = o.reflow
+    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
+    : '';
+  const maxCols = o.cols ?? profile.stripCols;
+  const cutoffL1 = Math.max(0, inputItems.length - 2);
+  const toolNameById = new Map<string, string>();
+  for (const rawItem of inputItems) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const callItem = rawItem as { type?: unknown; name?: unknown; call_id?: unknown; id?: unknown };
+    if (
+      (callItem.type === 'function_call' || callItem.type === 'custom_tool_call') &&
+      typeof callItem.name === 'string'
+    ) {
+      if (typeof callItem.call_id === 'string' && callItem.call_id) {
+        toolNameById.set(callItem.call_id, callItem.name);
+      }
+      if (typeof callItem.id === 'string' && callItem.id) {
+        toolNameById.set(callItem.id, callItem.name);
+      }
+    }
+  }
+
+  for (let i = 0; i < inputItems.length; i++) {
+    const rawItem = inputItems[i];
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const item = rawItem as { type?: unknown; output?: unknown; call_id?: unknown };
+    if (item.type !== 'function_call_output' && item.type !== 'custom_tool_call_output') continue;
+    if (typeof item.output !== 'string') continue;
+    const rawText = item.output;
+    if (rawText.length < HYBRID_TOOL_OPTICAL_MIN_CHARS) continue;
+    if (
+      rawText.startsWith('[fiche ') ||
+      rawText.startsWith('[folded into ') ||
+      rawText.startsWith('[inkling ')
+    ) {
+      continue;
+    }
+
+    const callIdStr = typeof item.call_id === 'string' && item.call_id ? item.call_id : '';
+    const toolName = callIdStr ? toolNameById.get(callIdStr) : undefined;
+    const origIdx = Math.max(0, i - rawIndexOffset);
+    const baseRef = callIdStr || `out_${origIdx}`;
+    const sealKey = buildOpticalToolSealKey(baseRef, rawText);
+    const alreadySealed = Boolean(sessionKey && hasStage2SealKey(sessionKey, sealKey));
+    // Protect recent live-tail file reads from imaging so Edit/apply_patch string anchors stay exact.
+    if (!alreadySealed && !sessionCacheCold && i >= cutoffL1 && isFileReadToolName(toolName)) {
+      continue;
+    }
+
+    const existingImages = (info.responsesComposition?.imageParts ?? 0) + info.imageCount;
+    const capRem = profile.providerImageCap !== undefined
+      ? Math.max(0, profile.providerImageCap - existingImages)
+      : HYBRID_TOOL_OPTICAL_MAX_IMAGES;
+    const remBudget = Math.min(HYBRID_TOOL_OPTICAL_MAX_IMAGES - addedImagesCount, capRem);
+    if (remBudget <= 0) break;
+
+    const compacted = compactSlabWhitespace(rawText);
+    const renderedText = prepareImagedRenderText(
+      `=== RENDERED TOOL OUTPUT ===${reflowNote}\n${compacted}`,
+      o.reflow,
+    );
+    const cols = Math.min(
+      shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
+      profile.stripCols,
+    );
+    const factSheet = factSheetText(rawText, profile.factSheetFormat);
+    const endMarker = '[End of rendered tool output.]';
+    const nativeOverhead = gptTextTokens(factSheet) + gptTextTokens(endMarker);
+    const rawTokens = gptTextTokens(rawText) || Math.ceil(rawText.length / Math.max(1, o.charsPerToken));
+    const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken, rawTokens);
+    if (!(gate.imageTokens + nativeOverhead < gate.textTokens * 0.7)) continue;
+
+    const imgs = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
+    if (imgs.length === 0 || imgs.length > remBudget) continue;
+    const imgTok = gptImageTokens(req.model, imgs);
+    if (!(imgTok + nativeOverhead < rawTokens * 0.7)) continue;
+
+    const estAddedBytes = imgs.reduce((s, img) => s + Math.ceil((img.png.length * 4) / 3) + 128, 0);
+    if (maxSerialized !== undefined && addedBase64Bytes + estAddedBytes > maxSerialized * 0.75) {
+      continue;
+    }
+
+    const acc = accumulateRenderedImages(imgs, info);
+    if (droppedCodepoints) {
+      for (const [cp, n] of acc.droppedCodepoints) {
+        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+      }
+    }
+    const imgPartsResp: ResponsesInputImagePart[] = imgs.map((img) => responsesImagePart(img, req.model));
+    const outParts: ResponsesContentPart[] = [...imgPartsResp];
+    if (factSheet) outParts.push({ type: 'input_text', text: factSheet });
+    outParts.push({ type: 'input_text', text: endMarker });
+    item.output = outParts;
+    if (sessionKey) recordStage2SealKey(sessionKey, sealKey);
+
+    info.imageCount += imgs.length;
+    info.imageTokens = (info.imageTokens ?? 0) + imgTok;
+    info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + rawTokens;
+    info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + nativeOverhead;
+    info.compressedChars += rawText.length;
+    (info.imagePngs ??= []).push(...imgs.map((img) => img.png));
+    (info.imageDims ??= []).push(...imgs.map((img) => ({ width: img.width, height: img.height })));
+    const sourceSlice = renderedText.slice(0, 65_536);
+    (info.imageSourceTexts ??= []).push(...imgs.map(() => sourceSlice));
+    if (!info.firstImagePng) {
+      info.firstImagePng = imgs[0]!.png;
+      info.firstImageWidth = imgs[0]!.width;
+      info.firstImageHeight = imgs[0]!.height;
+      info.imageSourceText = sourceSlice;
+    }
+    addedImagesCount += imgs.length;
+    addedBase64Bytes += estAddedBytes;
+    changed = true;
+  }
+
+  if (changed) {
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_tool_optical')) stages.push('hybrid_tool_optical');
+    info.textHygieneStages = stages;
+    if (droppedCodepoints && droppedCodepoints.size > 0) {
+      const top = droppedCodepointsTop(droppedCodepoints);
+      if (top) info.droppedCodepointsTop = top;
+    }
+  }
+  return changed;
+}
+
+async function compressResponsesLargeUserContextOptically(
+  req: ResponsesRequest,
+  inputItems: Array<ResponsesInputItem | Record<string, unknown>>,
+  info: TransformInfo,
+  o: OpenAIResolvedOptions,
+  profile: GptModelProfile,
+  droppedCodepoints?: Map<number, number>,
+): Promise<boolean> {
+  let addedImagesCount = 0;
+  let addedBase64Bytes = 0;
+  let changed = false;
+  const maxSerialized = profile.maxSerializedRequestBytes;
+  const reflowNote = o.reflow
+    ? ' The glyph ↵ (U+21B5) marks an original hard line break in content; treat it as a real newline.'
+    : '';
+  const maxCols = o.cols ?? profile.stripCols;
+
+  const tryCompressUserText = async (rawText: string): Promise<ResponsesContentPart[] | undefined> => {
+    if (rawText.length < LARGE_USER_OPTICAL_MIN_CHARS) return undefined;
+    if (rawText.includes('[fiche ') || rawText.includes('[End of rendered')) return undefined;
+
+    const existingImages = (info.responsesComposition?.imageParts ?? 0) + info.imageCount;
+    const capRem = profile.providerImageCap !== undefined
+      ? Math.max(0, profile.providerImageCap - existingImages)
+      : LARGE_USER_OPTICAL_MAX_IMAGES;
+    const remBudget = Math.min(LARGE_USER_OPTICAL_MAX_IMAGES - addedImagesCount, capRem);
+    if (remBudget <= 0) return undefined;
+
+    const nlHead = rawText.lastIndexOf('\n', USER_HEAD_KEEP_CHARS);
+    const headCut = nlHead >= 400 ? nlHead + 1 : USER_HEAD_KEEP_CHARS;
+    const nlTail = rawText.indexOf('\n', Math.max(headCut, rawText.length - USER_TAIL_KEEP_CHARS));
+    const tailCut =
+      nlTail >= headCut && rawText.length - nlTail >= 500
+        ? nlTail
+        : rawText.length - USER_TAIL_KEEP_CHARS;
+    const head = rawText.slice(0, headCut);
+    const middle = rawText.slice(headCut, tailCut);
+    const tail = rawText.slice(tailCut);
+    if (middle.length < 16_000) return undefined;
+
+    const compacted = compactSlabWhitespace(middle);
+    const renderedText = prepareImagedRenderText(
+      `=== RENDERED USER CONTEXT ===${reflowNote}\n${compacted}`,
+      o.reflow,
+    );
+    const cols = Math.min(
+      shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
+      profile.stripCols,
+    );
+    const factSheet = factSheetText(middle, profile.factSheetFormat);
+    const endMarker = '[End of rendered user context.]';
+    const nativeOverhead = gptTextTokens(factSheet) + gptTextTokens(endMarker);
+    const middleTokens = gptTextTokens(middle) || Math.ceil(middle.length / Math.max(1, o.charsPerToken));
+    const gate = evalOpenAIGate(req.model, renderedText, cols, o.charsPerToken, middleTokens);
+    if (!(gate.imageTokens + nativeOverhead < gate.textTokens * 0.65)) return undefined;
+
+    const imgs = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
+    if (imgs.length === 0 || imgs.length > remBudget) return undefined;
+    const imgTok = gptImageTokens(req.model, imgs);
+    if (!(imgTok + nativeOverhead < middleTokens * 0.65)) return undefined;
+
+    const estAddedBytes = imgs.reduce((s, img) => s + Math.ceil((img.png.length * 4) / 3) + 128, 0);
+    if (maxSerialized !== undefined && addedBase64Bytes + estAddedBytes > maxSerialized * 0.75) {
+      return undefined;
+    }
+
+    const acc = accumulateRenderedImages(imgs, info);
+    if (droppedCodepoints) {
+      for (const [cp, n] of acc.droppedCodepoints) {
+        droppedCodepoints.set(cp, (droppedCodepoints.get(cp) ?? 0) + n);
+      }
+    }
+    const imgPartsResp: ResponsesInputImagePart[] = imgs.map((img) => responsesImagePart(img, req.model));
+    const replacement: ResponsesContentPart[] = [];
+    if (head) replacement.push({ type: 'input_text', text: head });
+    replacement.push(...imgPartsResp);
+    if (factSheet) replacement.push({ type: 'input_text', text: factSheet });
+    replacement.push({ type: 'input_text', text: endMarker });
+    if (tail) replacement.push({ type: 'input_text', text: tail });
+
+    info.imageCount += imgs.length;
+    info.imageTokens = (info.imageTokens ?? 0) + imgTok;
+    info.baselineImagedTokens = (info.baselineImagedTokens ?? 0) + middleTokens;
+    info.nativeInjectedTokens = (info.nativeInjectedTokens ?? 0) + nativeOverhead;
+    info.compressedChars += middle.length;
+    (info.imagePngs ??= []).push(...imgs.map((img) => img.png));
+    (info.imageDims ??= []).push(...imgs.map((img) => ({ width: img.width, height: img.height })));
+    const sourceSlice = renderedText.slice(0, 65_536);
+    (info.imageSourceTexts ??= []).push(...imgs.map(() => sourceSlice));
+    if (!info.firstImagePng) {
+      info.firstImagePng = imgs[0]!.png;
+      info.firstImageWidth = imgs[0]!.width;
+      info.firstImageHeight = imgs[0]!.height;
+      info.imageSourceText = sourceSlice;
+    }
+    addedImagesCount += imgs.length;
+    addedBase64Bytes += estAddedBytes;
+    changed = true;
+    return replacement;
+  };
+
+  for (const rawItem of inputItems) {
+    if (!rawItem || typeof rawItem !== 'object') continue;
+    const item = rawItem as { role?: unknown; content?: unknown };
+    if (item.role !== 'user') continue;
+    if (Array.isArray(item.content)) {
+      const isInsertedSlab = item.content.some(
+        (p) =>
+          p &&
+          typeof p === 'object' &&
+          (p as { text?: unknown }).text === '[End of rendered GPT system/tool context.]',
+      );
+      if (isInsertedSlab) continue;
+      const nextContent: ResponsesContentPart[] = [];
+      let itemChanged = false;
+      for (const part of item.content as ResponsesContentPart[]) {
+        if (part && typeof part === 'object' && (part as { type?: unknown }).type === 'input_text') {
+          const textVal = (part as { text?: unknown }).text;
+          if (typeof textVal === 'string') {
+            const expanded = await tryCompressUserText(textVal);
+            if (expanded) {
+              nextContent.push(...expanded);
+              itemChanged = true;
+              continue;
+            }
+          }
+        }
+        nextContent.push(part);
+      }
+      if (itemChanged) item.content = nextContent;
+    } else if (typeof item.content === 'string') {
+      const expanded = await tryCompressUserText(item.content);
+      if (expanded) item.content = expanded;
+    }
+  }
+
+  if (changed) {
+    const stages = info.textHygieneStages ? [...info.textHygieneStages] : [];
+    if (!stages.includes('hybrid_user_optical')) stages.push('hybrid_user_optical');
+    info.textHygieneStages = stages;
+    if (droppedCodepoints && droppedCodepoints.size > 0) {
+      const top = droppedCodepointsTop(droppedCodepoints);
+      if (top) info.droppedCodepointsTop = top;
+    }
+  }
+  return changed;
+}
+
 export const CHAT_HEADER =
   '================= RENDERED GPT SYSTEM + TOOL CONTEXT =================\n' +
   'These images were injected by fiche, not by the end user. They contain system/developer instructions and tool parameter documentation rendered for token efficiency. Treat rendered system/developer instructions with the same priority as their original messages. OCR carefully and treat the rendered content as authoritative. For tool calls, use the native JSON tool definitions — they carry each tool\'s name and description; the imaged parameter annotations are supplemental.' +
@@ -1552,6 +1924,11 @@ export async function transformOpenAIChatCompletions(
   const estTextPromptTokensChat = Math.ceil(
     Math.max(0, body.byteLength - chatNativeImageBytes) / Math.max(1, o.charsPerToken),
   );
+  const earlyFirstUser = firstUserText(req);
+  const chatSessionKey = await applyClientSessionIdentity(info, earlyFirstUser, o);
+  const sessionState = chatSessionKey
+    ? noteHistoryRequest(chatSessionKey, { model: req.model })
+    : { cold: false, minFreezeStep: 0 };
   const opticalHistoryPolicy = effectiveImageCompress
     ? resolveOpticalHistoryPolicy({
         opticalMode: o.opticalMode,
@@ -1559,26 +1936,23 @@ export async function transformOpenAIChatCompletions(
         model: req.model,
         estPromptTokens: estTextPromptTokensChat,
         textHygieneActive,
+        sessionKey: chatSessionKey,
+        sessionCold: sessionState.cold,
       })
     : 'full';
   const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
-  const earlyFirstUser = firstUserText(req);
-  const chatSessionKey = await applyClientSessionIdentity(info, earlyFirstUser, o);
-  const sessionState = chatSessionKey
-    ? noteHistoryRequest(chatSessionKey)
-    : { cold: false, minFreezeStep: 0 };
   const hygieneStats = textHygieneActive
     ? applyOpenAIChatTextHygiene(req, {
         foldLogs: !effectiveImageCompress || hybridTextMmu,
         deepTextCompact: !effectiveImageCompress || hybridTextMmu,
         cleanUserPayloads: o.cleanUserPayloads,
-        enableTscg: hybridTextMmu ? false : o.stageToggles?.tscg,
+        enableTscg: o.stageToggles?.tscg,
         enableToon: o.stageToggles?.toon,
         enableAcdc: o.stageToggles?.acdc,
         enableCasi: (!effectiveImageCompress || hybridTextMmu) && o.stageToggles?.casi !== false,
         enableLsm: o.stageToggles?.lsm,
         enableMmu: o.stageToggles?.mmu,
-        enableSkillLinker: hybridTextMmu ? false : o.stageToggles?.skillLinker,
+        enableSkillLinker: o.stageToggles?.skillLinker,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: req.model,
         expectedOutputTokens: o.expectedOutputTokens,
@@ -1867,6 +2241,118 @@ export async function transformOpenAIChatCompletions(
   return finishSerializedChat();
 }
 
+const CODEX_ENV_CONTEXT_RE = /<environment_context>[\s\S]*?<\/environment_context>/g;
+
+function splitLeadingResponsesAuthorityText(text: string): {
+  staticText: string;
+  dynamicText: string;
+  blockCount: number;
+} {
+  if (!text) return { staticText: '', dynamicText: '', blockCount: 0 };
+  const base = splitStaticDynamic(text);
+  const dynamicParts: string[] = base.dynamicText ? [base.dynamicText] : [];
+  let blockCount = base.blockCount;
+
+  let rem = base.staticText.replace(CODEX_ENV_CONTEXT_RE, (m) => {
+    dynamicParts.push(m);
+    blockCount++;
+    return '';
+  });
+
+  const islands = splitVolatileXmlIslands(rem);
+  if (islands.some((isl) => isl.volatile)) {
+    const staticIslands: string[] = [];
+    for (const isl of islands) {
+      if (isl.volatile) {
+        dynamicParts.push(isl.text);
+        blockCount++;
+      } else {
+        staticIslands.push(isl.text);
+      }
+    }
+    rem = staticIslands.join('');
+  }
+
+  if (blockCount === 0 && dynamicParts.length === 0) {
+    return {
+      staticText: text,
+      dynamicText: '',
+      blockCount: 0,
+    };
+  }
+
+  return {
+    staticText: rem.replace(/\n{3,}/g, '\n\n').trim(),
+    dynamicText: dynamicParts.join('\n\n').trim(),
+    blockCount,
+  };
+}
+
+function makeRelocatedAuthorityItem(
+  sourceItem: ResponsesInputItem,
+  dynamicText: string,
+): ResponsesInputItem {
+  const hadArray = Array.isArray(sourceItem.content);
+  const base: Record<string, unknown> = {};
+  if (typeof (sourceItem as Record<string, unknown>).type === 'string') {
+    base.type = (sourceItem as Record<string, unknown>).type;
+  }
+  base.role = sourceItem.role;
+  base.content = hadArray ? [{ type: 'input_text', text: dynamicText }] : dynamicText;
+  return base as unknown as ResponsesInputItem;
+}
+
+async function computeResponsesCachePrefixSha8(req: ResponsesRequest): Promise<string | undefined> {
+  const input = Array.isArray(req.input) ? req.input : undefined;
+  let prefixItems: unknown[] = [];
+  if (input && input.length > 0) {
+    const slabIdx = input.findIndex((it) => {
+      const c = (it as { content?: unknown } | null)?.content;
+      return Array.isArray(c) && c.some((p) => (p as { text?: unknown } | null)?.text === '[End of rendered GPT system/tool context.]');
+    });
+    if (slabIdx >= 0) {
+      prefixItems = input.slice(0, slabIdx + 1);
+      for (let i = slabIdx + 1; i < input.length; i++) {
+        const it = input[i] as { role?: unknown; content?: unknown } | null;
+        if (
+          it?.role === 'user' &&
+          Array.isArray(it.content) &&
+          it.content.some((p) => {
+            const t = (p as { text?: unknown } | null)?.text;
+            return typeof t === 'string' && t.includes('Earlier turns in image(s)');
+          })
+        ) {
+          prefixItems.push(it);
+        }
+      }
+    } else {
+      for (const it of input) {
+        const r = (it as { role?: unknown } | null)?.role;
+        if (r === 'system' || r === 'developer') prefixItems.push(it);
+        else break;
+      }
+    }
+  }
+  if (
+    prefixItems.length === 0 &&
+    typeof req.instructions !== 'string' &&
+    !Array.isArray(req.tools)
+  ) {
+    return undefined;
+  }
+  try {
+    return await sha8(
+      JSON.stringify({
+        instructions: req.instructions ?? null,
+        tools: req.tools ?? null,
+        prefix: prefixItems,
+      }),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 export async function transformOpenAIResponses(
   body: Uint8Array,
   opts: TransformOptions = {},
@@ -1910,6 +2396,11 @@ export async function transformOpenAIResponses(
   const estTextPromptTokensResp = Math.ceil(
     Math.max(0, body.byteLength - respNativeImageBytes) / Math.max(1, o.charsPerToken),
   );
+  const earlyRespFirstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
+  const respSessionKey = await applyClientSessionIdentity(info, earlyRespFirstUser, o);
+  const sessionState = respSessionKey
+    ? noteHistoryRequest(respSessionKey, { model: req.model })
+    : { cold: false, minFreezeStep: 0 };
   const opticalHistoryPolicy = effectiveImageCompress
     ? resolveOpticalHistoryPolicy({
         opticalMode: o.opticalMode,
@@ -1917,26 +2408,23 @@ export async function transformOpenAIResponses(
         model: req.model,
         estPromptTokens: estTextPromptTokensResp,
         textHygieneActive,
+        sessionKey: respSessionKey,
+        sessionCold: sessionState.cold,
       })
     : 'full';
   const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
-  const earlyRespFirstUser = firstResponsesUserText(inputWasString, originalInputString, inputItems);
-  const respSessionKey = await applyClientSessionIdentity(info, earlyRespFirstUser, o);
-  const sessionState = respSessionKey
-    ? noteHistoryRequest(respSessionKey)
-    : { cold: false, minFreezeStep: 0 };
   const hygieneStats = textHygieneActive
     ? applyOpenAIResponsesTextHygiene(req, {
         foldLogs: !effectiveImageCompress || hybridTextMmu,
         deepTextCompact: !effectiveImageCompress || hybridTextMmu,
         cleanUserPayloads: o.cleanUserPayloads,
-        enableTscg: hybridTextMmu ? false : o.stageToggles?.tscg,
+        enableTscg: o.stageToggles?.tscg,
         enableToon: o.stageToggles?.toon,
         enableAcdc: o.stageToggles?.acdc,
         enableCasi: (!effectiveImageCompress || hybridTextMmu) && o.stageToggles?.casi !== false,
         enableLsm: o.stageToggles?.lsm,
         enableMmu: o.stageToggles?.mmu,
-        enableSkillLinker: hybridTextMmu ? false : o.stageToggles?.skillLinker,
+        enableSkillLinker: o.stageToggles?.skillLinker,
         aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
         model: req.model,
         expectedOutputTokens: o.expectedOutputTokens,
@@ -2038,12 +2526,20 @@ export async function transformOpenAIResponses(
     systemTexts.push(req.instructions);
     info.staticChars += req.instructions.length;
   }
-  // Only the LEADING system/developer items are static. Codex appends small
-  // developer notes mid-session (e.g. deferred tool namespaces added/removed);
-  // hoisting those into the slab re-rendered its last page and busted the whole
-  // cached prefix behind it. Later ones stay native, in place, as barriers.
+  // Only the LEADING system/developer items are static, and volatile XML islands
+  // (<env>, <git_status>, <system-reminder>, <environment_context>, etc.) inside them
+  // are split out and relocated after the static slab so per-turn changes never bust the slab.
   const leadingAuthorityEnd = inputWasString ? 0 : firstUserIdx;
-  for (const item of inputItems.slice(0, leadingAuthorityEnd)) {
+  interface LeadingAuthoritySplit {
+    readonly index: number;
+    readonly item: ResponsesInputItem;
+    readonly staticText: string;
+    readonly dynamicText: string;
+  }
+  const leadingSplits = new Map<number, LeadingAuthoritySplit>();
+  const relocatedVolatileItems: ResponsesInputItem[] = [];
+  for (let idx = 0; idx < leadingAuthorityEnd; idx++) {
+    const item = inputItems[idx]!;
     const r = (item as ResponsesInputItem).role;
     if (r !== 'system' && r !== 'developer') continue;
     const content = (item as ResponsesInputItem).content;
@@ -2051,9 +2547,27 @@ export async function transformOpenAIResponses(
     // Responses shapes for system/developer items) — read either form.
     const text = responsesContentText(content);
     if (!text) continue;
-    authorityDocs.push(`## ${String(r).toUpperCase()} MESSAGE\n${text}`);
-    systemTexts.push(text);
-    info.staticChars += text.length;
+    const split = r === 'developer'
+      ? splitLeadingResponsesAuthorityText(text)
+      : { staticText: text, dynamicText: '', blockCount: 0 };
+    leadingSplits.set(idx, {
+      index: idx,
+      item: item as ResponsesInputItem,
+      staticText: split.staticText,
+      dynamicText: split.dynamicText,
+    });
+    if (split.dynamicText) {
+      info.dynamicChars += split.dynamicText.length;
+      info.dynamicBlockCount += Math.max(1, split.blockCount);
+      relocatedVolatileItems.push(
+        makeRelocatedAuthorityItem(item as ResponsesInputItem, split.dynamicText),
+      );
+    }
+    if (split.staticText) {
+      authorityDocs.push(`## ${String(r).toUpperCase()} MESSAGE\n${split.staticText}`);
+      systemTexts.push(split.staticText);
+      info.staticChars += split.staticText.length;
+    }
   }
 
   const { tools: rewrittenTools, docs: toolDocs } = o.compressTools
@@ -2062,7 +2576,7 @@ export async function transformOpenAIResponses(
 
   const combinedRaw = [...authorityDocs, toolDocs].filter((s) => s.length > 0).join('\n\n');
   info.origChars = combinedRaw.length;
-  const finishSerialized = () => {
+  const finishSerialized = async () => {
     const encoded = new TextEncoder().encode(JSON.stringify(req));
     // The SAME cap the proxy enforces with a 413 (proxy.ts), applied to every
     // profile that declares one. Imaging trades tokens for bytes (base64 PNGs
@@ -2091,24 +2605,98 @@ export async function transformOpenAIResponses(
     }
     info.outgoingTextChars = countResponsesOutgoingTextChars(req);
     info.compressed = true;
+    const prefixSha = await computeResponsesCachePrefixSha8(req);
+    if (prefixSha) info.cachePrefixSha8 = prefixSha;
     return { body: encoded, info };
+  };
+  const origInputLen = inputItems.length;
+  const pureUserAssistantHybrid =
+    hybridTextMmu &&
+    (info.responsesComposition?.functionOutputs ?? 0) === 0 &&
+    (info.responsesComposition?.userAssistant ?? 0) >= 2_000;
+  const runFallbackTextHygiene = (): boolean => {
+    if (!textHygieneActive) return false;
+    const fb = applyOpenAIResponsesTextHygiene(req, {
+      foldLogs: true,
+      deepTextCompact: true,
+      cleanUserPayloads: o.cleanUserPayloads,
+      enableTscg: o.stageToggles?.tscg,
+      enableToon: o.stageToggles?.toon,
+      enableAcdc: o.stageToggles?.acdc,
+      enableCasi: o.stageToggles?.casi !== false,
+      enableLsm: o.stageToggles?.lsm,
+      enableMmu: o.stageToggles?.mmu,
+      enableSkillLinker: o.stageToggles?.skillLinker,
+      aggressiveToon: resolveTextHygieneMode(o.textHygiene) === 'on',
+      model: req.model,
+      expectedOutputTokens: o.expectedOutputTokens,
+      rawBodyBytes: body.byteLength,
+      nativeImageBytes: respNativeImageBytes,
+      sessionKey: respSessionKey,
+      firstUserText: earlyRespFirstUser,
+      sessionCacheCold: sessionState.cold,
+      liveTailTexts: extractResponsesLiveTailTexts(inputWasString, originalInputString, inputItems),
+      appendTailHydration: (blk) => appendResponsesTailHydration(req, blk),
+    });
+    if (!fb.changed && !fb.tailHydrated) return false;
+    info.textHygieneSavedChars = (info.textHygieneSavedChars ?? 0) + fb.savedChars;
+    info.textHygieneSavedTokens = (info.textHygieneSavedTokens ?? 0) + fb.savedTokens;
+    info.textHygieneBlocks = (info.textHygieneBlocks ?? 0) + fb.blocks;
+    const mergedStages = new Set([...(info.textHygieneStages ?? []), ...fb.stages]);
+    info.textHygieneStages = [...mergedStages];
+    if (!info.cliffAvoided && fb.cliffAvoided) info.cliffAvoided = fb.cliffAvoided;
+    return fb.changed;
   };
   const finishHistoryOnly = async (reason: string) => {
     info.reason = reason;
-    if (o.collapseHistory && !hybridTextMmu && !inputWasString && await applyResponsesHistoryCollapse(
-      req, inputItems, info, o, profile,
-    )) {
+    const collapseRan =
+      o.collapseHistory && (!hybridTextMmu || pureUserAssistantHybrid) && !inputWasString
+        ? await applyResponsesHistoryCollapse(req, inputItems, info, o, profile)
+        : false;
+    if (collapseRan) {
+      const collapsedItems = Array.isArray(req.input)
+        ? (req.input as Array<ResponsesInputItem | Record<string, unknown>>)
+        : inputItems;
+      await compressResponsesLargeUserContextOptically(req, collapsedItems, info, o, profile);
       info.reason = undefined;
       return finishSerialized();
     }
-    if (hygieneStats?.changed) {
+    const toolOptRan =
+      hybridTextMmu && o.compressToolResults && !inputWasString
+        ? await compressResponsesToolOutputsOptically(
+            req,
+            inputItems,
+            info,
+            o,
+            profile,
+            undefined,
+            respSessionKey,
+            sessionState.cold,
+            0,
+          )
+        : false;
+    const userOptRan = !inputWasString
+      ? await compressResponsesLargeUserContextOptically(req, inputItems, info, o, profile)
+      : false;
+    if (toolOptRan || userOptRan) {
+      info.reason = toolOptRan ? 'hybrid_tool_optical' : 'hybrid_user_optical';
+      return finishSerialized();
+    }
+    const fbChanged = !hybridTextMmu ? runFallbackTextHygiene() : false;
+    if (hygieneStats?.changed || fbChanged) {
       info.compressed = true;
       info.reason = 'text_hygiene';
       info.outgoingTextChars = countResponsesOutgoingTextChars(req);
-    } else if (hygieneStats?.tailHydrated) {
+      const prefixSha = await computeResponsesCachePrefixSha8(req);
+      if (prefixSha) info.cachePrefixSha8 = prefixSha;
+      return { body: new TextEncoder().encode(JSON.stringify(req)), info };
+    }
+    if (hygieneStats?.tailHydrated) {
       info.reason = 'mmu_hydrate';
       info.outgoingTextChars = countResponsesOutgoingTextChars(req);
     }
+    const prefixSha = await computeResponsesCachePrefixSha8(req);
+    if (prefixSha) info.cachePrefixSha8 = prefixSha;
     return { body: getPinBodyResp(), info };
   };
   if (!combinedRaw) {
@@ -2145,12 +2733,12 @@ export async function transformOpenAIResponses(
   );
 
   const slabFactSheetPreview = factSheetText(combinedRaw, profile.factSheetFormat);
+  let staticAuthorityCountPre = 0;
+  for (const s of leadingSplits.values()) {
+    if (s.staticText.length > 0) staticAuthorityCountPre++;
+  }
   const authorityPointerCountPre = (typeof req.instructions === 'string' && req.instructions.length > 0 ? 1 : 0)
-    + inputItems.slice(0, leadingAuthorityEnd).filter((item) => {
-      const it = item as ResponsesInputItem;
-      return (it.role === 'system' || it.role === 'developer')
-        && responsesContentText(it.content).length > 0;
-    }).length;
+    + staticAuthorityCountPre;
   const slabNativeOverhead = authorityPointerCountPre * gptTextTokens(RESPONSES_POINTER)
     + gptTextTokens(slabFactSheetPreview)
     + gptTextTokens('[End of rendered GPT system/tool context.]');
@@ -2234,16 +2822,37 @@ export async function transformOpenAIResponses(
       ],
     }];
   } else {
-    // Insert a dedicated static-slab item. Do not attach it to the opening real
-    // user prompt: that prompt is old history on long stateless Responses calls,
-    // and protecting it made stale first-turn requests look live.
+    // Insert a dedicated static-slab item. Replace static leading items with pointers,
+    // and relocate any volatile leading developer islands right AFTER the slab item so
+    // per-turn volatile updates never bust the cached slab prefix.
+    const staticLeadingItems: Array<ResponsesInputItem | Record<string, unknown>> = [];
+    for (let idx = 0; idx < leadingAuthorityEnd; idx++) {
+      const item = inputItems[idx]!;
+      const split = leadingSplits.get(idx);
+      if (!split) {
+        staticLeadingItems.push(item);
+        continue;
+      }
+      if (!split.staticText) {
+        // Wholly volatile leading developer item: relocated to `relocatedVolatileItems` after slabUserItem.
+        continue;
+      }
+      const it = item as ResponsesInputItem;
+      if (typeof it.content === 'string') {
+        it.content = RESPONSES_POINTER;
+      } else if (Array.isArray(it.content)) {
+        it.content = [{ type: 'input_text', text: RESPONSES_POINTER }];
+      }
+      staticLeadingItems.push(item);
+    }
     const slabUserItem: ResponsesInputItem = {
       role: 'user',
       content: [...imagePartsResp, ...slabFactSheetPart, endMarker],
     };
     inputItems = [
-      ...inputItems.slice(0, firstUserIdx),
+      ...staticLeadingItems,
       slabUserItem,
+      ...relocatedVolatileItems,
       ...inputItems.slice(firstUserIdx),
     ];
     req.input = inputItems;
@@ -2254,30 +2863,41 @@ export async function transformOpenAIResponses(
     req.instructions = RESPONSES_POINTER;
   }
 
-  // Replace system/developer input items with a pointer. Mirror the collection
-  // gate above for BOTH content shapes: a string becomes the pointer string; an
-  // input_text part array keeps its array shape with a single pointer part, so a
-  // request the caller sent as parts is not silently reshaped into a string.
-  if (!inputWasString) {
-    // The slab now sits at leadingAuthorityEnd, so indices below it are exactly
-    // the items that were collected.
-    for (const item of inputItems.slice(0, leadingAuthorityEnd)) {
-      const it = item as ResponsesInputItem;
-      if (it.role !== 'system' && it.role !== 'developer') continue;
-      const content = it.content;
-      if (typeof content === 'string') {
-        if (content.length > 0) it.content = RESPONSES_POINTER;
-      } else if (Array.isArray(content) && responsesContentText(content).length > 0) {
-        it.content = [{ type: 'input_text', text: RESPONSES_POINTER }];
-      }
-    }
-  }
-
   // Responses protocol state is not an ordinary contiguous conversation prefix.
   // The profile selects pair-only legacy coverage or mixed safe-message coverage;
   // both preserve recent/open/malformed calls and opaque protocol barriers.
-  if (o.collapseHistory && !hybridTextMmu && !inputWasString) {
-    await applyResponsesHistoryCollapse(req, inputItems, info, o, profile);
+  const mainCollapseRan =
+    o.collapseHistory && (!hybridTextMmu || pureUserAssistantHybrid) && !inputWasString
+      ? await applyResponsesHistoryCollapse(req, inputItems, info, o, profile)
+      : false;
+  const activeItems = Array.isArray(req.input)
+    ? (req.input as Array<ResponsesInputItem | Record<string, unknown>>)
+    : inputItems;
+  if (hybridTextMmu && o.compressToolResults && !inputWasString && !pureUserAssistantHybrid) {
+    await compressResponsesToolOutputsOptically(
+      req,
+      activeItems,
+      info,
+      o,
+      profile,
+      droppedCodepoints,
+      respSessionKey,
+      sessionState.cold,
+      Math.max(0, inputItems.length - origInputLen),
+    );
+  }
+  if (!inputWasString) {
+    await compressResponsesLargeUserContextOptically(
+      req,
+      activeItems,
+      info,
+      o,
+      profile,
+      droppedCodepoints,
+    );
+  }
+  if (!hybridTextMmu && !mainCollapseRan) {
+    runFallbackTextHygiene();
   }
 
   if (rewrittenTools !== undefined) req.tools = rewrittenTools;
@@ -2290,5 +2910,5 @@ export async function transformOpenAIResponses(
 
   // Regression denominator, same as the Chat path — Responses was the only
   // transform that never recorded it.
-  return finishSerialized();
+  return await finishSerialized();
 }

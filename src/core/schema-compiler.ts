@@ -32,11 +32,69 @@ const DIVIDER_LINE_RE = /^[ \t]*[-=*_~─━═]{4,}[ \t]*$/;
 const PROTECTED_SYS_LINE_RE = /^(?:You are Claude Code\b|You are a Claude agent, built on Anthropic's Claude Agent SDK\.|x-anthropic-billing-header:)/;
 const COMPILER_CACHE_MAX_CHARS = 4 * 1024 * 1024;
 
-const toolSchemaCache = new Map<string, { result: CompileResult; compiledJson?: string }>();
+interface EmittedPrefixParas {
+  readonly maxTag: number;
+  readonly taggedParas: ReadonlyMap<string, string>;
+  readonly untaggedParas: ReadonlySet<string>;
+  readonly compiledStrings: readonly string[];
+}
+
+const EMITTED_PREFIX_MAX = 512;
+const emittedToolPrefixCache = new Map<string, EmittedPrefixParas>();
+const emittedStaticPrefixCache = new Map<string, EmittedPrefixParas>();
+
+function schemaHash64Hex(s: string): string {
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x9e3779b1 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul((h1 ^ c) >>> 0, 0x01000193) >>> 0;
+    h2 = Math.imul((h2 ^ ((c + (i & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
+  }
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+function lruGet<V>(map: Map<string, V>, key: string): V | undefined {
+  const hit = map.get(key);
+  if (hit !== undefined) {
+    map.delete(key);
+    map.set(key, hit);
+  }
+  return hit;
+}
+
+function recordEmittedPrefix(map: Map<string, EmittedPrefixParas>, key: string, state: EmittedPrefixParas): void {
+  if (map.has(key)) map.delete(key);
+  while (map.size >= EMITTED_PREFIX_MAX) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+  map.set(key, state);
+}
+
+export function clearSchemaCompilerCachesForTests(): void {
+  toolSchemaCache.clear();
+  toolSchemaCacheChars = 0;
+  staticTextCache.clear();
+  staticTextCacheChars = 0;
+  segmentedStaticPatternCache.clear();
+  segmentedStaticPatternCacheChars = 0;
+  emittedToolPrefixCache.clear();
+  emittedStaticPrefixCache.clear();
+}
+
+const toolSchemaCache = new Map<string, { result: CompileResult; compiledJson?: string; cost: number }>();
 let toolSchemaCacheChars = 0;
-const staticTextCache = new Map<string, CompileTextResult>();
+const staticTextCache = new Map<string, { result: CompileTextResult; cost: number }>();
 let staticTextCacheChars = 0;
-const segmentedStaticPatternCache = new Map<string, { readonly compiledStatic: readonly string[]; readonly origStaticChars: number; readonly savedChars: number }>();
+const segmentedStaticPatternCache = new Map<string, {
+  readonly compiledStatic: readonly string[];
+  readonly origStaticChars: number;
+  readonly savedChars: number;
+  readonly savedTokens: number;
+  readonly cost: number;
+}>();
 let segmentedStaticPatternCacheChars = 0;
 
 const VOLATILE_XML_TAGS = new Set<string>([
@@ -636,14 +694,19 @@ function collectSchemaDescSlots(schema: unknown, out: DescSlot[], minChars = DEF
   }
 }
 
+const UNTAGGED_REF_TEXT = 'See matching guidance in earlier tool above.';
+
 function deduplicateSharedParagraphs(
   slots: readonly DescSlot[],
   tagPrefix: 'T' | 'S',
   minParaChars: number,
-): void {
+  immutablePrefixSlots = 0,
+  prefixState?: EmittedPrefixParas,
+): EmittedPrefixParas {
   const counts = new Map<string, number>();
-  const splitSlots = slots.map((slot) => {
+  const splitSlots = slots.map((slot, slotIdx) => {
     const raw = slot.get();
+    const isImmutable = slotIdx < immutablePrefixSlots;
     const segments = splitCodeFences(raw).map((seg) => {
       if (seg.fence) {
         return { fence: true as const, text: seg.text, paras: [] as string[] };
@@ -655,36 +718,62 @@ function deduplicateSharedParagraphs(
       }
       return { fence: false as const, text: seg.text, paras };
     });
-    return { slot, raw, segments };
+    return { slot, raw, isImmutable, segments };
   });
 
   const profitableParas = new Set<string>();
-  let estSeq = 1;
+  let estSeq = (prefixState?.maxTag ?? 0) + 1;
   for (const [p, count] of counts.entries()) {
     if (count < 2) continue;
-    const tagLen = 1 + String(estSeq).length + 1; // `#T1`
-    const netSaved = (count - 1) * (p.length - (12 + tagLen)) - (tagLen + 3);
-    if (netSaved > 0) {
+    const preTagged = prefixState?.taggedParas.get(p);
+    const preUntagged = prefixState?.untaggedParas.has(p) ?? false;
+    if (preTagged !== undefined) {
       profitableParas.add(p);
-      estSeq++;
+    } else if (preUntagged) {
+      if (p.length > UNTAGGED_REF_TEXT.length + 4) profitableParas.add(p);
+    } else {
+      const tagLen = 1 + String(estSeq).length + 1; // `#T1`
+      const netSaved = (count - 1) * (p.length - (12 + tagLen)) - (tagLen + 3);
+      if (netSaved > 0) {
+        profitableParas.add(p);
+        estSeq++;
+      }
     }
   }
-  if (profitableParas.size === 0) return;
 
-  const tagByPara = new Map<string, string>();
-  let seq = 1;
-  for (const item of splitSlots) {
+  const tagByPara = new Map<string, string>(prefixState?.taggedParas ?? []);
+  const untaggedInPrefix = new Set<string>(prefixState?.untaggedParas ?? []);
+  let seq = (prefixState?.maxTag ?? 0) + 1;
+  const compiledStrings: string[] = [];
+  for (let slotIdx = 0; slotIdx < splitSlots.length; slotIdx++) {
+    const item = splitSlots[slotIdx]!;
+    if (item.isImmutable) {
+      const frozen = prefixState?.compiledStrings[slotIdx] ?? item.raw;
+      if (frozen !== item.raw) item.slot.set(frozen);
+      compiledStrings.push(frozen);
+      continue; // Never retroactively mutate already-emitted prefix tools.
+    }
+    if (profitableParas.size === 0) {
+      compiledStrings.push(item.raw);
+      continue;
+    }
     let slotChanged = false;
     const outSegs = item.segments.map((seg) => {
       if (seg.fence) return seg.text;
       let segChanged = false;
       const nextParas = seg.paras.map((p) => {
         if (!profitableParas.has(p)) return p;
-        const existing = tagByPara.get(p);
-        if (existing) {
+        const existingTag = tagByPara.get(p);
+        if (existingTag) {
           segChanged = true;
           slotChanged = true;
-          return `See [${existing}] above.`;
+          return `See [${existingTag}] above.`;
+        }
+        if (untaggedInPrefix.has(p)) {
+          if (p.length <= UNTAGGED_REF_TEXT.length + 4) return p;
+          segChanged = true;
+          slotChanged = true;
+          return UNTAGGED_REF_TEXT;
         }
         const tag = `#${tagPrefix}${seq++}`;
         tagByPara.set(p, tag);
@@ -694,10 +783,18 @@ function deduplicateSharedParagraphs(
       });
       return segChanged ? nextParas.join('\n\n') : seg.text;
     });
+    const finalText = slotChanged ? outSegs.join('\n') : item.raw;
     if (slotChanged) {
-      item.slot.set(outSegs.join('\n'));
+      item.slot.set(finalText);
     }
+    compiledStrings.push(finalText);
   }
+
+  const nextUntagged = new Set<string>(untaggedInPrefix);
+  for (const [p] of counts.entries()) {
+    if (!tagByPara.has(p)) nextUntagged.add(p);
+  }
+  return { maxTag: seq - 1, taggedParas: tagByPara, untaggedParas: nextUntagged, compiledStrings };
 }
 
 const MIN_SUBTREE_JSON_CHARS = 220;
@@ -1280,8 +1377,8 @@ export function compileToolSchemas(
     return { changed: false, savedChars: 0, savedTokens: 0 };
   }
 
-  const cacheKey = `${wire}\0${origJson}`;
-  const cached = toolSchemaCache.get(cacheKey);
+  const cacheKey = `${wire}\0${origJson.length}:${schemaHash64Hex(origJson)}`;
+  const cached = lruGet(toolSchemaCache, cacheKey);
   if (cached !== undefined) {
     if (cached.compiledJson !== undefined) {
       const cloned = JSON.parse(cached.compiledJson) as unknown[];
@@ -1293,6 +1390,26 @@ export function compileToolSchemas(
   }
 
   const candidate = JSON.parse(origJson) as unknown[];
+  const rawToolHashes: string[] = [];
+  for (let i = 0; i < candidate.length; i++) {
+    rawToolHashes.push(schemaHash64Hex(JSON.stringify(candidate[i]) ?? ''));
+  }
+  let immutablePrefixTools = 0;
+  let matchedPrefixState: EmittedPrefixParas | undefined;
+  let runningPrefixKey = `${wire}`;
+  const prefixKeys: string[] = [];
+  for (let i = 0; i < rawToolHashes.length; i++) {
+    runningPrefixKey = `${runningPrefixKey}\0${rawToolHashes[i]!}`;
+    prefixKeys.push(runningPrefixKey);
+  }
+  for (let k = prefixKeys.length - 2; k >= 0; k--) {
+    const hit = lruGet(emittedToolPrefixCache, prefixKeys[k]!);
+    if (hit !== undefined) {
+      immutablePrefixTools = k + 1;
+      matchedPrefixState = hit;
+      break;
+    }
+  }
 
   for (const rawTool of candidate) {
     if (!rawTool || typeof rawTool !== 'object') continue;
@@ -1325,9 +1442,20 @@ export function compileToolSchemas(
   const schemaDagFactored = wire !== 'google' ? factorSharedSchemaSubtrees(candidate) : false;
 
   const slots: DescSlot[] = [];
-  for (const item of candidate) collectToolDescriptionSlots(item, slots, DEFAULT_SCHEMA_MIN_PARA_CHARS);
-  if (slots.length >= 2) {
-    deduplicateSharedParagraphs(slots, 'T', DEFAULT_SCHEMA_MIN_PARA_CHARS);
+  let immutablePrefixSlots = 0;
+  for (let i = 0; i < candidate.length; i++) {
+    collectToolDescriptionSlots(candidate[i], slots, DEFAULT_SCHEMA_MIN_PARA_CHARS);
+    if (i + 1 === immutablePrefixTools) immutablePrefixSlots = slots.length;
+  }
+  const nextPrefixState = deduplicateSharedParagraphs(
+    slots,
+    'T',
+    DEFAULT_SCHEMA_MIN_PARA_CHARS,
+    immutablePrefixSlots,
+    matchedPrefixState,
+  );
+  if (prefixKeys.length > 0) {
+    recordEmittedPrefix(emittedToolPrefixCache, prefixKeys[prefixKeys.length - 1]!, nextPrefixState);
   }
 
   const nextJson = JSON.stringify(candidate);
@@ -1335,11 +1463,19 @@ export function compileToolSchemas(
   const storeSchemaCache = (entry: { result: CompileResult; compiledJson?: string }) => {
     const cost = cacheKey.length + (entry.compiledJson?.length ?? 0);
     if (cost <= COMPILER_CACHE_MAX_CHARS) {
-      if (toolSchemaCacheChars + cost > COMPILER_CACHE_MAX_CHARS) {
-        toolSchemaCache.clear();
-        toolSchemaCacheChars = 0;
+      const prev = toolSchemaCache.get(cacheKey);
+      if (prev) {
+        toolSchemaCacheChars -= prev.cost;
+        toolSchemaCache.delete(cacheKey);
       }
-      toolSchemaCache.set(cacheKey, entry);
+      while (toolSchemaCacheChars + cost > COMPILER_CACHE_MAX_CHARS && toolSchemaCache.size > 0) {
+        const oldestKey = toolSchemaCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        const oldest = toolSchemaCache.get(oldestKey);
+        toolSchemaCache.delete(oldestKey);
+        if (oldest) toolSchemaCacheChars -= oldest.cost;
+      }
+      toolSchemaCache.set(cacheKey, { ...entry, cost });
       toolSchemaCacheChars += cost;
     }
   };
@@ -1380,17 +1516,26 @@ export function compileStaticText(text: string): CompileTextResult {
     return { text, changed: false, savedChars: 0, savedTokens: 0 };
   }
 
-  const hit = staticTextCache.get(text);
-  if (hit !== undefined) return hit;
+  const staticKey = `${text.length}:${schemaHash64Hex(text)}`;
+  const hit = lruGet(staticTextCache, staticKey);
+  if (hit !== undefined) return hit.result;
 
   const storeStaticCache = (res: CompileTextResult): CompileTextResult => {
-    const cost = text.length + (res.changed ? res.text.length : 0);
+    const cost = staticKey.length + (res.changed ? res.text.length : 0);
     if (cost <= COMPILER_CACHE_MAX_CHARS) {
-      if (staticTextCacheChars + cost > COMPILER_CACHE_MAX_CHARS) {
-        staticTextCache.clear();
-        staticTextCacheChars = 0;
+      const prev = staticTextCache.get(staticKey);
+      if (prev) {
+        staticTextCacheChars -= prev.cost;
+        staticTextCache.delete(staticKey);
       }
-      staticTextCache.set(text, res);
+      while (staticTextCacheChars + cost > COMPILER_CACHE_MAX_CHARS && staticTextCache.size > 0) {
+        const oldestKey = staticTextCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        const oldest = staticTextCache.get(oldestKey);
+        staticTextCache.delete(oldestKey);
+        if (oldest) staticTextCacheChars -= oldest.cost;
+      }
+      staticTextCache.set(staticKey, { result: res, cost });
       staticTextCacheChars += cost;
     }
     return res;
@@ -1489,30 +1634,51 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
 
   // Key cache strictly by the invariant static islands so volatile <env>/<git_status>
   // updates hit the compiled static outputs immediately without re-scanning.
-  const staticCacheKey = staticIslands.join('\uE002');
-  const cached = segmentedStaticPatternCache.get(staticCacheKey);
+  const staticCacheKey = `${origStaticChars}:${schemaHash64Hex(staticIslands.join('\uE002'))}`;
+  const cached = lruGet(segmentedStaticPatternCache, staticCacheKey);
   if (cached !== undefined) {
-    if (cached.savedChars < 150 || cached.savedChars < cached.origStaticChars * 0.03) {
+    if (cached.savedChars < 150 || cached.savedChars < cached.origStaticChars * 0.03 || cached.savedTokens <= 0) {
       return { text, changed: false, savedChars: 0, savedTokens: 0 };
     }
     let si = 0;
     const rebuilt = islands.map((isl) => (isl.volatile ? isl.text : cached.compiledStatic[si++]!)).join('');
-    const [origTokens, candTokens] = estimateTokenPair(text, rebuilt);
-    const savedTokens = Math.max(0, origTokens - candTokens);
-    if (savedTokens <= 0) {
-      return { text, changed: false, savedChars: 0, savedTokens: 0 };
-    }
-    return { text: rebuilt, changed: true, savedChars: cached.savedChars, savedTokens };
+    return { text: rebuilt, changed: true, savedChars: cached.savedChars, savedTokens: cached.savedTokens };
   }
 
-  const storePatternCache = (compiledStatic: readonly string[], savedChars: number): void => {
+  let immutableStaticCount = 0;
+  let matchedStaticPrefix: EmittedPrefixParas | undefined;
+  let runningStaticKey = '';
+  const staticPrefixKeys: string[] = [];
+  for (let i = 0; i < staticIslands.length; i++) {
+    const islHash = `${staticIslands[i]!.length}:${schemaHash64Hex(staticIslands[i]!)}`;
+    runningStaticKey = i === 0 ? islHash : `${runningStaticKey}\0${islHash}`;
+    staticPrefixKeys.push(runningStaticKey);
+  }
+  for (let k = staticPrefixKeys.length - 2; k >= 0; k--) {
+    const hit = lruGet(emittedStaticPrefixCache, staticPrefixKeys[k]!);
+    if (hit !== undefined) {
+      immutableStaticCount = k + 1;
+      matchedStaticPrefix = hit;
+      break;
+    }
+  }
+
+  const storePatternCache = (compiledStatic: readonly string[], savedChars: number, savedTokens: number): void => {
     const cost = staticCacheKey.length + compiledStatic.reduce((sum, s) => sum + s.length, 0);
     if (cost <= COMPILER_CACHE_MAX_CHARS) {
-      if (segmentedStaticPatternCacheChars + cost > COMPILER_CACHE_MAX_CHARS) {
-        segmentedStaticPatternCache.clear();
-        segmentedStaticPatternCacheChars = 0;
+      const prev = segmentedStaticPatternCache.get(staticCacheKey);
+      if (prev) {
+        segmentedStaticPatternCacheChars -= prev.cost;
+        segmentedStaticPatternCache.delete(staticCacheKey);
       }
-      segmentedStaticPatternCache.set(staticCacheKey, { compiledStatic, origStaticChars, savedChars });
+      while (segmentedStaticPatternCacheChars + cost > COMPILER_CACHE_MAX_CHARS && segmentedStaticPatternCache.size > 0) {
+        const oldestKey = segmentedStaticPatternCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        const oldest = segmentedStaticPatternCache.get(oldestKey);
+        segmentedStaticPatternCache.delete(oldestKey);
+        if (oldest) segmentedStaticPatternCacheChars -= oldest.cost;
+      }
+      segmentedStaticPatternCache.set(staticCacheKey, { compiledStatic, origStaticChars, savedChars, savedTokens, cost });
       segmentedStaticPatternCacheChars += cost;
     }
   };
@@ -1526,12 +1692,14 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
   }
   type CompiledIsland =
     | { readonly volatile: true; readonly text: string }
-    | { readonly volatile: false; readonly trailingInlineSpace: boolean; readonly segments: readonly CompiledFenceSeg[] };
+    | { readonly volatile: false; readonly staticIdx: number; readonly trailingInlineSpace: boolean; readonly segments: readonly CompiledFenceSeg[] };
 
+  let staticCursor = 0;
   const compiledIslands: CompiledIsland[] = islands.map((island, idx) => {
     if (island.volatile) {
       return { volatile: true, text: island.text };
     }
+    const staticIdx = staticCursor++;
     const trailingInlineSpace =
       idx < islands.length - 1 &&
       islands[idx + 1]!.volatile &&
@@ -1551,26 +1719,41 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
       }
       return { fence: false, text: cleaned, paras };
     });
-    return { volatile: false, trailingInlineSpace, segments };
+    return { volatile: false, staticIdx, trailingInlineSpace, segments };
   });
 
+  const UNTAGGED_STATIC_REF = 'See matching guidance in earlier section above.';
   const profitableParas = new Set<string>();
-  let estSeq = 1;
+  let estSeq = (matchedStaticPrefix?.maxTag ?? 0) + 1;
   for (const [core, count] of paraCounts.entries()) {
     if (count < 2) continue;
-    const tagLen = 1 + String(estSeq).length + 1;
-    const netSaved = (count - 1) * (core.length - (12 + tagLen)) - (tagLen + 3);
-    if (netSaved > 0) {
+    const preTagged = matchedStaticPrefix?.taggedParas.get(core);
+    const preUntagged = matchedStaticPrefix?.untaggedParas.has(core) ?? false;
+    if (preTagged !== undefined) {
       profitableParas.add(core);
-      estSeq++;
+    } else if (preUntagged) {
+      if (core.length > UNTAGGED_STATIC_REF.length + 4) profitableParas.add(core);
+    } else {
+      const tagLen = 1 + String(estSeq).length + 1;
+      const netSaved = (count - 1) * (core.length - (12 + tagLen)) - (tagLen + 3);
+      if (netSaved > 0) {
+        profitableParas.add(core);
+        estSeq++;
+      }
     }
   }
 
-  const tagByPara = new Map<string, string>();
-  let seq = 1;
+  const tagByPara = new Map<string, string>(matchedStaticPrefix?.taggedParas ?? []);
+  const untaggedStaticInPrefix = new Set<string>(matchedStaticPrefix?.untaggedParas ?? []);
+  let seq = (matchedStaticPrefix?.maxTag ?? 0) + 1;
   const compiledStaticOut: string[] = [];
   const outIslands = compiledIslands.map((island) => {
     if (island.volatile) return island.text;
+    if (island.staticIdx < immutableStaticCount) {
+      const frozen = matchedStaticPrefix?.compiledStrings[island.staticIdx] ?? staticIslands[island.staticIdx]!;
+      compiledStaticOut.push(frozen);
+      return frozen;
+    }
     const outFenceParts = island.segments.map((seg) => {
       if (seg.fence) return seg.text;
       if (profitableParas.size === 0) return seg.text;
@@ -1583,6 +1766,13 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
         if (existing) {
           any = true;
           return `${p.leadNl}See [${existing}] above.${p.trailNl}`;
+        }
+        if (untaggedStaticInPrefix.has(p.core)) {
+          if (p.core.length <= UNTAGGED_STATIC_REF.length + 4) {
+            return `${p.leadNl}${p.core}${p.trailNl}`;
+          }
+          any = true;
+          return `${p.leadNl}${UNTAGGED_STATIC_REF}${p.trailNl}`;
         }
         const tag = `#S${seq++}`;
         tagByPara.set(p.core, tag);
@@ -1599,15 +1789,28 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
     return compiledIslandText;
   });
 
+  if (staticPrefixKeys.length > 0) {
+    const nextUntagged = new Set<string>(untaggedStaticInPrefix);
+    for (const [core] of paraCounts.entries()) {
+      if (!tagByPara.has(core)) nextUntagged.add(core);
+    }
+    recordEmittedPrefix(emittedStaticPrefixCache, staticPrefixKeys[staticPrefixKeys.length - 1]!, {
+      maxTag: seq - 1,
+      taggedParas: tagByPara,
+      untaggedParas: nextUntagged,
+      compiledStrings: compiledStaticOut,
+    });
+  }
+
   const candidate = outIslands.join('');
   const savedChars = text.length - candidate.length;
-  storePatternCache(compiledStaticOut, savedChars);
-  if (savedChars < 150 || savedChars < origStaticChars * 0.03) {
-    return { text, changed: false, savedChars: 0, savedTokens: 0 };
-  }
-  const [origTokens, candTokens] = estimateTokenPair(text, candidate);
-  const savedTokens = Math.max(0, origTokens - candTokens);
-  if (savedTokens <= 0) {
+  const [origStaticTokens, candStaticTokens] = estimateTokenPair(
+    staticIslands.join('\n'),
+    compiledStaticOut.join('\n'),
+  );
+  const savedTokens = Math.max(0, origStaticTokens - candStaticTokens);
+  storePatternCache(compiledStaticOut, savedChars, savedTokens);
+  if (savedChars < 150 || savedChars < origStaticChars * 0.03 || savedTokens <= 0) {
     return { text, changed: false, savedChars: 0, savedTokens: 0 };
   }
   return { text: candidate, changed: true, savedChars, savedTokens };

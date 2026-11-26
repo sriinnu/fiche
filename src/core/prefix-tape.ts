@@ -13,6 +13,7 @@ const DEFAULT_MAX_STAGE2_ENTRIES = 1024;
 const DEFAULT_MAX_STAGE2_CHARS = 12 * 1024 * 1024;
 const DEFAULT_MAX_SESSIONS = 512;
 const DEFAULT_MAX_SEALS_PER_SESSION = 512;
+const DEFAULT_MAX_SEAL_CHARS = 16 * 1024 * 1024;
 const DEFAULT_MAX_CASI_ENTRIES = 1024;
 const DEFAULT_MAX_CASI_CHARS = 8 * 1024 * 1024;
 
@@ -60,6 +61,7 @@ export interface PrefixTapeStats {
   readonly stage2Misses: number;
   readonly sealSessions: number;
   readonly totalSeals: number;
+  readonly sealChars: number;
   readonly sealHits: number;
   readonly casiEntries: number;
   readonly casiChars: number;
@@ -72,6 +74,7 @@ export interface PrefixMemoTapeOptions {
   readonly maxStage2Chars?: number;
   readonly maxSessions?: number;
   readonly maxSealsPerSession?: number;
+  readonly maxSealChars?: number;
   readonly maxCasiEntries?: number;
   readonly maxCasiChars?: number;
 }
@@ -81,6 +84,7 @@ export class PrefixMemoTape {
   private readonly maxStage2Chars: number;
   private readonly maxSessions: number;
   private readonly maxSealsPerSession: number;
+  private readonly maxSealChars: number;
   private readonly maxCasiEntries: number;
   private readonly maxCasiChars: number;
 
@@ -91,6 +95,7 @@ export class PrefixMemoTape {
 
   private readonly sealSessions = new Map<string, Map<string, CommittedSlotSeal>>();
   private totalSeals = 0;
+  private sealChars = 0;
   private sealHits = 0;
 
   private readonly casiMap = new Map<string, CasiMemoEntry>();
@@ -103,6 +108,7 @@ export class PrefixMemoTape {
     this.maxStage2Chars = Math.max(0, opts.maxStage2Chars ?? DEFAULT_MAX_STAGE2_CHARS);
     this.maxSessions = Math.max(1, opts.maxSessions ?? DEFAULT_MAX_SESSIONS);
     this.maxSealsPerSession = Math.max(1, opts.maxSealsPerSession ?? DEFAULT_MAX_SEALS_PER_SESSION);
+    this.maxSealChars = Math.max(0, opts.maxSealChars ?? DEFAULT_MAX_SEAL_CHARS);
     this.maxCasiEntries = Math.max(1, opts.maxCasiEntries ?? DEFAULT_MAX_CASI_ENTRIES);
     this.maxCasiChars = Math.max(0, opts.maxCasiChars ?? DEFAULT_MAX_CASI_CHARS);
   }
@@ -182,8 +188,9 @@ export class PrefixMemoTape {
     };
   }
 
-  /** Record a committed slot seal under `sessionKey`, enforcing bounded session & per-session caps. */
+  /** Record a committed slot seal under `sessionKey`, enforcing bounded session, seal & total char caps. */
   setSeal(sessionKey: string | undefined, slotSig: string, seal: CommittedSlotSeal): void {
+    if (seal.text.length > this.maxSealChars) return;
     const norm = this.normalizeSession(sessionKey);
     let sess = this.sealSessions.get(norm);
     if (sess) {
@@ -198,6 +205,7 @@ export class PrefixMemoTape {
         const oldestMap = this.sealSessions.get(oldestSession);
         if (oldestMap) {
           this.totalSeals -= oldestMap.size;
+          for (const entry of oldestMap.values()) this.sealChars -= entry.text.length;
         }
         this.sealSessions.delete(oldestSession);
       }
@@ -209,18 +217,40 @@ export class PrefixMemoTape {
       kind: seal.kind,
       rawLen: seal.rawLen,
     };
-    const existed = sess.has(slotSig);
-    if (existed) {
+    const existing = sess.get(slotSig);
+    if (existing) {
+      this.sealChars -= existing.text.length;
       sess.delete(slotSig);
+    } else {
+      this.totalSeals++;
     }
     sess.set(slotSig, stored);
-    if (!existed) {
-      this.totalSeals++;
-      while (sess.size > this.maxSealsPerSession) {
+    this.sealChars += stored.text.length;
+    while (sess.size > this.maxSealsPerSession) {
+      const oldestSig = sess.keys().next().value;
+      if (oldestSig === undefined) break;
+      const oldestSeal = sess.get(oldestSig);
+      if (oldestSeal) this.sealChars -= oldestSeal.text.length;
+      sess.delete(oldestSig);
+      this.totalSeals--;
+    }
+    while (this.sealChars > this.maxSealChars && this.sealSessions.size > 0) {
+      const oldestSession = this.sealSessions.keys().next().value;
+      if (oldestSession === undefined) break;
+      if (oldestSession === norm && sess.size > 1) {
         const oldestSig = sess.keys().next().value;
         if (oldestSig === undefined) break;
+        const oldestSeal = sess.get(oldestSig);
+        if (oldestSeal) this.sealChars -= oldestSeal.text.length;
         sess.delete(oldestSig);
         this.totalSeals--;
+      } else {
+        const oldestMap = this.sealSessions.get(oldestSession);
+        if (oldestMap) {
+          this.totalSeals -= oldestMap.size;
+          for (const entry of oldestMap.values()) this.sealChars -= entry.text.length;
+        }
+        this.sealSessions.delete(oldestSession);
       }
     }
   }
@@ -231,6 +261,7 @@ export class PrefixMemoTape {
     const sess = this.sealSessions.get(norm);
     if (!sess) return;
     this.totalSeals -= sess.size;
+    for (const entry of sess.values()) this.sealChars -= entry.text.length;
     this.sealSessions.delete(norm);
   }
 
@@ -295,6 +326,7 @@ export class PrefixMemoTape {
       stage2Misses: this.stage2Misses,
       sealSessions: this.sealSessions.size,
       totalSeals: this.totalSeals,
+      sealChars: this.sealChars,
       sealHits: this.sealHits,
       casiEntries: this.casiMap.size,
       casiChars: this.casiChars,
@@ -311,6 +343,7 @@ export class PrefixMemoTape {
     this.stage2Misses = 0;
     this.sealSessions.clear();
     this.totalSeals = 0;
+    this.sealChars = 0;
     this.sealHits = 0;
     this.casiMap.clear();
     this.casiChars = 0;

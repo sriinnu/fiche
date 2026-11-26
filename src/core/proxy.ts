@@ -19,6 +19,8 @@ import {
   isThreadContinuation,
 } from './measurement.js';
 import type { Usage } from './types.js';
+import { redactSecrets } from './tracker.js';
+import type { DecodeRequestBodyResult } from '../request-decoding.js';
 import {
   anthropicMessagesToOpenAIResponses,
   openAIResponsesToAnthropicResponse,
@@ -61,6 +63,10 @@ export interface ProxyConfig {
   gatewayHeaders?: Record<string, string>;
   /** Anthropic API base, no trailing slash. Defaults to api.anthropic.com. */
   upstream?: string;
+  /** Optional shared upstream base (FICHE_UPSTREAM) applied across families
+   *  when family-specific upstreams are not set; kept distinct from `upstream`
+   *  so `ANTHROPIC_UPSTREAM` never hijacks base-URL Gemini requests. */
+  sharedUpstream?: string;
   /** Override or supply an API key. If unset, we forward whatever the client sent. */
   apiKey?: string;
   /** Override the Anthropic `authorization` bearer. Pass a function to re-resolve
@@ -126,7 +132,11 @@ export interface ProxyConfig {
    *  forwarded as plain bytes without the header, since chatgpt.com has been seen
    *  to refuse zstd on image-heavy bodies. Core stays runtime-neutral, so the Node
    *  entry supplies this; without it, encoded bodies pass through as before. */
-  decodeRequestBody?: (bytes: Uint8Array, encoding: string, maxBytes: number) => Uint8Array<ArrayBuffer> | undefined;
+  decodeRequestBody?: (
+    bytes: Uint8Array,
+    encoding: string,
+    maxBytes: number,
+  ) => Uint8Array<ArrayBuffer> | DecodeRequestBodyResult | undefined;
   /** "Follow the agent": forward a request whose Host is a registered
    *  third-party provider (as under `inkling warp`), or whose path is
    *  `/to/<host>/...`, to that host over https instead of the configured
@@ -326,22 +336,33 @@ function withIdleTimeout(
 function withClientDisconnect(
   body: ReadableStream<Uint8Array>,
   onCancel: (reason: unknown) => void,
+  onDone?: () => void,
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
+  let settled = false;
+  const finish = () => {
+    if (!settled) {
+      settled = true;
+      onDone?.();
+    }
+  };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const { done, value } = await reader.read();
         if (done) {
+          finish();
           controller.close();
           return;
         }
         controller.enqueue(value);
       } catch (e) {
+        finish();
         controller.error(e);
       }
     },
     cancel(reason) {
+      finish();
       onCancel(reason);
       void reader.cancel(reason).catch(() => undefined);
     },
@@ -1120,16 +1141,178 @@ function readStopReasonFromJson(j: unknown): string | undefined {
   return undefined;
 }
 
+const MAX_TEE_BUFFER_BYTES = 256 * 1024;
+
+function createBoundedScannerStream(
+  source: ReadableStream<Uint8Array>,
+  onChunk: (value: Uint8Array) => void,
+  onEof: () => void,
+  onAbort: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  const queued: Uint8Array[] = [];
+  let bufferedBytes = 0;
+  let done = false;
+  let hasError = false;
+  let streamErr: unknown;
+  let canceled = false;
+  let settled = false;
+  let wakePump: (() => void) | undefined;
+  let wakePull: (() => void) | undefined;
+
+  const finishAbort = () => {
+    if (settled) return;
+    settled = true;
+    onAbort();
+  };
+  const finishEof = () => {
+    if (settled) return;
+    settled = true;
+    onEof();
+  };
+
+  void (async () => {
+    try {
+      while (!canceled) {
+        if (bufferedBytes >= MAX_TEE_BUFFER_BYTES) {
+          await new Promise<void>((r) => {
+            wakePump = r;
+          });
+          continue;
+        }
+        const { done: isDone, value } = await reader.read();
+        if (canceled) break;
+        if (isDone) {
+          done = true;
+          finishEof();
+          wakePull?.();
+          wakePull = undefined;
+          break;
+        }
+        if (value) {
+          onChunk(value);
+          queued.push(value);
+          bufferedBytes += value.byteLength;
+          wakePull?.();
+          wakePull = undefined;
+        }
+      }
+    } catch (err) {
+      hasError = true;
+      streamErr = err;
+      finishAbort();
+      wakePull?.();
+      wakePull = undefined;
+    } finally {
+      try { reader.releaseLock(); } catch { /* already released */ }
+    }
+  })();
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      while (true) {
+        if (queued.length > 0) {
+          const chunk = queued.shift()!;
+          bufferedBytes -= chunk.byteLength;
+          if (bufferedBytes < MAX_TEE_BUFFER_BYTES && wakePump) {
+            const wake = wakePump;
+            wakePump = undefined;
+            wake();
+          }
+          controller.enqueue(chunk);
+          return;
+        }
+        if (hasError) {
+          controller.error(streamErr);
+          return;
+        }
+        if (done) {
+          controller.close();
+          return;
+        }
+        await new Promise<void>((r) => {
+          wakePull = r;
+        });
+      }
+    },
+    cancel(reason) {
+      canceled = true;
+      queued.length = 0;
+      bufferedBytes = 0;
+      const pump = wakePump;
+      wakePump = undefined;
+      pump?.();
+      const pull = wakePull;
+      wakePull = undefined;
+      pull?.();
+      finishAbort();
+      return reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
+
 /**
- * Tee the response body to extract usage + output measurement without blocking the client.
- * Streams are scanned to EOF (final output_tokens is in message_delta; redacted_thinking
- * blocks can appear anywhere). 4xx bodies are capped at ERROR_BODY_MAX. 5xx is skipped.
+ * Pure pull-through scanner for streaming SSE responses: only reads from upstream
+ * when the downstream client pulls, preserving strict 1-chunk backpressure.
+ */
+function createPullThroughScannerStream(
+  source: ReadableStream<Uint8Array>,
+  onChunk: (value: Uint8Array) => void,
+  onEof: () => void,
+  onAbort: () => void,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  let settled = false;
+  const finishEof = () => {
+    if (settled) return;
+    settled = true;
+    onEof();
+  };
+  const finishAbort = () => {
+    if (settled) return;
+    settled = true;
+    onAbort();
+  };
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          finishEof();
+          try { reader.releaseLock(); } catch { /* already released */ }
+          controller.close();
+          return;
+        }
+        if (value) {
+          onChunk(value);
+          controller.enqueue(value);
+        }
+      } catch (err) {
+        finishAbort();
+        try { reader.releaseLock(); } catch { /* already released */ }
+        controller.error(err);
+      }
+    },
+    cancel(reason) {
+      finishAbort();
+      return reader.cancel(reason).catch(() => undefined);
+    },
+  });
+}
+
+/**
+ * Inspect the response body inline with a bounded 256 KiB buffer: small JSON/4xx
+ * responses settle telemetry immediately even if a caller does not consume `res.body`,
+ * while large streams pause upstream once 256 KiB is buffered so slow clients exert
+ * strict backpressure. 5xx, undecoded compressed bodies, and unknown content-types
+ * are returned unwrapped.
  */
 function teeForUsage(
   res: Response,
   assumeResponsesSse = false,
   assumeResponsesJson = false,
   retainStreamReceipt = false,
+  skipBodyScan = false,
 ): {
   response: Response;
   usagePromise: Promise<Usage | undefined>;
@@ -1137,52 +1320,42 @@ function teeForUsage(
   measurementPromise: Promise<OutputMeasurement | undefined>;
   stopReasonPromise: Promise<string | undefined>;
 } {
-  // No body at all: nothing to extract on either path.
-  if (!res.body) {
-    return {
-      response: res,
-      usagePromise: Promise.resolve(undefined),
-      errorBodyPromise: Promise.resolve(undefined),
-      measurementPromise: Promise.resolve(undefined),
-      stopReasonPromise: Promise.resolve(undefined),
-    };
+  const emptyResult = {
+    response: res,
+    usagePromise: Promise.resolve(undefined),
+    errorBodyPromise: Promise.resolve(undefined),
+    measurementPromise: Promise.resolve(undefined),
+    stopReasonPromise: Promise.resolve(undefined),
+  };
+  if (!res.body || skipBodyScan || res.status >= 500) {
+    return emptyResult;
   }
-  // 4xx: tee for the error body but skip usage scanning entirely.
+
+  // 4xx: capture up to ERROR_BODY_MAX inline with bounded backpressure.
   if (res.status >= 400 && res.status < 500) {
-    const [forClient, forUs] = res.body.tee();
-    const errorBodyPromise = (async (): Promise<string | undefined> => {
-      const reader = forUs.getReader();
-      const decoder = new TextDecoder();
-      let out = '';
-      let drained = false;
-      try {
-        while (out.length < ERROR_BODY_MAX) {
-          const { done, value } = await reader.read();
-          if (done) {
-            drained = true;
-            break;
-          }
+    const decoder = new TextDecoder();
+    let out = '';
+    let resolveErr!: (v: string | undefined) => void;
+    const errorBodyPromise = new Promise<string | undefined>((r) => {
+      resolveErr = r;
+    });
+    const passThrough = createBoundedScannerStream(
+      res.body,
+      (value) => {
+        if (out.length < ERROR_BODY_MAX) {
           out += decoder.decode(value, { stream: true });
         }
+      },
+      () => {
         out += decoder.decode();
-        // Drain the rest so the tee buffer doesn't hold the stream open.
-        while (!drained) {
-          const { done } = await reader.read();
-          if (done) {
-            drained = true;
-            break;
-          }
-        }
-      } catch {
-        /* client may have aborted */
-      } finally {
-        if (!drained) await reader.cancel().catch(() => undefined);
-        try { reader.releaseLock(); } catch { /* already released */ }
-      }
-      return out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out;
-    })();
+        resolveErr(out.length > ERROR_BODY_MAX ? out.slice(0, ERROR_BODY_MAX) : out);
+      },
+      () => {
+        resolveErr(out.length > 0 ? out.slice(0, ERROR_BODY_MAX) : undefined);
+      },
+    );
     return {
-      response: new Response(forClient, {
+      response: new Response(passThrough, {
         status: res.status,
         statusText: res.statusText,
         headers: res.headers,
@@ -1193,163 +1366,125 @@ function teeForUsage(
       stopReasonPromise: Promise.resolve(undefined),
     };
   }
-  // 5xx: skip both (the host already synthesizes an error message).
-  if (res.status >= 500) {
-    return {
-      response: res,
-      usagePromise: Promise.resolve(undefined),
-      errorBodyPromise: Promise.resolve(undefined),
-      measurementPromise: Promise.resolve(undefined),
-      stopReasonPromise: Promise.resolve(undefined),
-    };
-  }
-  const ct = (res.headers.get('content-type') ?? '').toLowerCase();
-  const [forClient, forUs] = res.body.tee();
 
-  // Single read loop resolves all three; exposed as separate promises for call-site readability.
-  const scanResult = (async (): Promise<{
+  const ct = (res.headers.get('content-type') ?? '').toLowerCase();
+  const isSse = ct.includes('text/event-stream') || (ct === '' && assumeResponsesSse);
+  const isJson = !isSse && (ct.includes('application/json') || (ct === '' && assumeResponsesJson));
+  // Skip wrapping unknown content-types: zero scanner overhead, zero tee buffering.
+  if (!isSse && !isJson) {
+    return emptyResult;
+  }
+
+  const decoder = new TextDecoder();
+  let buf = '';
+  let overflow = false;
+  const MAX_SCAN_BYTES = 4 * 1024 * 1024;
+  const sseBoundaryRe = /\r\n\r\n|\n\n|\r\r/g;
+  const state: { usage: Usage | undefined; stopReason: string | undefined } = {
+    usage: undefined,
+    stopReason: undefined,
+  };
+  const streamedMeasurement: OutputMeasurement | undefined = isSse
+    ? { textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0 }
+    : undefined;
+
+  type ScanOutcome = {
     usage: Usage | undefined;
     measurement: OutputMeasurement | undefined;
     stopReason: string | undefined;
-  }> => {
-    const reader = forUs.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let drained = false;
-    let streamedMeasurement: OutputMeasurement | undefined;
-    const state: { usage: Usage | undefined; stopReason: string | undefined } = {
-      usage: undefined,
-      stopReason: undefined,
-    };
+  };
+  let resolveScan!: (v: ScanOutcome) => void;
+  const scanResult = new Promise<ScanOutcome>((r) => {
+    resolveScan = r;
+  });
 
+  const finalizeOnEof = (): ScanOutcome => {
+    if (overflow) {
+      return { usage: undefined, measurement: undefined, stopReason: undefined };
+    }
+    buf += decoder.decode();
+    if (isSse && streamedMeasurement) {
+      if (buf.trim().length > 0) processSseEvent(buf, streamedMeasurement, state);
+      return { usage: state.usage, measurement: streamedMeasurement, stopReason: state.stopReason };
+    }
     try {
-      // ChatGPT's /backend-api/codex/responses currently omits Content-Type.
-      // The request's top-level `stream` field selects SSE vs JSON for that
-      // route; explicit unknown media types still fail closed.
-      if (ct.includes('text/event-stream') || (ct === '' && assumeResponsesSse)) {
-        // Walk every SSE event to EOF — message_delta (final output_tokens) is last.
-        const m: OutputMeasurement = {
-          textChars: 0,
-          thinkingChars: 0,
-          toolUseChars: 0,
-          redactedBlockCount: 0,
-        };
-        streamedMeasurement = m;
-        const sseBoundaryRe = /\r\n\r\n|\n\n|\r\r/g;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            drained = true;
-            break;
-          }
-          const prevLen = buf.length;
-          buf += decoder.decode(value, { stream: true });
-          // SSE events are terminated by a blank line; start scanning at prevLen - 3 so
-          // a split delimiter is caught without rescanning the entire buffer O(N^2).
-          sseBoundaryRe.lastIndex = Math.max(0, prevLen - 3);
-          let consumedUntil = 0;
-          let boundary: RegExpExecArray | null;
-          while ((boundary = sseBoundaryRe.exec(buf)) !== null) {
-            const block = buf.slice(consumedUntil, boundary.index);
-            consumedUntil = boundary.index + boundary[0].length;
-            processSseEvent(block, m, state);
-          }
-          if (consumedUntil > 0) buf = buf.slice(consumedUntil);
-          // A malformed/headerless non-SSE response must not make the audit
-          // branch buffer without bound. Ordinary Responses events are far
-          // smaller; fail closed and drain if no delimiter arrives within 4 MiB.
-          if (buf.length > 4 * 1024 * 1024) {
-            while (true) {
-              const { done: eof } = await reader.read();
-              if (eof) {
-                drained = true;
-                break;
-              }
-            }
-            return { usage: undefined, measurement: undefined, stopReason: undefined };
-          }
-        }
-        buf += decoder.decode();
-        if (buf.trim().length > 0) processSseEvent(buf, m, state); // trailing partial event
-        return { usage: state.usage, measurement: m, stopReason: state.stopReason };
+      const objects = parseJsonObjects(buf);
+      if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
+      let usage: Usage | undefined;
+      let recognizedGoogle = false;
+      const measurement: OutputMeasurement = {
+        textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0,
+      };
+      const jsonState: { stopReason: string | undefined } = { stopReason: undefined };
+      for (const object of objects) {
+        const nextUsage = normalizeUsage(
+          object.usage
+            ?? object.usageMetadata
+            ?? (object.response as Record<string, unknown> | undefined)?.usageMetadata,
+        );
+        if (nextUsage) usage = nextUsage;
+        recognizedGoogle = measureGoogleCandidates(object, measurement, jsonState) || recognizedGoogle;
       }
-
-      if (ct.includes('application/json') || (ct === '' && assumeResponsesJson)) {
-        // Buffer up to 4 MiB for telemetry while still draining oversized
-        // streams to EOF so the client tee never stalls on backpressure.
-        const MAX = 4 * 1024 * 1024;
-        let overflow = false;
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            drained = true;
-            break;
-          }
-          if (!overflow) {
-            buf += decoder.decode(value, { stream: true });
-            if (buf.length > MAX) {
-              overflow = true;
-              buf = '';
-            }
-          }
-        }
-        if (overflow) {
-          return { usage: undefined, measurement: undefined, stopReason: undefined };
-        }
-        buf += decoder.decode();
-        try {
-          const objects = parseJsonObjects(buf);
-          if (!objects) return { usage: undefined, measurement: undefined, stopReason: undefined };
-          let usage: Usage | undefined;
-          let recognizedGoogle = false;
-          const measurement: OutputMeasurement = {
-            textChars: 0, thinkingChars: 0, toolUseChars: 0, redactedBlockCount: 0,
-          };
-          const state: { stopReason: string | undefined } = { stopReason: undefined };
-          for (const object of objects) {
-            const nextUsage = normalizeUsage(
-              object.usage
-                ?? object.usageMetadata
-                ?? (object.response as Record<string, unknown> | undefined)?.usageMetadata,
-            );
-            if (nextUsage) usage = nextUsage;
-            recognizedGoogle = measureGoogleCandidates(object, measurement, state) || recognizedGoogle;
-          }
-          const last = objects[objects.length - 1];
-          return {
-            usage,
-            measurement: recognizedGoogle ? measurement : measureFromMessageJson(last),
-            stopReason: state.stopReason ?? readStopReasonFromJson(last),
-          };
-        } catch {
-          return { usage: undefined, measurement: undefined, stopReason: undefined };
-        }
-      }
-      // Unknown content-type: drain to release the tee buffer.
-      while (true) {
-        const { done } = await reader.read();
-        if (done) {
-          drained = true;
-          break;
-        }
-      }
+      const last = objects[objects.length - 1];
+      return {
+        usage,
+        measurement: recognizedGoogle ? measurement : measureFromMessageJson(last),
+        stopReason: jsonState.stopReason ?? readStopReasonFromJson(last),
+      };
     } catch {
+      return { usage: undefined, measurement: undefined, stopReason: undefined };
+    }
+  };
+
+  const scanner = isSse ? createPullThroughScannerStream : createBoundedScannerStream;
+  const passThrough = scanner(
+    res.body,
+    (value) => {
+      if (overflow) return;
+      if (isSse && streamedMeasurement) {
+        const prevLen = buf.length;
+        buf += decoder.decode(value, { stream: true });
+        sseBoundaryRe.lastIndex = Math.max(0, prevLen - 3);
+        let consumedUntil = 0;
+        let boundary: RegExpExecArray | null;
+        while ((boundary = sseBoundaryRe.exec(buf)) !== null) {
+          const block = buf.slice(consumedUntil, boundary.index);
+          consumedUntil = boundary.index + boundary[0].length;
+          processSseEvent(block, streamedMeasurement, state);
+        }
+        if (consumedUntil > 0) buf = buf.slice(consumedUntil);
+        if (buf.length > MAX_SCAN_BYTES) {
+          overflow = true;
+          buf = '';
+        }
+      } else {
+        buf += decoder.decode(value, { stream: true });
+        if (buf.length > MAX_SCAN_BYTES) {
+          overflow = true;
+          buf = '';
+        }
+      }
+    },
+    () => {
+      resolveScan(finalizeOnEof());
+      buf = '';
+    },
+    () => {
       if (retainStreamReceipt) {
-        return {
+        resolveScan({
           usage: state.usage,
           measurement: streamedMeasurement,
           stopReason: state.stopReason ?? 'stream_error',
-        };
+        });
+      } else {
+        resolveScan({ usage: undefined, measurement: undefined, stopReason: undefined });
       }
-    } finally {
-      if (!drained) await reader.cancel().catch(() => undefined);
-      try { reader.releaseLock(); } catch { /* already released */ }
-    }
-    return { usage: undefined, measurement: undefined, stopReason: undefined };
-  })();
+      buf = '';
+    },
+  );
 
   return {
-    response: new Response(forClient, {
+    response: new Response(passThrough, {
       status: res.status,
       statusText: res.statusText,
       headers: res.headers,
@@ -1363,6 +1498,7 @@ function teeForUsage(
 
 const DEFAULT_UPSTREAM = 'https://api.anthropic.com';
 const DEFAULT_OPENAI_UPSTREAM = 'https://api.openai.com';
+const DEFAULT_CHATGPT_UPSTREAM = 'https://chatgpt.com';
 
 /** Headers we strip on the way out — they're hop-by-hop or proxy-injected. */
 const STRIP_REQ_HEADERS = new Set([
@@ -1379,6 +1515,7 @@ const STRIP_REQ_HEADERS = new Set([
   'x-inkling-bypass', // legacy opt-out alias; never forwarded upstream
   'x-fiche-session-id', // fiche-only swarm/session isolation key; never forwarded upstream
   'x-inkling-session-id', // legacy session isolation alias; never forwarded upstream
+  'x-fiche-warp-auth', // loopback warp->daemon auth token; never forwarded upstream
 ]);
 
 const STRIP_RES_HEADERS = new Set([
@@ -1387,6 +1524,14 @@ const STRIP_RES_HEADERS = new Set([
   'transfer-encoding',
   'content-encoding', // we don't re-encode
   'content-length',   // body may differ after streaming
+  'x-fiche-undecoded-encoding', // internal node-fetch signal
+]);
+
+const STRIP_RES_HEADERS_KEEP_ENCODING = new Set([
+  'connection',
+  'keep-alive',
+  'transfer-encoding',
+  'x-fiche-undecoded-encoding', // internal node-fetch signal
 ]);
 
 function filterHeaders(src: Headers, strip: Set<string>): Headers {
@@ -1432,7 +1577,9 @@ const OPENAI_CHAT_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/chat\\/completions$`
 const OPENAI_RESPONSES_PATH = new RegExp(`^${PROVIDER_SEGMENT}\\/responses$`);
 
 function isOpenAIChatPath(pathname: string): boolean {
-  return OPENAI_CHAT_PATH.test(pathname);
+  return OPENAI_CHAT_PATH.test(pathname)
+    || pathname === '/v1beta/openai/chat/completions'
+    || pathname === '/v1/openai/chat/completions';
 }
 
 function isOpenAIResponsesPath(pathname: string): boolean {
@@ -1451,9 +1598,11 @@ function isChatGPTBackendPath(pathname: string): boolean {
 }
 
 /** Google API shapes that are not inference (countTokens, model listing,
- *  Code Assist control calls). They go to the Google upstream untransformed. */
+ *  Code Assist control calls, and Gemini OpenAI-compat chat). They go to the
+ *  Google upstream. */
 function isGoogleFamilyPath(pathname: string): boolean {
   return /^\/(?:upload\/)?v1(?:beta|alpha)\//.test(pathname)
+    || pathname === '/v1/openai/chat/completions'
     || pathname.startsWith('/v1internal:')
     || /^\/v1\/models\/[^/]+:[A-Za-z]+$/.test(pathname);
 }
@@ -1487,7 +1636,7 @@ export type InboundCredential =
   /** A bearer of unrecognised shape. Gateways and self-hosted upstreams use these. */
   | 'opaque-bearer';
 
-const ANTHROPIC_BEARER_RE = /(?:^|,\s*)Bearer\s+sk-ant-/i;
+const ANTHROPIC_BEARER_RE = /\bsk-ant-/i;
 const API_KEY_BEARER_RE = /^Bearer\s+sk-/i;
 /** Three base64url segments whose first decodes to a JSON header (`eyJ…`). */
 const JWT_BEARER_RE = /^Bearer\s+eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
@@ -1551,21 +1700,52 @@ export function resolveOpenAIRouteAuth(
     : { action: 'keep-inbound', reason: 'caller-credential-forwarded' };
 }
 
+function isNonChatOpenAIPath(pathname: string): boolean {
+  return pathname === '/v1/embeddings'
+    || pathname.startsWith('/v1/embeddings/')
+    || pathname === '/v1/files'
+    || pathname.startsWith('/v1/files/')
+    || pathname === '/v1/batches'
+    || pathname.startsWith('/v1/batches/')
+    || pathname === '/v1/audio'
+    || pathname.startsWith('/v1/audio/')
+    || pathname === '/v1/images'
+    || pathname.startsWith('/v1/images/');
+}
+
 function isCanonicalOpenAIPath(pathname: string, headers: Headers, hasOpenAIKey: boolean): boolean {
-  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
-  // `/v1/models` exists on BOTH APIs, so it is routed by auth style — but an
-  // `sk-ant-…` bearer is Anthropic by construction (Claude Code subscription
-  // auth sends `authorization: Bearer sk-ant-oat01-…` with no x-api-key).
-  // Without this check that OAuth token would be forwarded to the OpenAI
-  // upstream: a credential leak, and a guaranteed 401.
-  const bearerIsAnthropic = /^Bearer\s+sk-ant-/i.test(headers.get('authorization') ?? '');
-  const looksOpenAIAuth =
-    hasOpenAIKey || (headers.has('authorization') && !headers.has('x-api-key') && !bearerIsAnthropic);
-  return pathname === '/v1/chat/completions'
+  if (
+    pathname === '/v1/chat/completions'
     || pathname === '/v1/responses'
     || pathname.startsWith('/v1/responses/')
     || isChatGPTBackendPath(pathname)
-    || (isModelsPath && looksOpenAIAuth);
+  ) {
+    return true;
+  }
+  const isModelsPath = pathname === '/v1/models' || pathname.startsWith('/v1/models/');
+  const isOtherOpenAI = isNonChatOpenAIPath(pathname);
+  if (!isModelsPath && !isOtherOpenAI) return false;
+
+  // Check Host first so explicit first-party Hosts never cross-route.
+  const host = extractHostname(headers.get('host'));
+  if (host === 'api.openai.com' || host === 'chatgpt.com') return true;
+  if (host === 'api.anthropic.com') return false;
+
+  // Check !isAnthropicAuth BEFORE hasOpenAIKey so setting OPENAI_API_KEY
+  // never hijacks Anthropic /v1/models or /v1/files requests.
+  const inbound = classifyInboundCredential(headers);
+  const isAnthropicAuth =
+    inbound === 'anthropic-key'
+    || inbound === 'anthropic-bearer'
+    || headers.has('x-api-key')
+    || /\bsk-ant-/i.test(headers.get('authorization') ?? '');
+  if (isAnthropicAuth) return false;
+
+  if (isModelsPath) {
+    return hasOpenAIKey || inbound !== 'none';
+  }
+  // Non-chat OpenAI /v1/* paths (/v1/embeddings, /v1/files, /v1/batches, /v1/audio/*, /v1/images/*)
+  return hasOpenAIKey || inbound === 'oauth-jwt' || inbound === 'api-key-bearer' || inbound === 'opaque-bearer';
 }
 
 /** anthropic-beta values count_tokens has rejected in this process. Clients
@@ -1606,6 +1786,31 @@ export function resetCountTokensRejectedBetasForTests(): void {
  *  on the PRE-COMPRESSION body to get the ground-truth baseline. Actual
  *  post-compression tokens already come back free in the /v1/messages usage
  *  block (input_tokens + cache_create + cache_read), so no second probe. */
+const COUNT_TOKENS_ERROR_MAX_BYTES = 4096;
+
+async function readBoundedErrorText(res: Response, maxBytes = COUNT_TOKENS_ERROR_MAX_BYTES): Promise<string> {
+  if (!res.body) return '';
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      const take = Math.min(value.byteLength, maxBytes - total);
+      chunks.push(take === value.byteLength ? value : value.subarray(0, take));
+      total += take;
+    }
+  } catch {
+    // Ignore read errors on error path.
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  return new TextDecoder().decode(concatChunks(chunks, total));
+}
+
 async function countTokensUpstream(
   countTokensUrl: string,
   body: Uint8Array,
@@ -1628,7 +1833,7 @@ async function countTokensUpstream(
       signal: combineAbortSignals(COUNT_TOKENS_TIMEOUT_MS, parentSignal),
     });
     if (res.status === 400 && !retried) {
-      const text = await res.text().catch(() => '');
+      const text = await readBoundedErrorText(res, COUNT_TOKENS_ERROR_MAX_BYTES);
       const rejected = parseRejectedBetas(text);
       if (rejected.length > 0 && rejected.some((b) => !countTokensRejectedBetas.has(b))) {
         for (const b of rejected) {
@@ -1637,16 +1842,12 @@ async function countTokensUpstream(
         }
         return countTokensUpstream(countTokensUrl, body, reqHeaders, onError, true, fetchImpl, parentSignal);
       }
-      onError?.(`http_400${text ? ` ${text.slice(0, 300)}` : ''}`);
+      const redacted = redactSecrets(text);
+      onError?.(`http_400${redacted ? ` ${redacted.slice(0, 300)}` : ''}`);
       return null;
     }
     if (!res.ok) {
-      let detail = '';
-      try {
-        detail = (await res.text()).slice(0, 300);
-      } catch {
-        await res.body?.cancel().catch(() => undefined);
-      }
+      const detail = redactSecrets(await readBoundedErrorText(res, COUNT_TOKENS_ERROR_MAX_BYTES)).slice(0, 300);
       onError?.(`http_${res.status}${detail ? ` ${detail}` : ''}`);
       return null;
     }
@@ -1656,11 +1857,13 @@ async function countTokensUpstream(
     return null;
   } catch (e) {
     await res?.body?.cancel().catch(() => undefined);
-    onError?.(`fetch_error ${(e as Error)?.name ?? ''}: ${String((e as Error)?.message ?? e).slice(0, 200)}`);
+    const msg = redactSecrets(String((e as Error)?.message ?? e)).slice(0, 200);
+    onError?.(`fetch_error ${(e as Error)?.name ?? ''}: ${msg}`);
     return null;
   }
 }
 
+const PREFERRED_GOOGLE_COUNT_SHAPE_MAX = 64;
 const preferredGoogleCountShapeByHost = new Map<string, 0 | 1>();
 
 export function resetGoogleCountShapePreferenceForTests(): void {
@@ -1686,7 +1889,12 @@ async function countGoogleTokensUpstream(
     try {
       host = new URL(countTokensUrl).host;
     } catch {}
-    const preferred = (host ? preferredGoogleCountShapeByHost.get(host) : undefined) ?? 0;
+    const cachedShape = host ? preferredGoogleCountShapeByHost.get(host) : undefined;
+    if (host && cachedShape !== undefined) {
+      preferredGoogleCountShapeByHost.delete(host);
+      preferredGoogleCountShapeByHost.set(host, cachedShape);
+    }
+    const preferred = cachedShape ?? 0;
     const orderedShapes: readonly string[] = preferred === 1
       ? [shapeWrapped, shapeBare]
       : [shapeBare, shapeWrapped];
@@ -1708,7 +1916,14 @@ async function countGoogleTokensUpstream(
         if (res.ok) {
           const json = (await res.json()) as { totalTokens?: unknown };
           if (typeof json.totalTokens === 'number') {
-            if (host) preferredGoogleCountShapeByHost.set(host, countBody === shapeWrapped ? 1 : 0);
+            if (host) {
+              preferredGoogleCountShapeByHost.delete(host);
+              preferredGoogleCountShapeByHost.set(host, countBody === shapeWrapped ? 1 : 0);
+              if (preferredGoogleCountShapeByHost.size > PREFERRED_GOOGLE_COUNT_SHAPE_MAX) {
+                const oldest = preferredGoogleCountShapeByHost.keys().next().value;
+                if (oldest !== undefined) preferredGoogleCountShapeByHost.delete(oldest);
+              }
+            }
             return json.totalTokens;
           }
         } else {
@@ -1754,8 +1969,8 @@ export function resolveUpstreams(config: ProxyConfig): {
     return { anthropic: `${base}/anthropic`, openai: `${base}/openai`, stripOpenAIV1: true };
   }
   return {
-    anthropic: (config.upstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
-    openai: (config.openAIUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
+    anthropic: (config.upstream ?? config.sharedUpstream ?? DEFAULT_UPSTREAM).trim().replace(/\/+$/, ''),
+    openai: (config.openAIUpstream ?? config.sharedUpstream ?? DEFAULT_OPENAI_UPSTREAM).trim().replace(/\/+$/, ''),
     stripOpenAIV1: false,
   };
 }
@@ -1787,7 +2002,7 @@ function extractHostname(hostHeader: string | null): string {
     return end !== -1 ? trimmed.slice(1, end) : trimmed;
   }
   const colon = trimmed.indexOf(':');
-  return colon !== -1 ? trimmed.slice(0, colon) : trimmed;
+  return (colon !== -1 ? trimmed.slice(0, colon) : trimmed).replace(/\.$/, '');
 }
 
 function stripTrailingSlashes(str: string): string {
@@ -1825,17 +2040,41 @@ function resolveGoogleUpstream(
   }
   const host = extractHostname(req.headers.get('host'));
   if (host === 'daily-cloudcode-pa.googleapis.com' || host === 'cloudcode-pa.googleapis.com' || pathname.startsWith('/v1internal:')) {
-    return host === 'cloudcode-pa.googleapis.com'
-      ? 'https://cloudcode-pa.googleapis.com'
-      : 'https://daily-cloudcode-pa.googleapis.com';
+    return host === 'daily-cloudcode-pa.googleapis.com'
+      ? 'https://daily-cloudcode-pa.googleapis.com'
+      : 'https://cloudcode-pa.googleapis.com';
   }
   if (host === 'generativelanguage.googleapis.com') {
     return 'https://generativelanguage.googleapis.com';
   }
-  if (passthroughUpstream !== DEFAULT_UPSTREAM && !passthroughUpstream.endsWith('/anthropic')) {
+  if (config.sharedUpstream) {
+    const shared = stripTrailingSlashes(config.sharedUpstream.trim());
+    if (shared && !shared.endsWith('/anthropic')) {
+      return shared;
+    }
+  }
+  if (isProviderPrefixedPath(pathname) && passthroughUpstream !== DEFAULT_UPSTREAM && !passthroughUpstream.endsWith('/anthropic')) {
     return passthroughUpstream;
   }
   return 'https://generativelanguage.googleapis.com';
+}
+
+function resolveOpenAIUpstream(
+  req: Request,
+  pathname: string,
+  openAIUpstream: string,
+  config: ProxyConfig,
+): string {
+  if (config.provider === 'cloudflare-ai-gateway') {
+    return openAIUpstream;
+  }
+  if (
+    openAIUpstream === DEFAULT_OPENAI_UPSTREAM &&
+    (isChatGPTBackendPath(pathname) || extractHostname(req.headers.get('host')) === 'chatgpt.com')
+  ) {
+    return DEFAULT_CHATGPT_UPSTREAM;
+  }
+  return openAIUpstream;
 }
 
 /** Build the proxy fetch handler. */
@@ -2054,7 +2293,7 @@ let responseContentType: string | undefined;
       return finalize();
     };
     const fireWait = (...args: Parameters<typeof fire>): void => {
-      const p = fire(...args);
+      const p = fire(...args).catch(() => undefined);
       config.waitUntil?.(p);
     };
 
@@ -2100,32 +2339,52 @@ let responseContentType: string | undefined;
     // Wire-shape detection stays independent from transform eligibility. A
     // bypassed Codex request is still an OpenAI Responses request for routing,
     // accounting, and response scanning; only its body transformation is off.
-    const isMessagesWire = req.method === 'POST' && isAnthropicMessagesPath(wirePathname);
+    const isMessagesWire =
+      req.method === 'POST'
+      && (isAnthropicMessagesPath(wirePathname) || (Boolean(follow) && wirePathname === '/messages'));
     const isOpenAIChatWire = req.method === 'POST' && isOpenAIChatPath(wirePathname);
     const isOpenAIResponsesWire = req.method === 'POST' && isOpenAIResponsesPath(wirePathname);
-    const isMessages = !bypass && isMessagesWire;
-    const isOpenAIChat = !bypass && isOpenAIChatWire;
-    const isOpenAIResponses = !bypass && isOpenAIResponsesWire;
     const googleModelFromPath = req.method === 'POST' && !follow
       ? parseGoogleModelFromPath(url.pathname)
       : null;
     const isGoogleInference = req.method === 'POST' && !follow && isGoogleInferencePath(url.pathname);
     const isGoogleRoute = googleModelFromPath !== null || isGoogleInference;
-    const isGoogle = isGoogleRoute && !bypass;
     const isGoogleFamily = !follow && (isGoogleRoute || isGoogleFamilyPath(url.pathname));
     const isOpenAIPath = !follow && isCanonicalOpenAIPath(
       url.pathname,
       req.headers,
       config.openAIApiKey !== undefined,
     );
+    const isAnthropicCredentialRoute =
+      !isGoogleFamily
+      && !isOpenAIChatWire
+      && !isOpenAIResponsesWire
+      && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))
+      && (isAnthropicFamilyPath(url.pathname) || url.pathname.startsWith('/anthropic/') || isMessagesWire);
+    const firstPartyProvider: 'anthropic' | 'openai' | 'google' | undefined = !follow
+      ? isGoogleFamily
+        ? 'google'
+        : (isOpenAIPath || isOpenAIChatWire || isOpenAIResponsesWire || url.pathname.startsWith('/openai/'))
+          ? 'openai'
+          : (isAnthropicCredentialRoute || isMessagesWire || url.pathname.startsWith('/anthropic/'))
+            ? 'anthropic'
+            : undefined
+      : undefined;
+    const firstPartyDisabled =
+      firstPartyProvider !== undefined && activeProviderSet !== undefined && !activeProviderSet.has(firstPartyProvider);
+    const isMessages = !bypass && !firstPartyDisabled && isMessagesWire;
+    const isOpenAIChat = !bypass && !firstPartyDisabled && isOpenAIChatWire;
+    const isOpenAIResponses = !bypass && !firstPartyDisabled && isOpenAIResponsesWire;
+    const isGoogle = isGoogleRoute && !bypass && !firstPartyDisabled;
     const googleUpstream = resolveGoogleUpstream(req, url.pathname, passthroughUpstream, config);
+    const resolvedOpenAIUpstream = resolveOpenAIUpstream(req, url.pathname, openAIUpstream, config);
     const upstreamBase = follow
       ? follow.origin
       : isGoogleFamily
-      ? googleUpstream
-      : providerPrefixed
-        ? passthroughUpstream
-        : isOpenAIPath ? openAIUpstream : upstream;
+        ? googleUpstream
+        : providerPrefixed
+          ? passthroughUpstream
+          : isOpenAIPath ? resolvedOpenAIUpstream : upstream;
 
     let bodyOut: BodyInit | null = null;
     /** Set when `decodeRequestBody` undid the request Content-Encoding. */
@@ -2172,10 +2431,64 @@ let responseContentType: string | undefined;
       }), { status: 404, headers: { 'content-type': 'application/json' } });
     }
 
-    if (bypass && isOpenAIResponsesWire
+    if ((bypass || firstPartyDisabled) && isOpenAIResponsesWire
       && (req.headers.get('content-type') ?? '').toLowerCase().includes('json')) {
       responsesStreaming = await readStreamFieldFromClone(req);
     }
+
+    let releaseInFlight = (): void => {};
+    const acquireInFlightLease = async (bodyBytesForKey: Uint8Array): Promise<Response | null> => {
+      if (bodyBytesForKey.byteLength === 0 || duplicateHoldMs <= 0) return null;
+      const rawHash = await sha256Bytes(bodyBytesForKey);
+      const keyHeaders: [string, string][] = [];
+      filterHeaders(req.headers, STRIP_REQ_HEADERS).forEach((value, name) => {
+        keyHeaders.push([name, value]);
+      });
+      const hostVal = req.headers.get('host');
+      if (hostVal) keyHeaders.push(['host', hostVal]);
+      keyHeaders.sort(([a, av], [b, bv]) => a.localeCompare(b) || av.localeCompare(bv));
+      const key = await sha256Text(JSON.stringify([
+        req.method,
+        upstreamBase,
+        path,
+        keyHeaders,
+        rawHash,
+        validatedClientSessionId ?? '',
+      ]));
+      const now = Date.now();
+      const sinceSweep = now - lastSweptAt;
+      if (
+        sinceSweep >= duplicateHoldMs
+        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
+      ) {
+        for (const [k, v] of inFlight) {
+          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
+        }
+        lastSweptAt = now;
+      }
+      const existing = inFlight.get(key);
+      if (existing && now - existing.startedAt < duplicateHoldMs) {
+        detachClientAbort();
+        if (!upstreamAbort.signal.aborted) {
+          upstreamAbort.abort(new Error('fiche: duplicate request rejected'));
+        }
+        const message = 'An identical request is already in progress';
+        fireWait(409, undefined, 'duplicate_request_in_flight');
+        const error = isMessages
+          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
+          : { error: { type: 'duplicate_request_in_flight', message } };
+        return new Response(JSON.stringify(error), {
+          status: 409,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      const lease = Symbol();
+      inFlight.set(key, { lease, startedAt: now });
+      releaseInFlight = () => {
+        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
+      };
+      return null;
+    };
 
     if (isMessages || isOpenAIChat || isOpenAIResponses || isGoogle) {
       // Transformable routes have to hold the whole body to rewrite it, so this
@@ -2222,13 +2535,48 @@ let responseContentType: string | undefined;
       } else {
         let bodyIn = bounded.bytes;
         const contentEncoding = (req.headers.get('content-encoding') ?? '').trim();
+        let decodeTooLarge = false;
         if (contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && config.decodeRequestBody) {
           const decoded = config.decodeRequestBody(bodyIn, contentEncoding, maxRequestBytes);
-          if (decoded) {
+          if (decoded instanceof Uint8Array) {
             bodyIn = decoded;
             requestBodyDecoded = true;
+          } else if (decoded && typeof decoded === 'object') {
+            if (decoded.status === 'ok') {
+              bodyIn = decoded.bytes;
+              requestBodyDecoded = true;
+            } else if (decoded.status === 'too_large') {
+              decodeTooLarge = true;
+            }
           }
         }
+        if (decodeTooLarge) {
+          if (!canStreamOversized) {
+            const message = `decoded request body exceeds the ${maxRequestBytes}-byte fiche limit`;
+            const error = isMessages
+              ? { type: 'error', error: { type: 'request_too_large', message } }
+              : { error: { type: 'request_too_large', message } };
+            fireWait(413, undefined, message);
+            return new Response(JSON.stringify(error), {
+              status: 413,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
+          bodyOut = bodyIn as unknown as BodyInit;
+          info = {
+            compressed: false,
+            reason: 'body_too_large',
+            origChars: 0,
+            compressedChars: 0,
+            imageCount: 0,
+            imageBytes: 0,
+            staticChars: 0,
+            dynamicChars: 0,
+            dynamicBlockCount: 0,
+          };
+        } else {
+        const dupRes = await acquireInFlightLease(bodyIn);
+        if (dupRes) return dupRes;
         const encodedUndecoded =
           contentEncoding !== '' && contentEncoding.toLowerCase() !== 'identity' && !requestBodyDecoded;
         try {
@@ -2255,6 +2603,7 @@ let responseContentType: string | undefined;
                 ? pinCommandResponse(bodyIn)
                 : pinCommandResponseOpenAI(bodyIn, isOpenAIResponses ? 'responses' : 'chat');
               if (pinReply) {
+                releaseInFlight();
                 return new Response(pinReply.body, {
                   status: 200,
                   headers: {
@@ -2322,7 +2671,7 @@ let responseContentType: string | undefined;
           // Third-party hosts never get the OpenAI-only breakpoint field.
           const allowBreakpoints = !follow && supportsExplicitPromptCacheBreakpoint({
             pathname: url.pathname,
-            upstream: openAIUpstream,
+            upstream: resolvedOpenAIUpstream,
           });
           // Allowlisted models image, except weak or unmeasured readers (Claude
           // 5.5, Grok, Gemini 4 hydrogen/carbon, DeepSeek, Kimi, GLM, MiniMax),
@@ -2468,6 +2817,7 @@ let responseContentType: string | undefined;
                 ? { type: 'error', error: { type: 'request_too_large', message } }
                 : { error: { type: 'request_too_large', message } };
               detachClientAbort();
+              releaseInFlight();
               return new Response(JSON.stringify(error), {
                 status: 413,
                 headers: { 'content-type': 'application/json' },
@@ -2509,7 +2859,12 @@ let responseContentType: string | undefined;
                 if (ctAuth) ctHeaders.set('authorization', `Bearer ${ctAuth}`);
                 ensureClientAbortWired();
                 baselinePromise = countTokensUpstream(ctUrl, ctBody, ctHeaders, (reason) => {
-                  baselineProbeError = reason;
+                  if (config.captureErrorReqBody) {
+                    baselineProbeError = redactSecrets(reason);
+                  } else {
+                    const httpMatch = /^(http_\d+)/.exec(reason);
+                    baselineProbeError = httpMatch ? httpMatch[1] : reason.split(' ', 1)[0];
+                  }
                 }, false, fetchImpl, upstreamAbort.signal);
                 // Null = no markers → cacheable=0 by definition, no probe needed.
                 const ctCacheableBody = buildCacheablePrefixCountTokensBody(bodyIn);
@@ -2530,10 +2885,12 @@ let responseContentType: string | undefined;
             }
           }
         } catch (e) {
+          releaseInFlight();
           if (
             (bridgedGptMessages || bridgedChatMessages) &&
             ((e as Error).name === 'MessagesBridgeInvalidRequest' || e instanceof SyntaxError)
           ) {
+            detachClientAbort();
             fireWait(400, undefined, `invalid_request: ${(e as Error).message}`);
             return new Response(JSON.stringify({
               type: 'error',
@@ -2546,6 +2903,7 @@ let responseContentType: string | undefined;
             status: 502,
             headers: { 'content-type': 'application/json' },
           });
+        }
         }
       }
     } else if (req.method === 'POST') {
@@ -2611,12 +2969,6 @@ let responseContentType: string | undefined;
     // The body now travels as plain bytes; a stale coding header would make
     // the upstream try to decompress JSON.
     if (requestBodyDecoded) outHeaders.delete('content-encoding');
-    const isAnthropicCredentialRoute =
-      !isGoogleFamily
-      && !isOpenAIChatWire
-      && !isOpenAIResponsesWire
-      && (!providerPrefixed || url.pathname.startsWith('/anthropic/'))
-      && (isAnthropicFamilyPath(url.pathname) || url.pathname.startsWith('/anthropic/') || isMessagesWire);
     if (follow) {
       // The agent addressed this host with this credential; it is the only one
       // that may travel. No configured key, no gateway header, and never an
@@ -2690,55 +3042,6 @@ let responseContentType: string | undefined;
           // Malformed header name/value in billingLine must never crash the proxy.
         }
       }
-    }
-    let releaseInFlight = (): void => {};
-    if (reqBodySha256 && duplicateHoldMs > 0) {
-      const headers: [string, string][] = [];
-      outHeaders.forEach((value, name) => { headers.push([name, value]); });
-      headers.sort(([a], [b]) => a.localeCompare(b));
-      const key = await sha256Text(JSON.stringify([
-        req.method,
-        upstreamUrl,
-        headers,
-        reqBodySha256,
-        validatedClientSessionId ?? '',
-      ]));
-      const now = Date.now();
-      // Time trigger keeps steady state clean; size trigger reclaims promptly if entries
-      // ever strand faster than the window. Both are throttled, so cost stays amortized.
-      const sinceSweep = now - lastSweptAt;
-      if (
-        sinceSweep >= duplicateHoldMs
-        || (inFlight.size > INFLIGHT_SWEEP_SIZE && sinceSweep >= INFLIGHT_SWEEP_MIN_INTERVAL_MS)
-      ) {
-        for (const [k, v] of inFlight) {
-          if (now - v.startedAt >= duplicateHoldMs) inFlight.delete(k);
-        }
-        lastSweptAt = now;
-      }
-      const existing = inFlight.get(key);
-      // Fail open once the holder is older than the window: a retry that arrives this
-      // late is the client recovering from a stall, not an accidental double-send.
-      if (existing && now - existing.startedAt < duplicateHoldMs) {
-        detachClientAbort();
-        if (!upstreamAbort.signal.aborted) {
-          upstreamAbort.abort(new Error('fiche: duplicate request rejected'));
-        }
-        const message = 'An identical request is already in progress';
-        fireWait(409, undefined, 'duplicate_request_in_flight');
-        const error = isMessages
-          ? { type: 'error', error: { type: 'duplicate_request_in_flight', message } }
-          : { error: { type: 'duplicate_request_in_flight', message } };
-        return new Response(JSON.stringify(error), {
-          status: 409,
-          headers: { 'content-type': 'application/json' },
-        });
-      }
-      const lease = Symbol();
-      inFlight.set(key, { lease, startedAt: now });
-      releaseInFlight = () => {
-        if (inFlight.get(key)?.lease === lease) inFlight.delete(key);
-      };
     }
     // One controller for the whole exchange: headers timeout, stall watchdog and client
     // disconnect all abort through it, so nothing can hold the socket open indefinitely.
@@ -2828,10 +3131,11 @@ let responseContentType: string | undefined;
 
     const finalUpstreamRes = upstreamRes;
     const firstByteMs = Date.now() - t0;
+    const keepUndecodedEncoding = finalUpstreamRes.headers.has('x-fiche-undecoded-encoding');
     responseContentType = finalUpstreamRes.headers.get('content-type') ?? undefined;
     responseContentEncoding = finalUpstreamRes.headers.get('content-encoding') ?? undefined;
 
-    // Tee: client gets one side; scanner reads the other for usage/measurement/error body.
+    // Inline pull-through scanner: client gets backpressure directly; 5xx/unknown/undecoded skip wrapping.
     let teed: Response;
     let usagePromise: Promise<Usage | undefined>;
     let errorBodyPromise: Promise<string | undefined>;
@@ -2844,6 +3148,7 @@ let responseContentType: string | undefined;
           isOpenAIResponsesWire && responsesStreaming,
           isOpenAIResponsesWire && !responsesStreaming,
           isMessages || isGoogle || isOpenAIChatWire || isOpenAIResponsesWire || bridgedGptMessages || bridgedChatMessages,
+          keepUndecodedEncoding,
         ));
     } catch (e) {
       if (finalUpstreamRes.body && !finalUpstreamRes.body.locked) {
@@ -2857,19 +3162,53 @@ let responseContentType: string | undefined;
       throw e;
     }
 
-    // Fire event in background once all four resolve (all share the same stream read).
+    // Client disconnect: drop the lease immediately and abort upstream, rather than
+    // waiting on scanner promises that a wedged connection would never settle.
+    let settleStreamDone = (): void => {};
+    const streamDonePromise =
+      finalUpstreamRes.status >= 500 && Boolean(teed.body)
+        ? new Promise<void>((resolve) => {
+            let done = false;
+            settleStreamDone = () => {
+              if (!done) {
+                done = true;
+                resolve();
+              }
+            };
+          })
+        : Promise.resolve();
+    const clientBody = teed.body
+      ? withClientDisconnect(
+          teed.body,
+          () => {
+            settleStreamDone();
+            clearHeadersTimer();
+            detachClientAbort();
+            releaseInFlight();
+            if (!upstreamAbort.signal.aborted) {
+              upstreamAbort.abort(new Error('fiche: client disconnected'));
+            }
+          },
+          () => {
+            settleStreamDone();
+          },
+        )
+      : null;
+
+    // Fire event in background once all scanner promises (and any 5xx body stream) resolve.
     const bgTask = Promise.all([
       usagePromise.catch(() => undefined),
       errorBodyPromise.catch(() => undefined),
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
+      streamDonePromise,
     ]).then(([usage, errorBody, measurement, stopReason]) => {
       // A rejected request never populated a prefix cache, so the append-only
       // freeze this session was protecting protects nothing: let the next turn
       // re-cut the grid for density instead of preserving dead bytes.
       const sessionKey = info?.sessionKey ?? info?.firstUserSha8;
       if (responseLeftNoCache(finalUpstreamRes.status, errorBody)) {
-        markCacheDead(sessionKey);
+        markCacheDead(sessionKey, requestModel ? { model: requestModel } : undefined);
       }
       // Feed the provider's own cache accounting back into the session store. A
       // read proves the prefix was live; a create proves one was just written.
@@ -2881,6 +3220,7 @@ let responseContentType: string | undefined;
           bridgedGptMessages || bridgedChatMessages
             ? undefined
             : (usage.cache_creation_input_tokens ?? usage.cache_write_tokens),
+          requestModel ? { model: requestModel } : undefined,
         );
       }
       return fire(
@@ -2889,7 +3229,7 @@ let responseContentType: string | undefined;
         timeoutKind === 'idle' ? `upstream_timeout: no upstream bytes for ${idleTimeoutMs}ms` : undefined,
         firstByteMs,
         usage,
-        config.captureErrorReqBody ? errorBody : undefined,
+        config.captureErrorReqBody && errorBody ? redactSecrets(errorBody) : undefined,
         measurement,
         stopReason,
       );
@@ -2897,23 +3237,13 @@ let responseContentType: string | undefined;
       clearHeadersTimer();
       detachClientAbort();
       releaseInFlight();
-    });
+    }).catch(() => undefined);
     config.waitUntil?.(bgTask);
 
-    // Client disconnect: drop the lease immediately and abort upstream, rather than
-    // waiting on scanner promises that a wedged connection would never settle.
-    const clientBody = teed.body
-      ? withClientDisconnect(teed.body, () => {
-          clearHeadersTimer();
-          detachClientAbort();
-          releaseInFlight();
-          if (!upstreamAbort.signal.aborted) {
-            upstreamAbort.abort(new Error('fiche: client disconnected'));
-          }
-        })
-      : null;
-
-    const resHeaders = filterHeaders(finalUpstreamRes.headers, STRIP_RES_HEADERS);
+    const resHeaders = filterHeaders(
+      finalUpstreamRes.headers,
+      keepUndecodedEncoding ? STRIP_RES_HEADERS_KEEP_ENCODING : STRIP_RES_HEADERS,
+    );
     if (info && (info.compressed || (info.textHygieneSavedTokens ?? 0) > 0 || (info.textHygieneStages?.length ?? 0) > 0)) {
       const imagedSaved = info.compressed
         ? Math.max(

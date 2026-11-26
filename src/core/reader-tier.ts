@@ -42,7 +42,11 @@ const TEXT_ONLY = [
   // Dash, dot or Vertex `@version` spellings: claude-opus-5-5, claude-opus-5.5,
   // claude-opus-5-5@20261001.
   /claude-(?:opus|sonnet|haiku)-5[-.]5(?:[-@.:]|$)/,
-  /claude-haiku(?:[-@.:]|$)/,
+  /claude-(?:[\d.-]+)?haiku(?:[-@.:]|$)/,
+  // Legacy / unmeasured OpenAI families routed to deterministic text hygiene.
+  /(?:^|[/.])gpt-5\.5(?:[-@.:]|$)/,
+  /(?:^|[/.])o[13](?:[-@.:]|$)/,
+  /(?:^|[/.])o4-mini(?:[-@.:]|$)/,
   // grok-4.7, x-ai/grok-4.7, x-ai.grok-4.7.
   /(?:^|[/.])grok(?:-|$)/,
   // Gemini 4 hydrogen, carbon, and neon have no reading measurements yet; the

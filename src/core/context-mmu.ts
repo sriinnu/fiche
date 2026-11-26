@@ -18,9 +18,14 @@
 import { extractFactSheetTokens } from './factsheet.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
 import { resetGlobalPrefixTape } from './prefix-tape.js';
-import { evaluateCliffAvoidance, resolvePriceRates } from './pricing.js';
-import { hasAnyFoldedEpisodeId, hasFoldedEpisodeId, recordFoldedEpisodeId } from './session-state.js';
-import type { TextEpochBlock } from './text-history.js';
+import { evaluateCliffAvoidance, isAutoCacheOpenAIModel, resolvePriceRates } from './pricing.js';
+import {
+  getFoldedEpisodeCertificate,
+  hasAnyFoldedEpisodeId,
+  hasFoldedEpisodeId,
+  recordFoldedEpisodeId,
+} from './session-state.js';
+import type { CacheBreakpointMarker, TextEpochBlock } from './text-history.js';
 
 // ---------------------------------------------------------------------------
 // Constants & Shared Helpers
@@ -2330,6 +2335,8 @@ export interface FoldMarkovianEpisodesArgs {
   readonly store?: ContextPageStore;
   readonly expectedOutputTokens?: number;
   readonly ttlSec?: number;
+  readonly msgTotalTokens?: readonly number[];
+  readonly cacheBreakpoints?: readonly CacheBreakpointMarker[];
   readonly totalPromptTokens?: number;
   /** When true, only replay already-folded sticky episodes without folding new spans. */
   readonly stickyOnly?: boolean;
@@ -2344,18 +2351,59 @@ export interface FoldMarkovianEpisodesResult {
   readonly episodeIds: readonly string[];
 }
 
+const FILE_READ_TOOL_RE =
+  /^(?:read|read_?file|view_?file|view_?file_?outline|view_?code_?item|cat|get_?file_?contents|get_?file|read_?text_?file|read_?resource|open_?file|fs_?read|file_?read|show_?file|inspect_?file)$/i;
+
+/** True when a tool name represents a file/resource read whose contents must not trigger checkpoints or whitespace rewrites. */
+export function isFileReadToolName(name: string | undefined): boolean {
+  if (!name) return false;
+  const trimmed = name.trim();
+  const bare = trimmed.split(/(?:__|[.:/])/).pop() ?? trimmed;
+  return FILE_READ_TOOL_RE.test(bare);
+}
+
+const MARKOV_CHECKPOINT_TOOL_RE =
+  /^(?:bash|sh|zsh|shell|terminal|cmd|command|exec(?:ute)?(?:_?command)?|run(?:_?command|_?shell|_?tests?)?|test(?:s|ing)?|verify|check|git|gh|pr|ci|vitest|jest|pytest|cargo|npm|pnpm|yarn|bun|make|gradle|mvn)$/i;
+
+function isMarkovCheckpointToolName(toolName: string | undefined): boolean {
+  if (!toolName) return true;
+  if (isFileReadToolName(toolName)) return false;
+  const trimmed = toolName.trim();
+  const bare = trimmed.split(/(?:__|[.:/])/).pop() ?? trimmed;
+  if (MARKOV_CHECKPOINT_TOOL_RE.test(bare)) return true;
+  return /(?:^|[_-])(bash|shell|exec|command|git|gh|test|verify|check)(?:$|[_-])/i.test(bare);
+}
+
 const stickyMarkovEpisodes = new Set<string>();
+const stickyMarkovCertificates = new Map<string, string>();
 const stickyMarkovSessions = new Set<string>();
+
+function addStickyMarkovSession(sessionKey: string): void {
+  if (stickyMarkovSessions.has(sessionKey)) {
+    stickyMarkovSessions.delete(sessionKey);
+  } else if (stickyMarkovSessions.size >= STICKY_EPISODE_CAP) {
+    const oldest = stickyMarkovSessions.values().next().value;
+    if (oldest !== undefined) stickyMarkovSessions.delete(oldest);
+  }
+  stickyMarkovSessions.add(sessionKey);
+}
 
 /** O(1) check for whether this session has ever folded a Markovian episode. */
 export function hasAnyStickyMarkovEpisode(sessionKey?: string): boolean {
   const key = sessionKey?.trim() || 'default';
-  return stickyMarkovSessions.has(key) || hasAnyFoldedEpisodeId(sessionKey);
+  const hit = stickyMarkovSessions.has(key);
+  if (hit) {
+    stickyMarkovSessions.delete(key);
+    stickyMarkovSessions.add(key);
+    return true;
+  }
+  return hasAnyFoldedEpisodeId(sessionKey);
 }
 
 /** Test helper: clear sticky Markovian episode seal memory. */
 export function clearStickyMarkovEpisodesForTests(): void {
   stickyMarkovEpisodes.clear();
+  stickyMarkovCertificates.clear();
   stickyMarkovSessions.clear();
 }
 
@@ -2468,8 +2516,9 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       continue;
     }
 
-    const isCommitOrMerge = isGitCommitCheckpoint(raw) || isPrMergeCheckpoint(raw);
-    const isGreen = !isCommitOrMerge && isGreenVerificationCheckpoint(raw, firstFailureIdx >= 0);
+    const checkpointAllowed = isMarkovCheckpointToolName(block.toolName);
+    const isCommitOrMerge = checkpointAllowed && (isGitCommitCheckpoint(raw) || isPrMergeCheckpoint(raw));
+    const isGreen = checkpointAllowed && !isCommitOrMerge && isGreenVerificationCheckpoint(raw, firstFailureIdx >= 0);
 
     if (isCommitOrMerge || isGreen) {
       const slice = isGreen && firstFailureIdx >= 0 ? pending.slice(firstFailureIdx) : pending;
@@ -2485,7 +2534,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       continue;
     }
 
-    if (firstFailureIdx < 0 && FAIL_SIGNAL_RE.test(raw)) {
+    if (firstFailureIdx < 0 && checkpointAllowed && FAIL_SIGNAL_RE.test(raw)) {
       firstFailureIdx = pending.length;
     }
     pending.push({ block, raw, rawTokens: countTokensFast(raw) });
@@ -2530,10 +2579,13 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       ep.predecessors.map((p) => `${p.block.refId}:${p.raw.length}:${fnv64Hex(p.raw)}`).join('|') +
       `->${ep.checkpoint.block.refId}:${fnv64Hex(ep.checkpoint.raw)}`;
     const epId = `ep_${fnv64Hex(signatureSource).slice(0, 10)}`;
-    const stickyKey = `${sessionKey}\0${args.model ?? ''}\0${args.ttlSec ?? ''}\0${epId}`;
+    const stickyKey = `${sessionKey}\0${args.model ?? ''}\0${epId}`;
     const alreadySealed =
       stickyMarkovEpisodes.has(stickyKey) || hasFoldedEpisodeId(args.sessionKey, stickyKey);
     if (args.stickyOnly && !alreadySealed) continue;
+    const frozenCertificate = alreadySealed
+      ? (stickyMarkovCertificates.get(stickyKey) ?? getFoldedEpisodeCertificate(args.sessionKey, stickyKey))
+      : undefined;
 
     // Write the causal certificate into the longest predecessor; skip tiny blocks that would bloat.
     let certIdx = 0;
@@ -2580,7 +2632,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
         `touched symbols/paths: ${touchedSummary}]`
       );
     };
-    let certificate = formatCertificate(pgIds);
+    let certificate = frozenCertificate ?? formatCertificate(pgIds);
 
     if (certificate.length >= ep.predecessors[certIdx]!.raw.length) continue;
 
@@ -2593,26 +2645,59 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
 
     if (foldedChars >= rawChars || foldedTok >= rawTok) continue;
 
-    if (!alreadySealed && args.sessionCacheCold !== true) {
-      let downstreamCachedTokens = 0;
-      for (const b of args.blocks) {
-        if (b.msgIndex >= ep.checkpoint.block.msgIndex && b.msgIndex < args.totalMessages - 2) {
-          downstreamCachedTokens += blockTokens.get(b) ?? 0;
+    const lastReplacedBlock = ep.predecessors[replaceableIndices[replaceableIndices.length - 1]!]!.block;
+    let coveringTtlSec = 0;
+    let horizonEndMsg = args.totalMessages - 2;
+    if (args.cacheBreakpoints && args.cacheBreakpoints.length > 0) {
+      const lastReplacedBlockIdx = lastReplacedBlock.blockIndex ?? 0;
+      let maxBpMsg = -1;
+      for (const bp of args.cacheBreakpoints) {
+        if (bp.msgIndex > lastReplacedBlock.msgIndex || (bp.msgIndex === lastReplacedBlock.msgIndex && bp.blockIndex >= lastReplacedBlockIdx)) {
+          if (bp.ttlSec > coveringTtlSec) coveringTtlSec = bp.ttlSec;
+          if (bp.msgIndex > maxBpMsg) maxBpMsg = bp.msgIndex;
         }
       }
-      if (nonToolPromptTokens > 0 && args.totalMessages > 2) {
-        const spanRatio = Math.max(
-          0,
-          Math.min(1, (args.totalMessages - 2 - ep.predecessors[0]!.block.msgIndex) / Math.max(1, args.totalMessages)),
-        );
-        downstreamCachedTokens += Math.round(nonToolPromptTokens * spanRatio);
+      if (maxBpMsg >= 0) {
+        horizonEndMsg = Math.max(horizonEndMsg, Math.min(args.totalMessages - 1, maxBpMsg));
       }
+    }
+    const effectiveTtlSec = Math.max(args.ttlSec ?? 0, coveringTtlSec) || undefined;
+    const epRates = effectiveTtlSec !== args.ttlSec
+      ? resolvePriceRates(args.model, { promptTokens: 0, ttlSec: effectiveTtlSec })
+      : rates;
+
+    if (!alreadySealed && args.sessionCacheCold !== true) {
+      let downstreamCachedTokens = 0;
+      if (args.msgTotalTokens && args.msgTotalTokens.length > 0) {
+        const limit = Math.min(args.msgTotalTokens.length - 1, horizonEndMsg);
+        for (let m = ep.checkpoint.block.msgIndex; m <= limit; m++) {
+          downstreamCachedTokens += args.msgTotalTokens[m] ?? 0;
+        }
+      } else {
+        for (const b of args.blocks) {
+          if (b.msgIndex >= ep.checkpoint.block.msgIndex && b.msgIndex <= horizonEndMsg) {
+            downstreamCachedTokens += blockTokens.get(b) ?? 0;
+          }
+        }
+        if (nonToolPromptTokens > 0 && args.totalMessages > 2) {
+          const spanRatio = Math.max(
+            0,
+            Math.min(1, (args.totalMessages - 2 - ep.predecessors[0]!.block.msgIndex) / Math.max(1, args.totalMessages)),
+          );
+          downstreamCachedTokens += Math.round(nonToolPromptTokens * spanRatio);
+        }
+      }
+      const isAutoCacheOpenAI =
+        !(args.cacheBreakpoints && args.cacheBreakpoints.length > 0) &&
+        args.ttlSec === undefined &&
+        isAutoCacheOpenAIModel(args.model);
+      const effectiveWriteRate = isAutoCacheOpenAI ? Math.min(epRates.write, 1) : epRates.write;
       const savedTok = rawTok - foldedTok;
-      const savedPerRead = savedTok * rates.read;
+      const savedPerRead = savedTok * epRates.read;
       const transitionCost =
-        foldedTok * rates.write -
-        rawTok * rates.read +
-        downstreamCachedTokens * (rates.write - rates.read);
+        foldedTok * effectiveWriteRate -
+        rawTok * epRates.read +
+        downstreamCachedTokens * (effectiveWriteRate - epRates.read);
       const paybackReads =
         savedPerRead > 0 ? Math.ceil(Math.max(0, transitionCost) / savedPerRead) : Infinity;
 
@@ -2623,20 +2708,25 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
         collapsedActualTokens: foldedTok,
         downstreamCachedTokens,
         expectedOutputTokens: expectedOut,
-        ttlSec: args.ttlSec,
+        ttlSec: effectiveTtlSec,
       });
       const cliffWins = Boolean(cliff?.crossesCliff && cliff.netSingleTurnUsd > 0);
-      const effectiveMaxPayback = computeHorizonPaybackLimit({
+      if (coveringTtlSec >= 3600 && savedTok < 2000 && !cliffWins) continue;
+      let effectiveMaxPayback = computeHorizonPaybackLimit({
         turnsObserved: Math.max(1, Math.floor(args.totalMessages / 2)),
         baseMaxPayback: 12,
         downstreamCachedTokens,
       });
+      if (coveringTtlSec >= 3600 && downstreamCachedTokens >= 20_000) {
+        effectiveMaxPayback = Math.min(effectiveMaxPayback, 8);
+      }
       if (paybackReads > effectiveMaxPayback && !cliffWins) continue;
     }
 
-    // Archive raw pages into ContextPageStore ONLY after payback gate passes,
-    // and emit only actually-resident page IDs in the certificate.
-    if (args.store) {
+    // Archive raw pages into ContextPageStore ONLY after payback gate passes.
+    // On replay of an already-sealed episode, preserve the frozen certificate bytes verbatim
+    // so page eviction never changes replayed prefix bytes.
+    if (args.store && !frozenCertificate) {
       const residentIds: string[] = [];
       for (const idx of replaceableIndices) {
         const pred = ep.predecessors[idx]!;
@@ -2652,7 +2742,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
           residentIds.push(stored.id);
         }
       }
-      if (residentIds.length !== pgIds.length) {
+      if (!alreadySealed && residentIds.length !== pgIds.length) {
         certificate = formatCertificate(residentIds);
         if (certificate.length >= ep.predecessors[certIdx]!.raw.length) continue;
         foldedChars = certificate.length + Math.max(0, replaceableIndices.length - 1) * continuationMarker.length;
@@ -2671,13 +2761,20 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       }
     }
 
-    if (stickyMarkovEpisodes.size >= STICKY_EPISODE_CAP && !stickyMarkovEpisodes.has(stickyKey)) {
+    if (stickyMarkovEpisodes.has(stickyKey)) {
+      stickyMarkovEpisodes.delete(stickyKey);
+    } else if (stickyMarkovEpisodes.size >= STICKY_EPISODE_CAP) {
       const oldest = stickyMarkovEpisodes.values().next().value;
-      if (oldest !== undefined) stickyMarkovEpisodes.delete(oldest);
+      if (oldest !== undefined) {
+        stickyMarkovEpisodes.delete(oldest);
+        stickyMarkovCertificates.delete(oldest);
+      }
     }
     stickyMarkovEpisodes.add(stickyKey);
-    stickyMarkovSessions.add(sessionKey);
-    recordFoldedEpisodeId(args.sessionKey, stickyKey);
+    stickyMarkovCertificates.delete(stickyKey);
+    stickyMarkovCertificates.set(stickyKey, certificate);
+    addStickyMarkovSession(sessionKey);
+    recordFoldedEpisodeId(args.sessionKey, stickyKey, certificate);
 
     const savedChars = rawChars - foldedChars;
     const savedTokens = rawTok - foldedTok;
@@ -3165,7 +3262,7 @@ export function pruneLowDensityBlob(
   const addCoverage = (ids: Int32Array): void => {
     for (let k = 0; k < ids.length; k++) {
       const id = ids[k]!;
-      covered[id] = (covered[id]! + 1) & 0xffff;
+      if (covered[id]! < 0xffff) covered[id]! += 1;
     }
   };
 
@@ -3196,7 +3293,8 @@ export function pruneLowDensityBlob(
     readonly chars: number;
     readonly structScore: number;
     readonly uniqIds: Int32Array;
-    gain: number;
+    rawGain: number;
+    density: number;
     evalVersion: number;
   }
 
@@ -3232,21 +3330,23 @@ export function pruneLowDensityBlob(
 
     const uniqIds = uniqLineWordIds[i]!;
     const initialGain = computeGain(structScore, uniqIds);
+    const chars = line.length + 1;
     lineScores[i] = initialGain;
     if (initialGain > -5) {
       heap.push({
         idx: i,
-        chars: line.length + 1,
+        chars,
         structScore,
         uniqIds,
-        gain: initialGain,
+        rawGain: initialGain,
+        density: initialGain / Math.max(16, chars),
         evalVersion: 0,
       });
     }
   }
 
   const higherPriority = (a: HeapItem, b: HeapItem): boolean =>
-    a.gain > b.gain || (a.gain === b.gain && a.idx < b.idx);
+    a.density > b.density || (a.density === b.density && a.idx < b.idx);
 
   const siftDown = (arr: HeapItem[], startIdx: number): void => {
     let idx = startIdx;
@@ -3302,13 +3402,15 @@ export function pruneLowDensityBlob(
 
   while (heap.length > 0 && keptChars < targetKeepChars) {
     const top = heapPop(heap);
-    let curGain = top.gain;
+    let curGain = top.rawGain;
+    let curDensity = top.density;
     if (top.evalVersion !== acceptedVersion && reevals < maxReevals) {
       curGain = computeGain(top.structScore, top.uniqIds);
+      curDensity = curGain / Math.max(16, top.chars);
       top.evalVersion = acceptedVersion;
       reevals += 1;
     }
-    const isMax = heap.length === 0 || curGain >= heap[0]!.gain - 1e-6;
+    const isMax = heap.length === 0 || curDensity >= heap[0]!.density - 1e-9;
     if (isMax || reevals >= maxReevals) {
       if (curGain <= -5) {
         if (isMax) break;
@@ -3320,7 +3422,8 @@ export function pruneLowDensityBlob(
       addCoverage(top.uniqIds);
       acceptedVersion += 1;
     } else {
-      top.gain = curGain;
+      top.rawGain = curGain;
+      top.density = curDensity;
       heapPush(heap, top);
     }
   }

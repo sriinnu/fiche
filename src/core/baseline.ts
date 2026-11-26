@@ -249,3 +249,25 @@ export function computeActualInputEffWithCacheTier(
     + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
     + cr * readRate;
 }
+
+/**
+ * Validate that an Anthropic `count_tokens` baseline probe represents a usable
+ * full-request baseline rather than a rejected/partial probe or a server-side
+ * `thread_continue` delta probe (which only probes the incremental delta while
+ * Anthropic expands the full cached thread in usage).
+ */
+export function isUsableAnthropicBaselineProbe(args: {
+  baselineTokens: number | undefined;
+  probeStatus: string | undefined;
+  threadContinue?: boolean;
+  cacheReadTokens: number;
+}): boolean {
+  const { baselineTokens, probeStatus, threadContinue, cacheReadTokens } = args;
+  if (baselineTokens === undefined || !Number.isFinite(baselineTokens) || !(baselineTokens > 0)) {
+    return false;
+  }
+  if (threadContinue === true) return false;
+  if (probeStatus !== undefined && probeStatus !== 'ok') return false;
+  if (cacheReadTokens > 2000 && baselineTokens < cacheReadTokens * 0.5) return false;
+  return true;
+}

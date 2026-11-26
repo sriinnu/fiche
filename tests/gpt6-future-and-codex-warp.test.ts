@@ -222,8 +222,42 @@ describe('Homebrew tap automation and release-macos packaging', () => {
     expect(dryRun.stdout).toContain('https://registry.npmjs.org/@sriinnu/fiche/-/fiche-0.19.0.tgz');
     expect(dryRun.stdout).toContain('FicheBar-#{version}.zip');
 
+    for (const shRel of ['apps/macos-bar/bundle.sh', 'apps/macos-bar/sign-app.sh', 'apps/macos-bar/notarize-app.sh']) {
+      const shCheck = spawnSync('bash', ['-n', resolve(repoRoot, shRel)], { encoding: 'utf8' });
+      expect(shCheck.status, `${shRel}: ${shCheck.stderr}`).toBe(0);
+    }
+
+    const buildNum = readFileSync(resolve(repoRoot, 'apps/macos-bar/BUILD_NUMBER'), 'utf8').trim();
+    expect(buildNum).toMatch(/^[1-9][0-9]*$/);
+    expect(Number.parseInt(buildNum, 10)).toBeGreaterThanOrEqual(3);
+    const bundleSh = readFileSync(resolve(repoRoot, 'apps/macos-bar/bundle.sh'), 'utf8');
+    expect(bundleSh).toContain('BUILD_NUMBER');
+    expect(bundleSh).toContain('CFBundleShortVersionString must match semver');
+    expect(bundleSh).toContain('CFBundleVersion must be a positive integer');
+
+    const badVersion = spawnSync(
+      'bash',
+      [resolve(repoRoot, 'apps/macos-bar/bundle.sh'), '--unsigned', '--no-install'],
+      {
+        encoding: 'utf8',
+        env: { ...process.env, CFBundleVersion: '0' },
+      },
+    );
+    expect(badVersion.status).toBe(1);
+    expect(badVersion.stderr).toContain('CFBundleVersion must be a positive integer');
+
+    const signSh = readFileSync(resolve(repoRoot, 'apps/macos-bar/sign-app.sh'), 'utf8');
+    expect(signSh).toContain('Contents/MacOS/');
+    expect(signSh).toContain('Authority=Developer ID Application:');
+
+    const notarizeSh = readFileSync(resolve(repoRoot, 'apps/macos-bar/notarize-app.sh'), 'utf8');
+    expect(notarizeSh).toContain('--output-format json');
+    expect(notarizeSh).toContain('xcrun notarytool log');
+
     const releaseYml = readFileSync(resolve(repoRoot, '.github/workflows/release.yml'), 'utf8');
+    expect(releaseYml).toContain('build-macos:');
     expect(releaseYml).toContain('release-macos:');
+    expect(releaseYml).toContain('notarize-app.sh');
     expect(releaseYml).toContain('FicheBar-${VERSION}.zip');
   });
 });

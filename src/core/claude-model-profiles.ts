@@ -20,8 +20,9 @@ import type { GptModelProfile, GptRenderStyle } from './gpt-model-profiles.js';
  *  tier downscale; `visionTier` below is the only knob that varies by release. */
 export const CLAUDE_PROFILE: GptModelProfile = {
   vision: { regime: 'patch28' },
-  // Anthropic list prices: cache read $0.10 / input $1.00; output $5.00 / input.
+  // Anthropic list prices: cache read $0.10 / 5m write $1.25 / input $1.00; output $5.00 / input.
   cacheReadRate: 0.1,
+  cacheWriteRate: 1.25,
   outputRate: 5,
   stripCols: ANTHROPIC_STRIP_COLS,
   maxHeightPx: ANTHROPIC_MAX_HEIGHT_PX,
@@ -126,7 +127,7 @@ export const CLAUDE_LEGACY_SPACED_PROFILE: GptModelProfile = {
  * trailing date stamp (`claude-fable-5-20260601`) from reading as a minor.
  */
 export function isBareDenseFable(model: string): boolean {
-  const v = /fable-(\d+)(?:-(\d{1,2})(?!\d))?/.exec(model.toLowerCase());
+  const v = /fable-(\d+)(?:[-.](\d{1,2})(?!\d))?/.exec(model.toLowerCase());
   return v !== null && Number(v[1]) === 5 && Number(v[2] ?? '0') === 0;
 }
 

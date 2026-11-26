@@ -1,5 +1,6 @@
 import { createServer as createNodeHttpServer } from 'node:http';
-import { afterEach, describe, expect, it } from 'vitest';
+import * as net from 'node:net';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getGlobalMmuStore, resetGlobalMmuStore } from '../src/core/context-mmu.js';
 import {
   MCP_MAX_BYTES,
@@ -25,8 +26,25 @@ function rpc(method: string, params?: unknown, id: number | null = 1) {
   return { jsonrpc: '2.0', id, method, params };
 }
 
+async function reserveUnusedPort(): Promise<number> {
+  const srv = net.createServer();
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()));
+  const port = (srv.address() as net.AddressInfo).port;
+  await new Promise<void>((resolve) => srv.close(() => resolve()));
+  return port;
+}
+
 describe('MCP server', () => {
+  let prevPort: string | undefined;
+
+  beforeEach(async () => {
+    prevPort = process.env.PORT;
+    process.env.PORT = String(await reserveUnusedPort());
+  });
+
   afterEach(() => {
+    if (prevPort === undefined) delete process.env.PORT;
+    else process.env.PORT = prevPort;
     resetMcpStatsForTests();
     resetGlobalMmuStore();
   });

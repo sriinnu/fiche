@@ -118,41 +118,45 @@ const PINNED_SKILLS_MAX = 32;
 /** Maximum persisted folded Markovian episode IDs per session. */
 const FOLDED_EPISODE_IDS_MAX = 256;
 
-interface SessionRecord {
-  /** Wall-clock ms of the last request we saw for this session. */
+/** Maximum per-session liveness scopes retained (e.g. opus vs haiku vs systemSha8). */
+const LIVENESS_SCOPES_MAX = 16;
+
+export type OpticalHistoryPolicy = 'hybrid' | 'full';
+
+export interface SessionLivenessScopeOpts {
+  readonly nowMs?: number;
+  readonly model?: string;
+  readonly modelFamily?: string;
+  readonly systemSha8?: string;
+  readonly scope?: string;
+}
+
+interface ScopedLivenessRecord {
   lastSeenMs: number;
-  /** Coarsest freeze step this session has been rendered at, in messages. */
   freezeStep: number;
-  /** Set when a request for this session failed in a way that leaves no cache. */
   cacheDead: boolean;
-  /**
-   * Transient in-memory flag set when `noteHistoryRequest()` returned `cold: true`
-   * on the current request (meaning a fresh repack is in flight that may populate
-   * an implicit upstream cache). Never persisted.
-   */
-  justRepacked?: boolean;
-  /**
-   * Did the provider's own accounting show a cache for this session on the last
-   * response — either read from it, or written to it? `undefined` = not observed
-   * yet. This is the server's answer to a question the clock can only guess at.
-   */
+  repackInFlightCount?: number;
+  repackGeneration?: number;
   lastCacheAlive?: boolean;
-  /**
-   * Has this session EVER shown a cache? Absence of caching is not the same fact
-   * as a cache that died: a request carrying no `cache_control` marker reports
-   * both counters zero forever, and repacking such a session every turn would
-   * re-cut the grid over and over for a cache that never existed. Only a session
-   * that once had one, and then lost it, has provably free room to re-cut.
-   */
   everCacheAlive?: boolean;
+  opticalHistoryPolicy?: OpticalHistoryPolicy;
+}
+
+interface SessionRecord extends ScopedLivenessRecord {
+  primaryScope?: string;
+  livenessScopes?: Record<string, ScopedLivenessRecord>;
   /** Sticky sealed LSM/ACDC text epoch keys (head-retained up to 512 keys). */
   sealedEpochKeys?: string[];
+  /** Sticky sealed Stage-2 text hygiene & frontier optical slot keys (head-retained up to 512 keys). */
+  sealedStage2SlotKeys?: string[];
   /** Session-pinned skill names (capped to 32 names) for cache prefix stability. */
   pinnedSkills?: string[];
   /** Hash of the skill catalog under which `pinnedSkills` were chosen. */
   pinnedSkillCatalogHash?: string;
   /** Persisted causal episode IDs folded for this session. */
   foldedMarkovEpisodeIds?: string[];
+  /** Frozen certificate bytes keyed by folded episode ID so page eviction never mutates replay. */
+  foldedMarkovCertificates?: Record<string, string>;
 }
 
 const sessions = new Map<string, SessionRecord>();
@@ -318,6 +322,8 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   if (isBool(e.everCacheAlive)) rec.everCacheAlive = e.everCacheAlive;
   const sealed = sanitizeStringArray(e.sealedEpochKeys, SEALED_EPOCH_KEYS_MAX, false);
   if (sealed) rec.sealedEpochKeys = sealed;
+  const stage2Sealed = sanitizeStringArray(e.sealedStage2SlotKeys, SEALED_EPOCH_KEYS_MAX, false);
+  if (stage2Sealed) rec.sealedStage2SlotKeys = stage2Sealed;
   const skills = sanitizeStringArray(e.pinnedSkills, PINNED_SKILLS_MAX, false);
   if (skills) rec.pinnedSkills = skills;
   if (typeof e.pinnedSkillCatalogHash === 'string' && e.pinnedSkillCatalogHash !== '') {
@@ -325,6 +331,51 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   }
   const folded = sanitizeStringArray(e.foldedMarkovEpisodeIds, FOLDED_EPISODE_IDS_MAX, false);
   if (folded) rec.foldedMarkovEpisodeIds = folded;
+  if (e.foldedMarkovCertificates && typeof e.foldedMarkovCertificates === 'object' && !Array.isArray(e.foldedMarkovCertificates)) {
+    const certs: Record<string, string> = {};
+    let count = 0;
+    for (const [k, v] of Object.entries(e.foldedMarkovCertificates)) {
+      if (typeof k === 'string' && k && typeof v === 'string' && v && count < FOLDED_EPISODE_IDS_MAX) {
+        certs[k] = v;
+        count++;
+      }
+    }
+    if (count > 0) rec.foldedMarkovCertificates = certs;
+  }
+  if (e.opticalHistoryPolicy === 'hybrid' || e.opticalHistoryPolicy === 'full') {
+    rec.opticalHistoryPolicy = e.opticalHistoryPolicy;
+  }
+  if (typeof e.primaryScope === 'string' && e.primaryScope) {
+    rec.primaryScope = e.primaryScope;
+  }
+  if (e.livenessScopes && typeof e.livenessScopes === 'object' && !Array.isArray(e.livenessScopes)) {
+    const scopes: Record<string, ScopedLivenessRecord> = {};
+    let sc = 0;
+    for (const [sk, rawScope] of Object.entries(e.livenessScopes)) {
+      if (sc >= LIVENESS_SCOPES_MAX || typeof sk !== 'string' || !sk || !rawScope || typeof rawScope !== 'object') continue;
+      const sr = rawScope as Partial<ScopedLivenessRecord>;
+      if (
+        typeof sr.lastSeenMs !== 'number' || !Number.isFinite(sr.lastSeenMs) || sr.lastSeenMs < 0 ||
+        typeof sr.freezeStep !== 'number' || !Number.isFinite(sr.freezeStep) || sr.freezeStep < 0 ||
+        !isBool(sr.cacheDead)
+      ) {
+        continue;
+      }
+      const cleanScope: ScopedLivenessRecord = {
+        lastSeenMs: sr.lastSeenMs,
+        freezeStep: sr.freezeStep,
+        cacheDead: sr.cacheDead,
+      };
+      if (isBool(sr.lastCacheAlive)) cleanScope.lastCacheAlive = sr.lastCacheAlive;
+      if (isBool(sr.everCacheAlive)) cleanScope.everCacheAlive = sr.everCacheAlive;
+      if (sr.opticalHistoryPolicy === 'hybrid' || sr.opticalHistoryPolicy === 'full') {
+        cleanScope.opticalHistoryPolicy = sr.opticalHistoryPolicy;
+      }
+      scopes[sk] = cleanScope;
+      sc++;
+    }
+    if (sc > 0) rec.livenessScopes = scopes;
+  }
   return rec;
 }
 
@@ -341,8 +392,30 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
     };
     if (rec.lastCacheAlive !== undefined) item.lastCacheAlive = rec.lastCacheAlive;
     if (rec.everCacheAlive !== undefined) item.everCacheAlive = rec.everCacheAlive;
+    if (rec.opticalHistoryPolicy !== undefined) item.opticalHistoryPolicy = rec.opticalHistoryPolicy;
+    if (rec.primaryScope !== undefined) item.primaryScope = rec.primaryScope;
+    if (rec.livenessScopes) {
+      const persistedScopes: Record<string, ScopedLivenessRecord> = {};
+      let sc = 0;
+      for (const [sk, sr] of Object.entries(rec.livenessScopes)) {
+        if (sc >= LIVENESS_SCOPES_MAX) break;
+        persistedScopes[sk] = {
+          lastSeenMs: sr.lastSeenMs,
+          freezeStep: sr.freezeStep,
+          cacheDead: sr.cacheDead,
+          ...(sr.lastCacheAlive !== undefined ? { lastCacheAlive: sr.lastCacheAlive } : {}),
+          ...(sr.everCacheAlive !== undefined ? { everCacheAlive: sr.everCacheAlive } : {}),
+          ...(sr.opticalHistoryPolicy !== undefined ? { opticalHistoryPolicy: sr.opticalHistoryPolicy } : {}),
+        };
+        sc++;
+      }
+      if (sc > 0) item.livenessScopes = persistedScopes;
+    }
     if (rec.sealedEpochKeys && rec.sealedEpochKeys.length > 0) {
       item.sealedEpochKeys = rec.sealedEpochKeys.slice(0, SEALED_EPOCH_KEYS_MAX);
+    }
+    if (rec.sealedStage2SlotKeys && rec.sealedStage2SlotKeys.length > 0) {
+      item.sealedStage2SlotKeys = rec.sealedStage2SlotKeys.slice(0, SEALED_EPOCH_KEYS_MAX);
     }
     if (rec.pinnedSkills && rec.pinnedSkills.length > 0) {
       item.pinnedSkills = rec.pinnedSkills.slice(0, PINNED_SKILLS_MAX);
@@ -352,6 +425,16 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
     }
     if (rec.foldedMarkovEpisodeIds && rec.foldedMarkovEpisodeIds.length > 0) {
       item.foldedMarkovEpisodeIds = rec.foldedMarkovEpisodeIds.slice(0, FOLDED_EPISODE_IDS_MAX);
+    }
+    if (rec.foldedMarkovCertificates) {
+      const certs: Record<string, string> = {};
+      let count = 0;
+      for (const [k, v] of Object.entries(rec.foldedMarkovCertificates)) {
+        if (count >= FOLDED_EPISODE_IDS_MAX) break;
+        certs[k] = v;
+        count++;
+      }
+      if (count > 0) item.foldedMarkovCertificates = certs;
     }
     out.push(item);
   }
@@ -403,6 +486,78 @@ export interface HistorySessionState {
 /** Neutral answer for callers without a session identity (no fingerprint yet). */
 const UNKNOWN_STATE: HistorySessionState = { cold: false, minFreezeStep: 0 };
 
+/** Normalize a model ID to its liveness family so auxiliary Haiku calls never clobber main-thread liveness. */
+export function normalizeSessionModelFamily(model: string | undefined): string {
+  const raw = (model ?? '').trim().toLowerCase().replace(/\[[^\]]*\]/g, '');
+  if (!raw) return '';
+  const tail = raw.includes('/') ? raw.slice(raw.lastIndexOf('/') + 1) : raw;
+  const bare = tail.split('@')[0]!;
+  if (bare.includes('claude') || bare.includes('anthropic')) {
+    if (bare.includes('haiku')) return 'claude-haiku';
+    if (bare.includes('opus')) return 'claude-opus';
+    if (bare.includes('sonnet')) return 'claude-sonnet';
+    if (bare.includes('fable')) return 'claude-fable';
+    return 'claude';
+  }
+  return bare.replace(/-\d{8}$/, '').replace(/-\d{4}-\d{2}-\d{2}$/, '');
+}
+
+function resolveScopeKey(opts?: SessionLivenessScopeOpts): string | undefined {
+  if (!opts) return undefined;
+  if (opts.scope) return opts.scope;
+  const family = opts.modelFamily ?? (opts.model ? normalizeSessionModelFamily(opts.model) : '');
+  if (family && opts.systemSha8) return `${family}:${opts.systemSha8}`;
+  if (family) return family;
+  if (opts.systemSha8) return opts.systemSha8;
+  return undefined;
+}
+
+function isAuxiliaryScope(scope: string | undefined): boolean {
+  return scope !== undefined && (scope === 'claude-haiku' || scope.startsWith('claude-haiku:'));
+}
+
+function getOrCreateScopeRecord(rec: SessionRecord, scope: string): ScopedLivenessRecord {
+  if (!rec.livenessScopes) rec.livenessScopes = {};
+  const existing = rec.livenessScopes[scope];
+  if (existing) return existing;
+  const keys = Object.keys(rec.livenessScopes);
+  if (keys.length >= LIVENESS_SCOPES_MAX) {
+    let oldestKey = keys[0];
+    for (const k of keys) {
+      if (k !== rec.primaryScope && (oldestKey === rec.primaryScope || rec.livenessScopes[k]!.lastSeenMs < rec.livenessScopes[oldestKey!]!.lastSeenMs)) {
+        oldestKey = k;
+      }
+    }
+    if (oldestKey !== undefined && oldestKey !== rec.primaryScope) {
+      delete rec.livenessScopes[oldestKey];
+    }
+  }
+  const fresh: ScopedLivenessRecord = { lastSeenMs: 0, freezeStep: 0, cacheDead: false };
+  rec.livenessScopes[scope] = fresh;
+  return fresh;
+}
+
+function computeCold(target: ScopedLivenessRecord, nowMs: number): boolean {
+  const known = target.lastSeenMs > 0;
+  const idleMs = nowMs - target.lastSeenMs;
+  const serverSaysAlive = target.lastCacheAlive === true;
+  const serverSaysGone = target.lastCacheAlive === false && target.everCacheAlive === true;
+  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
+  return target.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
+}
+
+function applyHistoryRequestToTarget(target: ScopedLivenessRecord, nowMs: number): HistorySessionState {
+  const cold = computeCold(target, nowMs);
+  target.lastSeenMs = nowMs;
+  target.cacheDead = false; // consumed: this request gets the repack
+  if (cold) {
+    target.repackInFlightCount = (target.repackInFlightCount ?? 0) + 1;
+    target.repackGeneration = (target.repackGeneration ?? 0) + 1;
+    target.lastCacheAlive = undefined;
+  }
+  return { cold, minFreezeStep: target.freezeStep };
+}
+
 /**
  * Record a request for `sessionKey` and report what the history collapse may
  * assume about the upstream cache. Call once per transformed request, BEFORE the
@@ -413,46 +568,32 @@ const UNKNOWN_STATE: HistorySessionState = { cold: false, minFreezeStep: 0 };
  */
 export function noteHistoryRequest(
   sessionKey: string | undefined,
-  nowMs: number = Date.now(),
+  nowMsOrOpts: number | SessionLivenessScopeOpts = Date.now(),
 ): HistorySessionState {
   if (!sessionKey) return UNKNOWN_STATE;
+  const nowMs = typeof nowMsOrOpts === 'number' ? nowMsOrOpts : (nowMsOrOpts.nowMs ?? Date.now());
+  const scope = typeof nowMsOrOpts === 'number' ? undefined : resolveScopeKey(nowMsOrOpts);
   const rec = touch(sessionKey);
-  const known = rec.lastSeenMs > 0;
-  const idleMs = nowMs - rec.lastSeenMs;
 
-  // Server truth beats the clock. If the provider's accounting showed a cache on
-  // the last response — read from OR written to — one exists now, and re-cutting
-  // the grid would throw it away.
-  //
-  // The clock alone was wrong most of the time it mattered. Measured over 143
-  // gaps on a production host: past a 5.5-minute gap the cache was still warm in
-  // 66% of cases, past 15 minutes in 40%, past an hour in 13%. One session was
-  // repacked three times in an hour on ~10-minute gaps, each time re-keying the
-  // whole prefix — and each of those turns had just WRITTEN a cache
-  // (create 60-98k, read 0), which the clock could not see and this can.
-  const serverSaysAlive = rec.lastCacheAlive === true;
-  // "Gone" requires that one existed. A session whose counters were always zero
-  // is not a dead cache, it is a session that never had one — repacking it every
-  // turn would churn the grid forever for nothing to reclaim.
-  const serverSaysGone = rec.lastCacheAlive === false && rec.everCacheAlive === true;
-
-  // Backstop for the case the server cannot answer: no observation yet, or an
-  // observation old enough that warmth is empirically rare (13% past an hour).
-  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
-
-  const cold = rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
-  rec.lastSeenMs = nowMs;
-  rec.cacheDead = false; // consumed: this request gets the repack
-  if (cold) {
-    // A fresh repack is in flight that may populate an implicit cache; clear any
-    // stale dead-cache bit so the very next turn does not thrash prematurely.
-    rec.justRepacked = true;
-    rec.lastCacheAlive = undefined;
-  } else {
-    rec.justRepacked = false;
+  if (scope) {
+    if (!rec.primaryScope && !isAuxiliaryScope(scope)) {
+      rec.primaryScope = scope;
+    }
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    const result = applyHistoryRequestToTarget(scoped, nowMs);
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      applyHistoryRequestToTarget(rec, nowMs);
+    } else if (rec.lastSeenMs <= 0) {
+      // Keep record non-stale for persistence without triggering primary coldness.
+      rec.lastSeenMs = nowMs;
+    }
+    scheduleSave();
+    return result;
   }
+
+  const result = applyHistoryRequestToTarget(rec, nowMs);
   scheduleSave();
-  return { cold, minFreezeStep: rec.freezeStep };
+  return result;
 }
 
 /**
@@ -461,17 +602,68 @@ export function noteHistoryRequest(
  */
 export function isSessionCacheCold(
   sessionKey: string | undefined,
-  nowMs: number = Date.now(),
+  nowMsOrOpts: number | SessionLivenessScopeOpts = Date.now(),
 ): boolean {
   if (!sessionKey) return false;
   const rec = sessions.get(sessionKey);
   if (!rec) return false;
-  const known = rec.lastSeenMs > 0;
-  const idleMs = nowMs - rec.lastSeenMs;
-  const serverSaysAlive = rec.lastCacheAlive === true;
-  const serverSaysGone = rec.lastCacheAlive === false && rec.everCacheAlive === true;
-  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
-  return rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
+  const nowMs = typeof nowMsOrOpts === 'number' ? nowMsOrOpts : (nowMsOrOpts.nowMs ?? Date.now());
+  const scope = typeof nowMsOrOpts === 'number' ? undefined : resolveScopeKey(nowMsOrOpts);
+  if (scope) {
+    const scoped = rec.livenessScopes?.[scope];
+    if (scoped) return computeCold(scoped, nowMs);
+    if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+      return false;
+    }
+  }
+  return computeCold(rec, nowMs);
+}
+
+export function getPinnedOpticalHistoryPolicy(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): OpticalHistoryPolicy | undefined {
+  if (!sessionKey) return undefined;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return undefined;
+  const scope = resolveScopeKey(opts);
+  if (scope && rec.livenessScopes?.[scope]?.opticalHistoryPolicy !== undefined) {
+    return rec.livenessScopes[scope]!.opticalHistoryPolicy;
+  }
+  if (scope && isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+    return undefined;
+  }
+  return rec.opticalHistoryPolicy;
+}
+
+export function setPinnedOpticalHistoryPolicy(
+  sessionKey: string | undefined,
+  policy: OpticalHistoryPolicy,
+  opts?: SessionLivenessScopeOpts,
+): void {
+  if (!sessionKey) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    if (scoped.lastSeenMs <= 0) scoped.lastSeenMs = rec.lastSeenMs;
+    if (scoped.opticalHistoryPolicy !== policy) {
+      scoped.opticalHistoryPolicy = policy;
+      scheduleSave();
+    }
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      if (rec.opticalHistoryPolicy !== policy) {
+        rec.opticalHistoryPolicy = policy;
+        scheduleSave();
+      }
+    }
+    return;
+  }
+  if (rec.opticalHistoryPolicy !== policy) {
+    rec.opticalHistoryPolicy = policy;
+    scheduleSave();
+  }
 }
 
 export function recordSealedEpochKey(
@@ -501,22 +693,70 @@ export function hasSealedEpochKey(
   return Boolean(rec?.sealedEpochKeys?.includes(epochKey));
 }
 
+/**
+ * Record a Stage-2 text-hygiene or hybrid optical slot seal key (head-retaining
+ * cap 512) so any compression performed at the uncached frontier replays
+ * bit-identically once downstream cache_control breakpoints cover that slot.
+ */
+export function recordStage2SealKey(
+  sessionKey: string | undefined,
+  slotKey: string,
+): void {
+  if (!sessionKey || !slotKey) return;
+  const rec = touch(sessionKey);
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  if (!rec.sealedStage2SlotKeys) {
+    rec.sealedStage2SlotKeys = [slotKey];
+    scheduleSave();
+    return;
+  }
+  if (rec.sealedStage2SlotKeys.includes(slotKey)) return;
+  if (rec.sealedStage2SlotKeys.length >= SEALED_EPOCH_KEYS_MAX) return;
+  rec.sealedStage2SlotKeys.push(slotKey);
+  scheduleSave();
+}
+
+export function hasStage2SealKey(
+  sessionKey: string | undefined,
+  slotKey: string,
+): boolean {
+  if (!sessionKey || !slotKey) return false;
+  const rec = sessions.get(sessionKey);
+  return Boolean(rec?.sealedStage2SlotKeys?.includes(slotKey));
+}
+
 export function recordFoldedEpisodeId(
   sessionKey: string | undefined,
   episodeId: string,
+  certificate?: string,
 ): void {
   if (!sessionKey || !episodeId) return;
   const rec = touch(sessionKey);
   if (rec.lastSeenMs <= 0) rec.lastSeenMs = Date.now();
+  let updated = false;
   if (!rec.foldedMarkovEpisodeIds) {
     rec.foldedMarkovEpisodeIds = [episodeId];
-    scheduleSave();
-    return;
+    updated = true;
+  } else if (!rec.foldedMarkovEpisodeIds.includes(episodeId) && rec.foldedMarkovEpisodeIds.length < FOLDED_EPISODE_IDS_MAX) {
+    rec.foldedMarkovEpisodeIds.push(episodeId);
+    updated = true;
   }
-  if (rec.foldedMarkovEpisodeIds.includes(episodeId)) return;
-  if (rec.foldedMarkovEpisodeIds.length >= FOLDED_EPISODE_IDS_MAX) return;
-  rec.foldedMarkovEpisodeIds.push(episodeId);
-  scheduleSave();
+  if (certificate) {
+    if (!rec.foldedMarkovCertificates) rec.foldedMarkovCertificates = {};
+    if (rec.foldedMarkovCertificates[episodeId] !== certificate && Object.keys(rec.foldedMarkovCertificates).length < FOLDED_EPISODE_IDS_MAX) {
+      rec.foldedMarkovCertificates[episodeId] = certificate;
+      updated = true;
+    }
+  }
+  if (updated) scheduleSave();
+}
+
+export function getFoldedEpisodeCertificate(
+  sessionKey: string | undefined,
+  episodeId: string,
+): string | undefined {
+  if (!sessionKey || !episodeId) return undefined;
+  return sessions.get(sessionKey)?.foldedMarkovCertificates?.[episodeId];
 }
 
 export function hasFoldedEpisodeId(
@@ -588,27 +828,49 @@ export function setPinnedSessionSkills(
  * (`cacheCreateTokens === undefined`), where a cold miss on that repack turn is
  * expected while the provider populates its new implicit cache.
  */
+function applyCacheOutcomeToTarget(
+  target: ScopedLivenessRecord,
+  alive: boolean,
+  cacheCreateTokens: number | undefined,
+): void {
+  if (alive) {
+    target.cacheDead = false;
+    target.repackInFlightCount = 0;
+    target.lastCacheAlive = true;
+    target.everCacheAlive = true;
+  } else if ((target.repackInFlightCount ?? 0) > 0 && cacheCreateTokens === undefined) {
+    // Implicit-cache provider reporting expected zero-read on a freshly repacked turn.
+    target.repackInFlightCount = Math.max(0, (target.repackInFlightCount ?? 0) - 1);
+    target.lastCacheAlive = undefined;
+  } else {
+    target.repackInFlightCount = Math.max(0, (target.repackInFlightCount ?? 0) - 1);
+    target.lastCacheAlive = false;
+  }
+}
+
 export function noteCacheOutcome(
   sessionKey: string | undefined,
   cacheReadTokens: number | undefined,
   cacheCreateTokens: number | undefined,
+  opts?: SessionLivenessScopeOpts,
 ): void {
   if (!sessionKey) return;
   const rec = sessions.get(sessionKey);
   if (!rec) return; // never transformed under this key — nothing to attribute
   const alive = (cacheReadTokens ?? 0) > 0 || (cacheCreateTokens ?? 0) > 0;
-  if (alive) {
-    rec.cacheDead = false;
-    rec.justRepacked = false;
-    rec.lastCacheAlive = true;
-    rec.everCacheAlive = true;
-  } else if (rec.justRepacked && cacheCreateTokens === undefined) {
-    // Implicit-cache provider reporting expected zero-read on the freshly repacked turn.
-    rec.justRepacked = false;
-    rec.lastCacheAlive = undefined;
-  } else {
-    rec.justRepacked = false;
-    rec.lastCacheAlive = false;
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    applyCacheOutcomeToTarget(scoped, alive, cacheCreateTokens);
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      applyCacheOutcomeToTarget(rec, alive, cacheCreateTokens);
+    }
+    scheduleSave();
+    return;
+  }
+  applyCacheOutcomeToTarget(rec, alive, cacheCreateTokens);
+  if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
+    applyCacheOutcomeToTarget(rec.livenessScopes[rec.primaryScope]!, alive, cacheCreateTokens);
   }
   scheduleSave();
 }
@@ -620,13 +882,27 @@ export function noteCacheOutcome(
 export function recordFreezeStep(
   sessionKey: string | undefined,
   step: number | undefined,
+  opts?: SessionLivenessScopeOpts,
 ): void {
   if (!sessionKey || !step || !Number.isFinite(step) || step <= 0) return;
   const rec = touch(sessionKey);
-  if (step > rec.freezeStep) {
+  const scope = resolveScopeKey(opts);
+  let changed = false;
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    if (step > scoped.freezeStep) {
+      scoped.freezeStep = step;
+      changed = true;
+    }
+    if ((rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) && step > rec.freezeStep) {
+      rec.freezeStep = step;
+      changed = true;
+    }
+  } else if (step > rec.freezeStep) {
     rec.freezeStep = step;
-    scheduleSave();
+    changed = true;
   }
+  if (changed) scheduleSave();
 }
 
 /**
@@ -634,9 +910,22 @@ export function recordFreezeStep(
  * nothing was cached and the next one may re-cut the grid for density. Call on
  * the failure paths that leave no cache entry (oversized request → opaque 500).
  */
-export function markCacheDead(sessionKey: string | undefined): void {
+export function markCacheDead(sessionKey: string | undefined, opts?: SessionLivenessScopeOpts): void {
   if (!sessionKey) return;
-  touch(sessionKey).cacheDead = true;
+  const rec = touch(sessionKey);
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    scoped.cacheDead = true;
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      rec.cacheDead = true;
+    }
+  } else {
+    rec.cacheDead = true;
+    if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
+      rec.livenessScopes[rec.primaryScope]!.cacheDead = true;
+    }
+  }
   scheduleSave();
 }
 
@@ -692,9 +981,13 @@ export function peekSessionState(
   lastSeenMs: number;
   freezeStep: number;
   cacheDead: boolean;
+  repackInFlightCount?: number;
+  justRepacked: boolean;
   lastCacheAlive?: boolean;
   everCacheAlive?: boolean;
+  opticalHistoryPolicy?: OpticalHistoryPolicy;
   sealedEpochKeys?: string[];
+  sealedStage2SlotKeys?: string[];
   pinnedSkills?: string[];
   pinnedSkillCatalogHash?: string;
 } | undefined {
@@ -702,7 +995,9 @@ export function peekSessionState(
   if (!rec) return undefined;
   return {
     ...rec,
+    justRepacked: (rec.repackInFlightCount ?? 0) > 0,
     ...(rec.sealedEpochKeys ? { sealedEpochKeys: [...rec.sealedEpochKeys] } : {}),
+    ...(rec.sealedStage2SlotKeys ? { sealedStage2SlotKeys: [...rec.sealedStage2SlotKeys] } : {}),
     ...(rec.pinnedSkills ? { pinnedSkills: [...rec.pinnedSkills] } : {}),
   };
 }

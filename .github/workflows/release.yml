@@ -23,6 +23,8 @@ jobs:
     permissions:
       contents: read
       id-token: write # npm provenance / trusted publishing (stage-only, no NPM_TOKEN)
+    outputs:
+      commit_sha: ${{ steps.verify.outputs.commit_sha }}
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
@@ -53,6 +55,7 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Verify tag matches package version and default branch
+        id: verify
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -75,6 +78,7 @@ jobs:
             echo "tagged commit $TAGGED_COMMIT is not reachable from $DEFAULT_BRANCH" >&2
             exit 1
           fi
+          echo "commit_sha=${TAGGED_COMMIT}" >> "$GITHUB_OUTPUT"
 
       # The publish job can mint an npm OIDC token. Do not execute transitive
       # dependency lifecycle scripts in that privileged job; the repository's
@@ -124,35 +128,172 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --verify-tag --generate-notes
 
-  release-macos:
-    needs: release
+  build-macos:
+    needs: [publish, release]
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 25
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      sha256: ${{ steps.package.outputs.sha256 }}
+      artifact: ${{ steps.package.outputs.artifact }}
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          ref: ${{ needs.publish.outputs.commit_sha }}
           persist-credentials: false
 
-      - name: Build, sign, and zip FicheBar.app
+      - name: Build unsigned FicheBar.app
+        id: package
         run: |
+          set -euo pipefail
           VERSION="${TAG#v}"
-          CFBundleShortVersionString="${VERSION}" ./apps/macos-bar/bundle.sh --no-install
+          CFBundleShortVersionString="${VERSION}" ./apps/macos-bar/bundle.sh --unsigned --no-install
           APP_PATH="apps/macos-bar/build.noindex/FicheBar.app"
           test -x "${APP_PATH}/Contents/MacOS/FicheBar"
-          codesign --verify --deep --strict "${APP_PATH}"
-          ZIP_NAME="FicheBar-${VERSION}.zip"
-          ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "${ZIP_NAME}"
-          shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
-          echo "ZIP_NAME=${ZIP_NAME}" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/unsigned"
+          ZIP="${RUNNER_TEMP}/unsigned/FicheBar-unsigned.zip"
+          /usr/bin/ditto --norsrc -c -k --keepParent "${APP_PATH}" "${ZIP}"
+          echo "sha256=$(shasum -a 256 "${ZIP}" | cut -d' ' -f1)" >> "${GITHUB_OUTPUT}"
+          echo "artifact=FicheBar-unsigned-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_OUTPUT}"
 
-      - name: Upload FicheBar zip to GitHub Release
+      - name: Upload unsigned FicheBar artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.artifact }}
+          path: ${{ runner.temp }}/unsigned/FicheBar-unsigned.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  release-macos:
+    needs: [publish, release, build-macos]
+    environment: release # holds Developer ID & App Store Connect notarization secrets
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      UNSIGNED_SHA256: ${{ needs.build-macos.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.publish.outputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Check signing & notarization secrets
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_PASSWORD }}
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_DEVELOPER_ID_P12 APPLE_DEVELOPER_ID_PASSWORD \
+            APP_STORE_CONNECT_API_KEY_P8 APP_STORE_CONNECT_KEY_ID APP_STORE_CONNECT_ISSUER_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Required release secret ${name} is missing" >&2
+              exit 1
+            fi
+          done
+
+      - name: Download unsigned FicheBar artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build-macos.outputs.artifact }}
+          path: ${{ runner.temp }}/unsigned
+
+      - name: Verify and unpack unsigned bundle
+        run: |
+          set -euo pipefail
+          ZIP="${RUNNER_TEMP}/unsigned/FicheBar-unsigned.zip"
+          ACTUAL="$(shasum -a 256 "${ZIP}" | cut -d' ' -f1)"
+          [[ "${ACTUAL}" == "${UNSIGNED_SHA256}" ]] || {
+            echo "::error::unsigned artifact sha256 mismatch" >&2
+            exit 1
+          }
+          python3 -I - "${ZIP}" "FicheBar.app/" <<'PY'
+          import pathlib, stat, sys, zipfile
+          archive, prefix = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(archive) as z:
+              for info in z.infolist():
+                  name = info.filename
+                  path = pathlib.PurePosixPath(name)
+                  if path.is_absolute() or ".." in path.parts or not (name + "/").startswith(prefix):
+                      raise SystemExit(f"unexpected entry in unsigned artifact: {name!r}")
+                  if stat.S_ISLNK(info.external_attr >> 16):
+                      raise SystemExit(f"symlink entry rejected in unsigned artifact: {name!r}")
+          PY
+          WORK="${RUNNER_TEMP}/app"
+          rm -rf "${WORK}" && mkdir -p "${WORK}"
+          /usr/bin/ditto -x -k "${ZIP}" "${WORK}"
+          test -x "${WORK}/FicheBar.app/Contents/MacOS/FicheBar"
+          echo "APP_PATH=${WORK}/FicheBar.app" >> "${GITHUB_ENV}"
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="${RUNNER_TEMP}/fiche-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          CERT_PATH="$(mktemp "${RUNNER_TEMP}/fiche-cert.XXXXXX")"
+          trap 'rm -f "${CERT_PATH}"' EXIT
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          printf '%s' "${APPLE_DEVELOPER_ID_P12}" | base64 --decode > "${CERT_PATH}"
+          chmod 600 "${CERT_PATH}"
+          security import "${CERT_PATH}" -P "${APPLE_DEVELOPER_ID_PASSWORD}" \
+            -T /usr/bin/codesign -T /usr/bin/security -t cert -f pkcs12 -k "${KEYCHAIN_PATH}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}" login.keychain
+
+      - name: Developer ID sign FicheBar.app
+        run: ./apps/macos-bar/sign-app.sh "${APP_PATH}"
+
+      - name: Notarize, staple, and Gatekeeper-verify FicheBar.app
+        env:
+          APP_STORE_CONNECT_API_KEY_P8: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          API_KEY_PATH="$(mktemp "${RUNNER_TEMP}/fiche-api-key.XXXXXX")"
+          trap 'rm -f "${API_KEY_PATH}"' EXIT
+          API_KEY_CONTENT="${APP_STORE_CONNECT_API_KEY_P8//\\n/$'\n'}"
+          printf '%s' "${API_KEY_CONTENT}" > "${API_KEY_PATH}"
+          chmod 600 "${API_KEY_PATH}"
+          unset API_KEY_CONTENT
+          ./apps/macos-bar/notarize-app.sh "${APP_PATH}" \
+            --key "${API_KEY_PATH}" \
+            --key-id "${APP_STORE_CONNECT_KEY_ID}" \
+            --issuer "${APP_STORE_CONNECT_ISSUER_ID}"
+
+      - name: Package & upload signed notarized FicheBar zip
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release upload "$TAG" "$ZIP_NAME" "${ZIP_NAME}.sha256" --clobber
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          ZIP_NAME="FicheBar-${VERSION}.zip"
+          /usr/bin/ditto --norsrc -c -k --keepParent "${APP_PATH}" "${ZIP_NAME}"
+          shasum -a 256 "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+          gh release upload "${TAG}" "${ZIP_NAME}" "${ZIP_NAME}.sha256" --clobber
+
+      - name: Clean up temporary signing keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/fiche-signing.keychain-db"
+          if [[ -f "${KEYCHAIN_PATH}" ]]; then
+            security delete-keychain "${KEYCHAIN_PATH}" || rm -f "${KEYCHAIN_PATH}" || true
+          fi
+          security list-keychains -d user -s login.keychain || true

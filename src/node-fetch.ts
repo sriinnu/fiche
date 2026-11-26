@@ -61,40 +61,52 @@ function resolveBufferedBody(body: BodyInit): Uint8Array | string {
   throw new TypeError('Unsupported request body type for Node upstream fetch');
 }
 
-function createDecompressStream(contentEncoding: string): {
-  stream: Readable & NodeJS.ReadWriteStream;
-  decompressed: boolean;
-} | null {
-  const coding = contentEncoding.trim().toLowerCase();
-  if (!coding || coding === 'identity') return null;
+const MAX_RESPONSE_CODINGS = 2;
+
+function createSingleDecompressStream(coding: string): (Readable & NodeJS.ReadWriteStream) | null {
   if (coding === 'gzip' || coding === 'x-gzip') {
-    return {
-      stream: zlib.createGunzip({ flush: zlib.constants.Z_SYNC_FLUSH }),
-      decompressed: true,
-    };
+    return zlib.createGunzip({ flush: zlib.constants.Z_SYNC_FLUSH });
   }
   if (coding === 'deflate') {
-    return {
-      stream: zlib.createInflate({ flush: zlib.constants.Z_SYNC_FLUSH }),
-      decompressed: true,
-    };
+    return zlib.createInflate({ flush: zlib.constants.Z_SYNC_FLUSH });
   }
   if (coding === 'br') {
-    return {
-      stream: zlib.createBrotliDecompress({ flush: zlib.constants.BROTLI_OPERATION_FLUSH }),
-      decompressed: true,
-    };
+    return zlib.createBrotliDecompress({ flush: zlib.constants.BROTLI_OPERATION_FLUSH });
   }
   const createZstd = (zlib as unknown as {
     createZstdDecompress?: () => Readable & NodeJS.ReadWriteStream;
   }).createZstdDecompress;
   if (coding === 'zstd' && typeof createZstd === 'function') {
-    return {
-      stream: createZstd(),
-      decompressed: true,
-    };
+    return createZstd();
   }
   return null;
+}
+
+function parseContentEncodings(contentEncoding: string): string[] {
+  return contentEncoding
+    .split(',')
+    .map((c) => c.trim().toLowerCase())
+    .filter((c) => c !== '' && c !== 'identity');
+}
+
+function createDecompressStream(contentEncoding: string): {
+  streams: Array<Readable & NodeJS.ReadWriteStream>;
+  decompressed: boolean;
+} | null {
+  const codings = parseContentEncodings(contentEncoding);
+  if (codings.length === 0 || codings.length > MAX_RESPONSE_CODINGS) return null;
+  const streams: Array<Readable & NodeJS.ReadWriteStream> = [];
+  for (const coding of codings.reverse()) {
+    const stream = createSingleDecompressStream(coding);
+    if (!stream) {
+      for (const s of streams) {
+        if (!s.destroyed) s.destroy();
+      }
+      return null;
+    }
+    streams.push(stream);
+  }
+  return { streams, decompressed: true };
 }
 
 function waitForRequestDrain(
@@ -212,7 +224,7 @@ export function createNodeUpstreamFetch(
       let settled = false;
       let aborted = false;
       let activeIncoming: http.IncomingMessage | undefined;
-      let activeDecoder: (Readable & NodeJS.ReadWriteStream) | undefined;
+      let activeDecoders: Array<Readable & NodeJS.ReadWriteStream> = [];
       let activeBodyController: ReadableStreamDefaultController<Uint8Array> | undefined;
       let activeStreamEnded = false;
       let bodyReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
@@ -246,8 +258,10 @@ export function createNodeUpstreamFetch(
           void bodyReader.cancel(err).catch(() => undefined);
           bodyReader = undefined;
         }
-        if (activeDecoder && !activeDecoder.destroyed) {
-          activeDecoder.destroy(err);
+        for (const decoder of activeDecoders) {
+          if (!decoder.destroyed) {
+            decoder.destroy(err);
+          }
         }
         if (activeIncoming && !activeIncoming.destroyed) {
           activeIncoming.destroy(err);
@@ -258,9 +272,9 @@ export function createNodeUpstreamFetch(
       };
 
       const failBeforeResponse = (err: unknown) => {
-        cleanupAbortListener();
         if (!settled) {
           settled = true;
+          cleanupAbortListener();
           tearDownStreams(err instanceof Error ? err : new Error(String(err)));
           reject(err);
         }
@@ -345,34 +359,49 @@ export function createNodeUpstreamFetch(
         const rawEncoding = typeof incoming.headers['content-encoding'] === 'string'
           ? incoming.headers['content-encoding']
           : '';
+        const nonIdentityCodings = parseContentEncodings(rawEncoding);
         const decoderSpec = createDecompressStream(rawEncoding);
         const resHeaders = toIncomingHeaders(incoming.headers, Boolean(decoderSpec?.decompressed));
-        const bodyStream: Readable = decoderSpec ? incoming.pipe(decoderSpec.stream) : incoming;
+        if (nonIdentityCodings.length > 0 && !decoderSpec) {
+          // Signal to core proxy.ts that the response body remains compressed so
+          // it preserves content-encoding and skips UTF-8 telemetry scanning.
+          resHeaders.set('x-fiche-undecoded-encoding', '1');
+        }
+        let bodyStream: Readable = incoming;
         if (decoderSpec) {
-          activeDecoder = decoderSpec.stream;
-          decoderSpec.stream.on('error', noop);
+          activeDecoders = decoderSpec.streams;
+          for (const dec of decoderSpec.streams) {
+            dec.on('error', noop);
+            bodyStream = bodyStream.pipe(dec);
+          }
         }
 
         settled = true;
+        let cleanupStream: (() => void) | undefined;
         const webBody = new ReadableStream<Uint8Array>({
           start(controller) {
             activeBodyController = controller;
             bodyStream.pause();
 
-            const cleanupStream = () => {
+            cleanupStream = () => {
               cleanupAbortListener();
               bodyStream.off('data', onData);
               bodyStream.off('end', onEnd);
               bodyStream.off('error', onStreamError);
               incoming.off('aborted', onUpstreamAborted);
               incoming.off('close', onUpstreamClose);
-              if (decoderSpec) incoming.off('error', onStreamError);
+              if (decoderSpec) {
+                incoming.off('error', onStreamError);
+                for (const dec of decoderSpec.streams) {
+                  if (dec !== bodyStream) dec.off('error', onStreamError);
+                }
+              }
             };
 
             const failStream = (err: Error) => {
               if (activeStreamEnded) return;
               activeStreamEnded = true;
-              cleanupStream();
+              cleanupStream?.();
               tearDownStreams(err);
               try {
                 controller.error(err);
@@ -396,7 +425,7 @@ export function createNodeUpstreamFetch(
             const onEnd = () => {
               if (activeStreamEnded) return;
               activeStreamEnded = true;
-              cleanupStream();
+              cleanupStream?.();
               try {
                 controller.close();
               } catch {
@@ -425,6 +454,9 @@ export function createNodeUpstreamFetch(
             bodyStream.on('error', onStreamError);
             if (decoderSpec) {
               incoming.on('error', onStreamError);
+              for (const dec of decoderSpec.streams) {
+                if (dec !== bodyStream) dec.on('error', onStreamError);
+              }
             }
             incoming.once('aborted', onUpstreamAborted);
             incoming.once('close', onUpstreamClose);
@@ -436,6 +468,7 @@ export function createNodeUpstreamFetch(
           },
           cancel() {
             activeStreamEnded = true;
+            cleanupStream?.();
             cleanupAbortListener();
             tearDownStreams();
           },

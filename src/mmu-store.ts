@@ -120,9 +120,9 @@ export function fileMmuPersistenceStore(
       if (!filePath || typeof filePath !== 'string') return undefined;
       let fd: number | undefined;
       try {
-        const st = fs.lstatSync(filePath);
-        if (!st.isFile() || st.size > maxFileBytes) return undefined;
         fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+        const st = fs.fstatSync(fd);
+        if (!st.isFile() || st.size > maxFileBytes) return undefined;
         return fs.readFileSync(fd, 'utf8');
       } catch {
         return undefined;
@@ -159,13 +159,19 @@ export function fileMmuPersistenceStore(
           fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0),
           0o600,
         );
-        fs.writeFileSync(fd, json, 'utf8');
+        const buf = Buffer.from(json, 'utf8');
+        let offset = 0;
+        while (offset < buf.length) {
+          const written = fs.writeSync(fd, buf, offset, buf.length - offset);
+          if (written <= 0) throw new Error('short write');
+          offset += written;
+        }
         fs.fchmodSync(fd, 0o600);
+        fs.fsyncSync(fd);
         fs.closeSync(fd);
         fd = undefined;
         fs.renameSync(tmpPath, filePath);
         tmpPath = undefined;
-        fs.chmodSync(filePath, 0o600);
       } catch {
         if (fd !== undefined) {
           try {
