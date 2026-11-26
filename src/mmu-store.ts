@@ -101,7 +101,6 @@ export function parseMmuCliArgs(argv: readonly string[], envPort?: string): MmuC
 
 const DEFAULT_MAX_MMU_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_MMU_FILE_BYTES_CAP = 512 * 1024 * 1024;
-let warnedPermissiveDir = false;
 
 export interface FileMmuPersistenceOptions {
   readonly maxFileBytes?: number;
@@ -146,11 +145,13 @@ export function fileMmuPersistenceStore(
         fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
         if (!parentExists) {
           fs.chmodSync(dir, 0o700);
-        } else if (!warnedPermissiveDir) {
-          const mode = fs.statSync(dir).mode & 0o077;
-          if (mode !== 0) {
-            warnedPermissiveDir = true;
-            console.warn(`[fiche] warning: MMU persistence directory ${dir} has permissive mode ${(fs.statSync(dir).mode & 0o777).toString(8)}; chmod 700 recommended`);
+        } else {
+          const st = fs.lstatSync(dir);
+          if (!st.isDirectory() || (process.platform !== 'win32' && (st.mode & 0o077) !== 0)) {
+            console.error(
+              `[fiche] error: refusing to persist MMU pages to ${filePath}; directory ${dir} has unsafe mode ${(st.mode & 0o777).toString(8)} (expected 700)`,
+            );
+            return;
           }
         }
         tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;

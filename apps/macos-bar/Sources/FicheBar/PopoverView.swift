@@ -267,21 +267,29 @@ struct PopoverView: View {
     @State private var expandedFAQ: Set<String> = []
     @State private var portDraft: String = ""
     @State private var logoWhisper: String? = nil
+    @State private var whisperGeneration: Int = 0
+    @State private var hasAppliedInitialTab: Bool = false
     @State private var livePulseActive: Bool = false
     @FocusState private var portFieldFocused: Bool
     @Namespace private var tabNamespace
 
     private let popoverWidth: CGFloat = 360
+    private let initialTab: PopoverTab?
 
     init(controller: DaemonController, initialTab: PopoverTab? = nil) {
         self.controller = controller
-        if let initialTab {
-            controller.selectedTab = initialTab
-        }
+        self.initialTab = initialTab
     }
 
     private func lossColor(theme: Theme) -> Color {
         theme.layout == .editorial ? theme.danger : theme.warn
+    }
+
+    private var maxScrollHeight: CGFloat {
+        let screenHeight = NSApp.keyWindow?.screen?.visibleFrame.height
+            ?? NSScreen.main?.visibleFrame.height
+            ?? 900
+        return min(540, max(240, screenHeight - 310))
     }
 
     var body: some View {
@@ -294,7 +302,12 @@ struct PopoverView: View {
                 transientNoticeBanner(notice, theme: theme)
             }
 
-            if controller.phase == .stopped || (controller.lastError?.isEmpty == false) {
+            if let actionErr = controller.actionError, !actionErr.isEmpty {
+                actionErrorBanner(actionErr, theme: theme)
+                Spacer().frame(height: theme.usesInsetCards ? 8 : 6)
+            }
+
+            if controller.phase == .stopped || (controller.daemonError?.isEmpty == false) {
                 offlineOrErrorBand(theme: theme)
                 Spacer().frame(height: theme.usesInsetCards ? 8 : 6)
             }
@@ -324,7 +337,7 @@ struct PopoverView: View {
                 }
                 .padding(.bottom, theme.usesInsetCards ? 10 : 8)
             }
-            .frame(minHeight: 280, maxHeight: 540)
+            .frame(minHeight: min(280, maxScrollHeight), maxHeight: maxScrollHeight)
 
             Hairline()
 
@@ -333,6 +346,10 @@ struct PopoverView: View {
         .frame(width: popoverWidth)
         .themed(theme)
         .onAppear {
+            if let initialTab, !hasAppliedInitialTab {
+                hasAppliedInitialTab = true
+                controller.selectedTab = initialTab
+            }
             portDraft = String(controller.daemonPort)
             controller.refreshNow()
             controller.refreshAgentDiscovery()
@@ -350,6 +367,39 @@ struct PopoverView: View {
             if !portFieldFocused {
                 portDraft = String(newPort)
             }
+        }
+    }
+
+    private func actionErrorBanner(_ message: String, theme: Theme) -> some View {
+        Band {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.subheadline)
+                    .foregroundStyle(theme.danger)
+                    .padding(.top, 1)
+
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(theme.primaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 4)
+
+                Button {
+                    controller.dismissActionError()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(theme.secondaryText)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Dismiss error")
+                .accessibilityLabel("Dismiss error")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
         }
     }
 
@@ -459,6 +509,8 @@ struct PopoverView: View {
     }
 
     private func triggerLogoWhisper(savedTokens: Double, savedPct: Double) {
+        whisperGeneration &+= 1
+        let gen = whisperGeneration
         let message: String
         if savedTokens > 0 {
             message = "-\(Fmt.pct(savedPct)) pruned"
@@ -470,10 +522,9 @@ struct PopoverView: View {
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(1_700))
+            guard whisperGeneration == gen else { return }
             withAnimation(.easeOut(duration: 0.25)) {
-                if logoWhisper == message {
-                    logoWhisper = nil
-                }
+                logoWhisper = nil
             }
         }
     }
@@ -494,7 +545,7 @@ struct PopoverView: View {
         let symbol = isStopped ? "exclamationmark.triangle.fill" : "exclamationmark.circle.fill"
         let color = isStopped ? theme.warn : theme.danger
         let headline = isStopped ? "Daemon is offline" : "Daemon notice"
-        let detail = controller.lastError ?? "Start the proxy on 127.0.0.1:\(controller.daemonPort) to capture turns."
+        let detail = controller.daemonError ?? "Start the proxy on 127.0.0.1:\(controller.daemonPort) to capture turns."
 
         return Band {
             VStack(alignment: .leading, spacing: 8) {
@@ -564,6 +615,11 @@ struct PopoverView: View {
         let savedUsd = isToday ? (today?.savedUsd ?? 0) : (stats?.savedUsd ?? 0)
         let cliffUsd = isToday ? (today?.cliffSavedUsd ?? 0) : (stats?.cliffSavedUsd ?? 0)
         let scopeRequests = isToday ? (today?.requests ?? 0) : (stats?.requests ?? 0)
+        let unpricedReqCount = stats?.pricingAssumptions?.usdUnpricedRequests ?? 0
+        let allUnpriced = (stats?.allRequestsUnpriced ?? false)
+            && (!isToday || (abs(savedUsd) < 1e-9 && abs(savedTokens) >= 0.5))
+        let isTokenOverhead = savedTokens < -0.5
+        let isUsdCost = !allUnpriced && savedUsd < 0
         let negColor = lossColor(theme: theme)
         let pctColor = savedPct >= 0.5 ? theme.live : (savedPct <= -0.5 ? negColor : theme.secondaryText)
         let sessionSavedRaw = controller.lastTurn?.session?.savedTokens ?? 0
@@ -648,10 +704,10 @@ struct PopoverView: View {
                 // Left: Tokens Saved (Weighted + Raw subtitle)
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text("TOKENS SAVED")
+                        Text(isTokenOverhead ? "NET OVERHEAD" : "TOKENS SAVED")
                             .font(.system(size: 10, weight: .semibold))
                             .tracking(0.6)
-                            .foregroundStyle(theme.secondaryText)
+                            .foregroundStyle(isTokenOverhead ? negColor : theme.secondaryText)
                         if theme.layout == .hardware {
                             Spacer()
                             Text("CH·01")
@@ -661,10 +717,10 @@ struct PopoverView: View {
                     }
 
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
-                        Text(Fmt.tokens(savedTokens))
+                        Text(isTokenOverhead ? Fmt.signedTokenDelta(savedTokens) : Fmt.tokens(savedTokens))
                             .font(.system(size: 22, weight: theme.bigNumberWeight, design: theme.fontDesign))
                             .fontWidth(theme.fontWidth)
-                            .foregroundStyle(savedTokens < -0.5 ? negColor : theme.primaryText)
+                            .foregroundStyle(isTokenOverhead ? negColor : theme.primaryText)
                             .monospacedDigit()
                             .contentTransition(.numericText())
 
@@ -672,7 +728,7 @@ struct PopoverView: View {
                             Text(
                                 abs(savedPct) >= 0.5
                                     ? (savedPct <= -0.5 ? "\(Fmt.signedPctDelta(savedPct)) cost" : Fmt.signedPctDelta(savedPct))
-                                    : Fmt.signedTokenDelta(savedTokens)
+                                    : (isTokenOverhead ? "overhead" : Fmt.signedTokenDelta(savedTokens))
                             )
                                 .font(.system(size: 10.5, weight: .semibold))
                                 .monospacedDigit()
@@ -714,10 +770,10 @@ struct PopoverView: View {
                 // Right: Real USD Saved
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text("REAL USD SAVED")
+                        Text(isUsdCost ? "NET COST" : "REAL USD SAVED")
                             .font(.system(size: 10, weight: .semibold))
                             .tracking(0.6)
-                            .foregroundStyle(theme.secondaryText)
+                            .foregroundStyle(isUsdCost ? negColor : theme.secondaryText)
                         if theme.layout == .hardware {
                             Spacer()
                             Text("CH·02")
@@ -726,17 +782,29 @@ struct PopoverView: View {
                         }
                     }
 
-                    Text(Fmt.usd(savedUsd))
-                        .font(.system(size: 22, weight: theme.bigNumberWeight, design: theme.fontDesign))
-                        .fontWidth(theme.fontWidth)
-                        .foregroundStyle(savedUsd < 0 ? negColor : theme.primaryText)
-                        .monospacedDigit()
-                        .contentTransition(.numericText())
+                    if allUnpriced {
+                        Text("unpriced")
+                            .font(.system(size: 20, weight: theme.bigNumberWeight, design: theme.fontDesign))
+                            .fontWidth(theme.fontWidth)
+                            .foregroundStyle(theme.secondaryText)
+                            .contentTransition(.numericText())
+                    } else {
+                        Text(isUsdCost ? Fmt.usd(abs(savedUsd)) : Fmt.usd(savedUsd))
+                            .font(.system(size: 22, weight: theme.bigNumberWeight, design: theme.fontDesign))
+                            .fontWidth(theme.fontWidth)
+                            .foregroundStyle(isUsdCost ? negColor : theme.primaryText)
+                            .monospacedDigit()
+                            .contentTransition(.numericText())
+                    }
 
                     Text(
-                        cliffUsd > 0
-                            ? "\(controller.priceMode) · cliff +\(Fmt.usd(cliffUsd))"
-                            : "\(controller.priceMode) pricing"
+                        allUnpriced
+                            ? "\(unpricedReqCount) unpriced req"
+                            : (cliffUsd > 0
+                                ? "\(controller.priceMode) · cliff +\(Fmt.usd(cliffUsd))"
+                                : (!isToday && unpricedReqCount > 0
+                                    ? "\(controller.priceMode) · \(unpricedReqCount) unpriced"
+                                    : (isUsdCost ? "\(controller.priceMode) · overhead" : "\(controller.priceMode) pricing")))
                     )
                     .font(.system(size: theme.layout == .instrumentation ? 9.5 : 10.5))
                     .foregroundStyle(theme.secondaryText)
@@ -793,6 +861,7 @@ struct PopoverView: View {
                         }
                 }
                 .buttonStyle(.plain)
+                .accessibilityAddTraits(active ? [.isSelected] : [])
             }
         }
         .padding(2)
@@ -825,9 +894,9 @@ struct PopoverView: View {
                         .minimumScaleFactor(0.90)
 
                     if abs(turn.savedTokens) >= 0.5 {
-                        Text("· \(Fmt.signedTokenDelta(turn.savedTokens))")
+                        Text(turn.savedTokens < -0.5 ? "· \(Fmt.signedTokenDelta(turn.savedTokens)) overhead" : "· \(Fmt.signedTokenDelta(turn.savedTokens))")
                             .foregroundStyle(
-                                turn.savedTokens < 0
+                                turn.savedTokens < -0.5
                                     ? negColor
                                     : (theme.layout == .editorial ? theme.secondaryText : theme.primaryText)
                             )
@@ -852,7 +921,7 @@ struct PopoverView: View {
                 Spacer(minLength: 4)
 
                 if abs(turn.savedUsd) > 0 {
-                    Text(Fmt.usd(turn.savedUsd))
+                    Text(turn.savedUsd < 0 ? "\(Fmt.usd(abs(turn.savedUsd))) cost" : Fmt.usd(turn.savedUsd))
                         .font(.system(size: stripFontSize, weight: .medium))
                         .foregroundStyle(turn.savedUsd < 0 ? negColor : theme.secondaryText)
                         .monospacedDigit()
@@ -910,6 +979,7 @@ struct PopoverView: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(active ? [.isSelected] : [])
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
                 Spacer(minLength: 0)
@@ -945,6 +1015,7 @@ struct PopoverView: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(active ? [.isSelected] : [])
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
             }
@@ -1001,6 +1072,7 @@ struct PopoverView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(active ? [.isSelected] : [])
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
             }
@@ -1052,6 +1124,7 @@ struct PopoverView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(active ? [.isSelected] : [])
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
             }
@@ -1097,6 +1170,7 @@ struct PopoverView: View {
                             .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
+                    .accessibilityAddTraits(active ? [.isSelected] : [])
                     .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
             }
@@ -1193,11 +1267,11 @@ struct PopoverView: View {
                                 .foregroundStyle(
                                     session.savedTokens > 0
                                         ? theme.live
-                                        : (session.savedTokens < 0 ? theme.warn : theme.secondaryText)
+                                        : (session.savedTokens < 0 ? lossColor(theme: theme) : theme.secondaryText)
                                 )
-                            Text(Fmt.usd(session.savedUsd))
+                            Text(session.savedUsd < 0 ? "\(Fmt.usd(abs(session.savedUsd))) cost" : Fmt.usd(session.savedUsd))
                                 .font(.caption)
-                                .foregroundStyle(theme.secondaryText)
+                                .foregroundStyle(session.savedUsd < 0 ? lossColor(theme: theme) : theme.secondaryText)
                                 .monospacedDigit()
                         }
                     }
@@ -1358,16 +1432,26 @@ struct PopoverView: View {
                         }
                     }
 
-                    let modelUsdText = (abs(stats.savedInputTokens) >= 0.5 && abs(stats.savedUsd) < 1e-9)
-                        ? "unpriced"
-                        : Fmt.usd(stats.savedUsd)
+                    let unpricedModel = stats.isUnpriced
+                    let modelUsdText: String = {
+                        if unpricedModel {
+                            if let unpricedReq = stats.usdUnpricedRequests, unpricedReq > 0 {
+                                return "\(unpricedReq) unpriced req"
+                            }
+                            return "unpriced"
+                        }
+                        if stats.savedUsd < 0 {
+                            return "\(Fmt.usd(abs(stats.savedUsd))) cost"
+                        }
+                        return Fmt.usd(stats.savedUsd)
+                    }()
                     Text(
                         abs(stats.savedInputTokens) >= 0.5
-                            ? "\(Fmt.tokens(stats.savedInputTokens)) wtd · \(modelUsdText)"
-                            : Fmt.usd(stats.savedUsd)
+                            ? "\(Fmt.signedTokenDelta(stats.savedInputTokens)) wtd · \(modelUsdText)"
+                            : modelUsdText
                     )
                     .font(.caption)
-                    .foregroundStyle(theme.secondaryText)
+                    .foregroundStyle(stats.savedUsd < 0 && !unpricedModel ? lossColor(theme: theme) : theme.secondaryText)
                     .monospacedDigit()
                 }
             }
@@ -1418,7 +1502,7 @@ struct PopoverView: View {
     }
 
     private func agentsTab(theme: Theme) -> some View {
-        let isOnline = controller.phase != .stopped
+        let isOnline = controller.isOnline
         let apps = controller.discoveredDesktopApps
         let clis = controller.discoveredCLIAgents
         let installedCLIs = clis.filter(\.installed)
@@ -1445,6 +1529,7 @@ struct PopoverView: View {
                 .padding(.trailing, 14)
                 .padding(.top, 10)
                 .help("Re-scan running apps and CLIs")
+                .accessibilityLabel("Refresh desktop apps and CLIs")
             }
 
             Band {
@@ -1476,6 +1561,8 @@ struct PopoverView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                        .help("Copy fiche warp --app Antigravity")
+                        .accessibilityLabel("Copy fiche warp command")
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
@@ -1503,7 +1590,7 @@ struct PopoverView: View {
                                 }
                                 Text(
                                     app.attachmentState == .runningDirect
-                                        ? "Quit app first, then Open to route via Fiche"
+                                        ? "Quit app (⌘Q) first, then Relaunch via Fiche"
                                         : cmd
                                 )
                                 .font(app.attachmentState == .runningDirect ? .caption : .caption.monospaced())
@@ -1521,14 +1608,33 @@ struct PopoverView: View {
                             .buttonStyle(.borderless)
                             .foregroundStyle(theme.secondaryText)
                             .help("Copy \(cmd)")
+                            .accessibilityLabel("Copy launch command for \(app.displayName)")
 
-                            Button("Open") {
-                                controller.launchDesktopAppViaFiche(app.name)
+                            if app.attachmentState == .runningDirect || app.attachmentState == .launchedWithoutProxyFlag {
+                                Button("Relaunch") {
+                                    controller.launchDesktopAppViaFiche(app.name)
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(theme.warn)
+                                .controlSize(.small)
+                                .disabled(!isOnline || controller.isBusy)
+                                .help("Quit \(app.displayName) (⌘Q) first so Fiche can attach, then relaunch")
+                            } else if app.attachmentState == .attached {
+                                Button("Open") {
+                                    controller.launchDesktopAppViaFiche(app.name)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(!isOnline || controller.isBusy)
+                            } else {
+                                Button("Open") {
+                                    controller.launchDesktopAppViaFiche(app.name)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(theme.accent)
+                                .controlSize(.small)
+                                .disabled(!isOnline || controller.isBusy)
                             }
-                            .buttonStyle(.borderedProminent)
-                            .tint(theme.accent)
-                            .controlSize(.small)
-                            .disabled(!isOnline || controller.isBusy)
                         }
                         .padding(.horizontal, 14)
                         .padding(.vertical, 7)
@@ -1561,7 +1667,7 @@ struct PopoverView: View {
                         }
                         Spacer(minLength: 6)
                         Button {
-                            let portPrefix = controller.daemonPort != 47_821 ? "PORT=\(controller.daemonPort) " : ""
+                            let portPrefix = controller.daemonPort != 47_821 ? "FICHE_PORT=\(controller.daemonPort) " : ""
                             controller.copyToClipboard("\(portPrefix)fiche warp -- claude", label: "Copied warp command")
                         } label: {
                             Image(systemName: "doc.on.doc")
@@ -1570,6 +1676,7 @@ struct PopoverView: View {
                         .buttonStyle(.borderless)
                         .foregroundStyle(theme.secondaryText)
                         .help("Copy fiche warp command")
+                        .accessibilityLabel("Copy fiche warp command")
                     } else {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 5) {
@@ -1595,7 +1702,7 @@ struct PopoverView: View {
                         }
                         Spacer(minLength: 6)
                         Button {
-                            let portPrefix = controller.daemonPort != 47_821 ? "export PORT=\(controller.daemonPort) && " : ""
+                            let portPrefix = controller.daemonPort != 47_821 ? "export FICHE_PORT=\(controller.daemonPort) && " : ""
                             controller.copyToClipboard(#"\#(portPrefix)eval "$(fiche shell-init --wrap)""#, label: "Copied shell-init snippet")
                         } label: {
                             Image(systemName: "doc.on.doc")
@@ -1604,6 +1711,7 @@ struct PopoverView: View {
                         .buttonStyle(.borderless)
                         .foregroundStyle(theme.secondaryText)
                         .help("Copy shell-init line")
+                        .accessibilityLabel("Copy shell-init snippet")
 
                         if controller.isShellAutoWrapInstalled {
                             Button("Remove") {
@@ -1770,12 +1878,16 @@ struct PopoverView: View {
                         Text("not in PATH")
                             .font(.system(size: 8.5, weight: .medium))
                             .foregroundStyle(theme.tertiaryText)
-                    } else if agent.attachedCount > 0 {
-                        attachmentPill("\(agent.attachedCount) attached", color: theme.live, theme: theme)
-                    } else if agent.directCount > 0 {
-                        attachmentPill("\(agent.directCount) direct", color: theme.warn, theme: theme)
-                    } else if controller.isShellAutoWrapInstalled {
-                        attachmentPill("Wrapped", color: theme.secondaryText, theme: theme)
+                    } else {
+                        if agent.attachedCount > 0 {
+                            attachmentPill("\(agent.attachedCount) attached", color: theme.live, theme: theme)
+                        }
+                        if agent.directCount > 0 {
+                            attachmentPill("\(agent.directCount) direct", color: theme.warn, theme: theme)
+                        }
+                        if agent.attachedCount == 0 && agent.directCount == 0 && controller.isShellAutoWrapInstalled {
+                            attachmentPill("Wrapped", color: theme.secondaryText, theme: theme)
+                        }
                     }
                 }
                 Text("\(agent.command) · \(agent.provider)")
@@ -1793,6 +1905,7 @@ struct PopoverView: View {
             .buttonStyle(.borderless)
             .foregroundStyle(theme.secondaryText)
             .help("Copy \(cmdSnippet)")
+            .accessibilityLabel("Copy launch command for \(agent.name)")
 
             if agent.installed {
                 Button("Launch") {
@@ -1845,7 +1958,7 @@ struct PopoverView: View {
     private func modelsTab(theme: Theme) -> some View {
         let activeSet = Set(controller.allowedModels)
         let catalog = controller.mergedModelsCatalog
-        let isOnline = controller.phase != .stopped
+        let isOnline = controller.isOnline
         let allProviders = controller.providers
         let primaryProviders = allProviders.filter { $0.isFirstParty || $0.enabled }
         let optionalProviders = allProviders.filter { !$0.isFirstParty && !$0.enabled }
@@ -2041,19 +2154,36 @@ struct PopoverView: View {
                         ProgressView()
                             .controlSize(.small)
                     } else {
-                        Button("Sync") {
-                            Task {
-                                await controller.syncModelsFromKosha(
-                                    updateFirst: false,
-                                    allProviders: koshaSyncAllProviders
-                                )
+                        let canSyncKosha = controller.hasKoshaRegistry || controller.hasKoshaCLI
+                        HStack(spacing: 6) {
+                            Button("Dry-run") {
+                                Task {
+                                    await controller.syncModelsFromKosha(
+                                        updateFirst: false,
+                                        allProviders: koshaSyncAllProviders,
+                                        dryRun: true
+                                    )
+                                }
                             }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(!canSyncKosha || controller.isBusy || controller.isSyncingKosha)
+                            .help("Preview `fiche models sync-kosha --json` without modifying config or daemon state.")
+
+                            Button("Sync") {
+                                Task {
+                                    await controller.syncModelsFromKosha(
+                                        updateFirst: false,
+                                        allProviders: koshaSyncAllProviders
+                                    )
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .tint(theme.accent)
+                            .disabled(!canSyncKosha || controller.isBusy || controller.isSyncingKosha)
+                            .help("Run `fiche models sync-kosha --apply` to merge active chat model bases from Kosha.")
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .tint(theme.accent)
-                        .disabled(!controller.hasKoshaRegistry)
-                        .help("Run `fiche models sync-kosha --apply` to merge active chat model bases from Kosha.")
                     }
                 }
                 .padding(.horizontal, 14)
@@ -2066,10 +2196,11 @@ struct PopoverView: View {
                         Text("All 21 providers")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(theme.secondaryText)
-                        Toggle("", isOn: $koshaSyncAllProviders)
+                        Toggle("Sync all 21 Kosha providers", isOn: $koshaSyncAllProviders)
                             .labelsHidden()
                             .toggleStyle(FicheSwitchToggleStyle())
-                            .disabled(controller.isSyncingKosha)
+                            .accessibilityLabel("Sync all 21 Kosha providers")
+                            .disabled(controller.isSyncingKosha || controller.isBusy)
                     }
 
                     Spacer(minLength: 8)
@@ -2085,7 +2216,7 @@ struct PopoverView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .disabled(controller.isSyncingKosha)
+                        .disabled(controller.isSyncingKosha || controller.isBusy)
                         .help("Run `kosha update` then `fiche models sync-kosha --apply`.")
                     } else {
                         Text("kosha CLI not found")
@@ -2186,7 +2317,7 @@ struct PopoverView: View {
             Spacer(minLength: 8)
 
             Toggle(
-                "",
+                "Enable \(provider.label) provider",
                 isOn: Binding(
                     get: { provider.enabled },
                     set: { next in controller.toggleProvider(id: provider.id, on: next) }
@@ -2194,6 +2325,7 @@ struct PopoverView: View {
             )
             .labelsHidden()
             .toggleStyle(FicheSwitchToggleStyle())
+            .accessibilityLabel("Enable \(provider.label) provider")
             .disabled(!isOnline)
         }
         .padding(.horizontal, 14)
@@ -2255,7 +2387,7 @@ struct PopoverView: View {
             Spacer(minLength: 8)
 
             Toggle(
-                "",
+                "Enable \(item.label) model",
                 isOn: Binding(
                     get: { isOn },
                     set: { next in controller.toggleModel(model: item.id, on: next) }
@@ -2263,6 +2395,7 @@ struct PopoverView: View {
             )
             .labelsHidden()
             .toggleStyle(FicheSwitchToggleStyle())
+            .accessibilityLabel("Enable \(item.label) model")
             .disabled(!isOnline)
         }
         .padding(.horizontal, 14)
@@ -2272,7 +2405,7 @@ struct PopoverView: View {
     // MARK: - Tab 3: Stages
 
     private func stagesTab(theme: Theme) -> some View {
-        let isOnline = controller.phase != .stopped
+        let isOnline = controller.isOnline
         let hasLivePlugins = !controller.plugins.isEmpty
         let builtInStages = hasLivePlugins
             ? controller.plugins.filter { ModelClassification.isBuiltInStage($0) }
@@ -2404,7 +2537,7 @@ struct PopoverView: View {
 
             if plugin.mutable {
                 Toggle(
-                    "",
+                    "Enable \(plugin.name)",
                     isOn: Binding(
                         get: { plugin.enabled },
                         set: { next in controller.togglePlugin(id: plugin.id, enabled: next) }
@@ -2412,6 +2545,7 @@ struct PopoverView: View {
                 )
                 .labelsHidden()
                 .toggleStyle(FicheSwitchToggleStyle())
+                .accessibilityLabel("Enable \(plugin.name)")
                 .disabled(!isOnline)
             } else {
                 Text("Built-in")
@@ -2426,7 +2560,7 @@ struct PopoverView: View {
     // MARK: - Tab 4: Control
 
     private func controlTab(theme: Theme) -> some View {
-        let isOnline = controller.phase != .stopped
+        let isOnline = controller.isOnline
 
         return VStack(alignment: .leading, spacing: 0) {
             SectionHeader(title: "Appearance & Proxy")
@@ -2473,7 +2607,7 @@ struct PopoverView: View {
                     }
                     Spacer()
                     Toggle(
-                        "",
+                        "Enable compression",
                         isOn: Binding(
                             get: { controller.compressionEnabled },
                             set: { next in
@@ -2483,6 +2617,7 @@ struct PopoverView: View {
                     )
                     .labelsHidden()
                     .toggleStyle(FicheSwitchToggleStyle())
+                    .accessibilityLabel("Enable compression")
                     .disabled(!isOnline || controller.isBusy)
                 }
                 .padding(.horizontal, 14)
@@ -2552,7 +2687,7 @@ struct PopoverView: View {
                     }
                     Spacer()
                     Toggle(
-                        "",
+                        "Enable 3rd-party plugins and skills",
                         isOn: Binding(
                             get: { controller.hasEnabledThirdPartyPlugins },
                             set: { next in controller.setAllThirdPartyPlugins(enabled: next) }
@@ -2560,6 +2695,7 @@ struct PopoverView: View {
                     )
                     .labelsHidden()
                     .toggleStyle(FicheSwitchToggleStyle())
+                    .accessibilityLabel("Enable 3rd-party plugins and skills")
                     .disabled(!isOnline || controller.isBusy || thirdPartyExt.isEmpty)
                 }
                 .padding(.horizontal, 14)
@@ -2574,9 +2710,10 @@ struct PopoverView: View {
                         .font(.subheadline)
                         .foregroundStyle(theme.primaryText)
                     Spacer()
-                    Toggle("", isOn: $controller.autoStartDaemon)
+                    Toggle("Auto-start daemon", isOn: $controller.autoStartDaemon)
                         .labelsHidden()
                         .toggleStyle(FicheSwitchToggleStyle())
+                        .accessibilityLabel("Auto-start daemon")
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
@@ -2595,7 +2732,7 @@ struct PopoverView: View {
                     }
                     Spacer()
                     Toggle(
-                        "",
+                        "Start at login",
                         isOn: Binding(
                             get: { controller.isLoginAgentInstalled },
                             set: { enabled in controller.setLoginAgent(enabled: enabled) }
@@ -2603,6 +2740,7 @@ struct PopoverView: View {
                     )
                     .labelsHidden()
                     .toggleStyle(FicheSwitchToggleStyle())
+                    .accessibilityLabel("Start at login")
                     .disabled(controller.isBusy)
                 }
                 .padding(.horizontal, 14)
@@ -2621,6 +2759,7 @@ struct PopoverView: View {
                         .font(.footnote.monospaced())
                         .frame(width: 68)
                         .focused($portFieldFocused)
+                        .disabled(controller.isBusy)
                         .onSubmit { commitPortDraft() }
                         .onChange(of: portFieldFocused) { _, focused in
                             if !focused { commitPortDraft() }
@@ -3090,6 +3229,8 @@ private struct ThemeSwatchButton: View {
             }
         }
         .help("Switch to \(id.label) theme")
+        .accessibilityLabel("\(id.label) theme")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
     private var previewCorner: CGFloat {
@@ -3324,7 +3465,13 @@ private struct FicheSwitchBody: View {
                 .fill(isOn ? theme.primaryText : theme.secondaryText)
                 .frame(width: 11, height: 12)
 
-        case .editorial, .controlCenter, .celestial:
+        case .celestial:
+            Circle()
+                .fill(isOn ? theme.ground : theme.primaryText)
+                .frame(width: 12, height: 12)
+                .shadow(color: .black.opacity(0.24), radius: 1.2, y: 0.6)
+
+        case .editorial, .controlCenter:
             Circle()
                 .fill(.white)
                 .frame(width: 12, height: 12)
@@ -3427,29 +3574,36 @@ private struct DailySavingsChartView: View {
         }
         let hoveredPoint = hoveredDate.flatMap { d in points.first(where: { $0.date == d }) }
         let negColor = theme.layout == .editorial ? theme.danger : theme.warn
+        let chartAccessibilitySummary: String = {
+            guard hasAnyData else { return "14-day daily \(metric.rawValue) chart: awaiting compressible traffic" }
+            let usdSummary = totalUsd < 0 ? "\(Fmt.usd(abs(totalUsd))) cost" : "\(Fmt.usd(totalUsd)) saved"
+            return "14-day daily \(metric.rawValue) chart: \(Fmt.tokens(totalWtd)) weighted tokens, \(usdSummary)"
+        }()
 
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
+            HStack(alignment: .top, spacing: 6) {
                 if let pt = hoveredPoint {
                     let ptNeg = (metric == .usd ? pt.savedUsd : pt.savedTokens) < 0
-                    Text("\(pt.shortDateLabel) · \(Fmt.tokens(pt.savedTokens)) wtd (\(Fmt.tokens(pt.rawSavedTokens)) raw) · \(Fmt.usd(pt.savedUsd))")
+                    let ptUsd = pt.savedUsd < 0 ? "\(Fmt.usd(abs(pt.savedUsd))) cost" : Fmt.usd(pt.savedUsd)
+                    Text("\(pt.shortDateLabel) · \(Fmt.signedTokenDelta(pt.savedTokens)) wtd (\(Fmt.tokens(pt.rawSavedTokens)) raw) · \(ptUsd)")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(ptNeg ? negColor : theme.primaryText)
                         .monospacedDigit()
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.80)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else if hasAnyData {
                     let totalNeg = (metric == .usd ? totalUsd : totalWtd) < 0
+                    let usdText = totalUsd < 0 ? "\(Fmt.usd(abs(totalUsd))) cost" : Fmt.usd(totalUsd)
                     Text(
                         totalRaw > 0
-                            ? "14d: \(Fmt.tokens(totalWtd)) wtd · \(Fmt.tokens(totalRaw)) raw · \(Fmt.usd(totalUsd))"
-                            : "14d: \(Fmt.tokens(totalWtd)) wtd · \(Fmt.usd(totalUsd))"
+                            ? "14d: \(Fmt.tokens(totalWtd)) wtd · \(Fmt.tokens(totalRaw)) raw · \(usdText)"
+                            : "14d: \(Fmt.tokens(totalWtd)) wtd · \(usdText)"
                     )
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(totalNeg ? negColor : theme.secondaryText)
                     .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Text("Awaiting compressible traffic")
                         .font(.system(size: 10))
@@ -3483,6 +3637,7 @@ private struct DailySavingsChartView: View {
                                 }
                         }
                         .buttonStyle(.plain)
+                        .accessibilityAddTraits(active ? [.isSelected] : [])
                     }
                 }
                 .padding(1.5)
@@ -3525,16 +3680,12 @@ private struct DailySavingsChartView: View {
                 HStack(alignment: .bottom, spacing: 6) {
                     ZStack(alignment: .top) {
                         VStack(spacing: 0) {
-                            DashedHorizontalRule(color: theme.hairline)
-                            Spacer()
-                            Rectangle().fill(theme.hairline).frame(height: 0.9)
-                                .offset(y: 0)
-                            Spacer(minLength: 0)
-                        }
-                        .frame(height: plotH)
-
-                        VStack(spacing: 0) {
-                            Spacer().frame(height: posZoneH)
+                            if scalePos > 0 {
+                                DashedHorizontalRule(color: theme.hairline)
+                                Spacer().frame(height: max(0, posZoneH - 1))
+                            } else {
+                                Spacer().frame(height: posZoneH)
+                            }
                             Rectangle().fill(theme.secondaryText.opacity(0.35)).frame(height: 0.9)
                             Spacer(minLength: 0)
                             DashedHorizontalRule(color: negColor.opacity(0.28))
@@ -3615,24 +3766,29 @@ private struct DailySavingsChartView: View {
                         }
                     }
 
-                    VStack(alignment: .trailing) {
+                    let zeroLabelY = max(scalePos > 0 ? 11 : 0, min(plotH - 18, posZoneH - 5.5))
+                    ZStack(alignment: .topTrailing) {
                         if scalePos > 0 {
                             Text(metric == .usd ? Fmt.usd(scalePos) : Fmt.tokens(scalePos))
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.75)
-                            Spacer()
+                                .frame(maxWidth: .infinity, alignment: .trailing)
                         }
                         Text(metric == .usd ? "$0" : "0")
-                        Spacer()
-                        Text(metric == .usd ? Fmt.usd(-scaleNeg) : Fmt.tokens(-scaleNeg))
-                            .foregroundStyle(negColor)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.75)
+                            .offset(y: zeroLabelY)
+                        VStack {
+                            Spacer(minLength: 0)
+                            Text(metric == .usd ? Fmt.usd(-scaleNeg) : Fmt.tokens(-scaleNeg))
+                                .foregroundStyle(negColor)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.75)
+                        }
+                        .frame(height: plotH, alignment: .bottomTrailing)
                     }
                     .font(.system(size: 8.5, design: .monospaced))
                     .foregroundStyle(theme.tertiaryText)
                     .monospacedDigit()
-                    .frame(width: 38, height: plotH, alignment: .trailing)
+                    .frame(width: 44, height: plotH, alignment: .topTrailing)
                 }
 
                 HStack {
@@ -3721,7 +3877,7 @@ private struct DailySavingsChartView: View {
                     .font(.system(size: 8.5, design: .monospaced))
                     .foregroundStyle(theme.tertiaryText)
                     .monospacedDigit()
-                    .frame(width: 34, height: plotH, alignment: .trailing)
+                    .frame(width: 44, height: plotH, alignment: .trailing)
                 }
 
                 HStack {
@@ -3741,6 +3897,8 @@ private struct DailySavingsChartView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(chartAccessibilitySummary)
         .onDisappear {
             hoveredDate = nil
         }

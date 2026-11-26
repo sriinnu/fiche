@@ -166,6 +166,8 @@ struct PricingAssumptions: Decodable, Sendable, Equatable {
     let priceSnapshot: String?
     let inputPerMtok: Double?
     let source: String?
+    let usdPricedRequests: Int?
+    let usdUnpricedRequests: Int?
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -173,6 +175,8 @@ struct PricingAssumptions: Decodable, Sendable, Equatable {
         self.priceSnapshot = c.firstString("price_snapshot", "priceSnapshot")
         self.inputPerMtok = c.firstDouble("input_per_mtok", "inputPerMtok")
         self.source = c.firstString("source")
+        self.usdPricedRequests = c.firstInt("usd_priced_requests", "usdPricedRequests")
+        self.usdUnpricedRequests = c.firstInt("usd_unpriced_requests", "usdUnpricedRequests")
     }
 }
 
@@ -263,8 +267,21 @@ struct ModelStats: Decodable, Sendable, Equatable {
     let rawSavedTokens: Double
     let savedPct: Double
     let savedUsd: Double
+    let priced: Bool?
+    let usdPricedRequests: Int?
+    let usdUnpricedRequests: Int?
     let cliffAvoidedEvents: Int
     let cliffSavedUsd: Double
+
+    var isUnpriced: Bool {
+        if let priced {
+            return !priced
+        }
+        if let p = usdPricedRequests, let u = usdUnpricedRequests, p == 0 && u > 0 {
+            return true
+        }
+        return abs(savedInputTokens) >= 0.5 && abs(savedUsd) < 1e-9
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -288,6 +305,9 @@ struct ModelStats: Decodable, Sendable, Equatable {
             self.savedPct = 0
         }
         self.savedUsd = c.firstDouble("saved_usd", "savedUsd") ?? 0
+        self.priced = c.firstBool("priced")
+        self.usdPricedRequests = c.firstInt("usd_priced_requests", "usdPricedRequests")
+        self.usdUnpricedRequests = c.firstInt("usd_unpriced_requests", "usdUnpricedRequests")
         self.cliffAvoidedEvents = c.firstInt("cliff_avoided_events", "cliffAvoidedEvents") ?? 0
         self.cliffSavedUsd = c.firstDouble("cliff_saved_usd", "cliffSavedUsd") ?? 0
     }
@@ -315,6 +335,11 @@ struct ProxyStatsResponse: Decodable, Sendable, Equatable {
     let byModel: [String: ModelStats]
     let today: DailySavingsPoint?
     let daily: [DailySavingsPoint]
+
+    var allRequestsUnpriced: Bool {
+        guard let pa = pricingAssumptions else { return false }
+        return (pa.usdPricedRequests ?? 0) == 0 && (pa.usdUnpricedRequests ?? 0) > 0
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: DynamicCodingKey.self)
@@ -569,6 +594,23 @@ struct KoshaSyncResponse: Decodable, Sendable {
     let models: [String]
     let saved: Bool
     let synced: Bool
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: DynamicCodingKey.self)
+        self.ok = c.firstBool("ok") ?? true
+        self.applied = c.firstBool("applied") ?? false
+        self.replace = c.firstBool("replace") ?? false
+        self.source = c.firstString("source") ?? "kosha"
+        self.providers = c.firstStringArray("providers") ?? []
+        self.providersMatched = c.firstStringArray("providersMatched", "providers_matched") ?? []
+        self.scannedModels = c.firstInt("scannedModels", "scanned_models") ?? 0
+        self.matchedModels = c.firstInt("matchedModels", "matched_models") ?? 0
+        self.discoveredCount = c.firstInt("discoveredCount", "discovered_count") ?? 0
+        self.added = c.firstStringArray("added") ?? []
+        self.models = c.firstStringArray("models") ?? []
+        self.saved = c.firstBool("saved") ?? false
+        self.synced = c.firstBool("synced") ?? false
+    }
 }
 
 // MARK: - GET /api/mmu/stats & /api/calibration

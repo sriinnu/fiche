@@ -23,6 +23,7 @@ import {
   getFoldedEpisodeCertificate,
   hasAnyFoldedEpisodeId,
   hasFoldedEpisodeId,
+  isCacheCircuitBreakerOpen,
   recordFoldedEpisodeId,
 } from './session-state.js';
 import type { CacheBreakpointMarker, TextEpochBlock } from './text-history.js';
@@ -33,6 +34,8 @@ import type { CacheBreakpointMarker, TextEpochBlock } from './text-history.js';
 
 const DEFAULT_MAX_PAGES = 512;
 const DEFAULT_MAX_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_SKILL_PAGES = 256;
+const DEFAULT_MAX_SKILL_BYTES = 4 * 1024 * 1024;
 const MIN_MMU_PAGES = 64;
 const MAX_MMU_PAGES = 16_384;
 const MIN_MMU_BYTES = 4 * 1024 * 1024;
@@ -949,6 +952,8 @@ export interface StorePageInput {
   readonly filePath?: string;
   readonly nowMs?: number;
   readonly extraSymbols?: readonly string[];
+  /** Apply structural admission filter (skip <4L, <200c, 0-symbol, pathless acks). */
+  readonly admissionFilter?: boolean;
 }
 
 export interface DerefPageOptions {
@@ -961,7 +966,13 @@ export interface DerefPageOptions {
 
 const SECRET_PEM_RE = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const SECRET_BEARER_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/;
-const SECRET_TOKEN_PREFIX_RE = /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16})\b/;
+const SECRET_BASIC_AUTH_RE = /Authorization:\s*Basic\s+[A-Za-z0-9+/=]{12,}/i;
+const SECRET_TOKEN_PREFIX_RE =
+  /\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|npm_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{35})\b/;
+const SECRET_JWT_RE = /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/;
+const SECRET_DSN_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i;
+const SECRET_JSON_YAML_KEY_RE =
+  /(?:"(?:api[_-]?key|secret|token|password|private[_-]?key|access[_-]?key)"\s*:\s*"[^"\s]{8,}"|^[ \t]*(?:api[_-]?key|secret|token|password|private[_-]?key|access[_-]?key)[ \t]*:[ \t]*(?:["'][^"'\s]{8,}["']|(?!undefined\b|null\b|boolean\b|string\b|number\b)[A-Za-z0-9_+./=-]{12,}[ \t]*$))/im;
 const SECRET_ENV_ASSIGN_RE =
   /^[ \t]*(?:export[ \t]+)?[A-Z0-9_]*(?:SECRET|TOKEN|API_KEY|PASSWORD|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*[ \t]*=[ \t]*["']?[^\s"'#]{8,}/m;
 
@@ -970,7 +981,11 @@ function containsHighConfidenceSecret(text: string): boolean {
   return (
     SECRET_PEM_RE.test(text) ||
     SECRET_BEARER_RE.test(text) ||
+    SECRET_BASIC_AUTH_RE.test(text) ||
     SECRET_TOKEN_PREFIX_RE.test(text) ||
+    SECRET_JWT_RE.test(text) ||
+    SECRET_DSN_RE.test(text) ||
+    SECRET_JSON_YAML_KEY_RE.test(text) ||
     SECRET_ENV_ASSIGN_RE.test(text)
   );
 }
@@ -999,6 +1014,7 @@ interface StoredEntry {
 interface PersistedPageRecord {
   id: string;
   sessionKey: string;
+  sharedSessionKeys?: string[];
   refId: string;
   toolName?: string;
   filePath?: string;
@@ -1067,10 +1083,16 @@ function collectIndexKeys(
 export class ContextPageStore {
   maxPages: number;
   maxBytes: number;
+  maxSkillPages: number = DEFAULT_MAX_SKILL_PAGES;
+  maxSkillBytes: number = DEFAULT_MAX_SKILL_BYTES;
   private readonly debounceMs: number;
 
   /** LRU map keyed by `${sessionKey}\0${id}` (insertion order = LRU -> MRU). */
   private readonly entries = new Map<string, StoredEntry>();
+  /** Shared deduplicated global skill slab keyed by `id` (insertion order = LRU -> MRU). */
+  private readonly skillEntries = new Map<string, StoredEntry>();
+  /** Session -> skill page IDs referencing `skillEntries`. */
+  private readonly sessionSkillIds = new Map<string, Set<string>>();
   /** Fast pageId -> latest entryKey lookup (one pageId can exist under multiple sessions). */
   private readonly keysByPageId = new Map<string, Set<string>>();
   /** Inverted index: lowercased symbol / basename -> page IDs. */
@@ -1079,6 +1101,7 @@ export class ContextPageStore {
   readonly sessionIndex = new Map<string, Set<string>>();
 
   private totalBytes = 0;
+  private totalSkillBytes = 0;
   private stats: MmuStats = emptyStats();
 
   private persistence: MmuPersistenceAdapter | undefined;
@@ -1146,14 +1169,11 @@ export class ContextPageStore {
   /** Serialize current store state in LRU order (oldest first), skipping expired or secret-bearing pages. */
   serialize(nowMs: number = Date.now()): string {
     const pages: PersistedPageRecord[] = [];
-    for (const entry of this.entries.values()) {
-      const p = entry.page;
-      const createdAtMs = p.createdAtMs > 0 ? p.createdAtMs : nowMs;
-      if (nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
-      if (containsHighConfidenceSecret(p.rawText)) continue;
+    const pushRecord = (p: MmuPage, createdAtMs: number, sharedSessions?: readonly string[]): void => {
       pages.push({
         id: p.id,
         sessionKey: p.sessionKey,
+        ...(sharedSessions && sharedSessions.length > 0 ? { sharedSessionKeys: [...sharedSessions] } : {}),
         refId: p.refId,
         ...(p.toolName !== undefined ? { toolName: p.toolName } : {}),
         ...(p.filePath !== undefined ? { filePath: p.filePath } : {}),
@@ -1163,6 +1183,24 @@ export class ContextPageStore {
         symbols: [...p.symbols],
         factTokens: [...p.factTokens],
       });
+    };
+    for (const entry of this.entries.values()) {
+      const p = entry.page;
+      const createdAtMs = p.createdAtMs > 0 ? p.createdAtMs : nowMs;
+      if (nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
+      if (containsHighConfidenceSecret(p.rawText)) continue;
+      pushRecord(p, createdAtMs);
+    }
+    for (const entry of this.skillEntries.values()) {
+      const p = entry.page;
+      const createdAtMs = p.createdAtMs > 0 ? p.createdAtMs : nowMs;
+      if (nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
+      if (containsHighConfidenceSecret(p.rawText)) continue;
+      const shared: string[] = [];
+      for (const [sk, set] of this.sessionSkillIds) {
+        if (set.has(p.id)) shared.push(sk);
+      }
+      pushRecord(p, createdAtMs, shared.length > 0 ? shared : [p.sessionKey]);
     }
     const payload: PersistedMmuState = {
       format: PERSIST_FORMAT,
@@ -1195,11 +1233,12 @@ export class ContextPageStore {
       if (createdAtMs <= 0 || nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
       if (containsHighConfidenceSecret(r.rawText)) continue;
       const id = typeof r.id === 'string' && /^pg_[0-9a-f]{8,16}$/.test(r.id) ? r.id : pageIdForText(r.rawText);
+      const isSkill = r.toolName === 'skill-catalog';
       const entryKey = `${r.sessionKey}\0${id}`;
-      if (this.entries.has(entryKey)) continue;
+      if (!isSkill && this.entries.has(entryKey)) continue;
 
       const bytes = utf8ByteLength(r.rawText);
-      if (bytes > this.maxBytes) continue;
+      if (bytes > (isSkill ? this.maxSkillBytes : this.maxBytes)) continue;
 
       const filePath = typeof r.filePath === 'string' && r.filePath ? r.filePath : inferFilePath(r.rawText, r.refId);
       const symbols = Array.isArray(r.symbols)
@@ -1230,8 +1269,17 @@ export class ContextPageStore {
         symbols,
         factTokens,
       };
-      this.insertEntry(entryKey, page, bytes, collectIndexKeys(symbols, filePath), false);
-      restored += 1;
+      if (isSkill) {
+        const sessionKeys = Array.isArray(r.sharedSessionKeys) && r.sharedSessionKeys.length > 0
+          ? r.sharedSessionKeys.filter((sk): sk is string => typeof sk === 'string' && sk.trim().length > 0)
+          : [r.sessionKey];
+        const existed = this.skillEntries.has(id);
+        this.upsertSkillEntry(page, bytes, collectIndexKeys(symbols, filePath), sessionKeys, false);
+        if (!existed) restored += 1;
+      } else {
+        this.insertEntry(entryKey, page, bytes, collectIndexKeys(symbols, filePath), false);
+        restored += 1;
+      }
     }
 
     if (obj.stats && typeof obj.stats === 'object') {
@@ -1253,8 +1301,40 @@ export class ContextPageStore {
   }
 
   private touchEntry(entry: StoredEntry): void {
+    if (this.skillEntries.get(entry.page.id) === entry) {
+      this.skillEntries.delete(entry.page.id);
+      this.skillEntries.set(entry.page.id, entry);
+      return;
+    }
     this.entries.delete(entry.key);
     this.entries.set(entry.key, entry);
+  }
+
+  private linkSessionSkill(sessionKey: string, pageId: string): void {
+    let skills = this.sessionSkillIds.get(sessionKey);
+    if (!skills) {
+      skills = new Set();
+      this.sessionSkillIds.set(sessionKey, skills);
+    }
+    skills.add(pageId);
+
+    let sessPages = this.sessionIndex.get(sessionKey);
+    if (!sessPages) {
+      sessPages = new Set();
+      this.sessionIndex.set(sessionKey, sessPages);
+    }
+    sessPages.add(pageId);
+  }
+
+  private addSymbolIndexesForPage(pageId: string, indexKeys: readonly string[]): void {
+    for (const idxKey of indexKeys) {
+      let set = this.symbolIndex.get(idxKey);
+      if (!set) {
+        set = new Set();
+        this.symbolIndex.set(idxKey, set);
+      }
+      set.add(pageId);
+    }
   }
 
   private addIndexes(entry: StoredEntry): void {
@@ -1273,72 +1353,91 @@ export class ContextPageStore {
     }
     sessPages.add(page.id);
 
-    for (const idxKey of indexKeys) {
-      let set = this.symbolIndex.get(idxKey);
-      if (!set) {
-        set = new Set();
-        this.symbolIndex.set(idxKey, set);
+    this.addSymbolIndexesForPage(page.id, indexKeys);
+  }
+
+  private isSymbolKeyOwnedByPageId(pageId: string, idxKey: string, pidKeys?: Set<string>): boolean {
+    if (pidKeys) {
+      for (const otherKey of pidKeys) {
+        const other = this.entries.get(otherKey);
+        if (other && other.indexKeys.includes(idxKey)) return true;
       }
-      set.add(page.id);
     }
+    const skill = this.skillEntries.get(pageId);
+    return Boolean(skill && skill.indexKeys.includes(idxKey));
   }
 
   private removeIndexes(entry: StoredEntry): void {
     const { page, key, indexKeys } = entry;
     const pidKeys = this.keysByPageId.get(page.id);
-    let pageIdStillExists = false;
     if (pidKeys) {
       pidKeys.delete(key);
       if (pidKeys.size === 0) {
         this.keysByPageId.delete(page.id);
-      } else {
-        pageIdStillExists = true;
       }
     }
 
-    const sessPages = this.sessionIndex.get(page.sessionKey);
-    if (sessPages) {
-      sessPages.delete(page.id);
-      if (sessPages.size === 0) this.sessionIndex.delete(page.sessionKey);
+    if (!this.sessionSkillIds.get(page.sessionKey)?.has(page.id)) {
+      const sessPages = this.sessionIndex.get(page.sessionKey);
+      if (sessPages) {
+        sessPages.delete(page.id);
+        if (sessPages.size === 0) this.sessionIndex.delete(page.sessionKey);
+      }
     }
 
+    const activePidKeys = this.keysByPageId.get(page.id);
     for (const idxKey of indexKeys) {
       const set = this.symbolIndex.get(idxKey);
       if (!set) continue;
-      if (!pageIdStillExists) {
+      if (!this.isSymbolKeyOwnedByPageId(page.id, idxKey, activePidKeys)) {
         set.delete(page.id);
-      } else {
-        // Only keep page.id under idxKey if another remaining entry with page.id owns idxKey
-        let stillOwned = false;
-        for (const otherKey of pidKeys!) {
-          const other = this.entries.get(otherKey);
-          if (other && other.indexKeys.includes(idxKey)) {
-            stillOwned = true;
-            break;
-          }
+      }
+      if (set.size === 0) this.symbolIndex.delete(idxKey);
+    }
+  }
+
+  private removeSkillIndexes(entry: StoredEntry): void {
+    const { page, indexKeys } = entry;
+    for (const [sk, skills] of this.sessionSkillIds) {
+      if (!skills.delete(page.id)) continue;
+      if (skills.size === 0) this.sessionSkillIds.delete(sk);
+      if (!this.entries.has(`${sk}\0${page.id}`)) {
+        const sessPages = this.sessionIndex.get(sk);
+        if (sessPages) {
+          sessPages.delete(page.id);
+          if (sessPages.size === 0) this.sessionIndex.delete(sk);
         }
-        if (!stillOwned) set.delete(page.id);
+      }
+    }
+    const activePidKeys = this.keysByPageId.get(page.id);
+    for (const idxKey of indexKeys) {
+      const set = this.symbolIndex.get(idxKey);
+      if (!set) continue;
+      if (!this.isSymbolKeyOwnedByPageId(page.id, idxKey, activePidKeys)) {
+        set.delete(page.id);
       }
       if (set.size === 0) this.symbolIndex.delete(idxKey);
     }
   }
 
   private evictOldest(): boolean {
-    let candidate: [string, StoredEntry] | undefined;
-    let firstEntry: [string, StoredEntry] | undefined;
-    for (const pair of this.entries.entries()) {
-      if (!firstEntry) firstEntry = pair;
-      if (pair[1].page.toolName !== 'skill-catalog') {
-        candidate = pair;
-        break;
-      }
-    }
-    const victim = candidate ?? firstEntry;
-    if (!victim) return false;
-    const [key, entry] = victim;
+    const first = this.entries.entries().next();
+    if (first.done) return false;
+    const [key, entry] = first.value;
     this.entries.delete(key);
     this.totalBytes = Math.max(0, this.totalBytes - entry.bytes);
     this.removeIndexes(entry);
+    this.stats.pagesEvicted += 1;
+    return true;
+  }
+
+  private evictOldestSkill(): boolean {
+    const first = this.skillEntries.entries().next();
+    if (first.done) return false;
+    const [id, entry] = first.value;
+    this.skillEntries.delete(id);
+    this.totalSkillBytes = Math.max(0, this.totalSkillBytes - entry.bytes);
+    this.removeSkillIndexes(entry);
     this.stats.pagesEvicted += 1;
     return true;
   }
@@ -1365,14 +1464,89 @@ export class ContextPageStore {
     if (schedule) this.scheduleSave();
   }
 
+  private upsertSkillEntry(
+    page: MmuPage,
+    bytes: number,
+    indexKeys: readonly string[],
+    sessionKeys: readonly string[],
+    schedule: boolean,
+  ): MmuPage {
+    const existing = this.skillEntries.get(page.id);
+    if (existing) {
+      const merged = [...new Set([...existing.indexKeys, ...indexKeys])];
+      const updated: StoredEntry = merged.length > existing.indexKeys.length
+        ? { ...existing, indexKeys: merged }
+        : existing;
+      this.skillEntries.delete(page.id);
+      this.skillEntries.set(page.id, updated);
+      if (merged.length > existing.indexKeys.length) {
+        this.addSymbolIndexesForPage(page.id, merged);
+      }
+      for (const sk of sessionKeys) {
+        this.linkSessionSkill(sk, page.id);
+      }
+      if (schedule) this.scheduleSave();
+      return existing.page;
+    }
+
+    while (
+      this.skillEntries.size > 0 &&
+      (this.skillEntries.size >= this.maxSkillPages || this.totalSkillBytes + bytes > this.maxSkillBytes)
+    ) {
+      if (!this.evictOldestSkill()) break;
+    }
+    const entry: StoredEntry = { key: page.id, page, bytes, indexKeys };
+    this.skillEntries.set(page.id, entry);
+    this.totalSkillBytes += bytes;
+    this.addSymbolIndexesForPage(page.id, indexKeys);
+    for (const sk of sessionKeys) {
+      this.linkSessionSkill(sk, page.id);
+    }
+    this.stats.pagesStored += 1;
+    this.stats.totalRawChars += page.rawText.length;
+    if (schedule) this.scheduleSave();
+    return page;
+  }
+
   /**
    * Store a paged-out block into Context-MMU.
    * Reuses an existing entry with identical `id` under `sessionKey` (no-op, refreshes LRU).
+   * `'skill-catalog'` entries live in a deduplicated shared global skill slab.
    */
   storePage(input: StorePageInput): MmuPage {
     const sessionKey = input.sessionKey && input.sessionKey.trim() ? input.sessionKey.trim() : 'default';
     const refId = input.refId && input.refId.trim() ? input.refId.trim() : 'page';
     const id = pageIdForText(input.rawText);
+
+    if (input.toolName === 'skill-catalog') {
+      const existingSkill = this.skillEntries.get(id);
+      if (existingSkill) {
+        const extraKeys = input.extraSymbols && input.extraSymbols.length > 0
+          ? collectIndexKeys([], existingSkill.page.filePath, input.extraSymbols)
+          : [];
+        return this.upsertSkillEntry(existingSkill.page, existingSkill.bytes, extraKeys, [sessionKey], false);
+      }
+      const filePath = input.filePath ?? inferFilePath(input.rawText, refId);
+      const symbols = extractSymbolSpans(input.rawText);
+      const factTokens = extractFactSheetTokens(input.rawText);
+      const page: MmuPage = {
+        id,
+        sessionKey,
+        refId,
+        toolName: 'skill-catalog',
+        ...(filePath !== undefined ? { filePath } : {}),
+        createdAtMs: input.nowMs ?? Date.now(),
+        rawText: input.rawText,
+        lineCount: countLines(input.rawText),
+        symbols,
+        factTokens,
+      };
+      const bytes = utf8ByteLength(input.rawText);
+      if (bytes > this.maxSkillBytes) return page;
+      const indexKeys = collectIndexKeys(symbols, filePath, input.extraSymbols);
+      return this.upsertSkillEntry(page, bytes, indexKeys, [sessionKey], true);
+    }
+
     const entryKey = `${sessionKey}\0${id}`;
     const existing = this.entries.get(entryKey);
     if (existing) {
@@ -1392,6 +1566,7 @@ export class ContextPageStore {
     const filePath = input.filePath ?? inferFilePath(input.rawText, refId);
     const symbols = extractSymbolSpans(input.rawText);
     const factTokens = extractFactSheetTokens(input.rawText);
+    const lineCount = countLines(input.rawText);
     const page: MmuPage = {
       id,
       sessionKey,
@@ -1400,10 +1575,15 @@ export class ContextPageStore {
       ...(filePath !== undefined ? { filePath } : {}),
       createdAtMs: input.nowMs ?? Date.now(),
       rawText: input.rawText,
-      lineCount: countLines(input.rawText),
+      lineCount,
       symbols,
       factTokens,
     };
+
+    // TinyLFU / Structural Admission Filter (V20-1): skip noisy 1-3 line tool acks with no symbols/path when auto-paging.
+    if (input.admissionFilter === true && lineCount < 4 && input.rawText.length < 200 && symbols.length === 0 && !filePath) {
+      return page;
+    }
 
     const bytes = utf8ByteLength(input.rawText);
     if (bytes > this.maxBytes) {
@@ -1419,16 +1599,20 @@ export class ContextPageStore {
   private resolveEntryByPageId(pageId: string, sessionKey?: string): StoredEntry | undefined {
     if (sessionKey !== undefined) {
       const sk = sessionKey.trim();
-      return sk ? this.entries.get(`${sk}\0${pageId}`) : undefined;
+      if (!sk) return undefined;
+      return this.entries.get(`${sk}\0${pageId}`) ??
+        (this.sessionSkillIds.get(sk)?.has(pageId) ? this.skillEntries.get(pageId) : undefined);
     }
     const keys = this.keysByPageId.get(pageId);
-    if (!keys || keys.size === 0) return undefined;
-    let latest: StoredEntry | undefined;
-    for (const key of keys) {
-      const e = this.entries.get(key);
-      if (e) latest = e;
+    if (keys && keys.size > 0) {
+      let latest: StoredEntry | undefined;
+      for (const key of keys) {
+        const e = this.entries.get(key);
+        if (e) latest = e;
+      }
+      if (latest) return latest;
     }
-    return latest;
+    return this.skillEntries.get(pageId);
   }
 
   /** Dereference a stored page by ID with optional sessionKey boundary, line range, or focused query. */
@@ -1543,6 +1727,19 @@ export class ContextPageStore {
       if (scopedKey !== undefined && entry.page.sessionKey !== scopedKey) continue;
       out.push(summarizePage(entry.page));
     }
+    if (scopedKey !== undefined) {
+      const skillIds = this.sessionSkillIds.get(scopedKey);
+      if (skillIds) {
+        for (const pid of skillIds) {
+          const entry = this.skillEntries.get(pid);
+          if (entry) out.push({ ...summarizePage(entry.page), sessionKey: scopedKey });
+        }
+      }
+    } else {
+      for (const entry of this.skillEntries.values()) {
+        out.push(summarizePage(entry.page));
+      }
+    }
     return out;
   }
 
@@ -1579,12 +1776,7 @@ export class ContextPageStore {
       return [];
     }
 
-    // Walk MRU -> LRU by iterating entries in reverse insertion order
-    const ordered = [...this.entries.values()].reverse();
-    for (const entry of ordered) {
-      const { page } = entry;
-      if (scopedKey !== undefined && page.sessionKey !== scopedKey) continue;
-
+    const scorePage = (page: MmuPage, effectiveSessionKey?: string): void => {
       let score = indexedIds.has(page.id) ? 50 : 0;
       const matchedSymbols: MmuSymbolSpan[] = [];
       for (const sym of page.symbols) {
@@ -1634,13 +1826,29 @@ export class ContextPageStore {
       }
 
       if (score > 0) {
+        const summary = summarizePage(page);
         hits.push({
-          page: summarizePage(page),
+          page: effectiveSessionKey ? { ...summary, sessionKey: effectiveSessionKey } : summary,
           score,
           matchedSymbols,
           matchedLine: matchedSymbols[0]?.startLine ?? textLineHit ?? 1,
         });
       }
+    };
+
+    // Walk MRU -> LRU by iterating entries and skillEntries in reverse insertion order
+    const ordered = [...this.entries.values()].reverse();
+    for (const entry of ordered) {
+      const { page } = entry;
+      if (scopedKey !== undefined && page.sessionKey !== scopedKey) continue;
+      scorePage(page);
+    }
+    const scopedSkills = scopedKey !== undefined ? this.sessionSkillIds.get(scopedKey) : undefined;
+    const orderedSkills = [...this.skillEntries.values()].reverse();
+    for (const entry of orderedSkills) {
+      const { page } = entry;
+      if (scopedKey !== undefined && !scopedSkills?.has(page.id)) continue;
+      scorePage(page, scopedKey);
     }
 
     hits.sort((a, b) => b.score - a.score || b.page.createdAtMs - a.page.createdAtMs);
@@ -1663,7 +1871,7 @@ export class ContextPageStore {
 
   /** O(1) resident page count (optionally scoped to one session). */
   getSessionPageCount(sessionKey?: string): number {
-    if (!sessionKey) return this.entries.size;
+    if (!sessionKey) return this.entries.size + this.skillEntries.size;
     return this.sessionIndex.get(sessionKey.trim())?.size ?? 0;
   }
 
@@ -1730,8 +1938,8 @@ export class ContextPageStore {
   getStats(): MmuStats {
     return {
       ...this.stats,
-      activePages: this.entries.size,
-      activeBytes: this.totalBytes,
+      activePages: this.entries.size + this.skillEntries.size,
+      activeBytes: this.totalBytes + this.totalSkillBytes,
     };
   }
 
@@ -1841,12 +2049,15 @@ export class ContextPageStore {
     }
     this.dirty = false;
     this.entries.clear();
+    this.skillEntries.clear();
+    this.sessionSkillIds.clear();
     this.keysByPageId.clear();
     this.symbolIndex.clear();
     this.sessionIndex.clear();
     this.hydrationTlb.clear();
     this.hydrationTurn.clear();
     this.totalBytes = 0;
+    this.totalSkillBytes = 0;
     this.stats = emptyStats();
   }
 }
@@ -2574,6 +2785,12 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
   let totalSavedTokens = 0;
   const episodeIds: string[] = [];
 
+  const circuitBreakerOpen = isCacheCircuitBreakerOpen(
+    args.sessionKey,
+    args.model ? { model: args.model } : undefined,
+  );
+  const stickyOnly = args.stickyOnly === true || circuitBreakerOpen;
+
   for (const ep of episodes) {
     const signatureSource =
       ep.predecessors.map((p) => `${p.block.refId}:${p.raw.length}:${fnv64Hex(p.raw)}`).join('|') +
@@ -2582,7 +2799,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
     const stickyKey = `${sessionKey}\0${args.model ?? ''}\0${epId}`;
     const alreadySealed =
       stickyMarkovEpisodes.has(stickyKey) || hasFoldedEpisodeId(args.sessionKey, stickyKey);
-    if (args.stickyOnly && !alreadySealed) continue;
+    if (stickyOnly && !alreadySealed) continue;
     const frozenCertificate = alreadySealed
       ? (stickyMarkovCertificates.get(stickyKey) ?? getFoldedEpisodeCertificate(args.sessionKey, stickyKey))
       : undefined;
@@ -2737,6 +2954,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
           toolName: pred.block.toolName,
           filePath: meta?.filePath,
           rawText: pred.raw,
+          admissionFilter: true,
         });
         if (args.store.getPage(stored.id, sessionKey)) {
           residentIds.push(stored.id);

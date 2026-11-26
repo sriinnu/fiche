@@ -37,15 +37,17 @@ import { basename, join } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
 import { buildWarpAppArgs, type ResolvedMacApp } from './app-launch.js';
-import { createWarpHandlers } from './connect.js';
+import { createWarpHandlers, destroyWarpAgents } from './connect.js';
 import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
 import { readBrandEnv } from '../core/env.js';
 import {
   buildUpstreamRegistry,
   DEFAULT_UPSTREAM_REGISTRY,
+  detectProvidersFromEnv,
   getEnabledProviders,
   parseUpstreamHosts,
+  PROVIDER_CATALOG,
   type ProviderId,
 } from '../core/upstream-hosts.js';
 
@@ -97,10 +99,16 @@ export function loadOrCreateWarpToken(dir: string): string {
   const dirExisted = existsSync(dir);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (!dirExisted) {
+    let dirFd: number | undefined;
     try {
-      fchmodSync(openSync(dir, fsConstants.O_RDONLY), 0o700);
+      dirFd = openSync(dir, fsConstants.O_RDONLY);
+      fchmodSync(dirFd, 0o700);
     } catch {
       /* best effort */
+    } finally {
+      if (dirFd !== undefined) {
+        try { closeSync(dirFd); } catch { /* ignore */ }
+      }
     }
   }
   const tokenPath = join(dir, 'warp-token');
@@ -534,8 +542,10 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     // The kernel picks it, nothing else needs to know it, so there is nothing to
     // collide with a inkling already running.
     proxy = createServer(handlers.handleAbsoluteForm);
+    proxy.requestTimeout = 0;
     proxy.on('connection', (socket) => socket.setNoDelay(true));
     proxy.on('connect', handlers.handleConnect);
+    proxy.on('upgrade', handlers.handleUpgrade);
 
     const spawnChild = (cmd: string[], proxyUrl: string): void => {
       const env = { ...process.env };
@@ -593,6 +603,8 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
             clearInterval(providersPollTimer);
             providersPollTimer = undefined;
           }
+          try { proxy.close(); } catch { /* ignore */ }
+          destroyWarpAgents();
         },
         launchedAt,
       );
@@ -682,6 +694,21 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       console.error(`[fiche] warp app → ${options.app.appName} [${modeLabel}] → ${options.app.appPath}`);
     } else {
       console.error(`[fiche] warp exec → ${augmentWrappedCommand(command).join(' ')}`);
+    }
+    if (verboseBanner || !process.stdout.isTTY) {
+      const activeSet = new Set<ProviderId>(activeProviders);
+      const thirdPartyIds = new Set(
+        PROVIDER_CATALOG.filter((p) => p.tier === 'third-party').map((p) => p.id),
+      );
+      const missingThirdParty = detectProvidersFromEnv(process.env).filter(
+        (hit) => thirdPartyIds.has(hit.id) && !activeSet.has(hit.id),
+      );
+      if (missingThirdParty.length > 0) {
+        const list = missingThirdParty.map((hit) => `${hit.id} (${hit.matchedEnvKey})`).join(', ');
+        console.error(
+          `[fiche] warp hint: detected disabled 3rd-party provider key(s): ${list} — run \`fiche providers enable <id>\` or pass \`--all-providers\` to intercept`,
+        );
+      }
     }
 
     proxy.on('error', (err) => {

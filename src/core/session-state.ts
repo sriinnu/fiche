@@ -123,6 +123,18 @@ const LIVENESS_SCOPES_MAX = 16;
 
 export type OpticalHistoryPolicy = 'hybrid' | 'full';
 
+export interface CacheHealthSample {
+  readonly hitRatio: number;
+  readonly wrote1h: boolean;
+}
+
+const CACHE_HEALTH_WINDOW_MAX = 5;
+const CACHE_BREAKER_TRIGGER_WROTE_1H = 3;
+const CACHE_BREAKER_TRIGGER_MEAN_RATIO = 0.70;
+const CACHE_BREAKER_OPEN_TURNS = 10;
+const CACHE_BREAKER_RECOVER_RATIO = 0.85;
+const CACHE_BREAKER_RECOVER_STREAK = 2;
+
 export interface SessionLivenessScopeOpts {
   readonly nowMs?: number;
   readonly model?: string;
@@ -140,6 +152,8 @@ interface ScopedLivenessRecord {
   lastCacheAlive?: boolean;
   everCacheAlive?: boolean;
   opticalHistoryPolicy?: OpticalHistoryPolicy;
+  recentCacheWindow?: CacheHealthSample[];
+  circuitBreakerTurnsLeft?: number;
 }
 
 interface SessionRecord extends ScopedLivenessRecord {
@@ -309,6 +323,32 @@ function sanitizeStringArray(raw: unknown, maxLen: number, keepTail: boolean): s
   return keepTail && deduped.length > maxLen ? deduped.slice(-maxLen) : deduped;
 }
 
+function sanitizeCacheWindow(raw: unknown): CacheHealthSample[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: CacheHealthSample[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const sample = item as Partial<CacheHealthSample>;
+    if (
+      typeof sample.hitRatio !== 'number' ||
+      !Number.isFinite(sample.hitRatio) ||
+      sample.hitRatio < 0 ||
+      sample.hitRatio > 1 ||
+      typeof sample.wrote1h !== 'boolean'
+    ) {
+      continue;
+    }
+    out.push({ hitRatio: sample.hitRatio, wrote1h: sample.wrote1h });
+  }
+  if (out.length === 0) return undefined;
+  return out.length > CACHE_HEALTH_WINDOW_MAX ? out.slice(-CACHE_HEALTH_WINDOW_MAX) : out;
+}
+
+function sanitizeBreakerTurns(raw: unknown): number | undefined {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined;
+  return Math.min(CACHE_BREAKER_OPEN_TURNS, Math.floor(raw));
+}
+
 function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   if (!entry || typeof entry !== 'object') return undefined;
   const e = entry as Partial<PersistedRecord>;
@@ -345,6 +385,10 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   if (e.opticalHistoryPolicy === 'hybrid' || e.opticalHistoryPolicy === 'full') {
     rec.opticalHistoryPolicy = e.opticalHistoryPolicy;
   }
+  const topWin = sanitizeCacheWindow(e.recentCacheWindow);
+  if (topWin) rec.recentCacheWindow = topWin;
+  const topBreaker = sanitizeBreakerTurns(e.circuitBreakerTurnsLeft);
+  if (topBreaker !== undefined) rec.circuitBreakerTurnsLeft = topBreaker;
   if (typeof e.primaryScope === 'string' && e.primaryScope) {
     rec.primaryScope = e.primaryScope;
   }
@@ -371,6 +415,10 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
       if (sr.opticalHistoryPolicy === 'hybrid' || sr.opticalHistoryPolicy === 'full') {
         cleanScope.opticalHistoryPolicy = sr.opticalHistoryPolicy;
       }
+      const scopeWin = sanitizeCacheWindow(sr.recentCacheWindow);
+      if (scopeWin) cleanScope.recentCacheWindow = scopeWin;
+      const scopeBreaker = sanitizeBreakerTurns(sr.circuitBreakerTurnsLeft);
+      if (scopeBreaker !== undefined) cleanScope.circuitBreakerTurnsLeft = scopeBreaker;
       scopes[sk] = cleanScope;
       sc++;
     }
@@ -393,6 +441,12 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
     if (rec.lastCacheAlive !== undefined) item.lastCacheAlive = rec.lastCacheAlive;
     if (rec.everCacheAlive !== undefined) item.everCacheAlive = rec.everCacheAlive;
     if (rec.opticalHistoryPolicy !== undefined) item.opticalHistoryPolicy = rec.opticalHistoryPolicy;
+    if (rec.recentCacheWindow && rec.recentCacheWindow.length > 0) {
+      item.recentCacheWindow = rec.recentCacheWindow.slice(-CACHE_HEALTH_WINDOW_MAX);
+    }
+    if ((rec.circuitBreakerTurnsLeft ?? 0) > 0) {
+      item.circuitBreakerTurnsLeft = rec.circuitBreakerTurnsLeft;
+    }
     if (rec.primaryScope !== undefined) item.primaryScope = rec.primaryScope;
     if (rec.livenessScopes) {
       const persistedScopes: Record<string, ScopedLivenessRecord> = {};
@@ -406,6 +460,12 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
           ...(sr.lastCacheAlive !== undefined ? { lastCacheAlive: sr.lastCacheAlive } : {}),
           ...(sr.everCacheAlive !== undefined ? { everCacheAlive: sr.everCacheAlive } : {}),
           ...(sr.opticalHistoryPolicy !== undefined ? { opticalHistoryPolicy: sr.opticalHistoryPolicy } : {}),
+          ...(sr.recentCacheWindow && sr.recentCacheWindow.length > 0
+            ? { recentCacheWindow: sr.recentCacheWindow.slice(-CACHE_HEALTH_WINDOW_MAX) }
+            : {}),
+          ...((sr.circuitBreakerTurnsLeft ?? 0) > 0
+            ? { circuitBreakerTurnsLeft: sr.circuitBreakerTurnsLeft }
+            : {}),
         };
         sc++;
       }
@@ -725,6 +785,21 @@ export function hasStage2SealKey(
   return Boolean(rec?.sealedStage2SlotKeys?.includes(slotKey));
 }
 
+export function removeStage2SealKeys(
+  sessionKey: string | undefined,
+  slotKeys: readonly string[],
+): void {
+  if (!sessionKey || slotKeys.length === 0) return;
+  const rec = sessions.get(sessionKey);
+  if (!rec?.sealedStage2SlotKeys || rec.sealedStage2SlotKeys.length === 0) return;
+  const drop = new Set(slotKeys);
+  const next = rec.sealedStage2SlotKeys.filter((k) => !drop.has(k));
+  if (next.length !== rec.sealedStage2SlotKeys.length) {
+    rec.sealedStage2SlotKeys = next;
+    scheduleSave();
+  }
+}
+
 export function recordFoldedEpisodeId(
   sessionKey: string | undefined,
   episodeId: string,
@@ -873,6 +948,150 @@ export function noteCacheOutcome(
     applyCacheOutcomeToTarget(rec.livenessScopes[rec.primaryScope]!, alive, cacheCreateTokens);
   }
   scheduleSave();
+}
+
+function applyRollingCacheHealthToTarget(
+  target: ScopedLivenessRecord,
+  hitRatio: number,
+  wrote1h: boolean,
+): void {
+  const win = target.recentCacheWindow ? [...target.recentCacheWindow] : [];
+  win.push({ hitRatio, wrote1h });
+  if (win.length > CACHE_HEALTH_WINDOW_MAX) {
+    win.splice(0, win.length - CACHE_HEALTH_WINDOW_MAX);
+  }
+  target.recentCacheWindow = win;
+
+  const left = target.circuitBreakerTurnsLeft ?? 0;
+  if (left > 0) {
+    const tailHealthy =
+      win.length >= CACHE_BREAKER_RECOVER_STREAK &&
+      win
+        .slice(-CACHE_BREAKER_RECOVER_STREAK)
+        .every((s) => s.hitRatio >= CACHE_BREAKER_RECOVER_RATIO);
+    target.circuitBreakerTurnsLeft = tailHealthy ? 0 : Math.max(0, left - 1);
+    return;
+  }
+
+  let wrote1hCount = 0;
+  let ratioSum = 0;
+  for (const s of win) {
+    if (s.wrote1h) wrote1hCount++;
+    ratioSum += s.hitRatio;
+  }
+  const meanHitRatio = win.length > 0 ? ratioSum / win.length : 1;
+  if (wrote1hCount >= CACHE_BREAKER_TRIGGER_WROTE_1H && meanHitRatio < CACHE_BREAKER_TRIGGER_MEAN_RATIO) {
+    target.circuitBreakerTurnsLeft = CACHE_BREAKER_OPEN_TURNS;
+  }
+}
+
+/**
+ * Record a turn's rolling cache hit ratio and 1h-write flag to detect repeated
+ * mid-prefix 1h cache busts and open a 10-turn mutation circuit breaker.
+ */
+export function noteRollingCacheHealth(
+  sessionKey: string | undefined,
+  usage: {
+    cacheReadTokens?: number;
+    cacheCreate1hTokens?: number;
+    totalInputTokens?: number;
+  },
+  opts?: SessionLivenessScopeOpts,
+): void {
+  if (!sessionKey) return;
+  const cacheRead = Math.max(0, usage.cacheReadTokens ?? 0);
+  const wrote1hTok = Math.max(0, usage.cacheCreate1hTokens ?? 0);
+  const totalIn = Math.max(0, usage.totalInputTokens ?? 0);
+  const denom = totalIn > 0 ? Math.max(totalIn, cacheRead) : cacheRead + wrote1hTok;
+  if (denom <= 0) return;
+
+  const hitRatio = Math.min(1, Math.max(0, cacheRead / denom));
+  const wrote1h = wrote1hTok > 0;
+  const rec = touch(sessionKey);
+  const nowMs = opts?.nowMs ?? Date.now();
+  if (rec.lastSeenMs <= 0) rec.lastSeenMs = nowMs;
+
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    if (!rec.primaryScope && !isAuxiliaryScope(scope)) {
+      rec.primaryScope = scope;
+    }
+    const scoped = getOrCreateScopeRecord(rec, scope);
+    if (scoped.lastSeenMs <= 0) scoped.lastSeenMs = nowMs;
+    applyRollingCacheHealthToTarget(scoped, hitRatio, wrote1h);
+    if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
+      applyRollingCacheHealthToTarget(rec, hitRatio, wrote1h);
+    }
+    scheduleSave();
+    return;
+  }
+
+  applyRollingCacheHealthToTarget(rec, hitRatio, wrote1h);
+  if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
+    applyRollingCacheHealthToTarget(rec.livenessScopes[rec.primaryScope]!, hitRatio, wrote1h);
+  }
+  scheduleSave();
+}
+
+/**
+ * Non-mutating check: true when the cache overhead circuit breaker is open
+ * for `(sessionKey, opts)`. Unknown sessions return `false`.
+ */
+export function isCacheCircuitBreakerOpen(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return false;
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = rec.livenessScopes?.[scope];
+    if (scoped) return (scoped.circuitBreakerTurnsLeft ?? 0) > 0;
+    if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+      return false;
+    }
+  }
+  return (rec.circuitBreakerTurnsLeft ?? 0) > 0;
+}
+
+/**
+ * Decrement one turn from an active cache overhead circuit breaker. Returns true
+ * if the breaker was open when consumed, false otherwise.
+ */
+export function consumeCacheCircuitBreakerTurn(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): boolean {
+  if (!sessionKey) return false;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return false;
+  const scope = resolveScopeKey(opts);
+  const consumeTarget = (target: ScopedLivenessRecord): boolean => {
+    const left = target.circuitBreakerTurnsLeft ?? 0;
+    if (left <= 0) return false;
+    target.circuitBreakerTurnsLeft = left - 1;
+    return true;
+  };
+  let wasOpen = false;
+  if (scope) {
+    const scoped = rec.livenessScopes?.[scope];
+    if (scoped) {
+      wasOpen = consumeTarget(scoped);
+      if (rec.primaryScope === scope) consumeTarget(rec);
+    } else if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+      return false;
+    } else {
+      wasOpen = consumeTarget(rec);
+    }
+  } else {
+    wasOpen = consumeTarget(rec);
+    if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
+      consumeTarget(rec.livenessScopes[rec.primaryScope]!);
+    }
+  }
+  if (wasOpen) scheduleSave();
+  return wasOpen;
 }
 
 /**

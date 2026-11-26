@@ -189,7 +189,7 @@ final class AboutWindowController {
             window.setContentSize(NSSize(width: 320, height: max(330, ceil(hosting.view.fittingSize.height))))
             Self.centerOnActiveScreen(window)
             window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp.activate()
             return
         }
 
@@ -211,7 +211,7 @@ final class AboutWindowController {
         win.setContentSize(NSSize(width: 320, height: max(330, ceil(hosting.view.fittingSize.height))))
         Self.centerOnActiveScreen(win)
         win.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         self.window = win
     }
 

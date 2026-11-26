@@ -21,7 +21,7 @@ import { factSheetText } from './factsheet.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
 import { resetGlobalPrefixTape } from './prefix-tape.js';
 import { evaluateCliffAvoidance, isAutoCacheOpenAIModel, priceMode, resolvePriceRates } from './pricing.js';
-import { hasSealedEpochKey, recordSealedEpochKey } from './session-state.js';
+import { hasSealedEpochKey, isCacheCircuitBreakerOpen, recordSealedEpochKey } from './session-state.js';
 
 export interface CacheBreakpointMarker {
   /** Message index in `messages`, or `-1` for tools/system. */
@@ -426,7 +426,11 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
   };
 
   const sealedList: Candidate[][] = [];
-  const stickyOnly = args.stickyOnly === true;
+  const circuitBreakerOpen = isCacheCircuitBreakerOpen(
+    args.sessionKey,
+    args.model ? { model: args.model } : undefined,
+  );
+  const stickyOnly = args.stickyOnly === true || circuitBreakerOpen;
 
   if (lsmActive && args.sessionCacheCold === true) {
     // L2 Cold-Cache Repack: partition all eligible blocks behind cutoffL1, flushing trailing remainder.
@@ -464,6 +468,10 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
         continue;
       }
       if (lsmActive && pending.length > 0 && singleSticky) {
+        if (!stickyOnly) sealedList.push(pending);
+        pending = [];
+        pendingTokens = 0;
+        pendingSig = '';
         sealedList.push([item]);
         continue;
       }

@@ -18,6 +18,7 @@ struct FicheLogoMark: View {
     @State private var glintProgress: CGFloat = -0.9
     @State private var sparkleOpacity: Double = 0
     @State private var sparkleScale: CGFloat = 0.4
+    @State private var glintGeneration: Int = 0
 
     var body: some View {
         Button {
@@ -76,6 +77,8 @@ struct FicheLogoMark: View {
     }
 
     private func triggerGlint() {
+        glintGeneration &+= 1
+        let gen = glintGeneration
         tiltSign *= -1
         glintProgress = -0.9
         sparkleOpacity = 0
@@ -95,11 +98,13 @@ struct FicheLogoMark: View {
 
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(160))
+            guard glintGeneration == gen else { return }
             withAnimation(.spring(response: 0.36, dampingFraction: 0.65)) {
                 bounceScale = 1.0
                 tiltAngle = 0
             }
             try? await Task.sleep(for: .milliseconds(140))
+            guard glintGeneration == gen else { return }
             withAnimation(.easeOut(duration: 0.22)) {
                 sparkleOpacity = 0
                 sparkleScale = 0.5

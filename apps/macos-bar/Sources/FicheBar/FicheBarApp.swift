@@ -127,7 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         self.popover = popover
 
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         popover.contentViewController?.view.window?.makeKey()
         installPopoverDismissMonitors(anchor: button)
     }
@@ -260,7 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ]
 
         for spec in specs {
-            let controller = DaemonController.previewSample(theme: spec.theme)
+            let controller = DaemonController.previewSample(theme: spec.theme, tab: spec.tab)
             let view = PopoverView(controller: controller, initialTab: spec.tab)
             guard let data = renderRetinaPNG(rootView: view, width: 360, appearanceName: spec.appearance) else {
                 continue
@@ -356,7 +356,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 return ("fiche", "Fiche active, no compressed turns yet")
             }
 
-            let usdStr = Fmt.usd(savedUsd)
+            let unpricedAll = stats?.allRequestsUnpriced ?? false
+            let isOverhead = savedTokens < -0.5 || savedUsd < 0
+            let usdStr: String = {
+                if unpricedAll {
+                    return "unpriced"
+                }
+                if isOverhead && savedUsd < 0 {
+                    return "\(Fmt.usd(abs(savedUsd))) cost"
+                }
+                return Fmt.usd(savedUsd)
+            }()
             let summary: String
             if abs(savedPct) >= 0.5 {
                 summary = "\(Fmt.signedPctDelta(savedPct)) · \(usdStr)"
@@ -367,8 +377,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
 
             let accessibilityText: String
-            if savedTokens < -0.5 || savedUsd < 0 {
-                accessibilityText = "Fiche active: \(Fmt.signedTokenDelta(savedTokens)) tokens delta, \(usdStr) net impact"
+            if unpricedAll {
+                accessibilityText = "Fiche active: \(Fmt.signedTokenDelta(savedTokens)) tokens delta, pricing unavailable"
+            } else if isOverhead {
+                accessibilityText = "Fiche active: \(Fmt.signedTokenDelta(savedTokens)) tokens overhead, \(Fmt.usd(abs(savedUsd))) net cost"
             } else {
                 accessibilityText = "Fiche active: \(Fmt.tokens(savedTokens)) tokens saved, \(usdStr) saved"
             }

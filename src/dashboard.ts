@@ -28,6 +28,7 @@
  * a process restart starts the image ring empty.
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -507,6 +508,16 @@ function isOpenAIEvent(
   return path.includes('responses') || path.includes('chat/completions');
 }
 
+function isGoogleEvent(
+  path: string | undefined,
+  accountingProvider?: 'anthropic' | 'openai' | 'google',
+): boolean {
+  if (accountingProvider) return accountingProvider === 'google';
+  if (!path) return false;
+  if (isOpenAIEvent(path, undefined)) return false;
+  return path.includes('google-ai-studio') || path.toLowerCase().includes('generatecontent');
+}
+
 function googleEff(args: {
   model?: string;
   inputTokens: number;
@@ -671,7 +682,11 @@ export interface DashboardHooks {
   readonly onProvidersPersist?: (providers: readonly ProviderId[]) => void;
   readonly onShutdown?: () => void;
   readonly getActiveRequests?: () => number;
+  readonly controlToken?: string;
+  readonly verifyControlToken?: (token: string | undefined) => boolean;
 }
+
+export type DashboardOptions = DashboardHooks;
 
 export class DashboardState {
   private recent: RecentRow[] = [];
@@ -1171,8 +1186,7 @@ export class DashboardState {
     const cc1h = u?.cache_creation?.ephemeral_1h_input_tokens ?? 0;
     const cr = u?.cache_read_input_tokens ?? 0;
     const gpt = isOpenAIEvent(ev.path, ev.accountingProvider);
-    const google = ev.accountingProvider === 'google'
-      || ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent');
+    const google = isGoogleEvent(ev.path, ev.accountingProvider);
 
     // Unified per-row accounting, filled by the provider branch below. The
     // downstream totals / per-session / recent-row code reads only these —
@@ -1228,7 +1242,7 @@ export class DashboardState {
           sidGoogle,
           {
             ts: completionSecGoogle,
-            cachedOrPrefixTokens: cachedGoogle > 0 ? cachedGoogle : Math.max(googlePrev?.cachedOrPrefixTokens ?? 0, inp),
+            cachedOrPrefixTokens: cachedGoogle > 0 ? cachedGoogle : 0,
             prefixSha: info?.systemSha8 ?? googlePrev?.prefixSha,
             pxPrefixSha: pxShaGoogle ?? googlePrev?.pxPrefixSha,
             model: ev.model ?? googlePrev?.model,
@@ -1284,7 +1298,7 @@ export class DashboardState {
           sidGpt,
           {
             ts: completionSecGpt,
-            cachedOrPrefixTokens: cachedGpt > 0 ? cachedGpt : Math.max(gptPrev?.cachedOrPrefixTokens ?? 0, inp),
+            cachedOrPrefixTokens: cachedGpt > 0 ? cachedGpt : 0,
             prefixSha: info?.systemSha8 ?? gptPrev?.prefixSha,
             pxPrefixSha: pxShaGpt ?? gptPrev?.pxPrefixSha,
             model: ev.model ?? gptPrev?.model,
@@ -1614,8 +1628,7 @@ export class DashboardState {
           const cr = finiteNum(t.cache_read_tokens);
           const compressed = t.compressed === true;
           const gpt = isOpenAIEvent(t.path, t.accounting_provider);
-          const google = t.accounting_provider === 'google'
-            || t.path.includes('google-ai-studio') || t.path.toLowerCase().includes('generatecontent');
+          const google = isGoogleEvent(t.path, t.accounting_provider);
 
           // Same unified accounting as update(); see the branch comments there.
           let haveUsage: boolean;
@@ -1679,7 +1692,7 @@ export class DashboardState {
                 sidGoogleR,
                 {
                   ts: completionSecGoogleR,
-                  cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : Math.max(googlePrevR?.cachedOrPrefixTokens ?? 0, inp),
+                  cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : 0,
                   prefixSha: (t as { system_sha8?: string }).system_sha8 ?? googlePrevR?.prefixSha,
                   pxPrefixSha: pxShaGoogleR ?? googlePrevR?.pxPrefixSha,
                   model: t.model ?? googlePrevR?.model,
@@ -1734,7 +1747,7 @@ export class DashboardState {
                 sidGptR,
                 {
                   ts: completionSecGptR,
-                  cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : Math.max(gptPrevR?.cachedOrPrefixTokens ?? 0, inp),
+                  cachedOrPrefixTokens: cachedTok > 0 ? cachedTok : 0,
                   prefixSha: (t as { system_sha8?: string }).system_sha8 ?? gptPrevR?.prefixSha,
                   pxPrefixSha: pxShaGptR ?? gptPrevR?.pxPrefixSha,
                   model: t.model ?? gptPrevR?.model,
@@ -2294,7 +2307,12 @@ export class DashboardState {
       allowed_models: getAllowedModelBases(),
       enabled_providers: getEnabledProviders(),
       by_model: (() => {
-        const byModel: Record<string, ModelStatsPayload> = {};
+        type ModelStatsWithPricing = ModelStatsPayload & {
+          priced: boolean;
+          usd_priced_requests: number;
+          usd_unpriced_requests: number;
+        };
+        const byModel: Record<string, ModelStatsWithPricing> = {};
         for (const [model, t] of this.totalsByModel) {
           if (!this.isModelIncludedInStats(model, t.textHygieneSavedTokens, this.otherHasSupportedModel)) {
             continue;
@@ -2313,6 +2331,8 @@ export class DashboardState {
           if (prev) {
             const nextBaseline = prev.baseline_input_weighted + baseline;
             const nextSaved = prev.saved_tokens + savedTokens;
+            const nextUsdPriced = prev.usd_priced_requests + t.usdPricedRequests;
+            const nextUsdUnpriced = prev.usd_unpriced_requests + t.usdUnpricedRequests;
             byModel[key] = {
               requests: prev.requests + t.requests,
               compressed: prev.compressed + t.compressedRequests,
@@ -2326,6 +2346,9 @@ export class DashboardState {
               saved_usd: round4(prev.saved_usd + savedUsd),
               cliff_avoided_events: prev.cliff_avoided_events + t.cliffAvoidedEvents,
               cliff_saved_usd: round4(prev.cliff_saved_usd + t.cliffSavedUsd),
+              priced: nextUsdPriced > 0,
+              usd_priced_requests: nextUsdPriced,
+              usd_unpriced_requests: nextUsdUnpriced,
             };
           } else {
             byModel[key] = {
@@ -2341,6 +2364,9 @@ export class DashboardState {
               saved_usd: savedUsd,
               cliff_avoided_events: t.cliffAvoidedEvents,
               cliff_saved_usd: round4(t.cliffSavedUsd),
+              priced: t.usdPricedRequests > 0,
+              usd_priced_requests: t.usdPricedRequests,
+              usd_unpriced_requests: t.usdUnpricedRequests,
             };
           }
         }
@@ -2875,14 +2901,40 @@ export class DashboardState {
     });
   }
 
+  verifyControlToken(presented: string | undefined): boolean {
+    if (typeof presented !== 'string') return false;
+    const trimmed = presented.trim();
+    if (!trimmed) return false;
+    if (this.hooks.verifyControlToken) {
+      return this.hooks.verifyControlToken(trimmed);
+    }
+    if (this.hooks.controlToken) {
+      const expected = this.hooks.controlToken.trim();
+      if (!expected) return false;
+      const a = crypto.createHash('sha256').update(trimmed, 'utf8').digest();
+      const b = crypto.createHash('sha256').update(expected, 'utf8').digest();
+      return crypto.timingSafeEqual(a, b);
+    }
+    return false;
+  }
+
   /** GET /api/mmu/page — retrieve exact slice by `id`/`pageId` or search by `query`. */
-  serveMmuPage(params: URLSearchParams): Response {
+  serveMmuPage(
+    params: URLSearchParams,
+    auth?: { controlTokenAuthorized?: boolean; hasControlTokenHeader?: boolean },
+  ): Response {
     const pageId = (params.get('id') ?? params.get('pageId'))?.trim() || undefined;
     const query = params.get('query')?.trim() || undefined;
     if (params.has('sessionKey') && !params.get('sessionKey')!.trim()) {
       return mmuJsonResponse({ error: 'sessionKey must be a non-empty string' }, 400);
     }
     const sessionKey = params.get('sessionKey')?.trim() || undefined;
+    if (!sessionKey && auth?.controlTokenAuthorized !== true) {
+      if (auth?.hasControlTokenHeader) {
+        return mmuJsonResponse({ error: 'invalid x-fiche-control-token' }, 403);
+      }
+      return mmuJsonResponse({ error: 'sessionKey or valid x-fiche-control-token is required' }, 400);
+    }
     if (!pageId && !query) {
       return mmuJsonResponse({ error: 'id/pageId or query parameter is required' }, 400);
     }
@@ -3157,7 +3209,7 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
   if (pathname === '/api/stats.json') return { kind: 'api-stats' };
   if (pathname === '/api/last-turn.json') return { kind: 'api-last-turn' };
   if (pathname === '/api/current-session.json') return { kind: 'current-session' };
-  if (pathname === '/api/health') return { kind: 'api-health' };
+  if (pathname === '/api/health' || pathname === '/health') return { kind: 'api-health' };
   if (pathname === '/api/compression') return { kind: 'api-compression' };
   if (pathname === '/api/models') return { kind: 'api-models' };
   if (pathname === '/api/providers') return { kind: 'api-providers' };
@@ -3211,6 +3263,24 @@ async function parseJsonRequestBody(
   }
 }
 
+export interface DashboardDispatchOptions {
+  readonly headers?: Record<string, string | string[] | undefined> | Headers;
+  readonly controlTokenAuthorized?: boolean;
+}
+
+function readControlTokenHeader(
+  headers: DashboardDispatchOptions['headers'],
+): string | undefined {
+  if (!headers) return undefined;
+  if (headers instanceof Headers) {
+    return headers.get('x-fiche-control-token') ?? undefined;
+  }
+  const raw = headers['x-fiche-control-token'];
+  if (typeof raw === 'string') return raw;
+  if (Array.isArray(raw)) return raw[0];
+  return undefined;
+}
+
 /** Dispatch a matched DashboardRoute to its handler. Returns `405` on `/api/*`
  *  and `/proxy-*` method mismatches so non-GET calls never leak to upstream. */
 export async function dispatchDashboard(
@@ -3220,6 +3290,7 @@ export async function dispatchDashboard(
   url: URL,
   port: number,
   readBody: () => Promise<string>,
+  options?: DashboardDispatchOptions,
 ): Promise<Response | undefined> {
   switch (route.kind) {
     case 'html':
@@ -3301,9 +3372,17 @@ export async function dispatchDashboard(
     case 'api-mmu-stats':
       if (method !== 'GET') return methodNotAllowed('GET');
       return dashboard.serveMmuStats(url.searchParams.has('sessionKey') ? url.searchParams.get('sessionKey')! : undefined);
-    case 'api-mmu-page':
+    case 'api-mmu-page': {
       if (method !== 'GET') return methodNotAllowed('GET');
-      return dashboard.serveMmuPage(url.searchParams);
+      const presentedToken = readControlTokenHeader(options?.headers);
+      const hasControlTokenHeader = typeof presentedToken === 'string' && presentedToken.trim().length > 0;
+      const controlTokenAuthorized =
+        options?.controlTokenAuthorized === true || dashboard.verifyControlToken(presentedToken);
+      return dashboard.serveMmuPage(url.searchParams, {
+        controlTokenAuthorized,
+        hasControlTokenHeader,
+      });
+    }
     case 'api-calibration':
       if (method !== 'GET') return methodNotAllowed('GET');
       return dashboard.serveCalibration();

@@ -150,7 +150,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${TAG#v}"
-          CFBundleShortVersionString="${VERSION}" ./apps/macos-bar/bundle.sh --unsigned --no-install
+          CFBundleShortVersionString="${VERSION}" CFBundleVersion="${GITHUB_RUN_NUMBER:-6}" ./apps/macos-bar/bundle.sh --unsigned --no-install
           APP_PATH="apps/macos-bar/build.noindex/FicheBar.app"
           test -x "${APP_PATH}/Contents/MacOS/FicheBar"
           mkdir -p "${RUNNER_TEMP}/unsigned"

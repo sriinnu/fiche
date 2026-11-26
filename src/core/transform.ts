@@ -59,9 +59,11 @@ import {
 import {
   getPinnedOpticalHistoryPolicy,
   hasStage2SealKey,
+  isCacheCircuitBreakerOpen,
   noteHistoryRequest,
   recordFreezeStep,
   recordStage2SealKey,
+  removeStage2SealKeys,
   sessionAnchorText,
   setPinnedOpticalHistoryPolicy,
   type HistorySessionState,
@@ -3070,7 +3072,66 @@ export async function transformRequest(
       })
     : 'full';
   const hybridTextMmu = effectiveImageCompress && opticalHistoryPolicy === 'hybrid';
-  const hygieneStats = textHygieneActive
+  const circuitBreakerOpen = resolvedSessionKey
+    ? isCacheCircuitBreakerOpen(resolvedSessionKey, o.model ? { model: o.model } : undefined)
+    : false;
+  const breakerSlots = textHygieneActive && circuitBreakerOpen && Array.isArray(req.messages)
+    ? (() => {
+        const slots: Array<{
+          refId: string;
+          origText: string;
+          stage2Sig: string;
+          wasStage2Sealed: boolean;
+          getText: () => string;
+          setText: (next: string) => void;
+        }> = [];
+        for (let mIdx = 0; mIdx < req.messages.length; mIdx++) {
+          const msg = req.messages[mIdx];
+          if (!msg || typeof msg !== 'object' || !Array.isArray(msg.content)) continue;
+          for (let bIdx = 0; bIdx < msg.content.length; bIdx++) {
+            const blk = msg.content[bIdx] as unknown as {
+              type?: unknown;
+              tool_use_id?: unknown;
+              content?: unknown;
+            };
+            if (!blk || typeof blk !== 'object' || blk.type !== 'tool_result') continue;
+            const baseRef = typeof blk.tool_use_id === 'string' && blk.tool_use_id
+              ? blk.tool_use_id
+              : `tr_${mIdx}_${bIdx}`;
+            if (typeof blk.content === 'string') {
+              const origText = blk.content;
+              const stage2Sig = `${baseRef}\0${origText.length}:${tapeHash64Hex(origText)}`;
+              slots.push({
+                refId: baseRef,
+                origText,
+                stage2Sig,
+                wasStage2Sealed: Boolean(resolvedSessionKey && hasStage2SealKey(resolvedSessionKey, stage2Sig)),
+                getText: () => blk.content as string,
+                setText: (next: string) => { blk.content = next; },
+              });
+            } else if (Array.isArray(blk.content)) {
+              for (let pIdx = 0; pIdx < blk.content.length; pIdx++) {
+                const part = blk.content[pIdx] as unknown as { type?: unknown; text?: unknown };
+                if (!part || typeof part !== 'object' || part.type !== 'text' || typeof part.text !== 'string') continue;
+                const refId = `${baseRef}#${pIdx}`;
+                const origText = part.text;
+                const stage2Sig = `${refId}\0${origText.length}:${tapeHash64Hex(origText)}`;
+                slots.push({
+                  refId,
+                  origText,
+                  stage2Sig,
+                  wasStage2Sealed: Boolean(resolvedSessionKey && hasStage2SealKey(resolvedSessionKey, stage2Sig)),
+                  getText: () => part.text as string,
+                  setText: (next: string) => { part.text = next; },
+                });
+              }
+            }
+          }
+        }
+        return slots;
+      })()
+    : undefined;
+  let hygieneStats = textHygieneActive
     ? applyAnthropicTextHygiene(req, {
         foldLogs: !effectiveImageCompress || hybridTextMmu,
         deepTextCompact: !effectiveImageCompress || hybridTextMmu,
@@ -3095,6 +3156,62 @@ export async function transformRequest(
         appendTailHydration: (!effectiveImageCompress || hybridTextMmu) ? (blk) => appendAnthropicTailHydration(req, blk) : undefined,
       })
     : undefined;
+  if (breakerSlots && hygieneStats) {
+    const toUnseal: string[] = [];
+    let revertedAny = false;
+    let keptSlotSavedChars = 0;
+    let keptSlotBlocks = 0;
+    for (const slot of breakerSlots) {
+      const curText = slot.getText();
+      if (curText === slot.origText) continue;
+      if (!slot.wasStage2Sealed) {
+        const isStickyStage3Placeholder =
+          curText.startsWith('[fiche epoch-digest') ||
+          curText.startsWith('[inkling epoch-digest') ||
+          curText.startsWith('[fiche vm-page') ||
+          curText.startsWith('[fiche causal-episode') ||
+          curText.startsWith('[folded into ');
+        if (!isStickyStage3Placeholder) {
+          slot.setText(slot.origText);
+          revertedAny = true;
+          if (resolvedSessionKey && hasStage2SealKey(resolvedSessionKey, slot.stage2Sig)) {
+            toUnseal.push(slot.stage2Sig);
+          }
+          continue;
+        }
+      }
+      keptSlotBlocks += 1;
+      keptSlotSavedChars += Math.max(0, slot.origText.length - curText.length);
+    }
+    if (resolvedSessionKey && toUnseal.length > 0) {
+      removeStage2SealKeys(resolvedSessionKey, toUnseal);
+    }
+    if (revertedAny) {
+      const hasStaticStages = hygieneStats.stages.some(
+        (s) => s === 'tscg' || s === 'schema_dag' || s === 'skill_linker',
+      );
+      if (keptSlotBlocks === 0 && !hasStaticStages) {
+        hygieneStats = hygieneStats.tailHydrated
+          ? {
+              changed: false,
+              tailHydrated: true,
+              savedChars: 0,
+              savedTokens: 0,
+              blocks: 0,
+              stages: hygieneStats.stages.filter((s) => s === 'mmu_hydrate'),
+            }
+          : undefined;
+      } else if (keptSlotBlocks > 0) {
+        hygieneStats = {
+          ...hygieneStats,
+          changed: true,
+          savedChars: keptSlotSavedChars,
+          savedTokens: Math.max(0, Math.round(keptSlotSavedChars / 3.5)),
+          blocks: keptSlotBlocks,
+        };
+      }
+    }
+  }
   if (hygieneStats?.changed || hygieneStats?.tailHydrated) {
     info.textHygieneSavedChars = hygieneStats.savedChars;
     info.textHygieneSavedTokens = hygieneStats.savedTokens;

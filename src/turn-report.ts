@@ -29,6 +29,7 @@ import {
 } from './core/openai-savings.js';
 import type { TrackEvent } from './core/tracker.js';
 import { anthropicReadRate, inputUsdPerMtok, priceMode, resolvePriceRates } from './core/pricing.js';
+import { eventLogFiles } from './file-tracker.js';
 
 const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
 
@@ -233,7 +234,7 @@ function computeTurnSnapshotWithCache(
     if (warmthState && inputTokens > 0) {
       warmthState.openai = {
         ts: completionSec,
-        cachedOrPrefixTokens: cachedTokens > 0 ? cachedTokens : Math.max(oPrev?.cachedOrPrefixTokens ?? 0, inp),
+        cachedOrPrefixTokens: cachedTokens > 0 ? cachedTokens : (oPrev?.cachedOrPrefixTokens ?? 0),
         prefixSha: ev.system_sha8 ?? oPrev?.prefixSha,
         pxPrefixSha: pxSha ?? oPrev?.pxPrefixSha,
         model: ev.model ?? oPrev?.model,
@@ -281,7 +282,7 @@ function computeTurnSnapshotWithCache(
     if (warmthState && inputTokens > 0) {
       warmthState.google = {
         ts: completionSec,
-        cachedTokens: cachedTokens > 0 ? cachedTokens : Math.max(gPrev?.cachedTokens ?? 0, inp),
+        cachedTokens: cachedTokens > 0 ? cachedTokens : (gPrev?.cachedTokens ?? 0),
         prefixSha: ev.system_sha8 ?? gPrev?.prefixSha,
         pxPrefixSha: pxSha ?? gPrev?.pxPrefixSha,
         model: ev.model ?? gPrev?.model,
@@ -558,33 +559,42 @@ function parseJsonLine(lineBuf: Buffer): TrackEvent | null {
   }
 }
 
-/** Read latest turn + session rollup from `eventsFile` with optional cursor de-duplication. */
+/** Read latest turn + session rollup from `eventsFile` (and rotated `.1` if needed) with optional cursor de-duplication. */
 export function readTurnReport(eventsFile: string, opts: ReadTurnReportOptions = {}): TurnReportPayload {
   const maxTailBytes = opts.maxTailBytes ?? DEFAULT_MAX_TAIL_BYTES;
-  const tail = readTailBuffer(eventsFile, maxTailBytes);
-  if (!tail || tail.buf.length === 0) {
+  const files = eventLogFiles(eventsFile);
+  if (files.length === 0) {
     return { eventsFile, hasNewTurn: false, lastTurn: null, session: emptyRollup(null) };
   }
 
-  const buf = tail.buf;
-  // Pass 1: reverse scan for the latest valid inference event (usually the very last line).
+  // Pass 1: reverse scan newest -> oldest file for the latest valid inference event.
   let lastEv: TrackEvent | null = null;
   let lastLineStart = 0;
-  let lineEnd = buf.length;
-  while (lineEnd > 0) {
-    const nl = buf.lastIndexOf(0x0a, lineEnd - 1);
-    const lineStart = nl >= 0 ? nl + 1 : 0;
-    const ev = parseJsonLine(buf.subarray(lineStart, lineEnd));
-    if (ev) {
-      lastEv = ev;
-      lastLineStart = lineStart;
-      break;
+  let tail: { buf: Buffer; startOffset: number; size: number; truncatedHead: boolean } | null = null;
+  let lastFileIdx = -1;
+  for (let fi = files.length - 1; fi >= 0; fi--) {
+    const candidateTail = readTailBuffer(files[fi]!, maxTailBytes);
+    if (!candidateTail || candidateTail.buf.length === 0) continue;
+    const buf = candidateTail.buf;
+    let lineEnd = buf.length;
+    while (lineEnd > 0) {
+      const nl = buf.lastIndexOf(0x0a, lineEnd - 1);
+      const lineStart = nl >= 0 ? nl + 1 : 0;
+      const ev = parseJsonLine(buf.subarray(lineStart, lineEnd));
+      if (ev) {
+        lastEv = ev;
+        lastLineStart = lineStart;
+        tail = candidateTail;
+        lastFileIdx = fi;
+        break;
+      }
+      lineEnd = nl;
+      if (nl < 0) break;
     }
-    lineEnd = nl;
-    if (nl < 0) break;
+    if (lastEv) break;
   }
 
-  if (!lastEv) {
+  if (!lastEv || !tail) {
     return { eventsFile, hasNewTurn: false, lastTurn: null, session: emptyRollup(null) };
   }
 
@@ -593,30 +603,46 @@ export function readTurnReport(eventsFile: string, opts: ReadTurnReportOptions =
   const lastMs = Date.parse(lastEv.ts);
   const sessionNeedle = sessionId ? Buffer.from(sessionId, 'ascii') : null;
 
-  // Pass 2: reverse scan prior lines, pre-filtering in native Buffer before JSON.parse.
+  // Pass 2: reverse scan prior lines, pre-filtering in native Buffer before JSON.parse,
+  // and spilling back to any older rotated `.1` log if the active tail is shorter than maxTailBytes.
   const sessionEvents: TrackEvent[] = [lastEv];
-  let scanEnd = lastLineStart > 0 ? lastLineStart - 1 : 0;
-  while (scanEnd > 0) {
-    const nl = buf.lastIndexOf(0x0a, scanEnd - 1);
-    const lineStart = nl >= 0 ? nl + 1 : 0;
-    const slice = buf.subarray(lineStart, scanEnd);
-    scanEnd = nl >= 0 ? nl : 0;
-    if (slice.length < 2) continue;
-    if (sessionNeedle) {
-      if (!slice.includes(sessionNeedle)) continue;
-      const ev = parseJsonLine(slice);
-      if (ev && ev.first_user_sha8 === sessionId) {
+  const scanPrior = (buf: Buffer, initialEnd: number): boolean => {
+    let scanEnd = initialEnd;
+    while (scanEnd > 0) {
+      const nl = buf.lastIndexOf(0x0a, scanEnd - 1);
+      const lineStart = nl >= 0 ? nl + 1 : 0;
+      const slice = buf.subarray(lineStart, scanEnd);
+      scanEnd = nl >= 0 ? nl : 0;
+      if (slice.length < 2) continue;
+      if (sessionNeedle) {
+        if (!slice.includes(sessionNeedle)) continue;
+        const ev = parseJsonLine(slice);
+        if (ev && ev.first_user_sha8 === sessionId) {
+          sessionEvents.push(ev);
+        }
+      } else {
+        const ev = parseJsonLine(slice);
+        if (!ev) continue;
+        if (Number.isFinite(lastMs)) {
+          const evMs = Date.parse(ev.ts);
+          if (!Number.isFinite(evMs)) continue;
+          if (lastMs - evMs > SESSION_FALLBACK_WINDOW_MS) return false;
+        }
         sessionEvents.push(ev);
       }
-    } else {
-      const ev = parseJsonLine(slice);
-      if (!ev) continue;
-      if (Number.isFinite(lastMs)) {
-        const evMs = Date.parse(ev.ts);
-        if (!Number.isFinite(evMs)) continue;
-        if (lastMs - evMs > SESSION_FALLBACK_WINDOW_MS) break;
-      }
-      sessionEvents.push(ev);
+    }
+    return true;
+  };
+
+  const keepScanningOlder = scanPrior(tail.buf, lastLineStart > 0 ? lastLineStart - 1 : 0);
+  if (keepScanningOlder && !tail.truncatedHead && lastFileIdx > 0) {
+    let remainingBudget = maxTailBytes - tail.buf.length;
+    for (let fi = lastFileIdx - 1; fi >= 0 && remainingBudget > 0; fi--) {
+      const olderTail = readTailBuffer(files[fi]!, remainingBudget);
+      if (!olderTail || olderTail.buf.length === 0) continue;
+      remainingBudget -= olderTail.buf.length;
+      const cont = scanPrior(olderTail.buf, olderTail.buf.length);
+      if (!cont || olderTail.truncatedHead) break;
     }
   }
 
@@ -803,6 +829,8 @@ export function runTurnReportCli(
       cursorFile = argv[++i]!;
     } else if (a.startsWith('--cursor=')) {
       cursorFile = a.slice('--cursor='.length);
+    } else if (a === '--json') {
+      format = 'json';
     } else if (a === '--no-update-cursor') {
       updateCursor = false;
     } else if (a === '--color') {
@@ -815,6 +843,7 @@ export function runTurnReportCli(
           '',
           'Options:',
           '  --format=cli|agy|claude-statusline|json   Output format (default: cli)',
+          '  --json                                    Alias for --format=json',
           '  --file <path>                             Events JSONL (default: $FICHE_LOG or ~/.fiche/events.jsonl)',
           '  --cursor <path>                           Cursor file for deduplicating repeat hook calls',
           '  --no-update-cursor                        Inspect cursor without updating it',

@@ -140,12 +140,18 @@ export function buildWarpAppArgs(
 const CLI_WRAPPERS = ['claude', 'codex', 'ribhu', 'kimi', 'agy', 'gemini', 'opencode', 'cursor-agent', 'amp', 'pi', 'aider'] as const;
 
 /** Render POSIX zsh/bash shell helpers (or transparent wrappers when `--wrap` is set). */
-export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string } = {}): string {
+export function renderShellInitScript(opts: { wrap?: boolean; ficheBin?: string; port?: number } = {}): string {
+  if (opts.port !== undefined) {
+    if (!Number.isSafeInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
+      throw new RangeError(`invalid shell-init port: ${String(opts.port)}`);
+    }
+  }
   const bin = opts.ficheBin?.trim() || 'fiche';
   const safeBin = `'${bin.replaceAll("'", `'\\''`)}'`;
   const lines: string[] = [
     '# Added by `fiche shell-init` — route coding agent CLIs & macOS apps via local Fiche proxy.',
     `export FICHE_BIN=${safeBin}`,
+    ...(opts.port !== undefined ? [`export FICHE_PORT=${opts.port}`] : []),
     'fiche-app() { if [ "$#" -eq 0 ]; then "$FICHE_BIN" warp --app; else local app="$1"; shift; "$FICHE_BIN" warp --app "$app" -- "$@"; fi; }',
     'fclaude() { "$FICHE_BIN" warp -- claude "$@"; }',
     'fcodex() { "$FICHE_BIN" warp -- codex "$@"; }',

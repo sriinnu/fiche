@@ -30,6 +30,7 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
+import { eventLogFiles } from './file-tracker.js';
 import type { TrackEvent } from './core/tracker.js';
 import {
   computeActualInputEffWithCacheTier,
@@ -114,19 +115,20 @@ export function defaultPaths(): SessionsPaths {
 export async function* readEvents(
   eventsFile: string,
 ): AsyncGenerator<{ ev: TrackEvent; rawBytes: number }> {
-  if (!fs.existsSync(eventsFile)) return;
-  const stream = fs.createReadStream(eventsFile, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let ev: TrackEvent;
-    try {
-      ev = JSON.parse(line) as TrackEvent;
-    } catch {
-      continue;
+  for (const file of eventLogFiles(eventsFile)) {
+    const stream = fs.createReadStream(file, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      let ev: TrackEvent;
+      try {
+        ev = JSON.parse(line) as TrackEvent;
+      } catch {
+        continue;
+      }
+      // +1 for the newline FileTracker writes after each row.
+      yield { ev, rawBytes: Buffer.byteLength(line, 'utf8') + 1 };
     }
-    // +1 for the newline FileTracker writes after each row.
-    yield { ev, rawBytes: Buffer.byteLength(line, 'utf8') + 1 };
   }
 }
 
@@ -202,11 +204,12 @@ export async function aggregateSessions(
     const cached = ev.cached_tokens ?? 0;
     const cacheWrite = ev.cache_write_tokens ?? 0;
     const out = ev.output_tokens ?? 0;
-    const isGoogle = ev.accounting_provider === 'google'
-      || ev.path.includes('google-ai-studio')
-      || ev.path.toLowerCase().includes('generatecontent');
-    const isOpenAI = ev.accounting_provider === 'openai'
-      || (!isGoogle && (ev.path.includes('responses') || ev.path.includes('chat/completions')));
+    const isGoogle = ev.accounting_provider
+      ? ev.accounting_provider === 'google'
+      : ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent');
+    const isOpenAI = ev.accounting_provider
+      ? ev.accounting_provider === 'openai'
+      : !isGoogle && (ev.path.includes('responses') || ev.path.includes('chat/completions'));
     const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0 || cached > 0 || cacheWrite > 0;
     const completionSec = Date.parse(ev.ts) / 1000;
     const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
@@ -262,7 +265,7 @@ export async function aggregateSessions(
       if (haveUsage) {
         googleWarmth.set(id, {
           ts: completionSec,
-          cachedOrPrefixTokens: clampedCached > 0 ? clampedCached : Math.max(gPrev?.cachedOrPrefixTokens ?? 0, inp),
+          cachedOrPrefixTokens: clampedCached > 0 ? clampedCached : (gPrev?.cachedOrPrefixTokens ?? 0),
           prefixSha: ev.system_sha8 ?? gPrev?.prefixSha,
           pxPrefixSha: pxShaG ?? gPrev?.pxPrefixSha,
           model: ev.model ?? gPrev?.model,
@@ -305,7 +308,7 @@ export async function aggregateSessions(
       if (haveUsage) {
         openaiWarmth.set(id, {
           ts: completionSec,
-          cachedOrPrefixTokens: cached > 0 ? cached : Math.max(oPrev?.cachedOrPrefixTokens ?? 0, inp),
+          cachedOrPrefixTokens: cached > 0 ? cached : (oPrev?.cachedOrPrefixTokens ?? 0),
           prefixSha: ev.system_sha8 ?? oPrev?.prefixSha,
           pxPrefixSha: pxShaO ?? oPrev?.pxPrefixSha,
           model: ev.model ?? oPrev?.model,

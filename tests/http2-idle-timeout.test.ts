@@ -334,7 +334,7 @@ describe('Issue #33: Node HTTP/1.1 upstream fetch + H2 idle timeout survival + b
     }));
     setTimeout(() => clientAc.abort(), 15);
     const abortRes = await reqPromise;
-    expect(abortRes.status).toBe(502);
+    expect(abortRes.status).toBe(499);
     expect(clientAbortObserved).toBe(true);
   });
 });

@@ -4,7 +4,7 @@
  */
 
 import { readBrandEnv } from './env.js';
-import { markCacheDead, noteCacheOutcome, responseLeftNoCache } from './session-state.js';
+import { markCacheDead, noteCacheOutcome, noteRollingCacheHealth, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import {
@@ -2026,6 +2026,18 @@ function stripAnthropicCredentials(headers: Headers): void {
   headers.delete('x-anthropic-billing-header');
 }
 
+function stripGoogleForeignApiKey(headers: Headers, targetUrl: string, pathname: string): void {
+  const raw = headers.get('x-api-key')?.trim();
+  if (!raw) return;
+  const isInternalOrOAuth =
+    pathname.startsWith('/v1internal:')
+    || targetUrl.includes('cloudcode-pa.googleapis.com')
+    || headers.has('authorization');
+  if (isInternalOrOAuth || !/^AIza/i.test(raw)) {
+    headers.delete('x-api-key');
+  }
+}
+
 function resolveGoogleUpstream(
   req: Request,
   pathname: string,
@@ -2754,6 +2766,7 @@ let responseContentType: string | undefined;
                 countUrl.toString(),
               );
               stripAnthropicCredentials(countHeaders);
+              stripGoogleForeignApiKey(countHeaders, countUrl.toString(), url.pathname);
               countHeaders.delete('content-encoding');
               countHeaders.set('content-type', 'application/json');
               const syncProbeEnv = readBrandEnv('GOOGLE_SYNC_PROBE') ?? '';
@@ -2898,6 +2911,13 @@ let responseContentType: string | undefined;
             }), { status: 400, headers: { 'content-type': 'application/json' } });
           }
           detachClientAbort();
+          if (clientSignal?.aborted) {
+            fireWait(499, undefined, 'client_disconnected');
+            return new Response(JSON.stringify({ error: 'fiche client disconnected' }), {
+              status: 499,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
           fireWait(502, undefined, `transform_error: ${(e as Error).message}`);
           return new Response(JSON.stringify({ error: 'fiche transform failed' }), {
             status: 502,
@@ -2974,6 +2994,9 @@ let responseContentType: string | undefined;
       // that may travel. No configured key, no gateway header, and never an
       // Anthropic-issued credential, which no third party should ever see.
       stripAnthropicCredentials(outHeaders);
+      if (isGoogleFamilyPath(follow.wirePathname) || upstreamUrl.includes('googleapis.com')) {
+        stripGoogleForeignApiKey(outHeaders, upstreamUrl, follow.outboundPath);
+      }
     } else if (isOpenAIPath || url.pathname.startsWith('/openai/') || bridgedGptMessages || bridgedChatMessages) {
       // `x-api-key` is Anthropic-only and never belongs on an OpenAI upstream.
       outHeaders.delete('x-api-key');
@@ -3015,6 +3038,9 @@ let responseContentType: string | undefined;
       // Non-Anthropic provider routes (Google, /compat/, /grok/, /xai/, /deepseek/,
       // /kimi/, /glm/, etc.) never receive Anthropic credentials.
       stripAnthropicCredentials(outHeaders);
+      if (isGoogleFamily || upstreamUrl.includes('googleapis.com')) {
+        stripGoogleForeignApiKey(outHeaders, upstreamUrl, path);
+      }
     } else {
       const bearer = resolveAuthToken(config);
       if (config.apiKey) outHeaders.delete('authorization');
@@ -3122,6 +3148,13 @@ let responseContentType: string | undefined;
           headers: { 'content-type': 'application/json' },
         });
       }
+      if (clientSignal?.aborted) {
+        fireWait(499, info, 'client_disconnected');
+        return new Response(JSON.stringify({ error: 'fiche client disconnected' }), {
+          status: 499,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
       fireWait(502, info, `upstream_error: ${(e as Error).message}`);
       return new Response(JSON.stringify({ error: 'fiche upstream unreachable' }), {
         status: 502,
@@ -3222,6 +3255,19 @@ let responseContentType: string | undefined;
             : (usage.cache_creation_input_tokens ?? usage.cache_write_tokens),
           requestModel ? { model: requestModel } : undefined,
         );
+        if (!bridgedGptMessages && !bridgedChatMessages) {
+          const cr = usage.cache_read_input_tokens ?? usage.cached_tokens ?? 0;
+          const cc = usage.cache_creation_input_tokens ?? usage.cache_write_tokens ?? 0;
+          const cc1h = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+          const inp = usage.input_tokens ?? 0;
+          const isInclusive = isOpenAIChatWire || isOpenAIResponsesWire || isGoogle;
+          const totalIn = isInclusive ? Math.max(inp, cr) : inp + cc + cr;
+          noteRollingCacheHealth(
+            sessionKey,
+            { cacheReadTokens: cr, cacheCreate1hTokens: cc1h, totalInputTokens: totalIn },
+            requestModel ? { model: requestModel } : undefined,
+          );
+        }
       }
       return fire(
         finalUpstreamRes.status,

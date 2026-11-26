@@ -86,11 +86,15 @@ fi
 
 echo "==> Building ${APP_NAME} (${SHORT_VERSION}, build ${BUILD_VERSION}) in release mode..."
 # shellcheck disable=SC2086
-swift build -c release --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-}
+swift build -c release --arch arm64 --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-}
 
-# shellcheck disable=SC2086
-BIN_DIR="$(swift build -c release --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-} --show-bin-path)"
-BINARY_PATH="${BIN_DIR}/${APP_NAME}"
+BINARY_PATH="${SCRIPT_DIR}/.build/arm64-apple-macosx/release/${APP_NAME}"
+if [[ ! -x "${BINARY_PATH}" ]]; then
+  # Fallback for custom --scratch-path overrides in SWIFTPM_ARGS
+  # shellcheck disable=SC2086
+  BIN_DIR="$(swift build -c release --arch arm64 --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-} --show-bin-path)"
+  BINARY_PATH="${BIN_DIR}/${APP_NAME}"
+fi
 if [[ ! -x "${BINARY_PATH}" ]]; then
   echo "ERROR: Built binary not found at ${BINARY_PATH}" >&2
   exit 1

@@ -101,6 +101,22 @@ describe('MCP server', () => {
       system: 'You are a coding agent.',
       messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 't', content: events }] }],
     };
+    const passthrough = await handleMcpMessage(rpc('tools/call', {
+      name: 'transform_request',
+      arguments: {
+        model: 'grok-4.7',
+        wire: 'anthropic',
+        upstream: 'https://chatgpt.com',
+        pathname: '/backend-api/codex/responses',
+        request,
+      },
+    }));
+    const passBody = (passthrough as {
+      result: { structuredContent: { report: { textCompressed?: boolean; savedVsOriginal: number } } };
+    }).result.structuredContent;
+    expect(passBody.report.textCompressed).toBeFalsy();
+    expect(passBody.report.savedVsOriginal).toBe(0);
+
     const transformed = await handleMcpMessage(rpc('tools/call', {
       name: 'transform_request',
       arguments: {
@@ -108,6 +124,7 @@ describe('MCP server', () => {
         wire: 'anthropic',
         upstream: 'https://chatgpt.com',
         pathname: '/backend-api/codex/responses',
+        textHygiene: 'on',
         request,
       },
     }));
