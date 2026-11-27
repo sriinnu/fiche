@@ -35,7 +35,7 @@ import * as path from 'node:path';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
-import { anthropicReadRate, estimateBillUsd, inputUsdPerMtok, priceMode, PRICE_SNAPSHOT, resolvePriceRates } from './core/pricing.js';
+import { anthropicReadRate, anthropicWriteRate5m, estimateBillUsd, inputUsdPerMtok, priceMode, PRICE_SNAPSHOT, resolvePriceRates } from './core/pricing.js';
 import { readTurnReport } from './turn-report.js';
 import {
   computeActualInputEffWithCacheTier,
@@ -665,7 +665,7 @@ function gptEff(args: {
 declare const __FICHE_VERSION__: string | undefined;
 
 function defaultDashboardVersion(): string {
-  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.20.0';
+  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.20.1';
 }
 
 export interface DashboardHooks {
@@ -1336,9 +1336,10 @@ export class DashboardState {
       });
       haveBaseline = typeof baseline === 'number' && baseline > 0 && probeOk;
 
+      const writeRateNow = anthropicWriteRate5m(ev.model);
       // Weighted INPUT cost we actually paid this turn.
       actualInputEff = haveUsage
-        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(ev.model))
+        ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(ev.model), writeRateNow)
         : 0;
 
       // inkling only reduces input by imaging the static slab. An UNCOMPRESSED
@@ -1390,6 +1391,7 @@ export class DashboardState {
             cc1h,
             cc5m,
             readRateNow,
+            writeRateNow,
           )
         : actualInputEff;
       const hygieneTok = info?.textHygieneSavedTokens ?? 0;
@@ -1401,7 +1403,7 @@ export class DashboardState {
           const reusedTarget = prevCacheable > 0 ? prevCacheable : (warmthPrev?.observedCachedTokens ?? 0);
           if (reusedTarget > 0) {
             const reused = Math.min(unproxiedRaw, reusedTarget);
-            const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+            const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRateNow) : 1.0;
             baselineInputEff = reused * readRateNow + (unproxiedRaw - reused) * createRate;
           } else {
             baselineInputEff = actualInputEff + hygieneTok * readRateNow;
@@ -1409,7 +1411,7 @@ export class DashboardState {
         } else {
           const deltaWeight = cr > 0
             ? readRateNow
-            : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+            : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRateNow) : 1.0;
           baselineInputEff = actualInputEff + hygieneTok * deltaWeight;
         }
       }
@@ -1780,8 +1782,10 @@ export class DashboardState {
               cacheReadTokens: cr,
             });
             haveBaseline = baselineOpt !== undefined && baselineOpt > 0 && probeOk;
+            const readRateR = anthropicReadRate(t.model, { at: eventMs });
+            const writeRateR = anthropicWriteRate5m(t.model, { at: eventMs });
             actualInputEff = haveUsage
-              ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(t.model, { at: eventMs }))
+              ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRateR, writeRateR)
               : 0;
             // Mirror update(): only credit the cache-modeled counterfactual on
             // compressed rows. Uncompressed/passthrough rows fall back to the
@@ -1806,7 +1810,6 @@ export class DashboardState {
               toolsShaR,
               { pxPrefixSha: t.cache_prefix_sha8, model: t.model },
             );
-            const readRateR = anthropicReadRate(t.model, { at: eventMs });
             baselineInputEff = creditSaving
               ? computeBaselineInputEffWithCacheTier(
                   baselineOpt as number,
@@ -1819,6 +1822,7 @@ export class DashboardState {
                   cc1h,
                   cc5m,
                   readRateR,
+                  writeRateR,
                 )
               : actualInputEff;
             if (!haveBaseline && compressed && haveUsage && hygieneTok > 0 && imageCount === 0) {
@@ -1829,7 +1833,7 @@ export class DashboardState {
                 const reusedTargetR = prevCacheableR > 0 ? prevCacheableR : (warmthPrevR?.observedCachedTokens ?? 0);
                 if (reusedTargetR > 0) {
                   const reusedR = Math.min(unproxiedRawR, reusedTargetR);
-                  const createRateR = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+                  const createRateR = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRateR) : 1.0;
                   baselineInputEff = reusedR * readRateR + (unproxiedRawR - reusedR) * createRateR;
                 } else {
                   baselineInputEff = actualInputEff + hygieneTok * readRateR;
@@ -1837,7 +1841,7 @@ export class DashboardState {
               } else {
                 const deltaWeightR = cr > 0
                   ? readRateR
-                  : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+                  : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRateR) : 1.0;
                 baselineInputEff = actualInputEff + hygieneTok * deltaWeightR;
               }
             }

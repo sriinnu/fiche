@@ -28,7 +28,7 @@ import {
   type OpenAIWarmthPrev,
 } from './core/openai-savings.js';
 import type { TrackEvent } from './core/tracker.js';
-import { anthropicReadRate, inputUsdPerMtok, priceMode, resolvePriceRates } from './core/pricing.js';
+import { anthropicReadRate, anthropicWriteRate5m, inputUsdPerMtok, priceMode, resolvePriceRates } from './core/pricing.js';
 import { eventLogFiles } from './file-tracker.js';
 
 const ASSUMED_INPUT_USD_PER_MTOK = 10.0;
@@ -290,8 +290,9 @@ function computeTurnSnapshotWithCache(
     }
   } else {
     const readRate = anthropicReadRate(ev.model, { promptTokens: inputTokens, at: eventMs });
+    const writeRate = anthropicWriteRate5m(ev.model, { promptTokens: inputTokens, at: eventMs });
     const actualEff = inputTokens > 0
-      ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate)
+      ? computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate, writeRate)
       : 0;
     const cacheable = ev.baseline_cacheable_tokens ?? 0;
     const aPrev = warmthState?.anthropic;
@@ -318,6 +319,7 @@ function computeTurnSnapshotWithCache(
           cc1h,
           cc5m,
           readRate,
+          writeRate,
         );
         weightedSaved = baselineEff - actualEff;
       } else if (cc === 0 && cr === 0) {
@@ -326,7 +328,7 @@ function computeTurnSnapshotWithCache(
         const unproxiedRaw = ev.baseline_tokens!;
         const reusedTarget = warmthState?.anthropicObservedPrefix ?? 0;
         const reused = Math.min(unproxiedRaw, reusedTarget);
-        const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+        const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRate) : 1.0;
         const baselineEff = reused * readRate + (unproxiedRaw - reused) * createRate;
         weightedSaved = baselineEff - actualEff;
       } else {
@@ -338,7 +340,7 @@ function computeTurnSnapshotWithCache(
         const reusedTarget = prevCacheable > 0 ? prevCacheable : (warmthState?.anthropicObservedPrefix ?? 0);
         if (reusedTarget > 0) {
           const reused = Math.min(unproxiedRaw, reusedTarget);
-          const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRate) : 1.0;
           const baselineEff = reused * readRate + (unproxiedRaw - reused) * createRate;
           weightedSaved = baselineEff - actualEff;
         } else {
@@ -347,7 +349,7 @@ function computeTurnSnapshotWithCache(
       } else {
         const deltaWeight = cr > 0
           ? readRate
-          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRate) : 1.0;
         weightedSaved = savedTokens * deltaWeight;
       }
     } else {

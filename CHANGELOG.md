@@ -4,6 +4,12 @@
 features or behaviour changes, patch = fixes). Where the code comes from is in
 the README's Credits section.
 
+## 0.20.1
+
+- **DeepSeek Harness & Desktop Agent Discovery**: Added desktop app detection for `DeepSeek Harness`, `Kimi Code`, `MiniMax Code`, and `Cline` in `FicheBar` and `fiche providers detect`.
+- **Node Proxy & Warp Support**: Set `NODE_USE_ENV_PROXY=1` in `fiche warp` so Electron/Node agents (such as DeepSeek Harness) honor `HTTPS_PROXY`/`NO_PROXY`.
+- **DeepSeek Harness Protocol & Session Accounting**: Added `x-deepseek-harness-session-id` tracking (`deepseek-harness-header`), `x-deepseek-harness-compact: 1` bypass, trailing in-history `{ role: 'system' }` handling in Anthropic MMU hydration, and `1.0x` (`as-input`) cache-write rate accounting.
+
 ## 0.20.0
 
 - **Deep-Audit Cache, Security & Accounting Hardening (`src/core/{session-state,prefix-tape,proxy,openai,openai-history,google,transform}.ts`, `src/{node,dashboard,sessions,turn-report,mmu-store}.ts`, `src/warp/`)**:

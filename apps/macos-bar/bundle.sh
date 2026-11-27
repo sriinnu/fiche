@@ -9,7 +9,7 @@
 #   ./bundle.sh --unsigned    # skip code signing (for split CI build jobs)
 #
 # Optional env overrides:
-#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.20.0)
+#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.20.1)
 #   CFBundleVersion             (defaults to apps/macos-bar/BUILD_NUMBER, or 1)
 #   SWIFTPM_ARGS                (extra flags passed to swift build, e.g. --disable-sandbox)
 
@@ -53,7 +53,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-DEFAULT_VERSION="0.20.0"
+DEFAULT_VERSION="0.20.1"
 if [[ -f "${REPO_ROOT}/package.json" ]]; then
   PARSED_VER="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "${REPO_ROOT}/package.json" | head -n 1 || true)"
   if [[ -n "${PARSED_VER}" ]]; then

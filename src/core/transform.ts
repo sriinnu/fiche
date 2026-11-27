@@ -156,7 +156,7 @@ export interface RecoverableBlock {
 
 export type OpticalMode = 'auto' | 'hybrid' | 'full';
 
-export type ClientSessionSource = 'fiche-header' | 'claude-code-header';
+export type ClientSessionSource = 'fiche-header' | 'claude-code-header' | 'deepseek-harness-header';
 
 export interface ClientSessionIdentityInput {
   clientSessionId?: string;
@@ -1604,7 +1604,12 @@ export async function applyClientSessionIdentity(
     const source: ClientSessionSource = explicitId
       ? (opts?.clientSessionSource ?? 'fiche-header')
       : 'claude-code-header';
-    const prefix = source === 'fiche-header' ? 'fs:' : 'cc:';
+    const prefix =
+      source === 'fiche-header'
+        ? 'fs:'
+        : source === 'deepseek-harness-header'
+          ? 'ds:'
+          : 'cc:';
     if (!info.sessionKey || info.sessionKeySource !== source) {
       info.sessionKey = await sha8(`${prefix}${resolvedId}`);
       info.sessionKeySource = source;
@@ -2876,14 +2881,34 @@ async function runHistoryCollapseAndFinalize(
 }
 
 /**
+ * Walk backwards past trailing in-history `system` updates (used by DeepSeek
+ * Harness `systemPromptUpdate: "in-history"`) without crossing an assistant turn.
+ */
+function findTrailingNonSystemMessageIndex(messages: readonly Message[] | undefined): number {
+  if (!Array.isArray(messages) || messages.length === 0) return -1;
+  let idx = messages.length - 1;
+  while (idx >= 0) {
+    const msg = messages[idx];
+    if (!msg || typeof msg !== 'object') return -1;
+    if ((msg as { role?: unknown }).role === 'system') {
+      idx -= 1;
+      continue;
+    }
+    return idx;
+  }
+  return -1;
+}
+
+/**
  * Rewrite a Messages API request body. Returns the new body (still JSON
  * bytes) plus diagnostic info. On any error, returns the original bytes
  * unchanged.
  */
 function extractAnthropicLiveTailTexts(messages: readonly Message[] | undefined): string[] {
-  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const tailIdx = findTrailingNonSystemMessageIndex(messages);
+  if (tailIdx < 0 || !messages) return [];
   const out: string[] = [];
-  const last = messages[messages.length - 1];
+  const last = messages[tailIdx];
   if (!last || typeof last !== 'object') return out;
 
   const isToolResultTurn =
@@ -2892,10 +2917,10 @@ function extractAnthropicLiveTailTexts(messages: readonly Message[] | undefined)
       (blk) => blk && typeof blk === 'object' && (blk as { type?: unknown }).type === 'tool_result',
     );
 
-  // Only inspect messages[n - 2] when messages[n - 1] is a tool-response turn,
+  // Only inspect messages[tailIdx - 1] when messages[tailIdx] is a tool-response turn,
   // and ONLY pull tool_use names/arguments — never Turn t-1's user prompt prose.
-  if (isToolResultTurn && messages.length >= 2) {
-    const prev = messages[messages.length - 2];
+  if (isToolResultTurn && tailIdx >= 1) {
+    const prev = messages[tailIdx - 1];
     if (prev && typeof prev === 'object' && Array.isArray(prev.content)) {
       for (const blk of prev.content) {
         if (!blk || typeof blk !== 'object') continue;
@@ -2906,10 +2931,10 @@ function extractAnthropicLiveTailTexts(messages: readonly Message[] | undefined)
         }
       }
     }
-  } else if (!isToolResultTurn && last.role === 'user' && messages.length >= 2) {
+  } else if (!isToolResultTurn && last.role === 'user' && tailIdx >= 1) {
     // If a trailing user prompt immediately follows a tool_result message, surface any
     // active fault/stack snippet from that tool_result (never prior user prompt prose).
-    const prev = messages[messages.length - 2];
+    const prev = messages[tailIdx - 1];
     if (prev && typeof prev === 'object' && Array.isArray(prev.content)) {
       for (const blk of prev.content) {
         if (!blk || typeof blk !== 'object') continue;
@@ -2981,9 +3006,10 @@ function extractAnthropicLiveTailTexts(messages: readonly Message[] | undefined)
 
 function appendAnthropicTailHydration(req: MessagesRequest, hydrationBlock: string): void {
   if (!hydrationBlock) return;
-  if (!Array.isArray(req.messages) || req.messages.length === 0) return;
+  const tailIdx = findTrailingNonSystemMessageIndex(req.messages);
+  if (tailIdx < 0 || !Array.isArray(req.messages)) return;
   // Never walk backwards past an assistant/prefill turn into earlier cached user messages.
-  const last = req.messages[req.messages.length - 1];
+  const last = req.messages[tailIdx];
   if (!last || last.role !== 'user') return;
   if (typeof last.content === 'string') {
     last.content = last.content ? `${last.content}\n\n${hydrationBlock}` : hydrationBlock;

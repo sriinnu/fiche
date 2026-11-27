@@ -8,7 +8,7 @@ struct AboutPanelView: View {
     let daemonVersion: String?
 
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.20.0"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.20.1"
     }
 
     private var appBuild: String? {

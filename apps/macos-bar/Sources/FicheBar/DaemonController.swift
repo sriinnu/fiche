@@ -287,7 +287,7 @@ final class DaemonController: ObservableObject {
         {
           "ok": true,
           "name": "fiche",
-          "version": "0.20.0",
+          "version": "0.20.1",
           "pid": 17130,
           "host": "127.0.0.1",
           "port": 47821,
@@ -1985,6 +1985,10 @@ final class DaemonController: ObservableObject {
             "OpenCode",
             "ChatGPT",
             "Codex",
+            "DeepSeek Harness",
+            "Kimi Code",
+            "MiniMax Code",
+            "Cline",
             "Runic",
         ]
         let fm = FileManager.default

@@ -249,6 +249,19 @@ export function anthropicReadRate(model: string | undefined, ctx?: PriceContext)
   return gateRatesFor(model, ctx)?.read ?? CACHE_READ_RATE;
 }
 
+/**
+ * 5-minute / base cache-write ratio for Anthropic-wire accounting.
+ * Models whose published pricing bills cache writes as plain input (`cwb: 'as-input'`,
+ * e.g. DeepSeek) return `1.0`; Claude and unpriced models keep `CACHE_CREATE_RATE` (`1.25`).
+ */
+export function anthropicWriteRate5m(model: string | undefined, ctx?: PriceContext): number {
+  if (priceMode() === 'kosha') {
+    const row = effectiveRow(priceRowFor(model), ctx);
+    if (row?.cwb === 'as-input') return 1;
+  }
+  return CACHE_CREATE_RATE;
+}
+
 /** USD per 1M uncached input tokens for converting saved token-equivalents to
  *  dollars, at the band and date in `ctx`, or undefined when legacy mode or
  *  the model is unpriced. */
@@ -262,6 +275,18 @@ export function inputUsdPerMtok(model: string | undefined, ctx?: PriceContext): 
 export function isAutoCacheOpenAIModel(model: string | null | undefined): boolean {
   if (!model) return false;
   return /^(?:(?:[^/]+\/)?(?:gpt-|o[134](?=[-.0-9]|$)))/i.test(model.trim());
+}
+
+/**
+ * True for models that use implicit automatic prefix caching with `1.0x` write cost
+ * and no explicit `cache_control` breakpoints (OpenAI GPT/o-series and `cwb: 'as-input'`
+ * providers such as DeepSeek).
+ */
+export function isImplicitAutoCacheModel(model: string | null | undefined): boolean {
+  if (!model) return false;
+  if (isAutoCacheOpenAIModel(model)) return true;
+  if (/^(?:[^/]+\/)?deepseek/i.test(model.trim())) return true;
+  return priceRowFor(model)?.cwb === 'as-input';
 }
 
 export interface CliffSavingsEval {
