@@ -36,6 +36,8 @@ interface EmittedPrefixParas {
   readonly maxTag: number;
   readonly taggedParas: ReadonlyMap<string, string>;
   readonly untaggedParas: ReadonlySet<string>;
+  readonly taggedLines: ReadonlyMap<string, string>;
+  readonly untaggedLines: ReadonlySet<string>;
   readonly compiledStrings: readonly string[];
 }
 
@@ -97,14 +99,23 @@ const segmentedStaticPatternCache = new Map<string, {
 }>();
 let segmentedStaticPatternCacheChars = 0;
 
-const VOLATILE_XML_TAGS = new Set<string>([
+export const VOLATILE_XML_TAGS: readonly string[] = [
   'env',
   'context',
   'system-reminder',
   'fast_mode_info',
   'git_status',
   'additional_metadata',
-]);
+  'environment_context',
+  'directorystructure',
+  'total_tokens',
+  'cc_automode_session_rules',
+  'cc_automode_permissions',
+  'system-notice',
+  'severity',
+  'category',
+] as const;
+const VOLATILE_XML_TAG_SET = new Set<string>(VOLATILE_XML_TAGS);
 const VOLATILE_ATTR_SCAN_LIMIT = 1024;
 
 function estimateTokenPair(before: string, after: string): [number, number] {
@@ -317,16 +328,16 @@ function parseOpenTagHead(
 ): { tagLower: string; openEnd: number; selfClosing: boolean } | undefined {
   const len = text.length;
   let nameEnd = lt + 1;
-  while (nameEnd < len && nameEnd - (lt + 1) <= 24 && isXmlTagChar(text.charCodeAt(nameEnd))) {
+  while (nameEnd < len && nameEnd - (lt + 1) <= 36 && isXmlTagChar(text.charCodeAt(nameEnd))) {
     nameEnd++;
   }
   const nameLen = nameEnd - (lt + 1);
-  if (nameLen === 0 || nameLen > 24 || nameEnd >= len) return undefined;
+  if (nameLen === 0 || nameLen > 36 || nameEnd >= len) return undefined;
 
   const tagLower = text.slice(lt + 1, nameEnd).toLowerCase();
   if (targetLower !== undefined) {
     if (tagLower !== targetLower) return undefined;
-  } else if (!VOLATILE_XML_TAGS.has(tagLower)) {
+  } else if (!VOLATILE_XML_TAG_SET.has(tagLower)) {
     return undefined;
   }
 
@@ -610,15 +621,19 @@ function cleanSchemaNode(node: unknown, propKey?: string): void {
       cleanSchemaNode(child, k);
     }
   }
-  if (obj.items !== undefined) cleanSchemaNode(obj.items);
-  if (Array.isArray(obj.anyOf)) cleanSchemaNode(obj.anyOf);
-  if (Array.isArray(obj.oneOf)) cleanSchemaNode(obj.oneOf);
-  if (Array.isArray(obj.allOf)) cleanSchemaNode(obj.allOf);
-  if (obj.$defs && typeof obj.$defs === 'object') {
-    for (const child of Object.values(obj.$defs as Record<string, unknown>)) cleanSchemaNode(child);
+  for (const mapKey of ['patternProperties', 'dependentSchemas', '$defs', 'definitions'] as const) {
+    const mapVal = obj[mapKey];
+    if (mapVal && typeof mapVal === 'object' && !Array.isArray(mapVal)) {
+      for (const child of Object.values(mapVal as Record<string, unknown>)) {
+        cleanSchemaNode(child);
+      }
+    }
   }
-  if (obj.definitions && typeof obj.definitions === 'object') {
-    for (const child of Object.values(obj.definitions as Record<string, unknown>)) cleanSchemaNode(child);
+  for (const singleKey of ['items', 'additionalProperties', 'unevaluatedProperties', 'contains', 'propertyNames', 'not', 'if', 'then', 'else', 'contentSchema'] as const) {
+    if (obj[singleKey] !== undefined) cleanSchemaNode(obj[singleKey]);
+  }
+  for (const arrKey of ['anyOf', 'oneOf', 'allOf', 'prefixItems'] as const) {
+    if (Array.isArray(obj[arrKey])) cleanSchemaNode(obj[arrKey]);
   }
 }
 
@@ -673,28 +688,25 @@ function collectSchemaDescSlots(schema: unknown, out: DescSlot[], minChars = DEF
       },
     });
   }
-  if (obj.properties && typeof obj.properties === 'object' && !Array.isArray(obj.properties)) {
-    for (const child of Object.values(obj.properties as Record<string, unknown>)) {
-      collectSchemaDescSlots(child, out, minChars);
+  for (const mapKey of ['properties', 'patternProperties', 'dependentSchemas', '$defs', 'definitions'] as const) {
+    const mapVal = obj[mapKey];
+    if (mapVal && typeof mapVal === 'object' && !Array.isArray(mapVal)) {
+      for (const child of Object.values(mapVal as Record<string, unknown>)) {
+        collectSchemaDescSlots(child, out, minChars);
+      }
     }
   }
-  if (obj.items !== undefined) collectSchemaDescSlots(obj.items, out, minChars);
-  if (Array.isArray(obj.anyOf)) collectSchemaDescSlots(obj.anyOf, out, minChars);
-  if (Array.isArray(obj.oneOf)) collectSchemaDescSlots(obj.oneOf, out, minChars);
-  if (Array.isArray(obj.allOf)) collectSchemaDescSlots(obj.allOf, out, minChars);
-  if (obj.$defs && typeof obj.$defs === 'object' && !Array.isArray(obj.$defs)) {
-    for (const child of Object.values(obj.$defs as Record<string, unknown>)) {
-      collectSchemaDescSlots(child, out, minChars);
-    }
+  for (const singleKey of ['items', 'additionalProperties', 'unevaluatedProperties', 'contains', 'propertyNames', 'not', 'if', 'then', 'else', 'contentSchema'] as const) {
+    if (obj[singleKey] !== undefined) collectSchemaDescSlots(obj[singleKey], out, minChars);
   }
-  if (obj.definitions && typeof obj.definitions === 'object' && !Array.isArray(obj.definitions)) {
-    for (const child of Object.values(obj.definitions as Record<string, unknown>)) {
-      collectSchemaDescSlots(child, out, minChars);
-    }
+  for (const arrKey of ['anyOf', 'oneOf', 'allOf', 'prefixItems'] as const) {
+    if (Array.isArray(obj[arrKey])) collectSchemaDescSlots(obj[arrKey], out, minChars);
   }
 }
 
 const UNTAGGED_REF_TEXT = 'See matching guidance in earlier tool above.';
+const MIN_SINGLE_LINE_DEDUP_CHARS = 80;
+const MIN_SINGLE_LINE_OCCURRENCES = 3;
 
 function deduplicateSharedParagraphs(
   slots: readonly DescSlot[],
@@ -741,8 +753,43 @@ function deduplicateSharedParagraphs(
     }
   }
 
+  // Count single-newline repeated lines/bullets (>= 80 chars, >= 3 occurrences) inside non-replaced paragraphs.
+  const lineCounts = new Map<string, number>();
+  for (const item of splitSlots) {
+    for (const seg of item.segments) {
+      if (seg.fence) continue;
+      for (const p of seg.paras) {
+        if (profitableParas.has(p) || !p.includes('\n')) continue;
+        for (const line of p.split('\n')) {
+          if (line.length < MIN_SINGLE_LINE_DEDUP_CHARS || PROTECTED_SYS_LINE_RE.test(line)) continue;
+          lineCounts.set(line, (lineCounts.get(line) ?? 0) + 1);
+        }
+      }
+    }
+  }
+  const profitableLines = new Set<string>();
+  for (const [line, count] of lineCounts.entries()) {
+    if (count < MIN_SINGLE_LINE_OCCURRENCES) continue;
+    const preTagged = prefixState?.taggedLines.get(line);
+    const preUntagged = prefixState?.untaggedLines.has(line) ?? false;
+    if (preTagged !== undefined) {
+      profitableLines.add(line);
+    } else if (preUntagged) {
+      if (line.length > UNTAGGED_REF_TEXT.length + 4) profitableLines.add(line);
+    } else {
+      const tagLen = 1 + String(estSeq).length + 1;
+      const netSaved = (count - 1) * (line.length - (12 + tagLen)) - (tagLen + 3);
+      if (netSaved > 0) {
+        profitableLines.add(line);
+        estSeq++;
+      }
+    }
+  }
+
   const tagByPara = new Map<string, string>(prefixState?.taggedParas ?? []);
   const untaggedInPrefix = new Set<string>(prefixState?.untaggedParas ?? []);
+  const tagByLine = new Map<string, string>(prefixState?.taggedLines ?? []);
+  const untaggedLinesInPrefix = new Set<string>(prefixState?.untaggedLines ?? []);
   let seq = (prefixState?.maxTag ?? 0) + 1;
   const compiledStrings: string[] = [];
   for (let slotIdx = 0; slotIdx < splitSlots.length; slotIdx++) {
@@ -753,7 +800,7 @@ function deduplicateSharedParagraphs(
       compiledStrings.push(frozen);
       continue; // Never retroactively mutate already-emitted prefix tools.
     }
-    if (profitableParas.size === 0) {
+    if (profitableParas.size === 0 && profitableLines.size === 0) {
       compiledStrings.push(item.raw);
       continue;
     }
@@ -762,24 +809,51 @@ function deduplicateSharedParagraphs(
       if (seg.fence) return seg.text;
       let segChanged = false;
       const nextParas = seg.paras.map((p) => {
-        if (!profitableParas.has(p)) return p;
-        const existingTag = tagByPara.get(p);
-        if (existingTag) {
+        if (profitableParas.has(p)) {
+          const existingTag = tagByPara.get(p);
+          if (existingTag) {
+            segChanged = true;
+            slotChanged = true;
+            return `See [${existingTag}] above.`;
+          }
+          if (untaggedInPrefix.has(p)) {
+            if (p.length <= UNTAGGED_REF_TEXT.length + 4) return p;
+            segChanged = true;
+            slotChanged = true;
+            return UNTAGGED_REF_TEXT;
+          }
+          const tag = `#${tagPrefix}${seq++}`;
+          tagByPara.set(p, tag);
           segChanged = true;
           slotChanged = true;
-          return `See [${existingTag}] above.`;
+          return `[${tag}] ${p}`;
         }
-        if (untaggedInPrefix.has(p)) {
-          if (p.length <= UNTAGGED_REF_TEXT.length + 4) return p;
-          segChanged = true;
-          slotChanged = true;
-          return UNTAGGED_REF_TEXT;
+        if (profitableLines.size > 0 && p.includes('\n')) {
+          let pChanged = false;
+          const nextLines = p.split('\n').map((line) => {
+            if (!profitableLines.has(line)) return line;
+            const existingTag = tagByLine.get(line);
+            if (existingTag) {
+              pChanged = true;
+              return `See [${existingTag}] above.`;
+            }
+            if (untaggedLinesInPrefix.has(line)) {
+              if (line.length <= UNTAGGED_REF_TEXT.length + 4) return line;
+              pChanged = true;
+              return UNTAGGED_REF_TEXT;
+            }
+            const tag = `#${tagPrefix}${seq++}`;
+            tagByLine.set(line, tag);
+            pChanged = true;
+            return `[${tag}] ${line}`;
+          });
+          if (pChanged) {
+            segChanged = true;
+            slotChanged = true;
+            return nextLines.join('\n');
+          }
         }
-        const tag = `#${tagPrefix}${seq++}`;
-        tagByPara.set(p, tag);
-        segChanged = true;
-        slotChanged = true;
-        return `[${tag}] ${p}`;
+        return p;
       });
       return segChanged ? nextParas.join('\n\n') : seg.text;
     });
@@ -794,7 +868,18 @@ function deduplicateSharedParagraphs(
   for (const [p] of counts.entries()) {
     if (!tagByPara.has(p)) nextUntagged.add(p);
   }
-  return { maxTag: seq - 1, taggedParas: tagByPara, untaggedParas: nextUntagged, compiledStrings };
+  const nextUntaggedLines = new Set<string>(untaggedLinesInPrefix);
+  for (const [line] of lineCounts.entries()) {
+    if (!tagByLine.has(line)) nextUntaggedLines.add(line);
+  }
+  return {
+    maxTag: seq - 1,
+    taggedParas: tagByPara,
+    untaggedParas: nextUntagged,
+    taggedLines: tagByLine,
+    untaggedLines: nextUntaggedLines,
+    compiledStrings,
+  };
 }
 
 const MIN_SUBTREE_JSON_CHARS = 220;
@@ -880,7 +965,7 @@ function hashJsonValue(val: unknown, depth = 0): [number, number] {
   return [0, 0];
 }
 
-function jsonValuesEqual(a: unknown, b: unknown, depth = 0): boolean {
+function jsonValuesEqual(a: unknown, b: unknown, depth = 0, ignoreTopDescription = false): boolean {
   if (depth > 64) return false;
   if (a === b) return true;
   if (a === null || b === null || typeof a !== typeof b) return false;
@@ -888,21 +973,29 @@ function jsonValuesEqual(a: unknown, b: unknown, depth = 0): boolean {
   if (Array.isArray(a)) {
     if (!Array.isArray(b) || a.length !== b.length) return false;
     for (let i = 0; i < a.length; i++) {
-      if (!jsonValuesEqual(a[i], b[i], depth + 1)) return false;
+      if (!jsonValuesEqual(a[i], b[i], depth + 1, false)) return false;
     }
     return true;
   }
   if (Array.isArray(b)) return false;
   const ao = a as Record<string, unknown>;
   const bo = b as Record<string, unknown>;
-  const ak = Object.keys(ao).filter((k) => ao[k] !== undefined);
-  const bk = Object.keys(bo).filter((k) => bo[k] !== undefined);
+  const ak = Object.keys(ao).filter((k) => ao[k] !== undefined && (!ignoreTopDescription || k !== 'description'));
+  const bk = Object.keys(bo).filter((k) => bo[k] !== undefined && (!ignoreTopDescription || k !== 'description'));
   if (ak.length !== bk.length) return false;
   for (const k of ak) {
     if (!Object.prototype.hasOwnProperty.call(bo, k)) return false;
-    if (!jsonValuesEqual(ao[k], bo[k], depth + 1)) return false;
+    if (!jsonValuesEqual(ao[k], bo[k], depth + 1, false)) return false;
   }
   return true;
+}
+
+function stripTopDescription(node: Record<string, unknown>): Record<string, unknown> {
+  const copy: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k !== 'description' && v !== undefined) copy[k] = v;
+  }
+  return copy;
 }
 
 interface SubschemaRec {
@@ -981,6 +1074,9 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
     const keys = Object.keys(node).filter((k) => node[k] !== undefined).sort();
     let h1 = 0x811c9dc5;
     let h2 = 0x9e3779b1;
+    let sh1 = 0x811c9dc5;
+    let sh2 = 0x9e3779b1;
+    let nonDescKeyCount = 0;
     let maxChildHeight = -1;
     let hasScopeAnchor = isEmbedded;
 
@@ -988,6 +1084,11 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
       if (SCOPE_ANCHOR_KEYS.has(k)) hasScopeAnchor = true;
       const val = node[k];
       [h1, h2] = mixHashString(h1, h2, k);
+      const includeInStruct = useDraft07Definitions || !replaceable || k !== 'description';
+      if (includeInStruct) {
+        [sh1, sh2] = mixHashString(sh1, sh2, k);
+        nonDescKeyCount++;
+      }
 
       if (SINGLE_SUBSCHEMA_KEYS.has(k) && isPlainRecord(val)) {
         const cid = nextId++;
@@ -1003,6 +1104,7 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
           isEmbedded,
         );
         [h1, h2] = mixHashPair(h1, h2, child.h1 ^ child.h2);
+        if (includeInStruct) [sh1, sh2] = mixHashPair(sh1, sh2, child.h1 ^ child.h2);
         if (child.height > maxChildHeight) maxChildHeight = child.height;
         if (child.hasScopeAnchor) hasScopeAnchor = true;
         continue;
@@ -1023,6 +1125,7 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
             isEmbedded,
           );
           [h1, h2] = mixHashPair(h1, h2, child.h1 ^ child.h2);
+          if (includeInStruct) [sh1, sh2] = mixHashPair(sh1, sh2, child.h1 ^ child.h2);
           if (child.height > maxChildHeight) maxChildHeight = child.height;
           if (child.hasScopeAnchor) hasScopeAnchor = true;
           continue;
@@ -1055,6 +1158,7 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
           }
           [ah1, ah2] = mixHashPair(ah1, ah2, val.length);
           [h1, h2] = mixHashPair(h1, h2, ah1 ^ ah2);
+          if (includeInStruct) [sh1, sh2] = mixHashPair(sh1, sh2, ah1 ^ ah2);
           continue;
         }
       }
@@ -1087,6 +1191,7 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
         }
         [ah1, ah2] = mixHashPair(ah1, ah2, val.length);
         [h1, h2] = mixHashPair(h1, h2, ah1 ^ ah2);
+        if (includeInStruct) [sh1, sh2] = mixHashPair(sh1, sh2, ah1 ^ ah2);
         continue;
       }
 
@@ -1121,25 +1226,32 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
         }
         [mh1, mh2] = mixHashPair(mh1, mh2, mapKeys.length);
         [h1, h2] = mixHashPair(h1, h2, mh1 ^ mh2);
+        if (includeInStruct) [sh1, sh2] = mixHashPair(sh1, sh2, mh1 ^ mh2);
         continue;
       }
 
       const [vh1, vh2] = hashJsonValue(val, depth + 1);
       [h1, h2] = mixHashPair(h1, h2, vh1 ^ vh2);
+      if (includeInStruct) [sh1, sh2] = mixHashPair(sh1, sh2, vh1 ^ vh2);
     }
 
     [h1, h2] = mixHashPair(h1, h2, keys.length);
+    [sh1, sh2] = mixHashPair(sh1, sh2, nonDescKeyCount);
     activeStack.delete(node);
 
     const height = maxChildHeight + 1;
-    const isPureRef = typeof node.$ref === 'string' && keys.length === 1;
+    const isPureRef =
+      typeof node.$ref === 'string' &&
+      (useDraft07Definitions ? keys.length === 1 : nonDescKeyCount === 1);
     if (replaceable && !isPureRef && !hasScopeAnchor && !isEmbedded) {
+      const kh1 = useDraft07Definitions ? h1 : sh1;
+      const kh2 = useDraft07Definitions ? h2 : sh2;
       const rec: SubschemaRec = {
         id,
         parentSchemaId,
         node,
         applyReplace,
-        hashKey: `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`,
+        hashKey: `${kh1.toString(16).padStart(8, '0')}${kh2.toString(16).padStart(8, '0')}`,
         height,
         groupId: -1,
       };
@@ -1176,7 +1288,7 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
     for (const rec of bucket) {
       let matched = false;
       for (const sg of subGroups) {
-        if (jsonValuesEqual(rec.node, sg[0]!.node)) {
+        if (jsonValuesEqual(rec.node, sg[0]!.node, 0, !useDraft07Definitions)) {
           sg.push(rec);
           matched = true;
           break;
@@ -1187,9 +1299,12 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
 
     for (const sg of subGroups) {
       if (sg.length < 2) continue;
+      const firstDesc = sg[0]!.node.description;
+      const allSameDesc = sg.every((m) => m.node.description === firstDesc);
+      const basis = !useDraft07Definitions && !allSameDesc ? stripTopDescription(sg[0]!.node) : sg[0]!.node;
       let serializedLen = 0;
       try {
-        serializedLen = JSON.stringify(sg[0]!.node).length;
+        serializedLen = JSON.stringify(basis).length;
       } catch {
         continue;
       }
@@ -1243,9 +1358,12 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
 
   for (const g of ordered) {
     const sample = g.members[0]!.node;
+    const firstDesc = sample.description;
+    const allSameDesc = useDraft07Definitions || g.members.every((m) => m.node.description === firstDesc);
+    const hoistTarget = allSameDesc ? sample : stripTopDescription(sample);
     let currentJson: string;
     try {
-      currentJson = JSON.stringify(sample);
+      currentJson = JSON.stringify(hoistTarget);
     } catch {
       continue;
     }
@@ -1260,7 +1378,11 @@ function factorSingleSchema(schema: Record<string, unknown>): boolean {
 
     const refTarget = `${defsPtr}${defName}`;
     for (const m of g.members) {
-      m.applyReplace({ $ref: refTarget });
+      if (!allSameDesc && typeof m.node.description === 'string') {
+        m.applyReplace({ $ref: refTarget, description: m.node.description });
+      } else {
+        m.applyReplace({ $ref: refTarget });
+      }
     }
   }
 
@@ -1743,8 +1865,43 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
     }
   }
 
+  const lineCounts = new Map<string, number>();
+  for (const island of compiledIslands) {
+    if (island.volatile) continue;
+    for (const seg of island.segments) {
+      if (seg.fence) continue;
+      for (const p of seg.paras) {
+        if (profitableParas.has(p.core) || !p.core.includes('\n')) continue;
+        for (const line of p.core.split('\n')) {
+          if (line.length < MIN_SINGLE_LINE_DEDUP_CHARS || PROTECTED_SYS_LINE_RE.test(line)) continue;
+          lineCounts.set(line, (lineCounts.get(line) ?? 0) + 1);
+        }
+      }
+    }
+  }
+  const profitableLines = new Set<string>();
+  for (const [line, count] of lineCounts.entries()) {
+    if (count < MIN_SINGLE_LINE_OCCURRENCES) continue;
+    const preTagged = matchedStaticPrefix?.taggedLines.get(line);
+    const preUntagged = matchedStaticPrefix?.untaggedLines.has(line) ?? false;
+    if (preTagged !== undefined) {
+      profitableLines.add(line);
+    } else if (preUntagged) {
+      if (line.length > UNTAGGED_STATIC_REF.length + 4) profitableLines.add(line);
+    } else {
+      const tagLen = 1 + String(estSeq).length + 1;
+      const netSaved = (count - 1) * (line.length - (12 + tagLen)) - (tagLen + 3);
+      if (netSaved > 0) {
+        profitableLines.add(line);
+        estSeq++;
+      }
+    }
+  }
+
   const tagByPara = new Map<string, string>(matchedStaticPrefix?.taggedParas ?? []);
   const untaggedStaticInPrefix = new Set<string>(matchedStaticPrefix?.untaggedParas ?? []);
+  const tagByLine = new Map<string, string>(matchedStaticPrefix?.taggedLines ?? []);
+  const untaggedStaticLinesInPrefix = new Set<string>(matchedStaticPrefix?.untaggedLines ?? []);
   let seq = (matchedStaticPrefix?.maxTag ?? 0) + 1;
   const compiledStaticOut: string[] = [];
   const outIslands = compiledIslands.map((island) => {
@@ -1756,28 +1913,52 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
     }
     const outFenceParts = island.segments.map((seg) => {
       if (seg.fence) return seg.text;
-      if (profitableParas.size === 0) return seg.text;
+      if (profitableParas.size === 0 && profitableLines.size === 0) return seg.text;
       let any = false;
       const mapped = seg.paras.map((p) => {
-        if (!profitableParas.has(p.core)) {
-          return `${p.leadNl}${p.core}${p.trailNl}`;
-        }
-        const existing = tagByPara.get(p.core);
-        if (existing) {
-          any = true;
-          return `${p.leadNl}See [${existing}] above.${p.trailNl}`;
-        }
-        if (untaggedStaticInPrefix.has(p.core)) {
-          if (p.core.length <= UNTAGGED_STATIC_REF.length + 4) {
-            return `${p.leadNl}${p.core}${p.trailNl}`;
+        if (profitableParas.has(p.core)) {
+          const existing = tagByPara.get(p.core);
+          if (existing) {
+            any = true;
+            return `${p.leadNl}See [${existing}] above.${p.trailNl}`;
           }
+          if (untaggedStaticInPrefix.has(p.core)) {
+            if (p.core.length <= UNTAGGED_STATIC_REF.length + 4) {
+              return `${p.leadNl}${p.core}${p.trailNl}`;
+            }
+            any = true;
+            return `${p.leadNl}${UNTAGGED_STATIC_REF}${p.trailNl}`;
+          }
+          const tag = `#S${seq++}`;
+          tagByPara.set(p.core, tag);
           any = true;
-          return `${p.leadNl}${UNTAGGED_STATIC_REF}${p.trailNl}`;
+          return `${p.leadNl}[${tag}] ${p.core}${p.trailNl}`;
         }
-        const tag = `#S${seq++}`;
-        tagByPara.set(p.core, tag);
-        any = true;
-        return `${p.leadNl}[${tag}] ${p.core}${p.trailNl}`;
+        if (profitableLines.size > 0 && p.core.includes('\n')) {
+          let pChanged = false;
+          const nextLines = p.core.split('\n').map((line) => {
+            if (!profitableLines.has(line)) return line;
+            const existing = tagByLine.get(line);
+            if (existing) {
+              pChanged = true;
+              return `See [${existing}] above.`;
+            }
+            if (untaggedStaticLinesInPrefix.has(line)) {
+              if (line.length <= UNTAGGED_STATIC_REF.length + 4) return line;
+              pChanged = true;
+              return UNTAGGED_STATIC_REF;
+            }
+            const tag = `#S${seq++}`;
+            tagByLine.set(line, tag);
+            pChanged = true;
+            return `[${tag}] ${line}`;
+          });
+          if (pChanged) {
+            any = true;
+            return `${p.leadNl}${nextLines.join('\n')}${p.trailNl}`;
+          }
+        }
+        return `${p.leadNl}${p.core}${p.trailNl}`;
       });
       return any ? mapped.join('\n\n') : seg.text;
     });
@@ -1794,10 +1975,16 @@ export function compileSegmentedStaticText(text: string): CompileTextResult {
     for (const [core] of paraCounts.entries()) {
       if (!tagByPara.has(core)) nextUntagged.add(core);
     }
+    const nextUntaggedLines = new Set<string>(untaggedStaticLinesInPrefix);
+    for (const [line] of lineCounts.entries()) {
+      if (!tagByLine.has(line)) nextUntaggedLines.add(line);
+    }
     recordEmittedPrefix(emittedStaticPrefixCache, staticPrefixKeys[staticPrefixKeys.length - 1]!, {
       maxTag: seq - 1,
       taggedParas: tagByPara,
       untaggedParas: nextUntagged,
+      taggedLines: tagByLine,
+      untaggedLines: nextUntaggedLines,
       compiledStrings: compiledStaticOut,
     });
   }

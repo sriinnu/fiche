@@ -204,12 +204,11 @@ export async function aggregateSessions(
     const cached = ev.cached_tokens ?? 0;
     const cacheWrite = ev.cache_write_tokens ?? 0;
     const out = ev.output_tokens ?? 0;
+    const pathIsOpenAI = ev.path.includes('responses') || ev.path.includes('chat/completions');
+    const isOpenAI = ev.accounting_provider ? ev.accounting_provider === 'openai' : pathIsOpenAI;
     const isGoogle = ev.accounting_provider
       ? ev.accounting_provider === 'google'
-      : ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent');
-    const isOpenAI = ev.accounting_provider
-      ? ev.accounting_provider === 'openai'
-      : !isGoogle && (ev.path.includes('responses') || ev.path.includes('chat/completions'));
+      : !pathIsOpenAI && (ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent'));
     const haveUsage = inp > 0 || out > 0 || cc > 0 || cr > 0 || cached > 0 || cacheWrite > 0;
     const completionSec = Date.parse(ev.ts) / 1000;
     const requestStartSec = completionSec - Math.max(0, ev.duration_ms || 0) / 1000;
@@ -265,7 +264,7 @@ export async function aggregateSessions(
       if (haveUsage) {
         googleWarmth.set(id, {
           ts: completionSec,
-          cachedOrPrefixTokens: clampedCached > 0 ? clampedCached : (gPrev?.cachedOrPrefixTokens ?? 0),
+          cachedOrPrefixTokens: clampedCached > 0 ? clampedCached : 0,
           prefixSha: ev.system_sha8 ?? gPrev?.prefixSha,
           pxPrefixSha: pxShaG ?? gPrev?.pxPrefixSha,
           model: ev.model ?? gPrev?.model,
@@ -308,7 +307,7 @@ export async function aggregateSessions(
       if (haveUsage) {
         openaiWarmth.set(id, {
           ts: completionSec,
-          cachedOrPrefixTokens: cached > 0 ? cached : (oPrev?.cachedOrPrefixTokens ?? 0),
+          cachedOrPrefixTokens: cached > 0 ? cached : 0,
           prefixSha: ev.system_sha8 ?? oPrev?.prefixSha,
           pxPrefixSha: pxShaO ?? oPrev?.pxPrefixSha,
           model: ev.model ?? oPrev?.model,
@@ -637,9 +636,9 @@ export async function prune(
     return report;
   }
 
-  // Atomic rewrite: stream the original through a filter into events.jsonl.tmp,
-  // fsync, then rename. Any partial state on crash leaves the original intact.
-  await rewriteEventsFile(paths.eventsFile, toRemove);
+  // Atomic rewrite: stream every existing log file (active + rotated .1) through a
+  // filter into a .tmp file, fsync, then rename (or unlink .1 if emptied).
+  await rewriteAllEventLogFiles(paths.eventsFile, toRemove);
 
   for (const { path: p } of sidecarsToDelete) {
     try {
@@ -653,22 +652,141 @@ export async function prune(
   return report;
 }
 
-function writeFilteredLine(outFd: number, line: string, toRemove: Set<string>): void {
+function writeFilteredLine(outFd: number, line: string, toRemove: Set<string>): boolean {
   const clean = line.replace(/\r?\n$/, '');
-  if (!clean.trim()) return;
+  if (!clean.trim()) return false;
   let ev: TrackEvent;
   try {
     ev = JSON.parse(clean) as TrackEvent;
   } catch {
     // Preserve malformed lines so we don't silently eat data we can't parse.
     fs.writeSync(outFd, clean + '\n');
-    return;
+    return true;
   }
-  if (toRemove.has(sessionIdOf(ev))) return;
+  if (toRemove.has(sessionIdOf(ev))) return false;
   fs.writeSync(outFd, clean + '\n');
+  return true;
 }
 
-async function rewriteEventsFile(
+async function rewriteSingleEventLogFile(
+  targetFile: string,
+  toRemove: Set<string>,
+  options: {
+    unlinkIfEmpty: boolean;
+    flushPending?: (outFd: number, writeLine?: (outFd: number, line: string) => void) => void;
+  },
+): Promise<void> {
+  if (!fs.existsSync(targetFile)) return;
+  const tmp = `${targetFile}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+  // Open with O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW and 0o600 permissions so pruned logs never expose prompts.
+  const openFlags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    (fs.constants.O_NOFOLLOW ?? 0);
+  const outFd = fs.openSync(tmp, openFlags, 0o600);
+  fs.fchmodSync(outFd, 0o600);
+  let outFdClosed = false;
+  let renamed = false;
+  let keptLines = 0;
+  try {
+    let streamBytes = 0;
+    let streamIno: number | null = null;
+    let streamDev: number | null = null;
+    const stream = fs.createReadStream(targetFile);
+    stream.on('open', (rfd: number) => {
+      try {
+        const fst = fs.fstatSync(rfd);
+        streamIno = fst.ino;
+        streamDev = fst.dev;
+      } catch {
+        /* ignore fstat error */
+      }
+    });
+    stream.on('data', (chunk: string | Buffer) => {
+      streamBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, 'utf8');
+    });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (writeFilteredLine(outFd, line, toRemove)) keptLines += 1;
+    }
+    // Catch up any lines appended externally during async streaming before locking in rename.
+    try {
+      const st = fs.statSync(targetFile);
+      const sameFile = streamIno === null || (st.ino === streamIno && st.dev === streamDev);
+      if (sameFile && st.size > streamBytes) {
+        const extraBuf = Buffer.allocUnsafe(st.size - streamBytes);
+        const rfd = fs.openSync(targetFile, 'r');
+        let readTotal = 0;
+        try {
+          const fst = fs.fstatSync(rfd);
+          if (streamIno === null || (fst.ino === streamIno && fst.dev === streamDev)) {
+            while (readTotal < extraBuf.length) {
+              const n = fs.readSync(rfd, extraBuf, readTotal, extraBuf.length - readTotal, streamBytes + readTotal);
+              if (n <= 0) break;
+              readTotal += n;
+            }
+          }
+        } finally {
+          fs.closeSync(rfd);
+        }
+        if (readTotal > 0) {
+          const tailText = extraBuf.subarray(0, readTotal).toString('utf8');
+          for (const tailLine of tailText.split(/\r?\n/)) {
+            if (writeFilteredLine(outFd, tailLine, toRemove)) keptLines += 1;
+          }
+        }
+      }
+    } catch {
+      /* ignore stat race */
+    }
+    if (options.flushPending) {
+      options.flushPending(outFd, (fd, rawLine) => {
+        if (writeFilteredLine(fd, rawLine, toRemove)) keptLines += 1;
+      });
+    }
+    if (options.unlinkIfEmpty && keptLines === 0) {
+      fs.closeSync(outFd);
+      outFdClosed = true;
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* ignore cleanup error */
+      }
+      try {
+        fs.unlinkSync(targetFile);
+      } catch {
+        /* ignore — already unlinked */
+      }
+      renamed = true;
+      return;
+    }
+    fs.fsyncSync(outFd);
+    fs.closeSync(outFd);
+    outFdClosed = true;
+    fs.renameSync(tmp, targetFile);
+    renamed = true;
+    fs.chmodSync(targetFile, 0o600);
+  } catch (err) {
+    if (!outFdClosed) {
+      try {
+        fs.closeSync(outFd);
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* ignore cleanup error */
+      }
+    }
+    throw err;
+  }
+}
+
+async function rewriteAllEventLogFiles(
   eventsFile: string,
   toRemove: Set<string>,
 ): Promise<void> {
@@ -682,105 +800,23 @@ async function rewriteEventsFile(
   await prevLock;
 
   try {
-    const runRewrite = async (
+    const runAll = async (
       flushPending?: (outFd: number, writeLine?: (outFd: number, line: string) => void) => void,
     ): Promise<void> => {
-      if (!fs.existsSync(eventsFile)) return;
-      const tmp = `${eventsFile}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
-      // Open with O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW and 0o600 permissions so pruned logs never expose prompts.
-      const openFlags =
-        fs.constants.O_WRONLY |
-        fs.constants.O_CREAT |
-        fs.constants.O_EXCL |
-        (fs.constants.O_NOFOLLOW ?? 0);
-      const outFd = fs.openSync(tmp, openFlags, 0o600);
-      fs.fchmodSync(outFd, 0o600);
-      let outFdClosed = false;
-      let renamed = false;
-      try {
-        let streamBytes = 0;
-        let streamIno: number | null = null;
-        let streamDev: number | null = null;
-        const stream = fs.createReadStream(eventsFile);
-        stream.on('open', (rfd: number) => {
-          try {
-            const fst = fs.fstatSync(rfd);
-            streamIno = fst.ino;
-            streamDev = fst.dev;
-          } catch {
-            /* ignore fstat error */
-          }
+      for (const targetFile of eventLogFiles(eventsFile)) {
+        const isRotated = targetFile !== eventsFile;
+        await rewriteSingleEventLogFile(targetFile, toRemove, {
+          unlinkIfEmpty: isRotated,
+          flushPending: isRotated ? undefined : flushPending,
         });
-        stream.on('data', (chunk: string | Buffer) => {
-          streamBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk, 'utf8');
-        });
-        const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-        for await (const line of rl) {
-          writeFilteredLine(outFd, line, toRemove);
-        }
-        // Catch up any lines appended externally during async streaming before locking in rename.
-        try {
-          const st = fs.statSync(eventsFile);
-          const sameFile = streamIno === null || (st.ino === streamIno && st.dev === streamDev);
-          if (sameFile && st.size > streamBytes) {
-            const extraBuf = Buffer.allocUnsafe(st.size - streamBytes);
-            const rfd = fs.openSync(eventsFile, 'r');
-            let readTotal = 0;
-            try {
-              const fst = fs.fstatSync(rfd);
-              if (streamIno === null || (fst.ino === streamIno && fst.dev === streamDev)) {
-                while (readTotal < extraBuf.length) {
-                  const n = fs.readSync(rfd, extraBuf, readTotal, extraBuf.length - readTotal, streamBytes + readTotal);
-                  if (n <= 0) break;
-                  readTotal += n;
-                }
-              }
-            } finally {
-              fs.closeSync(rfd);
-            }
-            if (readTotal > 0) {
-              const tailText = extraBuf.subarray(0, readTotal).toString('utf8');
-              for (const tailLine of tailText.split(/\r?\n/)) {
-                writeFilteredLine(outFd, tailLine, toRemove);
-              }
-            }
-          }
-        } catch {
-          /* ignore stat race */
-        }
-        if (flushPending) {
-          flushPending(outFd, (fd, rawLine) => writeFilteredLine(fd, rawLine, toRemove));
-        }
-        fs.fsyncSync(outFd);
-        fs.closeSync(outFd);
-        outFdClosed = true;
-        fs.renameSync(tmp, eventsFile);
-        renamed = true;
-        fs.chmodSync(eventsFile, 0o600);
-      } catch (err) {
-        if (!outFdClosed) {
-          try {
-            fs.closeSync(outFd);
-          } catch {
-            /* ignore */
-          }
-        }
-        if (!renamed) {
-          try {
-            fs.unlinkSync(tmp);
-          } catch {
-            /* ignore cleanup error */
-          }
-        }
-        throw err;
       }
     };
 
     const coordinator = eventsFileCoordinators.get(key);
     if (coordinator) {
-      await coordinator.runDuringRewrite((flushPending) => runRewrite(flushPending));
+      await coordinator.runDuringRewrite((flushPending) => runAll(flushPending));
     } else {
-      await runRewrite();
+      await runAll();
     }
   } finally {
     release();
@@ -794,10 +830,12 @@ async function rewriteEventsFile(
 
 export function diskUsage(paths: SessionsPaths): DiskUsage {
   let eventsJsonlBytes = 0;
-  try {
-    eventsJsonlBytes = fs.statSync(paths.eventsFile).size;
-  } catch {
-    /* no events file — leave at 0 */
+  for (const file of eventLogFiles(paths.eventsFile)) {
+    try {
+      eventsJsonlBytes += fs.statSync(file).size;
+    } catch {
+      /* ignore unreadable/missing rotated or active log */
+    }
   }
   const sidecarSizes = sidecarFileSizes(paths.sidecarDir);
   let sidecarsBytes = 0;

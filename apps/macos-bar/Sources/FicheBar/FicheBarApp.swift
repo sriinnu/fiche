@@ -269,7 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             try? data.write(to: outURL)
         }
 
-        let aboutView = AboutPanelView(daemonVersion: "0.19.0").themed(Theme.of(.editorial))
+        let aboutView = AboutPanelView(daemonVersion: "0.20.0").themed(Theme.of(.editorial))
         if let aboutData = renderRetinaPNG(
             rootView: aboutView,
             width: 320,

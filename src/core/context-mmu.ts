@@ -55,20 +55,60 @@ const EMPTY_I32 = new Int32Array(0);
 const POW_HALF = Float64Array.from({ length: 32 }, (_, k) => Math.pow(0.5, k));
 
 /**
- * Horizon-aware online compaction payback gate.
+ * Horizon-aware online compaction payback gate using TTL-hazard, Pareto-geometric
+ * survival, empirical cache hit ratio, and the 0.632 ski-rental factor.
  * At the append frontier (`downstreamCachedTokens <= 0`), admits fast (`>= 16` reads).
- * Mid-prefix (`downstreamCachedTokens > 0`), scales conservatively with observed turns
- * so immature sessions do not pay heavy cache-write penalties prematurely.
+ * Mid-prefix (`downstreamCachedTokens > 0`), scales with observed turns and cache
+ * survival horizon so immature or expiring sessions avoid heavy cache-write penalties.
  */
 export function computeHorizonPaybackLimit(opts: {
   readonly turnsObserved: number;
   readonly baseMaxPayback: number;
   readonly downstreamCachedTokens: number;
+  readonly frontierOnly?: boolean;
+  readonly ttlSec?: number;
+  readonly ewmaInterTurnSec?: number;
+  readonly ewmaHitRatio?: number;
+  readonly writeRate?: number;
 }): number {
   if (opts.downstreamCachedTokens <= 0) {
     return Math.max(opts.baseMaxPayback, 16);
   }
-  return Math.max(4, Math.min(opts.baseMaxPayback, Math.round(3 + opts.turnsObserved * 0.45)));
+  const turns = Math.max(1, opts.turnsObserved);
+  const paretoHorizon = 4.75 + 0.712 * turns;
+  const pTtl =
+    opts.ttlSec !== undefined &&
+    opts.ewmaInterTurnSec !== undefined &&
+    opts.ttlSec > 0 &&
+    opts.ewmaInterTurnSec > 0
+      ? Math.exp(-opts.ewmaInterTurnSec / opts.ttlSec)
+      : 1;
+  const pHit =
+    opts.ewmaHitRatio !== undefined && Number.isFinite(opts.ewmaHitRatio)
+      ? Math.min(0.99, Math.max(0.05, opts.ewmaHitRatio))
+      : 1;
+  const pSurvive = pTtl * pHit;
+  const survivalHorizon = pSurvive < 1 ? pSurvive / Math.max(0.02, 1 - pSurvive) : paretoHorizon;
+  const effectiveHorizon = Math.min(paretoHorizon, survivalHorizon);
+  const writeScale =
+    opts.writeRate !== undefined && Number.isFinite(opts.writeRate) && opts.writeRate > 1.25
+      ? Math.max(0.6, 1.25 / opts.writeRate)
+      : 1;
+  const hasTelemetry =
+    (opts.ttlSec !== undefined && opts.ewmaInterTurnSec !== undefined && opts.ewmaInterTurnSec > 0) ||
+    opts.ewmaHitRatio !== undefined ||
+    (opts.writeRate !== undefined && opts.writeRate > 1.25);
+  const minFloor = hasTelemetry ? 2 : 4;
+  if (opts.frontierOnly === true) {
+    const baseCeiling = opts.baseMaxPayback;
+    if (pSurvive < 1) {
+      const survivalLimit = Math.round((pSurvive / Math.max(0.02, 1 - pSurvive)) * 0.632 * writeScale);
+      return Math.max(minFloor, Math.min(baseCeiling, survivalLimit));
+    }
+    return Math.max(minFloor, Math.min(baseCeiling, Math.round(baseCeiling * writeScale)));
+  }
+  const rawLimit = Math.round(effectiveHorizon * 0.632 * writeScale);
+  return Math.max(minFloor, Math.min(opts.baseMaxPayback, rawLimit));
 }
 
 const TOKEN_CACHE_MAX = 2048;
@@ -972,22 +1012,57 @@ const SECRET_TOKEN_PREFIX_RE =
 const SECRET_JWT_RE = /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/;
 const SECRET_DSN_RE = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i;
 const SECRET_JSON_YAML_KEY_RE =
-  /(?:"(?:api[_-]?key|secret|token|password|private[_-]?key|access[_-]?key)"\s*:\s*"[^"\s]{8,}"|^[ \t]*(?:api[_-]?key|secret|token|password|private[_-]?key|access[_-]?key)[ \t]*:[ \t]*(?:["'][^"'\s]{8,}["']|(?!undefined\b|null\b|boolean\b|string\b|number\b)[A-Za-z0-9_+./=-]{12,}[ \t]*$))/im;
+  /(?:"(?:[a-z0-9_.-]+_)?(?:api[_-]?key|secret|token|password|passwd|private[_-]?key|access[_-]?key|client[_-]?secret)"[ \t]*:[ \t]*"([^"\s]{12,})"|^[ \t]*(?:[a-z0-9_.-]+_)?(?:api[_-]?key|secret|token|password|passwd|private[_-]?key|access[_-]?key|client[_-]?secret)[ \t]*:[ \t]*(?:"([^"\s]{12,})"|'([^'\s]{12,})'|([^\s"'#]{12,}))[ \t]*$)/gim;
+const SECRET_PLACEHOLDER_RE =
+  /^(?:your[_-]|example|placeholder|changeme|replace[_-]?me|redacted|dummy|fake|test[_-]?(?:key|token|secret|password)|current[-_]password|new[-_]password|confirm[-_]password|enter[-_]password|undefined|null|boolean|string|number|object|array|required|optional|default)/i;
+const SECRET_TEMPLATE_VAL_RE = /^[<${]|^<[^>]+>$|\{\{.*\}\}/;
+const SECRET_KEBAB_WORDS_RE = /^[a-z]+(?:-[a-z]+)+$/;
+const SECRET_SNAKE_WORDS_RE = /^(?:[a-z]+(?:_[a-z]+)+|[A-Z]+(?:_[A-Z]+)+)$/;
 const SECRET_ENV_ASSIGN_RE =
   /^[ \t]*(?:export[ \t]+)?[A-Z0-9_]*(?:SECRET|TOKEN|API_KEY|PASSWORD|PRIVATE_KEY|ACCESS_KEY)[A-Z0-9_]*[ \t]*=[ \t]*["']?[^\s"'#]{8,}/m;
 
+function isHighConfidenceSecretValue(val: string): boolean {
+  if (val.length < 12 || /\s/.test(val)) return false;
+  if (SECRET_PLACEHOLDER_RE.test(val) || SECRET_TEMPLATE_VAL_RE.test(val)) return false;
+  if (SECRET_KEBAB_WORDS_RE.test(val) || SECRET_SNAKE_WORDS_RE.test(val)) return false;
+  const hasDigit = /\d/.test(val);
+  const hasLower = /[a-z]/.test(val);
+  const hasUpper = /[A-Z]/.test(val);
+  const hasSymbol = /[^A-Za-z0-9]/.test(val);
+  const looksSecretShape =
+    (hasDigit && (hasLower || hasUpper || hasSymbol)) ||
+    (hasSymbol && (hasLower || hasUpper)) ||
+    (val.length >= 24 && hasUpper && hasLower);
+  if (!looksSecretShape) return false;
+  const distinct = new Set<string>();
+  const sampleLen = Math.min(val.length, 64);
+  for (let i = 0; i < sampleLen; i++) {
+    distinct.add(val[i]!);
+    if (distinct.size >= 6) return true;
+  }
+  return false;
+}
+
 /** Skip persisting raw pages containing high-confidence credentials or private keys. */
 function containsHighConfidenceSecret(text: string): boolean {
-  return (
+  if (
     SECRET_PEM_RE.test(text) ||
     SECRET_BEARER_RE.test(text) ||
     SECRET_BASIC_AUTH_RE.test(text) ||
     SECRET_TOKEN_PREFIX_RE.test(text) ||
     SECRET_JWT_RE.test(text) ||
     SECRET_DSN_RE.test(text) ||
-    SECRET_JSON_YAML_KEY_RE.test(text) ||
     SECRET_ENV_ASSIGN_RE.test(text)
-  );
+  ) {
+    return true;
+  }
+  SECRET_JSON_YAML_KEY_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SECRET_JSON_YAML_KEY_RE.exec(text)) !== null) {
+    const val = m[1] ?? m[2] ?? m[3] ?? m[4] ?? '';
+    if (isHighConfidenceSecretValue(val)) return true;
+  }
+  return false;
 }
 
 export interface DerefPageResult {
@@ -1009,6 +1084,10 @@ interface StoredEntry {
   readonly page: MmuPage;
   readonly bytes: number;
   readonly indexKeys: readonly string[];
+  readonly extraSymbols?: readonly string[];
+  queue: 'S' | 'M';
+  freq: number;
+  lastAccessedAtMs: number;
 }
 
 interface PersistedPageRecord {
@@ -1019,10 +1098,12 @@ interface PersistedPageRecord {
   toolName?: string;
   filePath?: string;
   createdAtMs: number;
+  lastAccessedAtMs?: number;
   rawText: string;
   lineCount: number;
   symbols?: MmuSymbolSpan[];
   factTokens?: string[];
+  extraSymbols?: string[];
 }
 
 interface PersistedMmuState {
@@ -1059,6 +1140,7 @@ function collectIndexKeys(
   symbols: readonly MmuSymbolSpan[],
   filePath: string | undefined,
   extraSymbols?: readonly string[],
+  factTokens?: readonly string[],
 ): string[] {
   const keys = new Set<string>();
   for (const sym of symbols) {
@@ -1071,6 +1153,13 @@ function collectIndexKeys(
     const base = pathBasename(norm);
     if (base) keys.add(base);
   }
+  if (factTokens) {
+    const cap = Math.min(32, factTokens.length);
+    for (let i = 0; i < cap; i++) {
+      const low = factTokens[i]!.trim().toLowerCase();
+      if (low.length >= 3) keys.add(low);
+    }
+  }
   if (extraSymbols) {
     for (const sym of extraSymbols) {
       const low = sym.trim().toLowerCase();
@@ -1080,26 +1169,46 @@ function collectIndexKeys(
   return [...keys];
 }
 
+const DEFAULT_MAX_SKILL_SESSIONS = 512;
+const TLB_MAX_LEASES_PER_PAGE = 4;
+
+interface TlbLease {
+  startLine: number;
+  endLine: number;
+  turn: number;
+}
+
 export class ContextPageStore {
   maxPages: number;
   maxBytes: number;
   maxSkillPages: number = DEFAULT_MAX_SKILL_PAGES;
   maxSkillBytes: number = DEFAULT_MAX_SKILL_BYTES;
+  maxSkillSessions: number = DEFAULT_MAX_SKILL_SESSIONS;
   private readonly debounceMs: number;
 
-  /** LRU map keyed by `${sessionKey}\0${id}` (insertion order = LRU -> MRU). */
-  private readonly entries = new Map<string, StoredEntry>();
+  /** Size-Aware S3-FIFO probation queue `S` (15%, min 8 pages), keyed by `${sessionKey}\0${id}`. */
+  private readonly probationQueue = new Map<string, StoredEntry>();
+  /** Size-Aware S3-FIFO protected queue `M` (85%), keyed by `${sessionKey}\0${id}`. */
+  private readonly protectedQueue = new Map<string, StoredEntry>();
+  /** Size-Aware S3-FIFO ghost key ring `G` (capped at `maxPages`). */
+  private readonly ghostKeys = new Set<string>();
   /** Shared deduplicated global skill slab keyed by `id` (insertion order = LRU -> MRU). */
   private readonly skillEntries = new Map<string, StoredEntry>();
-  /** Session -> skill page IDs referencing `skillEntries`. */
+  /** Session -> skill page IDs referencing `skillEntries` (LRU-capped at `maxSkillSessions`). */
   private readonly sessionSkillIds = new Map<string, Set<string>>();
+  /** Reverse index: skill pageId -> set of sessionKeys referencing it (O(1) removal/serialize). */
+  private readonly skillPageSessions = new Map<string, Set<string>>();
   /** Fast pageId -> latest entryKey lookup (one pageId can exist under multiple sessions). */
   private readonly keysByPageId = new Map<string, Set<string>>();
-  /** Inverted index: lowercased symbol / basename -> page IDs. */
+  /** Inverted index: lowercased symbol / basename / fact token -> page IDs. */
   readonly symbolIndex = new Map<string, Set<string>>();
+  /** O(1) ref-counted symbol ownership: idxKey -> (pageId -> refCount). */
+  private readonly symbolPageRefCount = new Map<string, Map<string, number>>();
   /** Session index: sessionKey -> page IDs. */
   readonly sessionIndex = new Map<string, Set<string>>();
 
+  private probationBytes = 0;
+  private protectedBytes = 0;
   private totalBytes = 0;
   private totalSkillBytes = 0;
   private stats: MmuStats = emptyStats();
@@ -1108,11 +1217,8 @@ export class ContextPageStore {
   private saveTimer: ReturnType<typeof setTimeout> | undefined;
   private dirty = false;
 
-  /** Per-session Context-TLB leases: sessionKey -> (pageId -> { startLine, endLine, turn }). */
-  private readonly hydrationTlb = new Map<
-    string,
-    Map<string, { startLine: number; endLine: number; turn: number }>
-  >();
+  /** Per-session Context-TLB leases: sessionKey -> (pageId -> up to 4 non-overlapping leases). */
+  private readonly hydrationTlb = new Map<string, Map<string, TlbLease[]>>();
   /** Per-session logical hydration turn counter (bounded to 512 LRU sessions). */
   private readonly hydrationTurn = new Map<string, number>();
 
@@ -1123,6 +1229,33 @@ export class ContextPageStore {
     if (options.persistence) {
       this.configurePersistence(options.persistence);
     }
+  }
+
+  private getEntry(entryKey: string): StoredEntry | undefined {
+    return this.probationQueue.get(entryKey) ?? this.protectedQueue.get(entryKey);
+  }
+
+  private entryCount(): number {
+    return this.probationQueue.size + this.protectedQueue.size;
+  }
+
+  private s3Capacities(): { sCapPages: number; sCapBytes: number } {
+    const sCapPages =
+      this.maxPages <= 1
+        ? 1
+        : Math.min(this.maxPages - 1, Math.max(8, Math.floor(this.maxPages * 0.15)));
+    const sCapBytes = Math.max(1, Math.floor(this.maxBytes * 0.15));
+    return { sCapPages, sCapBytes };
+  }
+
+  private addGhostKey(entryKey: string): void {
+    if (this.ghostKeys.has(entryKey)) this.ghostKeys.delete(entryKey);
+    while (this.ghostKeys.size >= this.maxPages) {
+      const oldest = this.ghostKeys.values().next().value;
+      if (oldest === undefined) break;
+      this.ghostKeys.delete(oldest);
+    }
+    if (this.maxPages > 0) this.ghostKeys.add(entryKey);
   }
 
   /** Attach or detach persistence adapter, restoring saved pages fail-open. */
@@ -1166,10 +1299,16 @@ export class ContextPageStore {
     }
   }
 
-  /** Serialize current store state in LRU order (oldest first), skipping expired or secret-bearing pages. */
+  /** Serialize current store state in FIFO/LRU order (oldest first), skipping expired or secret-bearing pages. */
   serialize(nowMs: number = Date.now()): string {
     const pages: PersistedPageRecord[] = [];
-    const pushRecord = (p: MmuPage, createdAtMs: number, sharedSessions?: readonly string[]): void => {
+    const pushRecord = (
+      entry: StoredEntry,
+      createdAtMs: number,
+      lastAccessedAtMs: number,
+      sharedSessions?: readonly string[],
+    ): void => {
+      const p = entry.page;
       pages.push({
         id: p.id,
         sessionKey: p.sessionKey,
@@ -1178,29 +1317,39 @@ export class ContextPageStore {
         ...(p.toolName !== undefined ? { toolName: p.toolName } : {}),
         ...(p.filePath !== undefined ? { filePath: p.filePath } : {}),
         createdAtMs,
+        lastAccessedAtMs,
         rawText: p.rawText,
         lineCount: p.lineCount,
         symbols: [...p.symbols],
         factTokens: [...p.factTokens],
+        ...(entry.extraSymbols && entry.extraSymbols.length > 0 ? { extraSymbols: [...entry.extraSymbols] } : {}),
       });
     };
-    for (const entry of this.entries.values()) {
+    for (const entry of this.probationQueue.values()) {
       const p = entry.page;
       const createdAtMs = p.createdAtMs > 0 ? p.createdAtMs : nowMs;
-      if (nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
+      const lastActiveMs = entry.lastAccessedAtMs > 0 ? entry.lastAccessedAtMs : createdAtMs;
+      if (nowMs - lastActiveMs > PERSIST_MAX_IDLE_MS) continue;
       if (containsHighConfidenceSecret(p.rawText)) continue;
-      pushRecord(p, createdAtMs);
+      pushRecord(entry, createdAtMs, lastActiveMs);
+    }
+    for (const entry of this.protectedQueue.values()) {
+      const p = entry.page;
+      const createdAtMs = p.createdAtMs > 0 ? p.createdAtMs : nowMs;
+      const lastActiveMs = entry.lastAccessedAtMs > 0 ? entry.lastAccessedAtMs : createdAtMs;
+      if (nowMs - lastActiveMs > PERSIST_MAX_IDLE_MS) continue;
+      if (containsHighConfidenceSecret(p.rawText)) continue;
+      pushRecord(entry, createdAtMs, lastActiveMs);
     }
     for (const entry of this.skillEntries.values()) {
       const p = entry.page;
       const createdAtMs = p.createdAtMs > 0 ? p.createdAtMs : nowMs;
-      if (nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
+      const lastActiveMs = entry.lastAccessedAtMs > 0 ? entry.lastAccessedAtMs : createdAtMs;
+      if (nowMs - lastActiveMs > PERSIST_MAX_IDLE_MS) continue;
       if (containsHighConfidenceSecret(p.rawText)) continue;
-      const shared: string[] = [];
-      for (const [sk, set] of this.sessionSkillIds) {
-        if (set.has(p.id)) shared.push(sk);
-      }
-      pushRecord(p, createdAtMs, shared.length > 0 ? shared : [p.sessionKey]);
+      const sharedSet = this.skillPageSessions.get(p.id);
+      const shared = sharedSet && sharedSet.size > 0 ? [...sharedSet] : [p.sessionKey];
+      pushRecord(entry, createdAtMs, lastActiveMs, shared);
     }
     const payload: PersistedMmuState = {
       format: PERSIST_FORMAT,
@@ -1228,14 +1377,20 @@ export class ContextPageStore {
     for (const rawRec of obj.pages) {
       if (!rawRec || typeof rawRec !== 'object' || Array.isArray(rawRec)) continue;
       const r = rawRec as Partial<PersistedPageRecord>;
-      if (typeof r.rawText !== 'string' || typeof r.sessionKey !== 'string' || !r.sessionKey) continue;
+      if (typeof r.rawText !== 'string' || typeof r.sessionKey !== 'string') continue;
+      const trimmedSessionKey = r.sessionKey.trim();
+      if (!trimmedSessionKey) continue;
       const createdAtMs = typeof r.createdAtMs === 'number' && Number.isFinite(r.createdAtMs) ? r.createdAtMs : 0;
-      if (createdAtMs <= 0 || nowMs - createdAtMs > PERSIST_MAX_IDLE_MS) continue;
+      const lastAccessedAtMs =
+        typeof r.lastAccessedAtMs === 'number' && Number.isFinite(r.lastAccessedAtMs) && r.lastAccessedAtMs > 0
+          ? r.lastAccessedAtMs
+          : createdAtMs;
+      if (lastAccessedAtMs <= 0 || nowMs - lastAccessedAtMs > PERSIST_MAX_IDLE_MS) continue;
       if (containsHighConfidenceSecret(r.rawText)) continue;
       const id = typeof r.id === 'string' && /^pg_[0-9a-f]{8,16}$/.test(r.id) ? r.id : pageIdForText(r.rawText);
       const isSkill = r.toolName === 'skill-catalog';
-      const entryKey = `${r.sessionKey}\0${id}`;
-      if (!isSkill && this.entries.has(entryKey)) continue;
+      const entryKey = `${trimmedSessionKey}\0${id}`;
+      if (!isSkill && this.getEntry(entryKey)) continue;
 
       const bytes = utf8ByteLength(r.rawText);
       if (bytes > (isSkill ? this.maxSkillBytes : this.maxBytes)) continue;
@@ -1254,13 +1409,16 @@ export class ContextPageStore {
       const factTokens = Array.isArray(r.factTokens)
         ? r.factTokens.filter((t): t is string => typeof t === 'string')
         : extractFactSheetTokens(r.rawText);
+      const extraSymbols = Array.isArray(r.extraSymbols)
+        ? [...new Set(r.extraSymbols.filter((s): s is string => typeof s === 'string').map((s) => s.trim()).filter(Boolean))]
+        : undefined;
       const page: MmuPage = {
         id,
-        sessionKey: r.sessionKey,
+        sessionKey: trimmedSessionKey,
         refId: typeof r.refId === 'string' && r.refId ? r.refId : 'restored',
         ...(typeof r.toolName === 'string' && r.toolName ? { toolName: r.toolName } : {}),
         ...(filePath !== undefined ? { filePath } : {}),
-        createdAtMs,
+        createdAtMs: createdAtMs > 0 ? createdAtMs : lastAccessedAtMs,
         rawText: r.rawText,
         lineCount:
           typeof r.lineCount === 'number' && Number.isFinite(r.lineCount) && r.lineCount >= 0
@@ -1269,15 +1427,17 @@ export class ContextPageStore {
         symbols,
         factTokens,
       };
+      const indexKeys = collectIndexKeys(symbols, filePath, extraSymbols, factTokens);
       if (isSkill) {
-        const sessionKeys = Array.isArray(r.sharedSessionKeys) && r.sharedSessionKeys.length > 0
-          ? r.sharedSessionKeys.filter((sk): sk is string => typeof sk === 'string' && sk.trim().length > 0)
-          : [r.sessionKey];
+        const cleanedShared = Array.isArray(r.sharedSessionKeys)
+          ? [...new Set(r.sharedSessionKeys.filter((sk): sk is string => typeof sk === 'string').map((sk) => sk.trim()).filter(Boolean))]
+          : [];
+        const sessionKeys = cleanedShared.length > 0 ? cleanedShared : [trimmedSessionKey];
         const existed = this.skillEntries.has(id);
-        this.upsertSkillEntry(page, bytes, collectIndexKeys(symbols, filePath), sessionKeys, false);
+        this.upsertSkillEntry(page, bytes, indexKeys, sessionKeys, false, lastAccessedAtMs, extraSymbols);
         if (!existed) restored += 1;
       } else {
-        this.insertEntry(entryKey, page, bytes, collectIndexKeys(symbols, filePath), false);
+        this.insertEntry(entryKey, page, bytes, indexKeys, false, lastAccessedAtMs, extraSymbols);
         restored += 1;
       }
     }
@@ -1300,23 +1460,54 @@ export class ContextPageStore {
     return restored;
   }
 
-  private touchEntry(entry: StoredEntry): void {
+  private touchEntry(entry: StoredEntry, nowMs: number = Date.now()): void {
+    entry.lastAccessedAtMs = nowMs;
+    if (entry.freq < 3) entry.freq += 1;
     if (this.skillEntries.get(entry.page.id) === entry) {
       this.skillEntries.delete(entry.page.id);
       this.skillEntries.set(entry.page.id, entry);
-      return;
     }
-    this.entries.delete(entry.key);
-    this.entries.set(entry.key, entry);
   }
 
   private linkSessionSkill(sessionKey: string, pageId: string): void {
     let skills = this.sessionSkillIds.get(sessionKey);
-    if (!skills) {
+    if (skills) {
+      this.sessionSkillIds.delete(sessionKey);
+      this.sessionSkillIds.set(sessionKey, skills);
+    } else {
+      while (this.sessionSkillIds.size >= this.maxSkillSessions) {
+        const oldestSk = this.sessionSkillIds.keys().next().value;
+        if (oldestSk === undefined) break;
+        const oldSkills = this.sessionSkillIds.get(oldestSk);
+        this.sessionSkillIds.delete(oldestSk);
+        if (oldSkills) {
+          for (const pid of oldSkills) {
+            const pSessions = this.skillPageSessions.get(pid);
+            if (pSessions) {
+              pSessions.delete(oldestSk);
+              if (pSessions.size === 0) this.skillPageSessions.delete(pid);
+            }
+            if (!this.getEntry(`${oldestSk}\0${pid}`)) {
+              const sessPages = this.sessionIndex.get(oldestSk);
+              if (sessPages) {
+                sessPages.delete(pid);
+                if (sessPages.size === 0) this.sessionIndex.delete(oldestSk);
+              }
+            }
+          }
+        }
+      }
       skills = new Set();
       this.sessionSkillIds.set(sessionKey, skills);
     }
     skills.add(pageId);
+
+    let pSessions = this.skillPageSessions.get(pageId);
+    if (!pSessions) {
+      pSessions = new Set();
+      this.skillPageSessions.set(pageId, pSessions);
+    }
+    pSessions.add(sessionKey);
 
     let sessPages = this.sessionIndex.get(sessionKey);
     if (!sessPages) {
@@ -1334,6 +1525,32 @@ export class ContextPageStore {
         this.symbolIndex.set(idxKey, set);
       }
       set.add(pageId);
+
+      let refMap = this.symbolPageRefCount.get(idxKey);
+      if (!refMap) {
+        refMap = new Map();
+        this.symbolPageRefCount.set(idxKey, refMap);
+      }
+      refMap.set(pageId, (refMap.get(pageId) ?? 0) + 1);
+    }
+  }
+
+  private removeSymbolIndexesForPage(pageId: string, indexKeys: readonly string[]): void {
+    for (const idxKey of indexKeys) {
+      const refMap = this.symbolPageRefCount.get(idxKey);
+      if (!refMap) continue;
+      const cur = refMap.get(pageId) ?? 0;
+      if (cur <= 1) {
+        refMap.delete(pageId);
+        if (refMap.size === 0) this.symbolPageRefCount.delete(idxKey);
+        const set = this.symbolIndex.get(idxKey);
+        if (set) {
+          set.delete(pageId);
+          if (set.size === 0) this.symbolIndex.delete(idxKey);
+        }
+      } else {
+        refMap.set(pageId, cur - 1);
+      }
     }
   }
 
@@ -1356,17 +1573,6 @@ export class ContextPageStore {
     this.addSymbolIndexesForPage(page.id, indexKeys);
   }
 
-  private isSymbolKeyOwnedByPageId(pageId: string, idxKey: string, pidKeys?: Set<string>): boolean {
-    if (pidKeys) {
-      for (const otherKey of pidKeys) {
-        const other = this.entries.get(otherKey);
-        if (other && other.indexKeys.includes(idxKey)) return true;
-      }
-    }
-    const skill = this.skillEntries.get(pageId);
-    return Boolean(skill && skill.indexKeys.includes(idxKey));
-  }
-
   private removeIndexes(entry: StoredEntry): void {
     const { page, key, indexKeys } = entry;
     const pidKeys = this.keysByPageId.get(page.id);
@@ -1385,50 +1591,106 @@ export class ContextPageStore {
       }
     }
 
-    const activePidKeys = this.keysByPageId.get(page.id);
-    for (const idxKey of indexKeys) {
-      const set = this.symbolIndex.get(idxKey);
-      if (!set) continue;
-      if (!this.isSymbolKeyOwnedByPageId(page.id, idxKey, activePidKeys)) {
-        set.delete(page.id);
-      }
-      if (set.size === 0) this.symbolIndex.delete(idxKey);
-    }
+    this.removeSymbolIndexesForPage(page.id, indexKeys);
   }
 
   private removeSkillIndexes(entry: StoredEntry): void {
     const { page, indexKeys } = entry;
-    for (const [sk, skills] of this.sessionSkillIds) {
-      if (!skills.delete(page.id)) continue;
-      if (skills.size === 0) this.sessionSkillIds.delete(sk);
-      if (!this.entries.has(`${sk}\0${page.id}`)) {
-        const sessPages = this.sessionIndex.get(sk);
-        if (sessPages) {
-          sessPages.delete(page.id);
-          if (sessPages.size === 0) this.sessionIndex.delete(sk);
+    const linkedSessions = this.skillPageSessions.get(page.id);
+    if (linkedSessions) {
+      for (const sk of linkedSessions) {
+        const skills = this.sessionSkillIds.get(sk);
+        if (skills) {
+          skills.delete(page.id);
+          if (skills.size === 0) this.sessionSkillIds.delete(sk);
+        }
+        if (!this.getEntry(`${sk}\0${page.id}`)) {
+          const sessPages = this.sessionIndex.get(sk);
+          if (sessPages) {
+            sessPages.delete(page.id);
+            if (sessPages.size === 0) this.sessionIndex.delete(sk);
+          }
         }
       }
+      this.skillPageSessions.delete(page.id);
     }
-    const activePidKeys = this.keysByPageId.get(page.id);
-    for (const idxKey of indexKeys) {
-      const set = this.symbolIndex.get(idxKey);
-      if (!set) continue;
-      if (!this.isSymbolKeyOwnedByPageId(page.id, idxKey, activePidKeys)) {
-        set.delete(page.id);
-      }
-      if (set.size === 0) this.symbolIndex.delete(idxKey);
-    }
+    this.removeSymbolIndexesForPage(page.id, indexKeys);
   }
 
-  private evictOldest(): boolean {
-    const first = this.entries.entries().next();
+  private evictFromS(): boolean {
+    const first = this.probationQueue.entries().next();
     if (first.done) return false;
     const [key, entry] = first.value;
-    this.entries.delete(key);
+    this.probationQueue.delete(key);
+    this.probationBytes = Math.max(0, this.probationBytes - entry.bytes);
     this.totalBytes = Math.max(0, this.totalBytes - entry.bytes);
+
+    if (entry.freq > 0 && this.maxPages > 1) {
+      entry.queue = 'M';
+      entry.freq = 0;
+      this.protectedQueue.set(key, entry);
+      this.protectedBytes += entry.bytes;
+      this.totalBytes += entry.bytes;
+      return false;
+    }
+
+    this.removeIndexes(entry);
+    this.addGhostKey(key);
+    this.stats.pagesEvicted += 1;
+    return true;
+  }
+
+  private evictFromM(): boolean {
+    const first = this.protectedQueue.entries().next();
+    if (first.done) return false;
+    const [key, entry] = first.value;
+    this.protectedQueue.delete(key);
+    this.protectedBytes = Math.max(0, this.protectedBytes - entry.bytes);
+    this.totalBytes = Math.max(0, this.totalBytes - entry.bytes);
+
+    if (entry.freq > 0) {
+      entry.freq -= 1;
+      this.protectedQueue.set(key, entry);
+      this.protectedBytes += entry.bytes;
+      this.totalBytes += entry.bytes;
+      return false;
+    }
+
     this.removeIndexes(entry);
     this.stats.pagesEvicted += 1;
     return true;
+  }
+
+  private evictOneS3Fifo(): boolean {
+    const maxSteps = this.entryCount() * 4 + 8;
+    for (let step = 0; step < maxSteps; step++) {
+      if (this.probationQueue.size === 0 && this.protectedQueue.size === 0) return false;
+      const { sCapPages, sCapBytes } = this.s3Capacities();
+      if (
+        this.probationQueue.size > 0 &&
+        (this.probationQueue.size >= sCapPages ||
+          this.probationBytes >= sCapBytes ||
+          this.protectedQueue.size === 0)
+      ) {
+        if (this.evictFromS()) return true;
+      } else if (this.protectedQueue.size > 0) {
+        if (this.evictFromM()) return true;
+      } else if (this.evictFromS()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private evictIfNeeded(incomingBytes = 0): void {
+    while (
+      this.entryCount() > 0 &&
+      (incomingBytes > 0
+        ? this.entryCount() >= this.maxPages || this.totalBytes + incomingBytes > this.maxBytes
+        : this.entryCount() > this.maxPages || this.totalBytes > this.maxBytes)
+    ) {
+      if (!this.evictOneS3Fifo()) break;
+    }
   }
 
   private evictOldestSkill(): boolean {
@@ -1448,15 +1710,29 @@ export class ContextPageStore {
     bytes: number,
     indexKeys: readonly string[],
     schedule: boolean,
+    lastAccessedAtMs: number = page.createdAtMs,
+    extraSymbols?: readonly string[],
   ): void {
-    while (
-      this.entries.size > 0 &&
-      (this.entries.size >= this.maxPages || this.totalBytes + bytes > this.maxBytes)
-    ) {
-      if (!this.evictOldest()) break;
+    this.evictIfNeeded(bytes);
+    const inGhost = this.ghostKeys.delete(entryKey);
+    const queue: 'S' | 'M' = inGhost && this.maxPages > 1 ? 'M' : 'S';
+    const entry: StoredEntry = {
+      key: entryKey,
+      page,
+      bytes,
+      indexKeys,
+      ...(extraSymbols && extraSymbols.length > 0 ? { extraSymbols: [...extraSymbols] } : {}),
+      queue,
+      freq: 0,
+      lastAccessedAtMs,
+    };
+    if (queue === 'M') {
+      this.protectedQueue.set(entryKey, entry);
+      this.protectedBytes += bytes;
+    } else {
+      this.probationQueue.set(entryKey, entry);
+      this.probationBytes += bytes;
     }
-    const entry: StoredEntry = { key: entryKey, page, bytes, indexKeys };
-    this.entries.set(entryKey, entry);
     this.totalBytes += bytes;
     this.addIndexes(entry);
     this.stats.pagesStored += 1;
@@ -1470,22 +1746,37 @@ export class ContextPageStore {
     indexKeys: readonly string[],
     sessionKeys: readonly string[],
     schedule: boolean,
+    lastAccessedAtMs: number = page.createdAtMs,
+    extraSymbols?: readonly string[],
   ): MmuPage {
     const existing = this.skillEntries.get(page.id);
     if (existing) {
-      const merged = [...new Set([...existing.indexKeys, ...indexKeys])];
-      const updated: StoredEntry = merged.length > existing.indexKeys.length
-        ? { ...existing, indexKeys: merged }
-        : existing;
+      const existingSet = new Set(existing.indexKeys);
+      const addedKeys = indexKeys.filter((k) => !existingSet.has(k));
+      const merged = addedKeys.length > 0 ? [...existing.indexKeys, ...addedKeys] : existing.indexKeys;
+      const mergedExtra = extraSymbols && extraSymbols.length > 0
+        ? [...new Set([...(existing.extraSymbols ?? []), ...extraSymbols])]
+        : existing.extraSymbols;
+      const updated: StoredEntry = {
+        ...existing,
+        indexKeys: merged,
+        ...(mergedExtra && mergedExtra.length > 0 ? { extraSymbols: mergedExtra } : {}),
+        lastAccessedAtMs: Math.max(existing.lastAccessedAtMs, lastAccessedAtMs),
+        freq: Math.min(3, existing.freq + 1),
+      };
       this.skillEntries.delete(page.id);
       this.skillEntries.set(page.id, updated);
-      if (merged.length > existing.indexKeys.length) {
-        this.addSymbolIndexesForPage(page.id, merged);
+      if (addedKeys.length > 0) {
+        this.addSymbolIndexesForPage(page.id, addedKeys);
       }
+      let linkedAnyNew = false;
       for (const sk of sessionKeys) {
+        if (!this.sessionSkillIds.get(sk)?.has(page.id)) linkedAnyNew = true;
         this.linkSessionSkill(sk, page.id);
       }
-      if (schedule) this.scheduleSave();
+      if (schedule || linkedAnyNew || addedKeys.length > 0) {
+        this.scheduleSave();
+      }
       return existing.page;
     }
 
@@ -1495,7 +1786,16 @@ export class ContextPageStore {
     ) {
       if (!this.evictOldestSkill()) break;
     }
-    const entry: StoredEntry = { key: page.id, page, bytes, indexKeys };
+    const entry: StoredEntry = {
+      key: page.id,
+      page,
+      bytes,
+      indexKeys,
+      ...(extraSymbols && extraSymbols.length > 0 ? { extraSymbols: [...extraSymbols] } : {}),
+      queue: 'M',
+      freq: 0,
+      lastAccessedAtMs,
+    };
     this.skillEntries.set(page.id, entry);
     this.totalSkillBytes += bytes;
     this.addSymbolIndexesForPage(page.id, indexKeys);
@@ -1510,32 +1810,49 @@ export class ContextPageStore {
 
   /**
    * Store a paged-out block into Context-MMU.
-   * Reuses an existing entry with identical `id` under `sessionKey` (no-op, refreshes LRU).
+   * Reuses an existing entry with identical `id` under `sessionKey` (no-op, refreshes S3-FIFO/LRU).
    * `'skill-catalog'` entries live in a deduplicated shared global skill slab.
    */
   storePage(input: StorePageInput): MmuPage {
     const sessionKey = input.sessionKey && input.sessionKey.trim() ? input.sessionKey.trim() : 'default';
     const refId = input.refId && input.refId.trim() ? input.refId.trim() : 'page';
+    const nowMs = input.nowMs ?? Date.now();
     const id = pageIdForText(input.rawText);
 
     if (input.toolName === 'skill-catalog') {
       const existingSkill = this.skillEntries.get(id);
       if (existingSkill) {
-        const extraKeys = input.extraSymbols && input.extraSymbols.length > 0
-          ? collectIndexKeys([], existingSkill.page.filePath, input.extraSymbols)
+        const extraSyms = input.extraSymbols
+          ? input.extraSymbols.map((s) => s.trim()).filter(Boolean)
+          : undefined;
+        const extraKeys = extraSyms && extraSyms.length > 0
+          ? collectIndexKeys([], existingSkill.page.filePath, extraSyms)
           : [];
-        return this.upsertSkillEntry(existingSkill.page, existingSkill.bytes, extraKeys, [sessionKey], false);
+        const alreadyLinked = Boolean(this.sessionSkillIds.get(sessionKey)?.has(id));
+        const hasNewKeys = extraKeys.some((k) => !existingSkill.indexKeys.includes(k));
+        return this.upsertSkillEntry(
+          existingSkill.page,
+          existingSkill.bytes,
+          extraKeys,
+          [sessionKey],
+          !alreadyLinked || hasNewKeys,
+          nowMs,
+          extraSyms,
+        );
       }
       const filePath = input.filePath ?? inferFilePath(input.rawText, refId);
       const symbols = extractSymbolSpans(input.rawText);
       const factTokens = extractFactSheetTokens(input.rawText);
+      const extraSyms = input.extraSymbols
+        ? [...new Set(input.extraSymbols.map((s) => s.trim()).filter(Boolean))]
+        : undefined;
       const page: MmuPage = {
         id,
         sessionKey,
         refId,
         toolName: 'skill-catalog',
         ...(filePath !== undefined ? { filePath } : {}),
-        createdAtMs: input.nowMs ?? Date.now(),
+        createdAtMs: nowMs,
         rawText: input.rawText,
         lineCount: countLines(input.rawText),
         symbols,
@@ -1543,47 +1860,93 @@ export class ContextPageStore {
       };
       const bytes = utf8ByteLength(input.rawText);
       if (bytes > this.maxSkillBytes) return page;
-      const indexKeys = collectIndexKeys(symbols, filePath, input.extraSymbols);
-      return this.upsertSkillEntry(page, bytes, indexKeys, [sessionKey], true);
+      const indexKeys = collectIndexKeys(symbols, filePath, extraSyms, factTokens);
+      return this.upsertSkillEntry(page, bytes, indexKeys, [sessionKey], true, nowMs, extraSyms);
     }
 
     const entryKey = `${sessionKey}\0${id}`;
-    const existing = this.entries.get(entryKey);
+    const existing = this.getEntry(entryKey);
     if (existing) {
       if (input.extraSymbols && input.extraSymbols.length > 0) {
-        const extraKeys = collectIndexKeys([], existing.page.filePath, input.extraSymbols);
-        const merged = [...new Set([...existing.indexKeys, ...extraKeys])];
-        const updated: StoredEntry = { ...existing, indexKeys: merged };
-        this.entries.delete(entryKey);
-        this.entries.set(entryKey, updated);
-        this.addIndexes(updated);
-      } else {
-        this.touchEntry(existing);
+        const extraSyms = input.extraSymbols.map((s) => s.trim()).filter(Boolean);
+        const extraKeys = collectIndexKeys([], existing.page.filePath, extraSyms);
+        const existingSet = new Set(existing.indexKeys);
+        const addedKeys = extraKeys.filter((k) => !existingSet.has(k));
+        if (addedKeys.length > 0) {
+          const merged = [...existing.indexKeys, ...addedKeys];
+          const mergedExtra = [...new Set([...(existing.extraSymbols ?? []), ...extraSyms])];
+          const updated: StoredEntry = {
+            ...existing,
+            indexKeys: merged,
+            ...(mergedExtra.length > 0 ? { extraSymbols: mergedExtra } : {}),
+          };
+          if (existing.queue === 'M') this.protectedQueue.set(entryKey, updated);
+          else this.probationQueue.set(entryKey, updated);
+          this.addSymbolIndexesForPage(existing.page.id, addedKeys);
+          this.touchEntry(updated, nowMs);
+          this.scheduleSave();
+          return updated.page;
+        }
       }
+      this.touchEntry(existing, nowMs);
       return existing.page;
     }
 
+    const lineCount = countLines(input.rawText);
     const filePath = input.filePath ?? inferFilePath(input.rawText, refId);
+    // Lightweight TinyLFU / Structural Admission Filter (V20-1): reject trivial 1-3L acks BEFORE extractFactSheetTokens.
+    if (input.admissionFilter === true && input.rawText.length < 200 && lineCount < 4) {
+      const quickSymbols = extractSymbolSpans(input.rawText);
+      if (quickSymbols.length === 0 && !filePath) {
+        return {
+          id,
+          sessionKey,
+          refId,
+          ...(input.toolName !== undefined ? { toolName: input.toolName } : {}),
+          createdAtMs: nowMs,
+          rawText: input.rawText,
+          lineCount,
+          symbols: quickSymbols,
+          factTokens: [],
+        };
+      }
+      const factTokens = extractFactSheetTokens(input.rawText);
+      const page: MmuPage = {
+        id,
+        sessionKey,
+        refId,
+        ...(input.toolName !== undefined ? { toolName: input.toolName } : {}),
+        ...(filePath !== undefined ? { filePath } : {}),
+        createdAtMs: nowMs,
+        rawText: input.rawText,
+        lineCount,
+        symbols: quickSymbols,
+        factTokens,
+      };
+      const bytes = utf8ByteLength(input.rawText);
+      if (bytes > this.maxBytes) return page;
+      const extraSyms = input.extraSymbols
+        ? [...new Set(input.extraSymbols.map((s) => s.trim()).filter(Boolean))]
+        : undefined;
+      const indexKeys = collectIndexKeys(quickSymbols, filePath, extraSyms, factTokens);
+      this.insertEntry(entryKey, page, bytes, indexKeys, true, nowMs, extraSyms);
+      return page;
+    }
+
     const symbols = extractSymbolSpans(input.rawText);
     const factTokens = extractFactSheetTokens(input.rawText);
-    const lineCount = countLines(input.rawText);
     const page: MmuPage = {
       id,
       sessionKey,
       refId,
       ...(input.toolName !== undefined ? { toolName: input.toolName } : {}),
       ...(filePath !== undefined ? { filePath } : {}),
-      createdAtMs: input.nowMs ?? Date.now(),
+      createdAtMs: nowMs,
       rawText: input.rawText,
       lineCount,
       symbols,
       factTokens,
     };
-
-    // TinyLFU / Structural Admission Filter (V20-1): skip noisy 1-3 line tool acks with no symbols/path when auto-paging.
-    if (input.admissionFilter === true && lineCount < 4 && input.rawText.length < 200 && symbols.length === 0 && !filePath) {
-      return page;
-    }
 
     const bytes = utf8ByteLength(input.rawText);
     if (bytes > this.maxBytes) {
@@ -1591,8 +1954,11 @@ export class ContextPageStore {
       return page;
     }
 
-    const indexKeys = collectIndexKeys(symbols, filePath, input.extraSymbols);
-    this.insertEntry(entryKey, page, bytes, indexKeys, true);
+    const extraSyms = input.extraSymbols
+      ? [...new Set(input.extraSymbols.map((s) => s.trim()).filter(Boolean))]
+      : undefined;
+    const indexKeys = collectIndexKeys(symbols, filePath, extraSyms, factTokens);
+    this.insertEntry(entryKey, page, bytes, indexKeys, true, nowMs, extraSyms);
     return page;
   }
 
@@ -1600,14 +1966,14 @@ export class ContextPageStore {
     if (sessionKey !== undefined) {
       const sk = sessionKey.trim();
       if (!sk) return undefined;
-      return this.entries.get(`${sk}\0${pageId}`) ??
+      return this.getEntry(`${sk}\0${pageId}`) ??
         (this.sessionSkillIds.get(sk)?.has(pageId) ? this.skillEntries.get(pageId) : undefined);
     }
     const keys = this.keysByPageId.get(pageId);
     if (keys && keys.size > 0) {
       let latest: StoredEntry | undefined;
       for (const key of keys) {
-        const e = this.entries.get(key);
+        const e = this.getEntry(key);
         if (e) latest = e;
       }
       if (latest) return latest;
@@ -1622,7 +1988,13 @@ export class ContextPageStore {
     if (!entry) return null;
     this.touchEntry(entry);
 
-    const { page } = entry;
+    const scopedKey = opts.sessionKey?.trim();
+    const isSharedSkill = this.skillEntries.get(entry.page.id) === entry;
+    const page =
+      scopedKey && isSharedSkill && entry.page.sessionKey !== scopedKey
+        ? { ...entry.page, sessionKey: scopedKey }
+        : entry.page;
+
     const lines = page.rawText.split('\n');
     const total = lines.length;
     if (total === 0) {
@@ -1723,7 +2095,11 @@ export class ContextPageStore {
       if (!scopedKey) return [];
     }
     const out: MmuPageSummary[] = [];
-    for (const entry of this.entries.values()) {
+    for (const entry of this.probationQueue.values()) {
+      if (scopedKey !== undefined && entry.page.sessionKey !== scopedKey) continue;
+      out.push(summarizePage(entry.page));
+    }
+    for (const entry of this.protectedQueue.values()) {
       if (scopedKey !== undefined && entry.page.sessionKey !== scopedKey) continue;
       out.push(summarizePage(entry.page));
     }
@@ -1836,9 +2212,15 @@ export class ContextPageStore {
       }
     };
 
-    // Walk MRU -> LRU by iterating entries and skillEntries in reverse insertion order
-    const ordered = [...this.entries.values()].reverse();
-    for (const entry of ordered) {
+    // Walk protected queue M -> probation queue S (most recent first)
+    const orderedProtected = [...this.protectedQueue.values()].reverse();
+    for (const entry of orderedProtected) {
+      const { page } = entry;
+      if (scopedKey !== undefined && page.sessionKey !== scopedKey) continue;
+      scorePage(page);
+    }
+    const orderedProbation = [...this.probationQueue.values()].reverse();
+    for (const entry of orderedProbation) {
       const { page } = entry;
       if (scopedKey !== undefined && page.sessionKey !== scopedKey) continue;
       scorePage(page);
@@ -1855,7 +2237,7 @@ export class ContextPageStore {
     return hits;
   }
 
-  /** Lookup page IDs indexed for a lowercased symbol or basename key. */
+  /** Lookup page IDs indexed for a lowercased symbol, fact token, or basename key. */
   lookupSymbolPageIds(symbolOrBasename: string, sessionKey?: string): string[] {
     const set = this.symbolIndex.get(symbolOrBasename.trim().toLowerCase());
     if (!set || set.size === 0) return [];
@@ -1871,7 +2253,7 @@ export class ContextPageStore {
 
   /** O(1) resident page count (optionally scoped to one session). */
   getSessionPageCount(sessionKey?: string): number {
-    if (!sessionKey) return this.entries.size + this.skillEntries.size;
+    if (!sessionKey) return this.entryCount() + this.skillEntries.size;
     return this.sessionIndex.get(sessionKey.trim())?.size ?? 0;
   }
 
@@ -1879,6 +2261,12 @@ export class ContextPageStore {
   getPage(pageId: string, sessionKey?: string): MmuPage | null {
     const entry = this.resolveEntryByPageId(pageId, sessionKey);
     return entry ? entry.page : null;
+  }
+
+  /** Touch entry frequency/access timestamp on hydration without modifying text. */
+  touchHydratedPage(pageId: string, sessionKey?: string): void {
+    const entry = this.resolveEntryByPageId(pageId, sessionKey);
+    if (entry) this.touchEntry(entry);
   }
 
   /**
@@ -1938,7 +2326,7 @@ export class ContextPageStore {
   getStats(): MmuStats {
     return {
       ...this.stats,
-      activePages: this.entries.size + this.skillEntries.size,
+      activePages: this.entryCount() + this.skillEntries.size,
       activeBytes: this.totalBytes + this.totalSkillBytes,
     };
   }
@@ -1963,11 +2351,11 @@ export class ContextPageStore {
     if (opts.maxBytes !== undefined && Number.isFinite(opts.maxBytes)) {
       this.maxBytes = Math.max(1, Math.floor(opts.maxBytes));
     }
-    while (
-      this.entries.size > 0 &&
-      (this.entries.size > this.maxPages || this.totalBytes > this.maxBytes)
-    ) {
-      if (!this.evictOldest()) break;
+    this.evictIfNeeded(0);
+    while (this.ghostKeys.size > this.maxPages) {
+      const oldest = this.ghostKeys.values().next().value;
+      if (oldest === undefined) break;
+      this.ghostKeys.delete(oldest);
     }
   }
 
@@ -2003,13 +2391,18 @@ export class ContextPageStore {
     const key = sessionKey || 'default';
     const sessionLeases = this.hydrationTlb.get(key);
     if (!sessionLeases) return false;
-    const prev = sessionLeases.get(pageId);
-    if (!prev) return false;
-    if (turn - prev.turn > cooldownTurns) return false;
-    return Math.max(startLine, prev.startLine) <= Math.min(endLine, prev.endLine) + TLB_OVERLAP_PAD_LINES;
+    const leases = sessionLeases.get(pageId);
+    if (!leases || leases.length === 0) return false;
+    for (const prev of leases) {
+      if (turn - prev.turn > cooldownTurns) continue;
+      if (Math.max(startLine, prev.startLine) <= Math.min(endLine, prev.endLine) + TLB_OVERLAP_PAD_LINES) {
+        return true;
+      }
+    }
+    return false;
   }
 
-  /** Record/refresh a Context-TLB hydration lease (LRU-bounded to 64 leases per session). */
+  /** Record/refresh a Context-TLB hydration lease (up to 4 non-overlapping leases per pageId, 64 pageIds per session). */
   recordHydrationLease(
     sessionKey: string,
     pageId: string,
@@ -2033,13 +2426,25 @@ export class ContextPageStore {
     }
     this.hydrationTlb.set(key, sessionLeases);
 
-    if (sessionLeases.has(pageId)) {
+    const existing = sessionLeases.get(pageId);
+    let nextLeases: TlbLease[];
+    if (existing) {
       sessionLeases.delete(pageId);
-    } else if (sessionLeases.size >= TLB_MAX_LEASES_PER_SESSION) {
-      const oldestPage = sessionLeases.keys().next().value;
-      if (oldestPage !== undefined) sessionLeases.delete(oldestPage);
+      nextLeases = existing.filter(
+        (prev) => Math.max(startLine, prev.startLine) > Math.min(endLine, prev.endLine) + TLB_OVERLAP_PAD_LINES,
+      );
+    } else {
+      if (sessionLeases.size >= TLB_MAX_LEASES_PER_SESSION) {
+        const oldestPage = sessionLeases.keys().next().value;
+        if (oldestPage !== undefined) sessionLeases.delete(oldestPage);
+      }
+      nextLeases = [];
     }
-    sessionLeases.set(pageId, { startLine, endLine, turn });
+    nextLeases.push({ startLine, endLine, turn });
+    while (nextLeases.length > TLB_MAX_LEASES_PER_PAGE) {
+      nextLeases.shift();
+    }
+    sessionLeases.set(pageId, nextLeases);
   }
 
   reset(): void {
@@ -2048,14 +2453,20 @@ export class ContextPageStore {
       this.saveTimer = undefined;
     }
     this.dirty = false;
-    this.entries.clear();
+    this.probationQueue.clear();
+    this.protectedQueue.clear();
+    this.ghostKeys.clear();
     this.skillEntries.clear();
     this.sessionSkillIds.clear();
+    this.skillPageSessions.clear();
     this.keysByPageId.clear();
     this.symbolIndex.clear();
+    this.symbolPageRefCount.clear();
     this.sessionIndex.clear();
     this.hydrationTlb.clear();
     this.hydrationTurn.clear();
+    this.probationBytes = 0;
+    this.protectedBytes = 0;
     this.totalBytes = 0;
     this.totalSkillBytes = 0;
     this.stats = emptyStats();
@@ -2138,9 +2549,18 @@ export interface TailHydrationResult {
 interface ExtractedTailTokens {
   readonly pageIds: string[];
   readonly symbols: string[];
+  readonly factIds: string[];
   readonly basenames: string[];
+  readonly singleWords: string[];
   readonly skillWords: string[];
 }
+
+const PRUNE_STOPWORDS = new Set<string>([
+  'the', 'and', 'for', 'that', 'this', 'with', 'from', 'are', 'was', 'were', 'been', 'have',
+  'has', 'had', 'not', 'but', 'you', 'your', 'can', 'will', 'all', 'any', 'its', 'into',
+  'out', 'use', 'when', 'who', 'what', 'which', 'there', 'their', 'they', 'them', 'then', 'than',
+  'also', 'only', 'more', 'some', 'such', 'each', 'other', 'about', 'could', 'would', 'should', 'after',
+]);
 
 const TAIL_PAGE_ID_RE = /\bpg_[0-9a-f]{8,16}\b/g;
 // Non-backtracking maximal path token scan for O(N) basename extraction (no nested path quantifier).
@@ -2150,7 +2570,10 @@ const TAIL_EXT_VALID_RE = /^[A-Za-z0-9]{1,10}$/;
 const TAIL_CAMEL_RE = /\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+\b/g;
 const TAIL_PASCAL_RE = /\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/g;
 const TAIL_SNAKE_RE = /\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b/g;
+const TAIL_SCREAMING_RE = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g;
 const TAIL_KEBAB_RE = /\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/g;
+const TAIL_TICKET_RE = /\b[A-Z]{2,10}-\d{1,6}\b/g;
+const TAIL_SHA_RE = /\b(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b/g;
 const TAIL_ERROR_RE = /\b(?:[A-Z][A-Za-z0-9]*(?:Error|Exception|Fault|Panic)|ERR_[A-Z0-9_]{2,}|E(?:NOENT|ACCES|PERM|CONNREFUSED|TIMEDOUT|ADDRINUSE|PIPE|ISDIR|NOSPC))\b/g;
 const TAIL_SKILL_WORD_RE = /\b[A-Za-z][A-Za-z0-9]{2,31}\b/g;
 
@@ -2175,11 +2598,15 @@ export function extractFaultSignalSnippet(
 function extractTailIdentifierTokens(texts: readonly string[]): ExtractedTailTokens {
   const pageIds: string[] = [];
   const symbols: string[] = [];
+  const factIds: string[] = [];
   const basenames: string[] = [];
+  const singleWords: string[] = [];
   const skillWords: string[] = [];
   const seenPage = new Set<string>();
   const seenSym = new Set<string>();
+  const seenFact = new Set<string>();
   const seenBase = new Set<string>();
+  const seenSingle = new Set<string>();
   const seenWord = new Set<string>();
 
   const pushMatches = (
@@ -2188,6 +2615,7 @@ function extractTailIdentifierTokens(texts: readonly string[]): ExtractedTailTok
     target: string[],
     seen: Set<string>,
     lowercaseOut = false,
+    filterStopwords = false,
   ) => {
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -2195,6 +2623,7 @@ function extractTailIdentifierTokens(texts: readonly string[]): ExtractedTailTok
       const val = m[0].trim();
       if (!val || val.length < 3 || val.length > 120) continue;
       const low = val.toLowerCase();
+      if (filterStopwords && PRUNE_STOPWORDS.has(low)) continue;
       if (!seen.has(low)) {
         seen.add(low);
         target.push(lowercaseOut ? low : val);
@@ -2212,8 +2641,11 @@ function extractTailIdentifierTokens(texts: readonly string[]): ExtractedTailTok
     if (symbols.length < 64) pushMatches(sample, TAIL_CAMEL_RE, symbols, seenSym);
     if (symbols.length < 64) pushMatches(sample, TAIL_PASCAL_RE, symbols, seenSym);
     if (symbols.length < 64) pushMatches(sample, TAIL_SNAKE_RE, symbols, seenSym);
+    if (symbols.length < 64) pushMatches(sample, TAIL_SCREAMING_RE, symbols, seenSym);
     if (symbols.length < 64) pushMatches(sample, TAIL_KEBAB_RE, symbols, seenSym);
     if (symbols.length < 64) pushMatches(sample, TAIL_ERROR_RE, symbols, seenSym);
+    if (factIds.length < 64) pushMatches(sample, TAIL_TICKET_RE, factIds, seenFact);
+    if (factIds.length < 64) pushMatches(sample, TAIL_SHA_RE, factIds, seenFact);
     if (basenames.length < 64) {
       TAIL_PATH_TOKEN_RE.lastIndex = 0;
       let pm: RegExpExecArray | null;
@@ -2232,16 +2664,30 @@ function extractTailIdentifierTokens(texts: readonly string[]): ExtractedTailTok
         if (basenames.length >= 64) break;
       }
     }
-    if (skillWords.length < 64) pushMatches(sample, TAIL_SKILL_WORD_RE, skillWords, seenWord, true);
+    if (singleWords.length < 64) pushMatches(sample, TAIL_SKILL_WORD_RE, singleWords, seenSingle, true, true);
+    if (skillWords.length < 64) pushMatches(sample, TAIL_SKILL_WORD_RE, skillWords, seenWord, true, false);
   }
-  return { pageIds, symbols, basenames, skillWords };
+  return { pageIds, symbols, factIds, basenames, singleWords, skillWords };
 }
+
+type Bm25Field = 'explicit' | 'decl' | 'fact' | 'skill' | 'error' | 'path';
+const BM25_FIELD_WEIGHT: Record<Bm25Field, number> = {
+  explicit: 100,
+  decl: 4.0,
+  fact: 3.2,
+  skill: 3.0,
+  error: 2.5,
+  path: 1.5,
+};
+const BM25_K1 = 1.2;
+const BM25_B = 0.5;
 
 /**
  * Purely read-only Symbol-Boundary-Aware Speculative MMU Prefetcher (SB-SMP).
- * Fuses `pg_*`, declaration spans, error anchors, basenames, and skill matches
- * with exact session IDF weighting; preserves full enclosing function bodies
- * up to ~45 lines; never modifies cached prefixes; fails closed without `sessionKey`.
+ * Fuses `pg_*`, declaration spans, fact tokens, error anchors, basenames, and
+ * skill matches with BM25F scoring + Best-of-Two Submodular Knapsack selection;
+ * preserves full enclosing function bodies up to ~45 lines; never modifies
+ * cached prefixes; fails closed without `sessionKey`.
  */
 export function computeTailHydration(input: TailHydrationInput): TailHydrationResult {
   const budgetTokens = Math.max(64, Math.floor(input.budgetTokens ?? 1400));
@@ -2256,90 +2702,176 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
   if (
     tokens.pageIds.length === 0 &&
     tokens.symbols.length === 0 &&
+    tokens.factIds.length === 0 &&
     tokens.basenames.length === 0 &&
+    tokens.singleWords.length === 0 &&
     tokens.skillWords.length === 0
   ) {
     return { text: '', changed: false, slices: [], totalTokens: 0 };
   }
 
+  // Pre-hash 3-line windows of recentVerbatimTexts for O(|sliceLines|) verbatim dedup.
   const recentTexts = (input.recentVerbatimTexts ?? []).filter(Boolean);
-  const isAlreadyVerbatim = (page: MmuPage, sliceText: string): boolean => {
+  const recent3LineHashes = new Set<string>();
+  for (const r of recentTexts) {
+    const rLines = r.split('\n');
+    for (let i = 0; i + 2 < rLines.length; i++) {
+      const w = `${rLines[i]!.trim()}\n${rLines[i + 1]!.trim()}\n${rLines[i + 2]!.trim()}`;
+      if (w.length >= 24) recent3LineHashes.add(fnv64Hex(w));
+    }
+  }
+  const isAlreadyVerbatim = (page: MmuPage, sliceLines: readonly string[]): boolean => {
     for (const r of recentTexts) {
-      if (r.includes(page.rawText)) return true;
-      if (sliceText.length >= 40 && r.includes(sliceText)) return true;
+      if (r.length >= page.rawText.length && r.includes(page.rawText)) return true;
+    }
+    if (sliceLines.length >= 3) {
+      let windowHits = 0;
+      let totalWindows = 0;
+      for (let i = 0; i + 2 < sliceLines.length; i++) {
+        const w = `${sliceLines[i]!.trim()}\n${sliceLines[i + 1]!.trim()}\n${sliceLines[i + 2]!.trim()}`;
+        if (w.length < 24) continue;
+        totalWindows += 1;
+        if (recent3LineHashes.has(fnv64Hex(w))) windowHits += 1;
+      }
+      if (totalWindows > 0) {
+        if (sliceLines.length <= 5 && windowHits === totalWindows) return true;
+        if (windowHits / totalWindows >= 0.85) return true;
+      }
+    } else {
+      const joined = sliceLines.join('\n');
+      if (joined.length >= 40) {
+        for (const r of recentTexts) {
+          if (r.includes(joined)) return true;
+        }
+      }
     }
     return false;
   };
 
+  interface SignalHit {
+    field: Bm25Field;
+    idf: number;
+  }
+
   interface Candidate {
     page: MmuPage;
     matchedSymbol: string;
+    matchedFieldWeight: number;
     targetLine: number;
     spanStartLine: number;
     spanEndLine: number;
     hasDeclSpan: boolean;
+    signals: Map<string, SignalHit>;
     score: number;
     isExplicitPageId?: boolean;
     hasHighSignal?: boolean;
   }
 
   const totalSessionPages = Math.max(1, input.store.getSessionPageCount(sessionKey));
-  const computeIdf = (df: number): number => Math.log(1 + totalSessionPages / (1 + Math.max(0, df)));
-
-  // Collect basename-matched pages up front so co-hits receive multi-signal fusion bonus.
-  const basenamePageInfo = new Map<string, { base: string; idf: number }>();
-  for (const base of tokens.basenames) {
-    const pageIds = input.store.lookupSymbolPageIds(base, sessionKey);
-    const idf = computeIdf(pageIds.length);
-    for (const pid of pageIds) {
-      const prev = basenamePageInfo.get(pid);
-      if (!prev || idf > prev.idf) basenamePageInfo.set(pid, { base, idf });
-    }
-  }
+  const computeIdf = (df: number): number =>
+    Math.log(1 + Math.max(0.5, totalSessionPages - df + 0.5) / (Math.max(0, df) + 0.5));
+  const singleWordMaxDf = Math.max(3, Math.floor(0.12 * totalSessionPages));
 
   const candidates: Candidate[] = [];
-  const addOrFuseCandidate = (next: Candidate) => {
+  const addOrFuseHit = (hit: {
+    page: MmuPage;
+    matchedSymbol: string;
+    targetLine: number;
+    spanStartLine: number;
+    spanEndLine: number;
+    hasDeclSpan: boolean;
+    field: Bm25Field;
+    termKey: string;
+    idf: number;
+    isExplicitPageId?: boolean;
+    hasHighSignal?: boolean;
+  }) => {
+    const w = BM25_FIELD_WEIGHT[hit.field];
     for (const existing of candidates) {
-      if (existing.page.id !== next.page.id) continue;
-      if (Math.abs(existing.targetLine - next.targetLine) <= 8) {
-        // Multi-signal fusion: boost composite score and preserve tighter/fuller span info.
-        existing.score += next.score * 0.5;
-        if (next.isExplicitPageId) existing.isExplicitPageId = true;
-        if (next.hasHighSignal) existing.hasHighSignal = true;
-        if (next.hasDeclSpan && !existing.hasDeclSpan) {
-          existing.matchedSymbol = next.matchedSymbol;
-          existing.targetLine = next.targetLine;
-          existing.spanStartLine = next.spanStartLine;
-          existing.spanEndLine = next.spanEndLine;
-          existing.hasDeclSpan = true;
+      if (existing.page.id !== hit.page.id) continue;
+      const inExistingSpan =
+        hit.targetLine >= existing.spanStartLine - 2 && hit.targetLine <= existing.spanEndLine + 2;
+      const existingInHitSpan =
+        existing.targetLine >= hit.spanStartLine - 2 && existing.targetLine <= hit.spanEndLine + 2;
+      const closeTarget = Math.abs(existing.targetLine - hit.targetLine) <= 8;
+      if (inExistingSpan || existingInHitSpan || closeTarget) {
+        // Commutative set-union fusion of matched terms/fields.
+        const sigKey = `${hit.field}\0${hit.termKey}`;
+        const prevSig = existing.signals.get(sigKey);
+        if (!prevSig || hit.idf > prevSig.idf) {
+          existing.signals.set(sigKey, { field: hit.field, idf: hit.idf });
+        }
+        if (hit.isExplicitPageId) existing.isExplicitPageId = true;
+        if (hit.hasHighSignal) existing.hasHighSignal = true;
+        if (hit.hasDeclSpan) {
+          if (!existing.hasDeclSpan) {
+            existing.spanStartLine = hit.spanStartLine;
+            existing.spanEndLine = hit.spanEndLine;
+            existing.targetLine = hit.targetLine;
+            existing.hasDeclSpan = true;
+          } else {
+            existing.spanStartLine = Math.min(existing.spanStartLine, hit.spanStartLine);
+            existing.spanEndLine = Math.max(existing.spanEndLine, hit.spanEndLine);
+          }
+        }
+        if (
+          w > existing.matchedFieldWeight ||
+          (w === existing.matchedFieldWeight && hit.matchedSymbol < existing.matchedSymbol)
+        ) {
+          existing.matchedSymbol = hit.matchedSymbol;
+          existing.matchedFieldWeight = w;
         }
         return;
       }
     }
-    candidates.push(next);
+    const signals = new Map<string, SignalHit>();
+    signals.set(`${hit.field}\0${hit.termKey}`, { field: hit.field, idf: hit.idf });
+    candidates.push({
+      page: hit.page,
+      matchedSymbol: hit.matchedSymbol,
+      matchedFieldWeight: w,
+      targetLine: hit.targetLine,
+      spanStartLine: hit.spanStartLine,
+      spanEndLine: hit.spanEndLine,
+      hasDeclSpan: hit.hasDeclSpan,
+      signals,
+      score: 0,
+      isExplicitPageId: hit.isExplicitPageId,
+      hasHighSignal: hit.hasHighSignal,
+    });
   };
 
-  // Explicit `pg_<hex>` reference (highest confidence, scoped to sessionKey)
+  // 1. Explicit `pg_<hex>` reference (highest confidence, scoped to sessionKey)
   for (const pid of tokens.pageIds) {
     const page = input.store.getPage(pid, sessionKey);
     if (!page) continue;
     const sp = page.symbols[0];
     const hasDecl = Boolean(sp && sp.kind !== 'error' && sp.kind !== 'anchor' && sp.endLine > sp.startLine);
-    addOrFuseCandidate({
+    addOrFuseHit({
       page,
       matchedSymbol: pid,
       targetLine: sp?.startLine ?? 1,
       spanStartLine: sp?.startLine ?? 1,
       spanEndLine: sp?.endLine ?? (sp?.startLine ?? 1),
       hasDeclSpan: hasDecl,
-      score: 100,
+      field: 'explicit',
+      termKey: pid,
+      idf: 1,
       isExplicitPageId: true,
       hasHighSignal: true,
     });
   }
 
-  // Symbol / declaration / error hits via inverted symbolIndex + IDF weighting
+  // 2. Symbol / declaration / error / fact hits via inverted symbolIndex
   const symbolMatchedPageIds = new Set<string>();
+  const findTermLine = (page: MmuPage, termLower: string): number => {
+    const lines = page.rawText.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]!.toLowerCase().includes(termLower)) return i + 1;
+    }
+    return 1;
+  };
+
   for (const sym of tokens.symbols) {
     const pageIds = input.store.lookupSymbolPageIds(sym, sessionKey);
     if (pageIds.length === 0) continue;
@@ -2352,22 +2884,80 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
       const span = page.symbols.find((s) => s.name.toLowerCase() === symLow);
       const isErrorOrAnchor = span?.kind === 'error' || span?.kind === 'anchor';
       const hasDecl = Boolean(span && !isErrorOrAnchor && span.endLine > span.startLine);
-      const baseBonus = basenamePageInfo.has(pid) ? 6 : 0;
-      const score = (isErrorOrAnchor ? 7 + 2 * idf : 12 + 4 * idf) + baseBonus;
-      addOrFuseCandidate({
+      const field: Bm25Field = isErrorOrAnchor ? 'error' : span ? 'decl' : 'fact';
+      const targetLine = span?.startLine ?? findTermLine(page, symLow);
+      addOrFuseHit({
         page,
         matchedSymbol: span?.name ?? sym,
-        targetLine: span?.startLine ?? 1,
-        spanStartLine: span?.startLine ?? 1,
-        spanEndLine: span?.endLine ?? (span?.startLine ?? 1),
+        targetLine,
+        spanStartLine: span?.startLine ?? targetLine,
+        spanEndLine: span?.endLine ?? targetLine,
         hasDeclSpan: hasDecl,
-        score,
+        field,
+        termKey: symLow,
+        idf,
         hasHighSignal: true,
       });
     }
   }
 
-  // Case-insensitive single-word skill name lookup (restricted to `skill-catalog` pages)
+  // 3. Fact-token hits (ticket IDs, git SHAs, etc.)
+  for (const fid of tokens.factIds) {
+    const pageIds = input.store.lookupSymbolPageIds(fid, sessionKey);
+    if (pageIds.length === 0) continue;
+    const idf = computeIdf(pageIds.length);
+    const fidLow = fid.toLowerCase();
+    for (const pid of pageIds) {
+      const page = input.store.getPage(pid, sessionKey);
+      if (!page) continue;
+      symbolMatchedPageIds.add(pid);
+      const span = page.symbols.find((s) => s.name.toLowerCase() === fidLow);
+      const targetLine = span?.startLine ?? findTermLine(page, fidLow);
+      addOrFuseHit({
+        page,
+        matchedSymbol: fid,
+        targetLine,
+        spanStartLine: span?.startLine ?? targetLine,
+        spanEndLine: span?.endLine ?? targetLine,
+        hasDeclSpan: Boolean(span && span.kind !== 'error' && span.kind !== 'anchor' && span.endLine > span.startLine),
+        field: span ? 'decl' : 'fact',
+        termKey: fidLow,
+        idf,
+        hasHighSignal: true,
+      });
+    }
+  }
+
+  // 4. IDF-gated stopword-free single-word hits against declarations/factTokens
+  for (const word of tokens.singleWords) {
+    const pageIds = input.store.lookupSymbolPageIds(word, sessionKey);
+    if (pageIds.length === 0 || pageIds.length > singleWordMaxDf) continue;
+    const idf = computeIdf(pageIds.length);
+    for (const pid of pageIds) {
+      const page = input.store.getPage(pid, sessionKey);
+      if (!page || page.toolName === 'skill-catalog') continue;
+      const span = page.symbols.find((s) => s.name.toLowerCase() === word);
+      const isErr = span?.kind === 'error' || span?.kind === 'anchor';
+      const hasDecl = Boolean(span && !isErr && span.endLine > span.startLine);
+      const field: Bm25Field = isErr ? 'error' : span ? 'decl' : 'fact';
+      const targetLine = span?.startLine ?? findTermLine(page, word);
+      symbolMatchedPageIds.add(pid);
+      addOrFuseHit({
+        page,
+        matchedSymbol: span?.name ?? word,
+        targetLine,
+        spanStartLine: span?.startLine ?? targetLine,
+        spanEndLine: span?.endLine ?? targetLine,
+        hasDeclSpan: hasDecl,
+        field,
+        termKey: word,
+        idf,
+        hasHighSignal: true,
+      });
+    }
+  }
+
+  // 5. Case-insensitive single-word skill name lookup (restricted to `skill-catalog` pages)
   for (const word of tokens.skillWords) {
     const pageIds = input.store.lookupSymbolPageIds(word, sessionKey);
     if (pageIds.length === 0) continue;
@@ -2376,39 +2966,69 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
       const page = input.store.getPage(pid, sessionKey);
       if (!page || page.toolName !== 'skill-catalog') continue;
       const sp = page.symbols[0];
-      addOrFuseCandidate({
+      addOrFuseHit({
         page,
         matchedSymbol: word,
         targetLine: sp?.startLine ?? 1,
         spanStartLine: sp?.startLine ?? 1,
         spanEndLine: sp?.endLine ?? (sp?.startLine ?? 1),
         hasDeclSpan: Boolean(sp && sp.endLine > sp.startLine),
-        score: 10 + 3 * idf,
+        field: 'skill',
+        termKey: word,
+        idf,
         hasHighSignal: true,
       });
     }
   }
 
-  // File basename fallback hits (for pages matched by path/filename)
-  for (const [pid, info] of basenamePageInfo) {
-    const page = input.store.getPage(pid, sessionKey);
-    if (!page) continue;
-    const sp = page.symbols[0];
-    const hasDecl = Boolean(sp && sp.kind !== 'error' && sp.kind !== 'anchor' && sp.endLine > sp.startLine);
-    addOrFuseCandidate({
-      page,
-      matchedSymbol: info.base,
-      targetLine: sp?.startLine ?? 1,
-      spanStartLine: sp?.startLine ?? 1,
-      spanEndLine: sp?.endLine ?? (sp?.startLine ?? 1),
-      hasDeclSpan: hasDecl,
-      score: 4 + 2 * info.idf,
-      hasHighSignal: symbolMatchedPageIds.has(pid),
-    });
+  // 6. File basename hits (co-hits boost fused score; bare generic basenames remain gated)
+  for (const base of tokens.basenames) {
+    const pageIds = input.store.lookupSymbolPageIds(base, sessionKey);
+    if (pageIds.length === 0) continue;
+    const idf = computeIdf(pageIds.length);
+    const baseLow = base.toLowerCase();
+    for (const pid of pageIds) {
+      const page = input.store.getPage(pid, sessionKey);
+      if (!page) continue;
+      const sp = page.symbols[0];
+      const hasDecl = Boolean(sp && sp.kind !== 'error' && sp.kind !== 'anchor' && sp.endLine > sp.startLine);
+      addOrFuseHit({
+        page,
+        matchedSymbol: base,
+        targetLine: sp?.startLine ?? 1,
+        spanStartLine: sp?.startLine ?? 1,
+        spanEndLine: sp?.endLine ?? (sp?.startLine ?? 1),
+        hasDeclSpan: hasDecl,
+        field: 'path',
+        termKey: baseLow,
+        idf,
+        hasHighSignal: symbolMatchedPageIds.has(pid),
+      });
+    }
   }
 
   if (candidates.length === 0) {
     return { text: '', changed: false, slices: [], totalTokens: 0 };
+  }
+
+  // Compute BM25F score per fused candidate deterministically.
+  let lineSum = 0;
+  for (const cand of candidates) lineSum += Math.max(1, cand.page.lineCount);
+  const avgdl = Math.max(16, lineSum / candidates.length);
+
+  for (const cand of candidates) {
+    const norm = 1 - BM25_B + BM25_B * (Math.max(1, cand.page.lineCount) / avgdl);
+    let score = 0;
+    for (const sig of cand.signals.values()) {
+      if (sig.field === 'explicit') {
+        score += BM25_FIELD_WEIGHT.explicit;
+        continue;
+      }
+      const w = BM25_FIELD_WEIGHT[sig.field];
+      const tfNorm = w / norm;
+      score += sig.idf * ((tfNorm * (BM25_K1 + 1)) / (tfNorm + BM25_K1));
+    }
+    cand.score = score;
   }
 
   candidates.sort(
@@ -2419,19 +3039,28 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
   );
 
   const wrapperOverheadTokens = 16;
-  let usedTokens = wrapperOverheadTokens;
-  const emitted: TailHydrationSlice[] = [];
-  const emittedChunks: string[] = [];
-  const acceptedTargetsByPage = new Map<string, number[]>();
+  const availableBudget = budgetTokens - wrapperOverheadTokens;
+  if (availableBudget < 48) {
+    return { text: '', changed: false, slices: [], totalTokens: 0 };
+  }
 
-  for (const cand of candidates) {
-    if (emitted.length >= maxSlices) break;
+  interface ViableSlice {
+    readonly cand: Candidate;
+    readonly startLine: number;
+    readonly endLine: number;
+    readonly sliceBody: string;
+    readonly chunk: string;
+    readonly tokens: number;
+    readonly termKeys: readonly string[];
+  }
+
+  const viable: ViableSlice[] = [];
+  const candLimit = Math.min(candidates.length, 32);
+
+  for (let cIdx = 0; cIdx < candLimit; cIdx++) {
+    const cand = candidates[cIdx]!;
     if (!cand.isExplicitPageId && !cand.hasHighSignal && cand.score < 9) continue;
     const { page } = cand;
-    const prevTargets = acceptedTargetsByPage.get(page.id);
-    if (prevTargets && prevTargets.some((t) => Math.abs(t - cand.targetLine) <= 15)) {
-      continue;
-    }
     const lines = page.rawText.split('\n');
     const totalLines = lines.length;
     if (totalLines === 0) continue;
@@ -2443,8 +3072,9 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
     let endLine = cand.hasDeclSpan
       ? Math.min(totalLines, Math.min(cand.spanStartLine + 44, cand.spanEndLine + 2))
       : Math.min(totalLines, cand.targetLine + 15);
-    let sliceBody = lines.slice(startLine - 1, endLine).join('\n');
-    if (!sliceBody.trim() || isAlreadyVerbatim(page, sliceBody)) continue;
+    let sliceLines = lines.slice(startLine - 1, endLine);
+    let sliceBody = sliceLines.join('\n');
+    if (!sliceBody.trim() || isAlreadyVerbatim(page, sliceLines)) continue;
     if (!cand.isExplicitPageId && input.store.isTlbSuppressed(sessionKey, page.id, startLine, endLine, tlbTurn)) {
       continue;
     }
@@ -2456,18 +3086,16 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
     let chunk = makeChunk(startLine, endLine, sliceBody);
     let chunkTokens = countTokensFast(chunk);
 
-    // If a slice exceeds remaining budget, try exact span first, then shrink radius cleanly.
-    if (usedTokens + chunkTokens > budgetTokens) {
-      const remaining = budgetTokens - usedTokens;
-      if (remaining < 48) continue;
+    if (chunkTokens > availableBudget) {
       let fitted = false;
       if (cand.hasDeclSpan && cand.spanEndLine <= cand.spanStartLine + 42) {
         const sExact = Math.max(1, cand.spanStartLine);
         const eExact = Math.min(totalLines, cand.spanEndLine);
-        const bExact = lines.slice(sExact - 1, eExact).join('\n');
+        const lExact = lines.slice(sExact - 1, eExact);
+        const bExact = lExact.join('\n');
         const cExact = makeChunk(sExact, eExact, bExact);
         const tExact = countTokensFast(cExact);
-        if (tExact <= remaining) {
+        if (tExact <= availableBudget && !isAlreadyVerbatim(page, lExact)) {
           startLine = sExact;
           endLine = eExact;
           sliceBody = bExact;
@@ -2481,10 +3109,11 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
         while (radius >= 2) {
           const s2 = Math.max(1, cand.targetLine - radius);
           const e2 = Math.min(totalLines, cand.targetLine + radius);
-          const b2 = lines.slice(s2 - 1, e2).join('\n');
+          const l2 = lines.slice(s2 - 1, e2);
+          const b2 = l2.join('\n');
           const c2 = makeChunk(s2, e2, b2);
           const t2 = countTokensFast(c2);
-          if (t2 <= remaining) {
+          if (t2 <= availableBudget && !isAlreadyVerbatim(page, l2)) {
             startLine = s2;
             endLine = e2;
             sliceBody = b2;
@@ -2499,22 +3128,95 @@ export function computeTailHydration(input: TailHydrationInput): TailHydrationRe
       if (!fitted) continue;
     }
 
-    usedTokens += chunkTokens;
-    const existingTargets = acceptedTargetsByPage.get(page.id);
-    if (existingTargets) existingTargets.push(cand.targetLine);
-    else acceptedTargetsByPage.set(page.id, [cand.targetLine]);
+    const termKeys: string[] = [];
+    for (const sigKey of cand.signals.keys()) termKeys.push(sigKey);
+    viable.push({ cand, startLine, endLine, sliceBody, chunk, tokens: chunkTokens, termKeys });
+  }
+
+  if (viable.length === 0) {
+    return { text: '', changed: false, slices: [], totalTokens: 0 };
+  }
+
+  // Best-of-Two Monotone Submodular Knapsack selection (`S_unit` vs `S_dens` with tok^0.7 normalization).
+  const runGreedyKnapsack = (densityMode: boolean): { chosen: ViableSlice[]; objective: number } => {
+    const chosen: ViableSlice[] = [];
+    const usedIdx = new Set<number>();
+    const termCov = new Map<string, number>();
+    const pageCov = new Map<string, number>();
+    const targetsByPage = new Map<string, number[]>();
+    let usedTokens = 0;
+    let totalObj = 0;
+
+    while (chosen.length < maxSlices) {
+      let bestViableIdx = -1;
+      let bestPriority = -1;
+      let bestGain = 0;
+
+      for (let i = 0; i < viable.length; i++) {
+        if (usedIdx.has(i)) continue;
+        const item = viable[i]!;
+        if (usedTokens + item.tokens > availableBudget) continue;
+        const prevTargets = targetsByPage.get(item.cand.page.id);
+        if (prevTargets && prevTargets.some((t) => Math.abs(t - item.cand.targetLine) <= 15)) {
+          continue;
+        }
+
+        let gain = 0;
+        for (const sk of item.termKeys) {
+          const c = termCov.get(sk) ?? 0;
+          const sig = item.cand.signals.get(sk)!;
+          const baseVal = sig.field === 'explicit' ? 100 : BM25_FIELD_WEIGHT[sig.field] * sig.idf;
+          if (c < 32) gain += baseVal * POW_HALF[c]!;
+        }
+        const pc = pageCov.get(item.cand.page.id) ?? 0;
+        if (pc < 32) gain += item.cand.score * 0.5 * POW_HALF[pc]!;
+
+        const prio = densityMode
+          ? gain / Math.pow(Math.max(1, item.tokens), 0.7)
+          : gain;
+        if (prio > bestPriority + 1e-12) {
+          bestPriority = prio;
+          bestGain = gain;
+          bestViableIdx = i;
+        }
+      }
+
+      if (bestViableIdx < 0 || bestGain <= 0) break;
+      const picked = viable[bestViableIdx]!;
+      usedIdx.add(bestViableIdx);
+      chosen.push(picked);
+      usedTokens += picked.tokens;
+      totalObj += bestGain;
+      for (const sk of picked.termKeys) termCov.set(sk, (termCov.get(sk) ?? 0) + 1);
+      pageCov.set(picked.cand.page.id, (pageCov.get(picked.cand.page.id) ?? 0) + 1);
+      const tList = targetsByPage.get(picked.cand.page.id);
+      if (tList) tList.push(picked.cand.targetLine);
+      else targetsByPage.set(picked.cand.page.id, [picked.cand.targetLine]);
+    }
+    return { chosen, objective: totalObj };
+  };
+
+  const sUnit = runGreedyKnapsack(false);
+  const sDens = runGreedyKnapsack(true);
+  const selected = sDens.objective > sUnit.objective ? sDens.chosen : sUnit.chosen;
+
+  const emitted: TailHydrationSlice[] = [];
+  const emittedChunks: string[] = [];
+  for (const s of selected) {
+    const { page } = s.cand;
     emitted.push({
       pageId: page.id,
       refId: page.refId,
       ...(page.filePath !== undefined ? { filePath: page.filePath } : {}),
-      matchedSymbol: cand.matchedSymbol,
-      startLine,
-      endLine,
-      text: sliceBody,
-      tokens: chunkTokens,
+      matchedSymbol: s.cand.matchedSymbol,
+      startLine: s.startLine,
+      endLine: s.endLine,
+      text: s.sliceBody,
+      tokens: s.tokens,
     });
-    input.store.recordHydrationLease(sessionKey, page.id, startLine, endLine, tlbTurn);
-    emittedChunks.push(chunk);
+    input.store.touchHydratedPage(page.id, sessionKey);
+    input.store.recordHydrationLease(sessionKey, page.id, s.startLine, s.endLine, tlbTurn);
+    emittedChunks.push(s.chunk);
   }
 
   if (emitted.length === 0) {
@@ -2551,6 +3253,11 @@ export interface FoldMarkovianEpisodesArgs {
   readonly totalPromptTokens?: number;
   /** When true, only replay already-folded sticky episodes without folding new spans. */
   readonly stickyOnly?: boolean;
+  readonly earliestNewInvalidationMsg?: number;
+  readonly ewmaInterTurnSec?: number;
+  readonly ewmaHitRatio?: number;
+  readonly writeRate?: number;
+  readonly circuitBreakerState?: 'closed' | 'open' | 'half_open';
 }
 
 export interface FoldMarkovianEpisodesResult {
@@ -2560,6 +3267,7 @@ export interface FoldMarkovianEpisodesResult {
   readonly savedChars: number;
   readonly savedTokens: number;
   readonly episodeIds: readonly string[];
+  readonly earliestNewInvalidationMsg?: number;
 }
 
 const FILE_READ_TOOL_RE =
@@ -2789,7 +3497,9 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
     args.sessionKey,
     args.model ? { model: args.model } : undefined,
   );
-  const stickyOnly = args.stickyOnly === true || circuitBreakerOpen;
+  const breakerState = args.circuitBreakerState ?? (circuitBreakerOpen ? 'open' : 'closed');
+  const stickyOnly = args.stickyOnly === true || breakerState === 'open';
+  let earliestNewInvalidationMsg = args.earliestNewInvalidationMsg;
 
   for (const ep of episodes) {
     const signatureSource =
@@ -2822,6 +3532,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
 
     const pgIds: string[] = [];
     const touchedSet = new Set<string>();
+    const resolvedErrorsSet = new Set<string>();
     const predMeta = new Map<number, { filePath?: string; symbols: MmuSymbolSpan[] }>();
 
     for (const idx of replaceableIndices) {
@@ -2832,21 +3543,24 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       const syms = extractSymbolSpans(pred.raw);
       predMeta.set(idx, { filePath: fp, symbols: syms });
       for (const s of syms) {
-        if (s.kind !== 'error' && s.kind !== 'anchor') {
+        if (s.kind === 'error' || s.kind === 'anchor') {
+          if (resolvedErrorsSet.size < 4) resolvedErrorsSet.add(s.name);
+        } else if (touchedSet.size < 12) {
           touchedSet.add(s.name);
-          if (touchedSet.size >= 12) break;
         }
       }
     }
 
     const touchedSummary = touchedSet.size > 0 ? [...touchedSet].join(', ') : 'none';
+    const resolvedErrorsPart =
+      resolvedErrorsSet.size > 0 ? `; resolved errors: ${[...resolvedErrorsSet].join(', ')}` : '';
     const cpRef = ep.checkpoint.block.refId;
     const formatCertificate = (ids: readonly string[]): string => {
       const pageSummary = ids.length > 0 ? ids.join(', ') : 'none';
       return (
         `[fiche causal-episode ${epId}: folded ${replaceableIndices.length} intermediate debug steps ` +
         `before verified checkpoint ${cpRef}; archived pages: ${pageSummary}; ` +
-        `touched symbols/paths: ${touchedSummary}]`
+        `touched symbols/paths: ${touchedSummary}${resolvedErrorsPart}]`
       );
     };
     let certificate = frozenCertificate ?? formatCertificate(pgIds);
@@ -2862,6 +3576,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
 
     if (foldedChars >= rawChars || foldedTok >= rawTok) continue;
 
+    const firstReplacedMsg = ep.predecessors[replaceableIndices[0]!]!.block.msgIndex;
     const lastReplacedBlock = ep.predecessors[replaceableIndices[replaceableIndices.length - 1]!]!.block;
     let coveringTtlSec = 0;
     let horizonEndMsg = args.totalMessages - 2;
@@ -2884,26 +3599,32 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       : rates;
 
     if (!alreadySealed && args.sessionCacheCold !== true) {
+      const coalescedInWave =
+        earliestNewInvalidationMsg !== undefined && firstReplacedMsg > earliestNewInvalidationMsg;
       let downstreamCachedTokens = 0;
-      if (args.msgTotalTokens && args.msgTotalTokens.length > 0) {
-        const limit = Math.min(args.msgTotalTokens.length - 1, horizonEndMsg);
-        for (let m = ep.checkpoint.block.msgIndex; m <= limit; m++) {
-          downstreamCachedTokens += args.msgTotalTokens[m] ?? 0;
-        }
-      } else {
-        for (const b of args.blocks) {
-          if (b.msgIndex >= ep.checkpoint.block.msgIndex && b.msgIndex <= horizonEndMsg) {
-            downstreamCachedTokens += blockTokens.get(b) ?? 0;
+      if (!coalescedInWave) {
+        if (args.msgTotalTokens && args.msgTotalTokens.length > 0) {
+          const limit = Math.min(args.msgTotalTokens.length - 1, horizonEndMsg);
+          for (let m = ep.checkpoint.block.msgIndex; m <= limit; m++) {
+            downstreamCachedTokens += args.msgTotalTokens[m] ?? 0;
+          }
+        } else {
+          for (const b of args.blocks) {
+            if (b.msgIndex >= ep.checkpoint.block.msgIndex && b.msgIndex <= horizonEndMsg) {
+              downstreamCachedTokens += blockTokens.get(b) ?? 0;
+            }
+          }
+          if (nonToolPromptTokens > 0 && args.totalMessages > 2) {
+            const spanRatio = Math.max(
+              0,
+              Math.min(1, (args.totalMessages - 2 - ep.predecessors[0]!.block.msgIndex) / Math.max(1, args.totalMessages)),
+            );
+            downstreamCachedTokens += Math.round(nonToolPromptTokens * spanRatio);
           }
         }
-        if (nonToolPromptTokens > 0 && args.totalMessages > 2) {
-          const spanRatio = Math.max(
-            0,
-            Math.min(1, (args.totalMessages - 2 - ep.predecessors[0]!.block.msgIndex) / Math.max(1, args.totalMessages)),
-          );
-          downstreamCachedTokens += Math.round(nonToolPromptTokens * spanRatio);
-        }
       }
+      if (breakerState === 'half_open' && downstreamCachedTokens > 0) continue;
+
       const isAutoCacheOpenAI =
         !(args.cacheBreakpoints && args.cacheBreakpoints.length > 0) &&
         args.ttlSec === undefined &&
@@ -2911,10 +3632,11 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
       const effectiveWriteRate = isAutoCacheOpenAI ? Math.min(epRates.write, 1) : epRates.write;
       const savedTok = rawTok - foldedTok;
       const savedPerRead = savedTok * epRates.read;
-      const transitionCost =
-        foldedTok * effectiveWriteRate -
-        rawTok * epRates.read +
-        downstreamCachedTokens * (effectiveWriteRate - epRates.read);
+      const transitionCost = coalescedInWave
+        ? (foldedTok - rawTok) * effectiveWriteRate
+        : foldedTok * effectiveWriteRate -
+          rawTok * epRates.read +
+          downstreamCachedTokens * (effectiveWriteRate - epRates.read);
       const paybackReads =
         savedPerRead > 0 ? Math.ceil(Math.max(0, transitionCost) / savedPerRead) : Infinity;
 
@@ -2928,11 +3650,15 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
         ttlSec: effectiveTtlSec,
       });
       const cliffWins = Boolean(cliff?.crossesCliff && cliff.netSingleTurnUsd > 0);
-      if (coveringTtlSec >= 3600 && savedTok < 2000 && !cliffWins) continue;
+      if (coveringTtlSec >= 3600 && savedTok < 2000 && !cliffWins && !coalescedInWave) continue;
       let effectiveMaxPayback = computeHorizonPaybackLimit({
         turnsObserved: Math.max(1, Math.floor(args.totalMessages / 2)),
         baseMaxPayback: 12,
         downstreamCachedTokens,
+        ttlSec: effectiveTtlSec,
+        ewmaInterTurnSec: args.ewmaInterTurnSec,
+        ewmaHitRatio: args.ewmaHitRatio,
+        writeRate: args.writeRate ?? effectiveWriteRate,
       });
       if (coveringTtlSec >= 3600 && downstreamCachedTokens >= 20_000) {
         effectiveMaxPayback = Math.min(effectiveMaxPayback, 8);
@@ -2978,6 +3704,12 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
         ep.predecessors[idx]!.block.setText(continuationMarker);
       }
     }
+    if (!alreadySealed) {
+      earliestNewInvalidationMsg =
+        earliestNewInvalidationMsg === undefined
+          ? firstReplacedMsg
+          : Math.min(earliestNewInvalidationMsg, firstReplacedMsg);
+    }
 
     if (stickyMarkovEpisodes.has(stickyKey)) {
       stickyMarkovEpisodes.delete(stickyKey);
@@ -3012,6 +3744,7 @@ export function foldMarkovianEpisodes(args: FoldMarkovianEpisodesArgs): FoldMark
     savedChars: totalSavedChars,
     savedTokens: totalSavedTokens,
     episodeIds,
+    ...(earliestNewInvalidationMsg !== undefined ? { earliestNewInvalidationMsg } : {}),
   };
 }
 
@@ -3395,10 +4128,13 @@ function extractLineRarityWords(line: string): string[] {
     } else if (start >= 0) {
       const len = i - start;
       if (len >= 3 && len <= 40) {
-        words.push(line.slice(start, i).toLowerCase());
+        const w = line.slice(start, i).toLowerCase();
+        if (!PRUNE_STOPWORDS.has(w)) {
+          words.push(w);
+          if (words.length >= 48) break;
+        }
       }
       start = -1;
-      if (words.length >= 48) break;
     }
   }
   return words;
@@ -3433,9 +4169,11 @@ export function pruneLowDensityBlob(
   const wordIdMap = new Map<string, number>();
   const dfCounts: number[] = [];
   const uniqLineWordIds: Int32Array[] = new Array(n);
+  const seenWordGen = new Int32Array(8192);
 
-  // Pass 1: document-frequency scan + integer-indexed unique rarity words per line (O(N))
+  // Pass 1: document-frequency scan + O(1) generation-stamped unique rarity words per line (O(N))
   for (let i = 0; i < n; i++) {
+    const gen = i + 1;
     const words = extractLineRarityWords(lines[i]!);
     if (words.length === 0) {
       uniqLineWordIds[i] = EMPTY_I32;
@@ -3451,14 +4189,8 @@ export function pruneLowDensityBlob(
         wordIdMap.set(w, id);
         dfCounts.push(0);
       }
-      let dup = false;
-      for (let j = 0; j < ids.length; j++) {
-        if (ids[j] === id) {
-          dup = true;
-          break;
-        }
-      }
-      if (!dup) {
+      if (seenWordGen[id] !== gen) {
+        seenWordGen[id] = gen;
         ids.push(id);
         dfCounts[id]! += 1;
       }
@@ -3469,7 +4201,7 @@ export function pruneLowDensityBlob(
   const wordCount = dfCounts.length;
   const wordIdf = new Float64Array(wordCount);
   for (let id = 0; id < wordCount; id++) {
-    wordIdf[id] = Math.log(1 + n / (1 + dfCounts[id]!));
+    wordIdf[id] = Math.max(0, Math.log((n + 1) / (dfCounts[id]! + 1)));
   }
 
   // Pass 2: seed submodular coverage from fixed head-4 + tail-4 lines

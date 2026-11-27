@@ -441,7 +441,7 @@ struct PopoverView: View {
                 .fontWidth(theme.fontWidth)
                 .foregroundStyle(theme.primaryText)
 
-            Text("v\(controller.health?.version ?? "0.19.0")")
+            Text("v\(controller.health?.version ?? "0.20.0")")
                 .font(.footnote)
                 .foregroundStyle(theme.tertiaryText)
 

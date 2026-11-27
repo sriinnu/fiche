@@ -59,16 +59,23 @@ interface CasiEntry {
   readonly chunks: readonly FastCdcChunk[];
 }
 
-// Keep total postings alongside bounded entry indices so hot lines (e.g. `{` or `return;`) skip voting cleanly.
+// Bounded MRU postings `(entryIdx, freq)` paired with total document frequency `df`
+// for smooth IDF-weighted multiplicity scoring.
+interface LinePostingItem {
+  readonly entryIdx: number;
+  readonly freq: number;
+}
+
 interface LinePostings {
-  total: number;
-  entries: number[];
+  df: number;
+  entries: LinePostingItem[];
 }
 
 const MAX_CASI_ENTRIES = 128;
 const MAX_SEED_ENTRIES = 48;
-const MAX_LINE_POSTINGS = 24;
-const HOT_POSTING_VOTE_SKIP = 16;
+const MAX_LINE_POSTINGS = 32;
+const TOP_DELTA_CANDIDATES = 3;
+const SUBWINDOW_PAD_LINES = 16;
 const MIN_EXACT_DUP_CHARS = 400;
 const MIN_DELTA_CHARS = 800;
 const MIN_DELTA_LINES = 16;
@@ -76,6 +83,7 @@ const MAX_INPUT_CHARS = 512_000;
 const HUNK_CONTEXT = 2;
 const HISTOGRAM_MAX_DEPTH = 16;
 const HISTOGRAM_MAX_OCCURRENCES = 64;
+const HISTOGRAM_MAX_OPS = 4096;
 const PREPARED_CACHE_MAX_ENTRIES = 192;
 const PREPARED_CACHE_MAX_CHARS = 16 * 1024 * 1024;
 const PREPARED_CACHE_MIN_CHARS = 256;
@@ -406,12 +414,12 @@ function prepareLines(rawText: string): PreparedLines {
     if (i < effectiveLineCount) {
       if (i > 0) {
         ch1 = Math.imul((ch1 ^ 10) >>> 0, 0x01000193) >>> 0;
-        ch2 = Math.imul((ch2 ^ 10) >>> 0, 0x01000193) >>> 0;
+        ch2 = Math.imul((ch2 ^ (10 + (i & 0xff))) >>> 0, 0x85ebca6b) >>> 0;
       }
       for (let j = 0; j < body.length; j++) {
         const c = body.charCodeAt(j);
         ch1 = Math.imul((ch1 ^ c) >>> 0, 0x01000193) >>> 0;
-        ch2 = Math.imul((ch2 ^ c) >>> 0, 0x01000193) >>> 0;
+        ch2 = Math.imul((ch2 ^ ((c + (j & 0xff)) >>> 0)) >>> 0, 0x85ebca6b) >>> 0;
       }
     }
   }
@@ -441,9 +449,16 @@ function sliceCharLength(lines: readonly string[], start: number, end: number): 
   return len;
 }
 
+interface SubWindowDeltaOpts {
+  readonly baseRefId: string;
+  readonly bLo: number;
+  readonly curLineCount: number;
+}
+
 function formatUnifiedDelta(
   base: CasiEntry,
   cur: PreparedLines,
+  subWindow?: SubWindowDeltaOpts,
 ): { text: string; matchedLines: number; exactBodyMatch?: boolean } | null {
   const { lines: curLines, bodies: curBodies, canonLines: curCanonLines, canonHashes: curCanonHashes } = cur;
   // Use canonical matching only on unguttered non-code log streams; any guttered,
@@ -623,8 +638,8 @@ function formatUnifiedDelta(
     }
   };
 
-  // Recursive Histogram Diff on unmatched intervals: resolves repeated boilerplate
-  // blocks (freq >= 2) where globally unique anchors are sparse or exhausted.
+  // True single-pass JGit Histogram Diff on unmatched intervals: resolves repeated
+  // boilerplate blocks (freq >= 2) without O(OCC^2) blowup or 1-line stray preemption.
   const histogramAnchors = (
     bStart: number,
     bEnd: number,
@@ -652,129 +667,116 @@ function formatUnifiedDelta(
     }
     if (basePositions.size === 0) return;
 
-    const curPositions = new Map<number, number[]>();
-    for (let c = cStart; c < cEnd; c++) {
-      if (matchedCur[c] !== -1 || !curHas4[c]) continue;
-      const h = curCanonHashes[c]!;
-      const bArr = basePositions.get(h);
-      if (!bArr || bArr.length > HISTOGRAM_MAX_OCCURRENCES) continue;
-      let cArr = curPositions.get(h);
-      if (!cArr) {
-        cArr = [c];
-        curPositions.set(h, cArr);
-      } else if (cArr.length <= HISTOGRAM_MAX_OCCURRENCES) {
-        cArr.push(c);
-      }
-    }
-    if (curPositions.size === 0) return;
-
-    interface HistogramCandidate {
-      readonly score: number;
-      readonly bArr: readonly number[];
-      readonly cArr: readonly number[];
-    }
-    const candidates: HistogramCandidate[] = [];
-    for (const [h, cArr] of curPositions) {
-      if (cArr.length > HISTOGRAM_MAX_OCCURRENCES) continue;
-      const bArr = basePositions.get(h)!;
-      candidates.push({
-        score: bArr.length + cArr.length,
-        bArr,
-        cArr,
-      });
-    }
-    if (candidates.length === 0) {
-      lisIntervalFallback(bStart, bEnd, cStart, cEnd);
-      return;
-    }
-    candidates.sort((a, b) => a.score - b.score || a.cArr[0]! - b.cArr[0]!);
-
-    let bestScore = Infinity;
+    let bestHasRun4 = false;
+    let bestMinOcc = Infinity;
     let bestRunLen = 0;
+    let bestDiagOffset = Infinity;
     let bestBStart = 0;
     let bestBEnd = 0;
     let bestCStart = 0;
     let bestCEnd = 0;
-    const diagCovered = new Map<number, Array<[number, number]>>();
+    let workOps = 0;
 
-    for (const cand of candidates) {
-      if (bestRunLen > 0 && cand.score > bestScore) break;
-      for (let bi = 0; bi < cand.bArr.length; bi++) {
-        const bIdx = cand.bArr[bi]!;
-        for (let ci = 0; ci < cand.cArr.length; ci++) {
-          const cIdx = cand.cArr[ci]!;
-          const diag = bIdx - cIdx;
-          const spans = diagCovered.get(diag);
-          if (spans) {
-            let already = false;
-            for (let s = 0; s < spans.length; s++) {
-              const sp = spans[s]!;
-              if (cIdx >= sp[0] && cIdx < sp[1]) {
-                already = true;
-                break;
-              }
-            }
-            if (already) continue;
+    let c = cStart;
+    while (c < cEnd) {
+      if (matchedCur[c] !== -1 || !curHas4[c]) {
+        c++;
+        continue;
+      }
+      const h = curCanonHashes[c]!;
+      const bArr = basePositions.get(h);
+      if (!bArr || bArr.length > HISTOGRAM_MAX_OCCURRENCES) {
+        c++;
+        continue;
+      }
+      let nextC = c + 1;
+      for (let bi = 0; bi < bArr.length; bi++) {
+        const bIdx = bArr[bi]!;
+        if (usedBase[bIdx]) continue;
+        if (++workOps > HISTOGRAM_MAX_OPS) {
+          if (bestRunLen === 0) {
+            lisIntervalFallback(bStart, bEnd, cStart, cEnd);
+            return;
           }
-          if (!matchCanon(bIdx, cIdx)) continue;
+          break;
+        }
+        if (!matchCanon(bIdx, c)) continue;
 
-          let rbStart = bIdx;
-          let rcStart = cIdx;
-          while (
-            rbStart > bStart &&
-            rcStart > cStart &&
-            !usedBase[rbStart - 1] &&
-            matchedCur[rcStart - 1] === -1 &&
-            curCanonHashes[rcStart - 1] === base.canonHashes[rbStart - 1] &&
-            matchCanon(rbStart - 1, rcStart - 1)
-          ) {
-            rbStart--;
-            rcStart--;
-          }
-          let rbEnd = bIdx + 1;
-          let rcEnd = cIdx + 1;
-          while (
-            rbEnd < bEnd &&
-            rcEnd < cEnd &&
-            !usedBase[rbEnd] &&
-            matchedCur[rcEnd] === -1 &&
-            curCanonHashes[rcEnd] === base.canonHashes[rbEnd] &&
-            matchCanon(rbEnd, rcEnd)
-          ) {
-            rbEnd++;
-            rcEnd++;
-          }
+        let rbStart = bIdx;
+        let rcStart = c;
+        while (
+          rbStart > bStart &&
+          rcStart > cStart &&
+          !usedBase[rbStart - 1] &&
+          matchedCur[rcStart - 1] === -1 &&
+          curCanonHashes[rcStart - 1] === base.canonHashes[rbStart - 1] &&
+          matchCanon(rbStart - 1, rcStart - 1)
+        ) {
+          rbStart--;
+          rcStart--;
+        }
+        let rbEnd = bIdx + 1;
+        let rcEnd = c + 1;
+        while (
+          rbEnd < bEnd &&
+          rcEnd < cEnd &&
+          !usedBase[rbEnd] &&
+          matchedCur[rcEnd] === -1 &&
+          curCanonHashes[rcEnd] === base.canonHashes[rbEnd] &&
+          matchCanon(rbEnd, rcEnd)
+        ) {
+          rbEnd++;
+          rcEnd++;
+        }
 
-          if (spans) {
-            spans.push([rcStart, rcEnd]);
-          } else {
-            diagCovered.set(diag, [[rcStart, rcEnd]]);
-          }
+        if (rcEnd > nextC) nextC = rcEnd;
 
-          const runLen = rcEnd - rcStart;
-          const isBetter =
-            bestRunLen === 0 ||
-            runLen > bestRunLen ||
-            (runLen === bestRunLen &&
-              (rcStart < bestCStart || (rcStart === bestCStart && rbStart < bestBStart)));
-          if (isBetter) {
-            bestScore = cand.score;
-            bestRunLen = runLen;
-            bestBStart = rbStart;
-            bestBEnd = rbEnd;
-            bestCStart = rcStart;
-            bestCEnd = rcEnd;
+        let minOcc = bArr.length;
+        for (let k = rbStart; k < rbEnd; k++) {
+          if (!baseHas4[k]) continue;
+          const occ = basePositions.get(base.canonHashes[k]!)?.length ?? 1;
+          if (occ < minOcc) {
+            minOcc = occ;
+            if (minOcc === 1) break;
           }
         }
+
+        const runLen = rcEnd - rcStart;
+        const hasRun4 = runLen >= 4;
+        const diagOffset = Math.abs((rbStart - bStart) - (rcStart - cStart));
+        const isBetter =
+          bestRunLen === 0 ||
+          (hasRun4 !== bestHasRun4
+            ? hasRun4
+            : minOcc !== bestMinOcc
+              ? minOcc < bestMinOcc
+              : runLen !== bestRunLen
+                ? runLen > bestRunLen
+                : diagOffset !== bestDiagOffset
+                  ? diagOffset < bestDiagOffset
+                  : rcStart < bestCStart || (rcStart === bestCStart && rbStart < bestBStart));
+
+        if (isBetter) {
+          bestHasRun4 = hasRun4;
+          bestMinOcc = minOcc;
+          bestRunLen = runLen;
+          bestDiagOffset = diagOffset;
+          bestBStart = rbStart;
+          bestBEnd = rbEnd;
+          bestCStart = rcStart;
+          bestCEnd = rcEnd;
+        }
       }
+      if (workOps > HISTOGRAM_MAX_OPS) break;
+      c = nextC;
     }
 
     if (bestRunLen === 0) return;
 
     for (let k = 0; k < bestRunLen; k++) {
       const b = bestBStart + k;
-      const c = bestCStart + k;
-      matchedCur[c] = b;
+      const cIdx = bestCStart + k;
+      matchedCur[cIdx] = b;
       usedBase[b] = 1;
     }
 
@@ -834,7 +836,28 @@ function formatUnifiedDelta(
   for (let c = 0; c < curLines.length; c++) {
     if (matchedCur[c]! >= 0) matchedLines++;
   }
-  if (matchedLines / Math.max(1, curLines.length, base.lines.length) < 0.65) return null;
+
+  let bTrimStart = 0;
+  let bTrimEnd = baseLen;
+  if (subWindow) {
+    let cFirst = -1;
+    let cLast = -1;
+    for (let c = 0; c < curLen; c++) {
+      if (matchedCur[c]! >= 0) {
+        if (cFirst < 0) cFirst = c;
+        cLast = c;
+      }
+    }
+    if (cFirst < 0) return null;
+    bTrimStart = matchedCur[0]! >= 0 ? matchedCur[0]! : Math.max(0, matchedCur[cFirst]! - cFirst - HUNK_CONTEXT);
+    bTrimEnd =
+      matchedCur[curLen - 1]! >= 0
+        ? matchedCur[curLen - 1]! + 1
+        : Math.min(baseLen, matchedCur[cLast]! + (curLen - 1 - cLast) + HUNK_CONTEXT + 1);
+  }
+  const activeBaseLen = Math.max(1, bTrimEnd - bTrimStart);
+  const minMatchRatio = subWindow ? 0.50 : 0.45;
+  if (matchedLines / Math.max(1, curLines.length, activeBaseLen) < minMatchRatio) return null;
 
   // Collect unmatched gap intervals (baseStart..baseEnd, curStart..curEnd).
   interface DiffGap {
@@ -845,9 +868,9 @@ function formatUnifiedDelta(
   }
   const gaps: DiffGap[] = [];
   prevC = -1;
-  prevB = -1;
+  prevB = bTrimStart - 1;
   for (let c = 0; c <= curLines.length; c++) {
-    const b = c < curLines.length ? matchedCur[c]! : base.lines.length;
+    const b = c < curLines.length ? matchedCur[c]! : bTrimEnd;
     if (c < curLines.length && b < 0) continue;
     const bStart = prevB + 1;
     const bEnd = b;
@@ -861,7 +884,7 @@ function formatUnifiedDelta(
   }
 
   if (gaps.length === 0) {
-    if (base.effectiveLineCount === cur.effectiveLineCount) {
+    if (!subWindow && base.effectiveLineCount === cur.effectiveLineCount) {
       let exact = true;
       for (let i = 0; i < cur.effectiveLineCount; i++) {
         if (base.bodies[i] !== curBodies[i]) {
@@ -886,7 +909,9 @@ function formatUnifiedDelta(
 
   // Merge gaps whose ±HUNK_CONTEXT regions overlap, then render hunks with exact raw lines.
   const hunks: string[] = [];
+  let totalHunkLines = 0;
   let gIdx = 0;
+  const baseLineOffset = subWindow?.bLo ?? 0;
   while (gIdx < gaps.length) {
     const firstIdx = gIdx;
     const first = gaps[firstIdx]!;
@@ -903,15 +928,16 @@ function formatUnifiedDelta(
     gIdx++;
 
     const ctxCStart = Math.max(0, first.cStart - HUNK_CONTEXT);
-    const ctxBStart = Math.max(0, first.bStart - HUNK_CONTEXT);
+    const ctxBStart = Math.max(bTrimStart, first.bStart - HUNK_CONTEXT);
     const ctxCEnd = Math.min(curLines.length, last.cEnd + HUNK_CONTEXT);
-    const ctxBEnd = Math.min(base.lines.length, last.bEnd + HUNK_CONTEXT);
+    const ctxBEnd = Math.min(bTrimEnd, last.bEnd + HUNK_CONTEXT);
 
     const resolveHunkEndLineNum = (
       prepared: { readonly allHaveLineNums: boolean; readonly lineNums: Int32Array },
       startIdx: number,
       endIdx: number,
       startNum: number,
+      offset: number,
     ): number => {
       if (prepared.allHaveLineNums && endIdx > startIdx) {
         for (let k = endIdx - 1; k >= startIdx; k--) {
@@ -919,13 +945,14 @@ function formatUnifiedDelta(
           if (ln > 0) return ln;
         }
       }
-      return endIdx > startIdx ? Math.max(startNum, endIdx) : endIdx;
+      return endIdx > startIdx ? Math.max(startNum, offset + endIdx) : offset + endIdx;
     };
 
-    const ctxBNumStart = base.allHaveLineNums && base.lineNums[ctxBStart]! > 0 ? base.lineNums[ctxBStart]! : ctxBStart + 1;
-    const ctxBNumEnd = resolveHunkEndLineNum(base, ctxBStart, ctxBEnd, ctxBNumStart);
+    const ctxBNumStart =
+      base.allHaveLineNums && base.lineNums[ctxBStart]! > 0 ? base.lineNums[ctxBStart]! : baseLineOffset + ctxBStart + 1;
+    const ctxBNumEnd = resolveHunkEndLineNum(base, ctxBStart, ctxBEnd, ctxBNumStart, baseLineOffset);
     const ctxCNumStart = cur.allHaveLineNums && cur.lineNums[ctxCStart]! > 0 ? cur.lineNums[ctxCStart]! : ctxCStart + 1;
-    const ctxCNumEnd = resolveHunkEndLineNum(cur, ctxCStart, ctxCEnd, ctxCNumStart);
+    const ctxCNumEnd = resolveHunkEndLineNum(cur, ctxCStart, ctxCEnd, ctxCNumStart, 0);
     const hunkLines: string[] = [
       `@@ base:${ctxBNumStart}-${ctxBNumEnd} -> cur:${ctxCNumStart}-${ctxCNumEnd} @@`,
     ];
@@ -946,13 +973,132 @@ function formatUnifiedDelta(
     for (let c = last.cEnd; c < ctxCEnd; c++) {
       hunkLines.push(` ${curLines[c]!}`);
     }
+    totalHunkLines += hunkLines.length;
     hunks.push(hunkLines.join('\n'));
   }
 
-  const outText =
-    `[fiche cas-delta vs ${base.refId}: ${matchedLines}/${curLines.length} lines unchanged; only changed hunks below (±${HUNK_CONTEXT} context)]\n` +
-    hunks.join('\n');
+  const header = subWindow
+    ? `[fiche cas-delta vs ${subWindow.baseRefId}:L${subWindow.bLo + bTrimStart + 1}..${subWindow.bLo + bTrimEnd} (${subWindow.curLineCount}L→${1 + totalHunkLines}L); apply before reading]`
+    : `[fiche cas-delta vs ${base.refId}: ${matchedLines}/${curLines.length} lines unchanged; only changed hunks below (±${HUNK_CONTEXT} context)]`;
+  const outText = `${header}\n${hunks.join('\n')}`;
   return { text: outText, matchedLines };
+}
+
+function trySubWindowDelta(
+  base: CasiEntry,
+  cur: PreparedLines,
+  qFreq: Map<number, number>,
+): { text: string; matchedLines: number; exactBodyMatch?: boolean } | null {
+  const strictBody =
+    base.allHaveLineNums ||
+    cur.allHaveLineNums ||
+    base.isCodeLike ||
+    cur.isCodeLike ||
+    !(base.isLogLike && cur.isLogLike);
+
+  // Collect unique/low-freq line anchors `(bIdx, cIdx)`.
+  const basePosLowFreq = new Map<number, number[]>();
+  for (let b = 0; b < base.effectiveLineCount; b++) {
+    if (!hasAtLeast4NonWs(base.canonLines[b]!)) continue;
+    const h = base.canonHashes[b]!;
+    const bf = base.lineFreq.get(h) ?? 0;
+    const qf = qFreq.get(h) ?? 0;
+    if (bf === 0 || bf > 4 || qf === 0 || qf > 4) continue;
+    let arr = basePosLowFreq.get(h);
+    if (!arr) {
+      arr = [b];
+      basePosLowFreq.set(h, arr);
+    } else {
+      arr.push(b);
+    }
+  }
+  if (basePosLowFreq.size === 0) return null;
+
+  const pairs: AnchorPair[] = [];
+  for (let c = 0; c < cur.effectiveLineCount; c++) {
+    if (!hasAtLeast4NonWs(cur.canonLines[c]!)) continue;
+    const h = cur.canonHashes[c]!;
+    const bArr = basePosLowFreq.get(h);
+    if (!bArr) continue;
+    for (let k = bArr.length - 1; k >= 0; k--) {
+      const b = bArr[k]!;
+      const eq = strictBody ? base.bodies[b] === cur.bodies[c] : base.canonLines[b] === cur.canonLines[c];
+      if (eq) pairs.push({ baseIdx: b, curIdx: c });
+    }
+  }
+  if (pairs.length === 0) return null;
+
+  const anchors = lisAnchors(pairs);
+  if (anchors.length === 0) return null;
+
+  const need = Math.max(1, Math.ceil(0.70 * anchors.length));
+  let bestSpanLen = Infinity;
+  let aStart = 0;
+  let aEnd = 0;
+  for (let i = 0; i + need <= anchors.length; i++) {
+    const lo = anchors[i]!.baseIdx;
+    const hi = anchors[i + need - 1]!.baseIdx;
+    const span = hi - lo + 1;
+    if (span < bestSpanLen) {
+      bestSpanLen = span;
+      aStart = lo;
+      aEnd = hi;
+    }
+  }
+  const maxWidth = Math.max(cur.lines.length, Math.floor(1.8 * cur.lines.length));
+  if (bestSpanLen > maxWidth) return null;
+
+  let bLo = Math.max(0, aStart - SUBWINDOW_PAD_LINES);
+  let bHi = Math.min(base.lines.length, aEnd + 1 + SUBWINDOW_PAD_LINES);
+  if (bHi - bLo > maxWidth) {
+    const excess = bHi - bLo - maxWidth;
+    const trimLeft = Math.min(aStart - bLo, Math.ceil(excess / 2));
+    bLo += trimLeft;
+    const trimRight = Math.min(bHi - (aEnd + 1), excess - trimLeft);
+    bHi -= trimRight;
+    if (bHi - bLo > maxWidth) bHi = bLo + maxWidth;
+  }
+
+  const winLines = base.lines.slice(bLo, bHi);
+  const winCanonLines = base.canonLines.slice(bLo, bHi);
+  const winCanonHashes = base.canonHashes.subarray(bLo, bHi);
+  const winEffCount =
+    bHi === base.lines.length && base.effectiveLineCount < base.lines.length
+      ? Math.max(0, winLines.length - 1)
+      : winLines.length;
+  const winFreq = new Map<number, number>();
+  for (let i = 0; i < winEffCount; i++) {
+    if (!hasAtLeast4NonWs(winCanonLines[i]!)) continue;
+    const h = winCanonHashes[i]!;
+    winFreq.set(h, (winFreq.get(h) ?? 0) + 1);
+  }
+
+  const windowBase: CasiEntry = {
+    idx: base.idx,
+    refId: base.refId,
+    turnGroup: base.turnGroup,
+    rawText: base.rawText,
+    lineCount: winLines.length,
+    effectiveLineCount: winEffCount,
+    hash64: base.hash64,
+    bodyDocHash: base.bodyDocHash,
+    allHaveLineNums: base.allHaveLineNums,
+    isCodeLike: base.isCodeLike,
+    isLogLike: base.isLogLike,
+    lines: winLines,
+    bodies: base.bodies.slice(bLo, bHi),
+    canonLines: winCanonLines,
+    lineNums: base.lineNums.subarray(bLo, bHi),
+    canonHashes: winCanonHashes,
+    lineFreq: winFreq,
+    chunks: [],
+  };
+
+  return formatUnifiedDelta(windowBase, cur, {
+    baseRefId: base.refId,
+    bLo,
+    curLineCount: cur.lines.length,
+  });
 }
 
 export class CasiIndex {
@@ -1011,21 +1157,17 @@ export class CasiIndex {
     if (bodyBucket) bodyBucket.push(entry);
     else this.exactBodyByHash.set(prep.bodyDocHash, [entry]);
 
-    const seenEntryHashes = new Set<number>();
-    for (let i = 0; i < prep.canonLines.length; i++) {
-      if (!hasAtLeast4NonWs(prep.canonLines[i]!)) continue;
-      const h = prep.canonHashes[i]!;
-      if (seenEntryHashes.has(h)) continue;
-      seenEntryHashes.add(h);
+    for (const [h, freq] of lineFreq) {
       let postings = this.lineIndex.get(h);
       if (!postings) {
-        postings = { total: 1, entries: [entryIdx] };
+        postings = { df: 1, entries: [{ entryIdx, freq }] };
         this.lineIndex.set(h, postings);
       } else {
-        postings.total += 1;
-        if (postings.total <= MAX_LINE_POSTINGS) {
-          postings.entries.push(entryIdx);
+        postings.df += 1;
+        if (postings.entries.length >= MAX_LINE_POSTINGS) {
+          postings.entries.shift();
         }
+        postings.entries.push({ entryIdx, freq });
       }
     }
 
@@ -1267,6 +1409,7 @@ export class CasiIndex {
     refId: string,
     turnGroup?: number,
     minBaseTurnGroup?: number,
+    precomputedHash64?: string,
   ): CasiResult {
     if (
       typeof rawText !== 'string' ||
@@ -1287,7 +1430,7 @@ export class CasiIndex {
     };
 
     // Step 1a: Exact raw duplicate check.
-    const hash64 = dualHash64Hex(rawText);
+    const hash64 = precomputedHash64 && precomputedHash64.length > 0 ? precomputedHash64 : dualHash64Hex(rawText);
     const exactCandidates = this.exactByHash.get(hash64);
     let exactHit: CasiEntry | undefined;
     if (exactCandidates) {
@@ -1385,56 +1528,90 @@ export class CasiIndex {
       return { text: rawText, changed: false, savedChars: 0, savedTokens: 0 };
     }
 
-    // Step 2: Canonical whole-block voting & anchor-aligned unified delta.
-    const votes = new Int32Array(this.entries.length);
-    const seenQueryHashes = new Set<number>();
-    let anyVote = false;
-    for (let i = 0; i < prep.canonLines.length; i++) {
-      const canon = prep.canonLines[i]!;
-      if (!hasAtLeast4NonWs(canon)) continue;
+    // Step 2: Smooth IDF-weighted multiplicity scoring + whole-block / sub-window delta across top K=3.
+    const qFreq = new Map<number, number>();
+    for (let i = 0; i < prep.effectiveLineCount; i++) {
+      if (!hasAtLeast4NonWs(prep.canonLines[i]!)) continue;
       const h = prep.canonHashes[i]!;
-      if (seenQueryHashes.has(h)) continue;
-      seenQueryHashes.add(h);
+      qFreq.set(h, (qFreq.get(h) ?? 0) + 1);
+    }
+
+    const entryCount = this.entries.length;
+    const scores = new Float64Array(entryCount);
+    let wq = 0;
+    let anyScore = false;
+    for (const [h, fQ] of qFreq) {
       const postings = this.lineIndex.get(h);
-      if (!postings || postings.total > HOT_POSTING_VOTE_SKIP) continue;
+      const df = postings ? postings.df : 0;
+      const w = Math.log(1 + (entryCount + 1) / (df + 1));
+      wq += w * fQ;
+      if (!postings) continue;
       for (let p = 0; p < postings.entries.length; p++) {
-        const entryIdx = postings.entries[p]!;
-        const candidate = this.entries[entryIdx];
+        const item = postings.entries[p]!;
+        const candidate = this.entries[item.entryIdx];
         if (!candidate || !isEligibleBase(candidate)) continue;
-        votes[entryIdx]! += 1;
-        anyVote = true;
+        scores[item.entryIdx]! += w * Math.min(fQ, item.freq);
+        anyScore = true;
       }
     }
 
-    if (anyVote) {
-      let bestEntryIdx = -1;
-      let bestVotes = 0;
-      for (let idx = 0; idx < votes.length; idx++) {
-        const count = votes[idx]!;
-        if (count > bestVotes) {
-          bestVotes = count;
-          bestEntryIdx = idx;
+    if (anyScore && wq > 0) {
+      interface DeltaCandidate {
+        readonly entryIdx: number;
+        readonly score: number;
+        readonly wholeEligible: boolean;
+        readonly subWindowEligible: boolean;
+      }
+      const candidates: DeltaCandidate[] = [];
+      const minNecessaryScore = 0.29 * wq;
+      for (let idx = entryCount - 1; idx >= 0; idx--) {
+        const s = scores[idx]!;
+        if (s < minNecessaryScore) continue;
+        const base = this.entries[idx]!;
+        let we = 0;
+        for (const [h, fE] of base.lineFreq) {
+          const df = this.lineIndex.get(h)?.df ?? 1;
+          we += Math.log(1 + (entryCount + 1) / (df + 1)) * fE;
+        }
+        const symSim = wq + we > 0 ? (2 * s) / (wq + we) : 0;
+        const containSim = s / wq;
+        const lenRatio = prep.lines.length / Math.max(1, base.lines.length);
+        const wholeEligible = symSim >= 0.45 || (containSim >= 0.55 && lenRatio >= 0.55 && lenRatio <= 1.8);
+        const subWindowEligible = prep.lines.length < 0.60 * base.lines.length && containSim >= 0.55;
+        if (wholeEligible || subWindowEligible) {
+          candidates.push({ entryIdx: idx, score: s, wholeEligible, subWindowEligible });
         }
       }
-      if (bestEntryIdx >= 0) {
-        const base = this.entries[bestEntryIdx]!;
-        if (bestVotes >= Math.max(prep.lines.length, base.lines.length) * 0.45) {
-          const delta = formatUnifiedDelta(base, prep);
-          if (
-            delta &&
-            rawText.length - delta.text.length >= (delta.exactBodyMatch ? 200 : 400) &&
-            (delta.exactBodyMatch || delta.text.length <= rawText.length * 0.55)
-          ) {
-            return {
+
+      candidates.sort((a, b) => b.score - a.score || b.entryIdx - a.entryIdx);
+      let bestResult: CasiResult | null = null;
+      const topLimit = Math.min(TOP_DELTA_CANDIDATES, candidates.length);
+      for (let k = 0; k < topLimit; k++) {
+        const cand = candidates[k]!;
+        const base = this.entries[cand.entryIdx]!;
+        const delta = cand.wholeEligible
+          ? formatUnifiedDelta(base, prep)
+          : cand.subWindowEligible
+            ? trySubWindowDelta(base, prep, qFreq)
+            : null;
+        if (!delta) continue;
+        const saved = rawText.length - delta.text.length;
+        const minSaved = delta.exactBodyMatch ? 200 : 400;
+        if (saved >= minSaved && (delta.exactBodyMatch || delta.text.length <= rawText.length * 0.55)) {
+          if (!bestResult || delta.text.length < bestResult.text.length) {
+            bestResult = {
               text: delta.text,
               changed: true,
               kind: delta.exactBodyMatch ? 'exact_dup' : 'delta',
               baseRefId: base.refId,
-              savedChars: rawText.length - delta.text.length,
+              savedChars: saved,
               savedTokens: estimateSavedTokens(rawText, delta.text),
             };
           }
         }
+      }
+      if (bestResult) {
+        return bestResult;
       }
     }
 

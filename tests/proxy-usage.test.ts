@@ -2883,7 +2883,7 @@ describe('proxy usage extraction', () => {
       expect(res.status).toBe(413);
       expect(upstreamCalls).toBe(0);
       expect(captured?.status).toBe(413);
-      expect(captured?.info?.compressed).toBe(true);
+      expect(captured?.info?.compressed).toBe(false);
       expect(captured?.info?.serializedRequestBytes).toBeGreaterThan(1);
       expect(captured?.info?.sizeLimitOutcome).toBe('rejected');
     } finally {

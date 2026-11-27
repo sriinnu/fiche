@@ -797,7 +797,7 @@ function resolvedCliVersion(): string {
       : typeof __INKLING_VERSION__ === 'string'
         ? __INKLING_VERSION__
         : undefined;
-  return injected ?? process.env.npm_package_version ?? '0.19.0';
+  return injected ?? process.env.npm_package_version ?? '0.20.0';
 }
 
 function printVersion(): void {
@@ -2541,7 +2541,9 @@ async function main(): Promise<void> {
     let statsHttpError: string | undefined;
     const statsQs = sessionKey ? `?sessionKey=${encodeURIComponent(sessionKey)}` : '';
     try {
+      const controlToken = readExistingWarpToken();
       const res = await fetch(`http://127.0.0.1:${port}/api/mmu/stats${statsQs}`, {
+        ...(controlToken ? { headers: { 'x-fiche-control-token': controlToken } } : {}),
         signal: AbortSignal.timeout(400),
       });
       if (res.ok) {
@@ -2810,29 +2812,39 @@ async function main(): Promise<void> {
     (readBrandEnv('DASHBOARD_ALLOW_PRIVATE') ?? '').trim(),
   );
   const warpTokenDir = resolveWarpTokenDir();
+  const warpTokenPath = path.join(warpTokenDir, 'warp-token');
   let cachedWarpTokenDigest: Buffer | undefined;
   let cachedWarpTokenMtimeMs = -1;
+  const primeWarpTokenCache = (): void => {
+    const expected = loadOrCreateWarpToken(warpTokenDir);
+    cachedWarpTokenDigest = crypto.createHash('sha256').update(expected, 'utf8').digest();
+    try {
+      cachedWarpTokenMtimeMs = fs.statSync(warpTokenPath).mtimeMs;
+    } catch {
+      cachedWarpTokenMtimeMs = Date.now();
+    }
+  };
+  try {
+    primeWarpTokenCache();
+  } catch {
+    // Best-effort eager init so non-warp installs still have ~/.fiche/warp-token;
+    // verifyWarpAuthHeader retries lazily if startup filesystem access failed.
+  }
   const verifyWarpAuthHeader = (presented: string | string[] | undefined): boolean => {
     if (typeof presented !== 'string') return false;
     const trimmed = presented.trim();
     if (!trimmed) return false;
-    const tokenPath = path.join(warpTokenDir, 'warp-token');
     try {
       let currentMtime = -1;
       try {
-        currentMtime = fs.statSync(tokenPath).mtimeMs;
+        currentMtime = fs.statSync(warpTokenPath).mtimeMs;
       } catch {
         currentMtime = -1;
       }
       if (!cachedWarpTokenDigest || currentMtime !== cachedWarpTokenMtimeMs) {
-        const expected = loadOrCreateWarpToken(warpTokenDir);
-        cachedWarpTokenDigest = crypto.createHash('sha256').update(expected, 'utf8').digest();
-        try {
-          cachedWarpTokenMtimeMs = fs.statSync(tokenPath).mtimeMs;
-        } catch {
-          cachedWarpTokenMtimeMs = Date.now();
-        }
+        primeWarpTokenCache();
       }
+      if (!cachedWarpTokenDigest) return false;
       const actualDigest = crypto.createHash('sha256').update(trimmed, 'utf8').digest();
       return crypto.timingSafeEqual(actualDigest, cachedWarpTokenDigest);
     } catch {

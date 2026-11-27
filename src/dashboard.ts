@@ -665,7 +665,7 @@ function gptEff(args: {
 declare const __FICHE_VERSION__: string | undefined;
 
 function defaultDashboardVersion(): string {
-  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.19.0';
+  return typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.20.0';
 }
 
 export interface DashboardHooks {
@@ -2346,7 +2346,7 @@ export class DashboardState {
               saved_usd: round4(prev.saved_usd + savedUsd),
               cliff_avoided_events: prev.cliff_avoided_events + t.cliffAvoidedEvents,
               cliff_saved_usd: round4(prev.cliff_saved_usd + t.cliffSavedUsd),
-              priced: nextUsdPriced > 0,
+              priced: priceMode() !== 'kosha' || nextUsdUnpriced === 0 || nextUsdPriced > 0,
               usd_priced_requests: nextUsdPriced,
               usd_unpriced_requests: nextUsdUnpriced,
             };
@@ -2364,7 +2364,7 @@ export class DashboardState {
               saved_usd: savedUsd,
               cliff_avoided_events: t.cliffAvoidedEvents,
               cliff_saved_usd: round4(t.cliffSavedUsd),
-              priced: t.usdPricedRequests > 0,
+              priced: priceMode() !== 'kosha' || t.usdUnpricedRequests === 0 || t.usdPricedRequests > 0,
               usd_priced_requests: t.usdPricedRequests,
               usd_unpriced_requests: t.usdUnpricedRequests,
             };
@@ -2559,11 +2559,18 @@ export class DashboardState {
     }
   }
 
+  private eventLogStatSig(eventsFile: string): string | null {
+    const rotated = this.statSig(`${eventsFile}.1`);
+    const active = this.statSig(eventsFile);
+    if (!rotated && !active) return null;
+    return `${rotated ?? 'missing'}|${active ?? 'missing'}`;
+  }
+
   private async loadSessionsAggregate(): Promise<AggregateResult> {
     if (!this.paths) {
       return { sessions: new Map(), sidecarsBySession: new Map() };
     }
-    const evSig = this.statSig(this.paths.eventsFile) ?? 'missing';
+    const evSig = this.eventLogStatSig(this.paths.eventsFile) ?? 'missing';
     const scSig = this.statSig(this.paths.sidecarDir) ?? 'missing';
     const sig = `${evSig}|${scSig}`;
     if (this.apiSessionsCache && this.apiSessionsCache.sig === sig) {
@@ -2576,7 +2583,7 @@ export class DashboardState {
     this.apiSessionsInFlight = { sig, promise: p };
     try {
       const result = await p;
-      const afterEvSig = this.statSig(this.paths.eventsFile) ?? 'missing';
+      const afterEvSig = this.eventLogStatSig(this.paths.eventsFile) ?? 'missing';
       const afterScSig = this.statSig(this.paths.sidecarDir) ?? 'missing';
       if (`${afterEvSig}|${afterScSig}` === sig && evSig !== 'missing') {
         this.apiSessionsCache = { sig, result };
@@ -2610,7 +2617,7 @@ export class DashboardState {
    *  former `inkling stats` CLI. */
   async serveApiStats(): Promise<Response> {
     if (!this.paths) return notConfigured('stats');
-    const sig = this.statSig(this.paths.eventsFile);
+    const sig = this.eventLogStatSig(this.paths.eventsFile);
     if (!sig) {
       this.apiStatsCache = null;
       return jsonResponse({
@@ -2649,7 +2656,7 @@ export class DashboardState {
           path: this.paths.eventsFile,
         }, 404);
       }
-      if (this.statSig(this.paths.eventsFile) === sig) {
+      if (this.eventLogStatSig(this.paths.eventsFile) === sig) {
         this.apiStatsCache = { sig, body };
       }
       return jsonResponse(body);
@@ -2880,22 +2887,36 @@ export class DashboardState {
   }
 
   /** GET /api/mmu/stats — Context-MMU counters & bounded page summaries. */
-  serveMmuStats(sessionKey?: string): Response {
+  serveMmuStats(
+    sessionKey?: string,
+    opts?: { controlTokenAuthorized?: boolean; hasControlTokenHeader?: boolean },
+  ): Response {
     if (sessionKey !== undefined && !sessionKey.trim()) {
       return mmuJsonResponse({ error: 'sessionKey must be a non-empty string' }, 400);
     }
+    if (opts?.hasControlTokenHeader && opts?.controlTokenAuthorized !== true) {
+      return mmuJsonResponse({ error: 'invalid x-fiche-control-token' }, 403);
+    }
     const store = getGlobalMmuStore();
     const sk = sessionKey?.trim();
-    const pages = store.listPages(sk);
-    const safePages = pages.slice(0, 50).map((p) => {
-      if (sk) return p;
-      const { factTokens: _omitted, ...rest } = p;
-      return rest;
-    });
+    const authorized = opts?.controlTokenAuthorized === true;
+    const allPages = store.listPages(sk);
+    if (!authorized && !sk) {
+      return mmuJsonResponse({
+        stats: store.getStats(),
+        pageCount: allPages.length,
+        pages: [],
+        scoped: false,
+        limits: store.getLimits(),
+        prefixTape: getGlobalPrefixTape().getStats(),
+      });
+    }
+    const safePages = allPages.slice(0, 50);
     return mmuJsonResponse({
       stats: store.getStats(),
-      pageCount: pages.length,
+      pageCount: allPages.length,
       pages: safePages,
+      scoped: true,
       limits: store.getLimits(),
       prefixTape: getGlobalPrefixTape().getStats(),
     });
@@ -3281,6 +3302,17 @@ function readControlTokenHeader(
   return undefined;
 }
 
+function resolveMmuAuth(
+  dashboard: DashboardState,
+  options?: DashboardDispatchOptions,
+): { controlTokenAuthorized: boolean; hasControlTokenHeader: boolean } {
+  const presentedToken = readControlTokenHeader(options?.headers);
+  const hasControlTokenHeader = typeof presentedToken === 'string' && presentedToken.trim().length > 0;
+  const controlTokenAuthorized =
+    options?.controlTokenAuthorized === true || dashboard.verifyControlToken(presentedToken);
+  return { controlTokenAuthorized, hasControlTokenHeader };
+}
+
 /** Dispatch a matched DashboardRoute to its handler. Returns `405` on `/api/*`
  *  and `/proxy-*` method mismatches so non-GET calls never leak to upstream. */
 export async function dispatchDashboard(
@@ -3371,18 +3403,13 @@ export async function dispatchDashboard(
       return dashboard.handleShutdown();
     case 'api-mmu-stats':
       if (method !== 'GET') return methodNotAllowed('GET');
-      return dashboard.serveMmuStats(url.searchParams.has('sessionKey') ? url.searchParams.get('sessionKey')! : undefined);
-    case 'api-mmu-page': {
+      return dashboard.serveMmuStats(
+        url.searchParams.has('sessionKey') ? url.searchParams.get('sessionKey')! : undefined,
+        resolveMmuAuth(dashboard, options),
+      );
+    case 'api-mmu-page':
       if (method !== 'GET') return methodNotAllowed('GET');
-      const presentedToken = readControlTokenHeader(options?.headers);
-      const hasControlTokenHeader = typeof presentedToken === 'string' && presentedToken.trim().length > 0;
-      const controlTokenAuthorized =
-        options?.controlTokenAuthorized === true || dashboard.verifyControlToken(presentedToken);
-      return dashboard.serveMmuPage(url.searchParams, {
-        controlTokenAuthorized,
-        hasControlTokenHeader,
-      });
-    }
+      return dashboard.serveMmuPage(url.searchParams, resolveMmuAuth(dashboard, options));
     case 'api-calibration':
       if (method !== 'GET') return methodNotAllowed('GET');
       return dashboard.serveCalibration();

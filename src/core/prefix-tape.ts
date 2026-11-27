@@ -16,6 +16,7 @@ const DEFAULT_MAX_SEALS_PER_SESSION = 512;
 const DEFAULT_MAX_SEAL_CHARS = 16 * 1024 * 1024;
 const DEFAULT_MAX_CASI_ENTRIES = 1024;
 const DEFAULT_MAX_CASI_CHARS = 8 * 1024 * 1024;
+const DEFAULT_MAX_CASI_SNAPSHOTS = 24;
 
 export const INITIAL_PREFIX_HASH = '0000000000000000';
 
@@ -67,6 +68,7 @@ export interface PrefixTapeStats {
   readonly casiChars: number;
   readonly casiHits: number;
   readonly casiMisses: number;
+  readonly casiSnapshots: number;
 }
 
 export interface PrefixMemoTapeOptions {
@@ -77,6 +79,7 @@ export interface PrefixMemoTapeOptions {
   readonly maxSealChars?: number;
   readonly maxCasiEntries?: number;
   readonly maxCasiChars?: number;
+  readonly maxCasiSnapshots?: number;
 }
 
 export class PrefixMemoTape {
@@ -87,6 +90,7 @@ export class PrefixMemoTape {
   private readonly maxSealChars: number;
   private readonly maxCasiEntries: number;
   private readonly maxCasiChars: number;
+  private readonly maxCasiSnapshots: number;
 
   private readonly stage2Map = new Map<string, Stage2MemoEntry>();
   private stage2Chars = 0;
@@ -103,6 +107,8 @@ export class PrefixMemoTape {
   private casiHits = 0;
   private casiMisses = 0;
 
+  private readonly casiSnapshots = new Map<string, unknown>();
+
   constructor(opts: PrefixMemoTapeOptions = {}) {
     this.maxStage2Entries = Math.max(1, opts.maxStage2Entries ?? DEFAULT_MAX_STAGE2_ENTRIES);
     this.maxStage2Chars = Math.max(0, opts.maxStage2Chars ?? DEFAULT_MAX_STAGE2_CHARS);
@@ -111,6 +117,7 @@ export class PrefixMemoTape {
     this.maxSealChars = Math.max(0, opts.maxSealChars ?? DEFAULT_MAX_SEAL_CHARS);
     this.maxCasiEntries = Math.max(1, opts.maxCasiEntries ?? DEFAULT_MAX_CASI_ENTRIES);
     this.maxCasiChars = Math.max(0, opts.maxCasiChars ?? DEFAULT_MAX_CASI_CHARS);
+    this.maxCasiSnapshots = Math.max(1, opts.maxCasiSnapshots ?? DEFAULT_MAX_CASI_SNAPSHOTS);
   }
 
   private normalizeSession(rawSession: string | undefined): string {
@@ -142,11 +149,13 @@ export class PrefixMemoTape {
       this.stage2Chars -= existing.text.length;
       this.stage2Map.delete(key);
     }
-    if (entry.text.length > this.maxStage2Chars) {
+    // Zero-copy unchanged memo sentinel: callers skip .text when !entry.changed.
+    const storedText = entry.changed ? entry.text : '';
+    if (storedText.length > this.maxStage2Chars) {
       return;
     }
     const stored: Stage2MemoEntry = {
-      text: entry.text,
+      text: storedText,
       changed: entry.changed,
       stages: [...entry.stages],
     };
@@ -211,13 +220,18 @@ export class PrefixMemoTape {
       }
     }
 
+    const existing = sess.get(slotSig);
+    if (!existing && sess.size >= this.maxSealsPerSession) {
+      // Head-retaining cap: never evict earliest sealed prefix slots (`epoch_0`),
+      // because mutating early prefix bytes busts the upstream prompt cache.
+      return;
+    }
     const stored: CommittedSlotSeal = {
       text: seal.text,
       stages: [...seal.stages],
       kind: seal.kind,
       rawLen: seal.rawLen,
     };
-    const existing = sess.get(slotSig);
     if (existing) {
       this.sealChars -= existing.text.length;
       sess.delete(slotSig);
@@ -226,23 +240,16 @@ export class PrefixMemoTape {
     }
     sess.set(slotSig, stored);
     this.sealChars += stored.text.length;
-    while (sess.size > this.maxSealsPerSession) {
-      const oldestSig = sess.keys().next().value;
-      if (oldestSig === undefined) break;
-      const oldestSeal = sess.get(oldestSig);
-      if (oldestSeal) this.sealChars -= oldestSeal.text.length;
-      sess.delete(oldestSig);
-      this.totalSeals--;
-    }
     while (this.sealChars > this.maxSealChars && this.sealSessions.size > 0) {
       const oldestSession = this.sealSessions.keys().next().value;
       if (oldestSession === undefined) break;
       if (oldestSession === norm && sess.size > 1) {
-        const oldestSig = sess.keys().next().value;
-        if (oldestSig === undefined) break;
-        const oldestSeal = sess.get(oldestSig);
-        if (oldestSeal) this.sealChars -= oldestSeal.text.length;
-        sess.delete(oldestSig);
+        let lastSig: string | undefined;
+        for (const k of sess.keys()) lastSig = k;
+        if (lastSig === undefined) break;
+        const lastSeal = sess.get(lastSig);
+        if (lastSeal) this.sealChars -= lastSeal.text.length;
+        sess.delete(lastSig);
         this.totalSeals--;
       } else {
         const oldestMap = this.sealSessions.get(oldestSession);
@@ -295,11 +302,13 @@ export class PrefixMemoTape {
       this.casiChars -= existing.text.length;
       this.casiMap.delete(key);
     }
-    if (entry.text.length > this.maxCasiChars) {
+    // Zero-copy unchanged memo sentinel: callers read original text when !entry.changed.
+    const storedText = entry.changed ? entry.text : '';
+    if (storedText.length > this.maxCasiChars) {
       return;
     }
     const stored: CasiMemoEntry = {
-      text: entry.text,
+      text: storedText,
       changed: entry.changed,
       kind: entry.kind,
     };
@@ -317,7 +326,29 @@ export class PrefixMemoTape {
     }
   }
 
-  /** Return exact counters and sizes across all three memo subsystems. */
+  /** Move-on-hit transfer of an opaque CASI index snapshot keyed by prefix state. */
+  takeCasiSnapshot<T>(stateKey: string): T | undefined {
+    const snapshot = this.casiSnapshots.get(stateKey);
+    if (snapshot === undefined) return undefined;
+    this.casiSnapshots.delete(stateKey);
+    return snapshot as T;
+  }
+
+  /** Store an opaque CASI index snapshot under a bounded LRU cap (default 24). */
+  putCasiSnapshot(stateKey: string, snapshot: unknown): void {
+    if (snapshot === undefined) return;
+    if (this.casiSnapshots.has(stateKey)) {
+      this.casiSnapshots.delete(stateKey);
+    }
+    while (this.casiSnapshots.size >= this.maxCasiSnapshots) {
+      const oldestKey = this.casiSnapshots.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.casiSnapshots.delete(oldestKey);
+    }
+    this.casiSnapshots.set(stateKey, snapshot);
+  }
+
+  /** Return exact counters and sizes across all memo subsystems. */
   getStats(): PrefixTapeStats {
     return {
       stage2Entries: this.stage2Map.size,
@@ -332,10 +363,11 @@ export class PrefixMemoTape {
       casiChars: this.casiChars,
       casiHits: this.casiHits,
       casiMisses: this.casiMisses,
+      casiSnapshots: this.casiSnapshots.size,
     };
   }
 
-  /** Clear all cached entries, seals, and hit/miss counters. */
+  /** Clear all cached entries, seals, snapshots, and hit/miss counters. */
   reset(): void {
     this.stage2Map.clear();
     this.stage2Chars = 0;
@@ -349,6 +381,7 @@ export class PrefixMemoTape {
     this.casiChars = 0;
     this.casiHits = 0;
     this.casiMisses = 0;
+    this.casiSnapshots.clear();
   }
 }
 

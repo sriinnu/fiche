@@ -6,6 +6,7 @@
  */
 
 import { readBrandEnv } from './env.js';
+import { ANTHROPIC_PATCH_PX, visionTokens, type VisionPricing } from './vision-cost.js';
 import {
   ATLAS_CELL_W,
   ATLAS_CELL_H,
@@ -1552,6 +1553,113 @@ export interface RenderDensePagesOptions {
   readonly style?: RenderStyle;
   /** Max page height in px. Default MAX_HEIGHT_PX. */
   readonly maxHeightPx?: number;
+  /** Optional vision pricing for single-page patch-grid column optimization when reflow=true. */
+  readonly pricing?: VisionPricing;
+}
+
+const OPENAI_PATCH_PX = 32;
+
+/**
+ * Discrete O(maxW/P) width solver for patch-billed regimes (`patch28` and `patch`).
+ * Finds `c_k <= maxCols` aligned to patch boundaries `k * P` that minimizes
+ * `visionTokens(pricing, w, h)` for a single-page reflowed payload without ever
+ * exceeding the baseline cost at `maxCols`. Untouched for `flat`/`tile`/`mpix`.
+ */
+export function optimizePatchCols(
+  visualCells: number,
+  maxCols: number,
+  cellW: number,
+  cellH: number,
+  pricing: VisionPricing,
+  maxHeightPx?: number,
+): number {
+  const safeMaxCols = Math.max(1, Math.floor(maxCols));
+  const regime = pricing.vision.regime;
+  if (regime !== 'patch28' && regime !== 'patch') return safeMaxCols;
+  if (
+    !Number.isFinite(visualCells) ||
+    visualCells <= 0 ||
+    safeMaxCols <= 1 ||
+    !Number.isFinite(cellW) ||
+    cellW <= 0 ||
+    !Number.isFinite(cellH) ||
+    cellH <= 0
+  ) {
+    return safeMaxCols;
+  }
+
+  const patchPx = regime === 'patch28' ? ANTHROPIC_PATCH_PX : OPENAI_PATCH_PX;
+  const maxW = 2 * PAD_X + safeMaxCols * cellW;
+  const maxLines =
+    maxHeightPx !== undefined && Number.isFinite(maxHeightPx) && maxHeightPx > 2 * PAD_Y
+      ? Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH))
+      : undefined;
+
+  const evalCols = (c: number): number => {
+    const rows = Math.max(1, Math.ceil(visualCells / c));
+    const w = 2 * PAD_X + c * cellW;
+    const h = 2 * PAD_Y + rows * cellH;
+    return visionTokens(pricing, w, h);
+  };
+
+  let bestCols = safeMaxCols;
+  let bestTokens = evalCols(safeMaxCols);
+  const maxPatches = Math.ceil(maxW / patchPx);
+
+  for (let k = 1; k <= maxPatches; k++) {
+    const ck = Math.floor((k * patchPx - 2 * PAD_X) / cellW);
+    if (ck < 1 || ck > safeMaxCols) continue;
+    const rows = Math.max(1, Math.ceil(visualCells / ck));
+    if (maxLines !== undefined && rows > maxLines) continue;
+    const tok = evalCols(ck);
+    if (tok < bestTokens || (tok === bestTokens && ck > bestCols)) {
+      bestTokens = tok;
+      bestCols = ck;
+    }
+  }
+  return bestCols;
+}
+
+/**
+ * Resolve optimal column width for a single-page reflowed render under `patch28`
+ * or `patch` pricing; returns `maxCols` unchanged for multi-page renders or other
+ * pricing regimes.
+ */
+export function resolveSinglePagePatchCols(
+  text: string,
+  maxCols: number,
+  style: RenderStyle,
+  maxHeightPx: number,
+  pricing: VisionPricing,
+  maxCharsPerPage: number = READABLE_CHARS_PER_IMAGE,
+): number {
+  const safeMaxCols = Math.max(1, Math.floor(maxCols));
+  const regime = pricing.vision.regime;
+  if (regime !== 'patch28' && regime !== 'patch') return safeMaxCols;
+  if (!text || text.length > maxCharsPerPage) return safeMaxCols;
+
+  const cellW = renderCellWidth(style);
+  const cellH = renderCellHeight(style);
+  const maxLines = Math.max(1, Math.floor((maxHeightPx - 2 * PAD_Y) / cellH));
+  const rowsAtMax = countVisualRows(text, safeMaxCols);
+  if (rowsAtMax > maxLines) return safeMaxCols;
+
+  const markerScale = Math.max(1, Math.floor(style.markerScale ?? 1));
+  let totalVisualCells = 0;
+  for (const line of text.split('\n')) {
+    const expanded = padNewlineMarkers(expandTabsInLine(line));
+    totalVisualCells += Math.max(1, measureLineCols(expanded, markerScale, style.font));
+  }
+
+  const optCols = optimizePatchCols(totalVisualCells, safeMaxCols, cellW, cellH, pricing, maxHeightPx);
+  if (optCols >= safeMaxCols) return safeMaxCols;
+
+  const optRows = countVisualRows(text, optCols);
+  if (optRows > maxLines) return safeMaxCols;
+
+  const baseTok = visionTokens(pricing, 2 * PAD_X + safeMaxCols * cellW, 2 * PAD_Y + rowsAtMax * cellH);
+  const optTok = visionTokens(pricing, 2 * PAD_X + optCols * cellW, 2 * PAD_Y + optRows * cellH);
+  return optTok <= baseTok ? optCols : safeMaxCols;
 }
 
 /**
@@ -1576,12 +1684,15 @@ export async function renderDensePages(
   const source = opts.reflow ? reflow(text) ?? text : text;
   const maxCols = Math.max(1, (opts.cols ?? DENSE_CONTENT_COLS) | 0);
   const style = opts.style ?? DENSE_RENDER_STYLE;
-  const cols =
+  let cols =
     opts.shrink === false
       ? maxCols
       : measureContentCols(source, maxCols, style.markerScale, style.font);
   const maxChars = opts.maxCharsPerImage ?? DENSE_CONTENT_CHARS_PER_IMAGE;
   const maxHeightPx = opts.maxHeightPx ?? MAX_HEIGHT_PX;
+  if (opts.reflow && opts.shrink !== false && opts.pricing) {
+    cols = resolveSinglePagePatchCols(source, cols, style, maxHeightPx, opts.pricing, maxChars);
+  }
   return renderTextToPngsWithCharLimit(source, cols, maxChars, style, maxHeightPx);
 }
 

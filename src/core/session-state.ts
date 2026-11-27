@@ -122,6 +122,7 @@ const FOLDED_EPISODE_IDS_MAX = 256;
 const LIVENESS_SCOPES_MAX = 16;
 
 export type OpticalHistoryPolicy = 'hybrid' | 'full';
+export type CacheCircuitBreakerState = 'closed' | 'open' | 'half_open';
 
 export interface CacheHealthSample {
   readonly hitRatio: number;
@@ -129,11 +130,14 @@ export interface CacheHealthSample {
 }
 
 const CACHE_HEALTH_WINDOW_MAX = 5;
-const CACHE_BREAKER_TRIGGER_WROTE_1H = 3;
-const CACHE_BREAKER_TRIGGER_MEAN_RATIO = 0.70;
-const CACHE_BREAKER_OPEN_TURNS = 10;
-const CACHE_BREAKER_RECOVER_RATIO = 0.85;
-const CACHE_BREAKER_RECOVER_STREAK = 2;
+const CACHE_BREAKER_MAX_TURNS = 32;
+const CACHE_BREAKER_COLD_MIN_TOKENS = 1024;
+const CACHE_BREAKER_CUSUM_DRIFT = 0.12;
+const CACHE_BREAKER_CUSUM_ALARM = 0.50;
+const CACHE_BREAKER_REGRET_ALARM = 1.80;
+const CACHE_BREAKER_REGRET_DECAY = 0.70;
+const CACHE_BREAKER_INTERTURN_MIN_SEC = 1;
+const CACHE_BREAKER_INTERTURN_MAX_SEC = 86_400;
 
 export interface SessionLivenessScopeOpts {
   readonly nowMs?: number;
@@ -142,6 +146,8 @@ export interface SessionLivenessScopeOpts {
   readonly systemSha8?: string;
   readonly scope?: string;
 }
+
+export type SessionScopeOptions = SessionLivenessScopeOpts;
 
 interface ScopedLivenessRecord {
   lastSeenMs: number;
@@ -154,6 +160,16 @@ interface ScopedLivenessRecord {
   opticalHistoryPolicy?: OpticalHistoryPolicy;
   recentCacheWindow?: CacheHealthSample[];
   circuitBreakerTurnsLeft?: number;
+  prevPromptTokens?: number;
+  cusum?: number;
+  ewmaRegret?: number;
+  ewmaHitRatio?: number;
+  breakerState?: 0 | 1 | 2;
+  breakerTurnsLeft?: number;
+  breakerTripCount?: number;
+  cleanStreak?: number;
+  ewmaInterTurnSec?: number;
+  lastTurnTsMs?: number;
 }
 
 interface SessionRecord extends ScopedLivenessRecord {
@@ -346,7 +362,66 @@ function sanitizeCacheWindow(raw: unknown): CacheHealthSample[] | undefined {
 
 function sanitizeBreakerTurns(raw: unknown): number | undefined {
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined;
-  return Math.min(CACHE_BREAKER_OPEN_TURNS, Math.floor(raw));
+  return Math.min(CACHE_BREAKER_MAX_TURNS, Math.floor(raw));
+}
+
+function sanitizeFiniteNonNeg(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
+}
+
+function sanitizeScopedHealthFields(src: Partial<ScopedLivenessRecord>, dst: ScopedLivenessRecord): void {
+  const win = sanitizeCacheWindow(src.recentCacheWindow);
+  if (win) dst.recentCacheWindow = win;
+  const legacyTurns = sanitizeBreakerTurns(src.circuitBreakerTurnsLeft);
+  if (legacyTurns !== undefined) dst.circuitBreakerTurnsLeft = legacyTurns;
+
+  const prevPrompt = sanitizeFiniteNonNeg(src.prevPromptTokens);
+  if (prevPrompt !== undefined) dst.prevPromptTokens = Math.floor(prevPrompt);
+  const cusum = sanitizeFiniteNonNeg(src.cusum);
+  if (cusum !== undefined) dst.cusum = cusum;
+  const regret = sanitizeFiniteNonNeg(src.ewmaRegret);
+  if (regret !== undefined) dst.ewmaRegret = regret;
+  if (typeof src.ewmaHitRatio === 'number' && Number.isFinite(src.ewmaHitRatio) && src.ewmaHitRatio >= 0 && src.ewmaHitRatio <= 1) {
+    dst.ewmaHitRatio = src.ewmaHitRatio;
+  }
+  if (src.breakerState === 0 || src.breakerState === 1 || src.breakerState === 2) {
+    dst.breakerState = src.breakerState;
+  }
+  const turnsLeft = sanitizeFiniteNonNeg(src.breakerTurnsLeft);
+  if (turnsLeft !== undefined) dst.breakerTurnsLeft = Math.min(CACHE_BREAKER_MAX_TURNS, Math.floor(turnsLeft));
+  const tripCount = sanitizeFiniteNonNeg(src.breakerTripCount);
+  if (tripCount !== undefined) dst.breakerTripCount = Math.min(4, Math.floor(tripCount));
+  const cleanStreak = sanitizeFiniteNonNeg(src.cleanStreak);
+  if (cleanStreak !== undefined) dst.cleanStreak = Math.floor(cleanStreak);
+  if (typeof src.ewmaInterTurnSec === 'number' && Number.isFinite(src.ewmaInterTurnSec) && src.ewmaInterTurnSec > 0) {
+    dst.ewmaInterTurnSec = Math.min(CACHE_BREAKER_INTERTURN_MAX_SEC, Math.max(CACHE_BREAKER_INTERTURN_MIN_SEC, src.ewmaInterTurnSec));
+  }
+  if (typeof src.lastTurnTsMs === 'number' && Number.isFinite(src.lastTurnTsMs) && src.lastTurnTsMs > 0) {
+    dst.lastTurnTsMs = src.lastTurnTsMs;
+  }
+  if (dst.breakerState === undefined && legacyTurns !== undefined && legacyTurns > 0) {
+    dst.breakerState = 1;
+    dst.breakerTurnsLeft = dst.breakerTurnsLeft ?? legacyTurns;
+  }
+}
+
+function serializeScopedHealthFields(src: ScopedLivenessRecord, dst: ScopedLivenessRecord): void {
+  if (src.recentCacheWindow && src.recentCacheWindow.length > 0) {
+    dst.recentCacheWindow = src.recentCacheWindow.slice(-CACHE_HEALTH_WINDOW_MAX);
+  }
+  if ((src.circuitBreakerTurnsLeft ?? 0) > 0) {
+    dst.circuitBreakerTurnsLeft = src.circuitBreakerTurnsLeft;
+  }
+  if (src.prevPromptTokens !== undefined) dst.prevPromptTokens = src.prevPromptTokens;
+  if (src.cusum !== undefined && src.cusum > 0) dst.cusum = src.cusum;
+  if (src.ewmaRegret !== undefined && src.ewmaRegret > 0) dst.ewmaRegret = src.ewmaRegret;
+  if (src.ewmaHitRatio !== undefined) dst.ewmaHitRatio = src.ewmaHitRatio;
+  if (src.breakerState !== undefined && src.breakerState !== 0) dst.breakerState = src.breakerState;
+  if ((src.breakerTurnsLeft ?? 0) > 0) dst.breakerTurnsLeft = src.breakerTurnsLeft;
+  if ((src.breakerTripCount ?? 0) > 0) dst.breakerTripCount = src.breakerTripCount;
+  if ((src.cleanStreak ?? 0) > 0) dst.cleanStreak = src.cleanStreak;
+  if (src.ewmaInterTurnSec !== undefined) dst.ewmaInterTurnSec = src.ewmaInterTurnSec;
+  if (src.lastTurnTsMs !== undefined) dst.lastTurnTsMs = src.lastTurnTsMs;
 }
 
 function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
@@ -385,10 +460,7 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
   if (e.opticalHistoryPolicy === 'hybrid' || e.opticalHistoryPolicy === 'full') {
     rec.opticalHistoryPolicy = e.opticalHistoryPolicy;
   }
-  const topWin = sanitizeCacheWindow(e.recentCacheWindow);
-  if (topWin) rec.recentCacheWindow = topWin;
-  const topBreaker = sanitizeBreakerTurns(e.circuitBreakerTurnsLeft);
-  if (topBreaker !== undefined) rec.circuitBreakerTurnsLeft = topBreaker;
+  sanitizeScopedHealthFields(e, rec);
   if (typeof e.primaryScope === 'string' && e.primaryScope) {
     rec.primaryScope = e.primaryScope;
   }
@@ -415,10 +487,7 @@ function validRecord(entry: unknown, nowMs: number): SessionRecord | undefined {
       if (sr.opticalHistoryPolicy === 'hybrid' || sr.opticalHistoryPolicy === 'full') {
         cleanScope.opticalHistoryPolicy = sr.opticalHistoryPolicy;
       }
-      const scopeWin = sanitizeCacheWindow(sr.recentCacheWindow);
-      if (scopeWin) cleanScope.recentCacheWindow = scopeWin;
-      const scopeBreaker = sanitizeBreakerTurns(sr.circuitBreakerTurnsLeft);
-      if (scopeBreaker !== undefined) cleanScope.circuitBreakerTurnsLeft = scopeBreaker;
+      sanitizeScopedHealthFields(sr, cleanScope);
       scopes[sk] = cleanScope;
       sc++;
     }
@@ -441,32 +510,23 @@ export function serializeSessionState(nowMs: number = Date.now()): string {
     if (rec.lastCacheAlive !== undefined) item.lastCacheAlive = rec.lastCacheAlive;
     if (rec.everCacheAlive !== undefined) item.everCacheAlive = rec.everCacheAlive;
     if (rec.opticalHistoryPolicy !== undefined) item.opticalHistoryPolicy = rec.opticalHistoryPolicy;
-    if (rec.recentCacheWindow && rec.recentCacheWindow.length > 0) {
-      item.recentCacheWindow = rec.recentCacheWindow.slice(-CACHE_HEALTH_WINDOW_MAX);
-    }
-    if ((rec.circuitBreakerTurnsLeft ?? 0) > 0) {
-      item.circuitBreakerTurnsLeft = rec.circuitBreakerTurnsLeft;
-    }
+    serializeScopedHealthFields(rec, item);
     if (rec.primaryScope !== undefined) item.primaryScope = rec.primaryScope;
     if (rec.livenessScopes) {
       const persistedScopes: Record<string, ScopedLivenessRecord> = {};
       let sc = 0;
       for (const [sk, sr] of Object.entries(rec.livenessScopes)) {
         if (sc >= LIVENESS_SCOPES_MAX) break;
-        persistedScopes[sk] = {
+        const ps: ScopedLivenessRecord = {
           lastSeenMs: sr.lastSeenMs,
           freezeStep: sr.freezeStep,
           cacheDead: sr.cacheDead,
           ...(sr.lastCacheAlive !== undefined ? { lastCacheAlive: sr.lastCacheAlive } : {}),
           ...(sr.everCacheAlive !== undefined ? { everCacheAlive: sr.everCacheAlive } : {}),
           ...(sr.opticalHistoryPolicy !== undefined ? { opticalHistoryPolicy: sr.opticalHistoryPolicy } : {}),
-          ...(sr.recentCacheWindow && sr.recentCacheWindow.length > 0
-            ? { recentCacheWindow: sr.recentCacheWindow.slice(-CACHE_HEALTH_WINDOW_MAX) }
-            : {}),
-          ...((sr.circuitBreakerTurnsLeft ?? 0) > 0
-            ? { circuitBreakerTurnsLeft: sr.circuitBreakerTurnsLeft }
-            : {}),
         };
+        serializeScopedHealthFields(sr, ps);
+        persistedScopes[sk] = ps;
         sc++;
       }
       if (sc > 0) item.livenessScopes = persistedScopes;
@@ -950,65 +1010,208 @@ export function noteCacheOutcome(
   scheduleSave();
 }
 
+interface NormalizedCacheHealthSample {
+  readonly cacheReadTokens: number;
+  readonly totalInputTokens: number;
+  readonly writeRate: number;
+  readonly readRate: number;
+  readonly nowMs: number;
+}
+
+function resolveBreakerState(target: ScopedLivenessRecord): CacheCircuitBreakerState {
+  if (target.breakerState === 1) return 'open';
+  if (target.breakerState === 2) return 'half_open';
+  if (target.breakerState === 0) return 'closed';
+  return (target.circuitBreakerTurnsLeft ?? 0) > 0 ? 'open' : 'closed';
+}
+
+function readScopedTarget(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): ScopedLivenessRecord | undefined {
+  if (!sessionKey) return undefined;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return undefined;
+  const scope = resolveScopeKey(opts);
+  if (scope) {
+    const scoped = rec.livenessScopes?.[scope];
+    if (scoped) return scoped;
+    if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
+      return undefined;
+    }
+  }
+  return rec;
+}
+
 function applyRollingCacheHealthToTarget(
   target: ScopedLivenessRecord,
-  hitRatio: number,
-  wrote1h: boolean,
+  sample: NormalizedCacheHealthSample,
 ): void {
-  const win = target.recentCacheWindow ? [...target.recentCacheWindow] : [];
-  win.push({ hitRatio, wrote1h });
-  if (win.length > CACHE_HEALTH_WINDOW_MAX) {
-    win.splice(0, win.length - CACHE_HEALTH_WINDOW_MAX);
-  }
-  target.recentCacheWindow = win;
+  const { cacheReadTokens, totalInputTokens, writeRate, readRate, nowMs } = sample;
 
-  const left = target.circuitBreakerTurnsLeft ?? 0;
-  if (left > 0) {
-    const tailHealthy =
-      win.length >= CACHE_BREAKER_RECOVER_STREAK &&
-      win
-        .slice(-CACHE_BREAKER_RECOVER_STREAK)
-        .every((s) => s.hitRatio >= CACHE_BREAKER_RECOVER_RATIO);
-    target.circuitBreakerTurnsLeft = tailHealthy ? 0 : Math.max(0, left - 1);
-    return;
+  if (Number.isFinite(nowMs) && nowMs > 0) {
+    if (target.lastTurnTsMs !== undefined && target.lastTurnTsMs > 0) {
+      const dtSec = Math.min(
+        CACHE_BREAKER_INTERTURN_MAX_SEC,
+        Math.max(CACHE_BREAKER_INTERTURN_MIN_SEC, (nowMs - target.lastTurnTsMs) / 1000),
+      );
+      target.ewmaInterTurnSec =
+        target.ewmaInterTurnSec === undefined
+          ? dtSec
+          : 0.7 * target.ewmaInterTurnSec + 0.3 * dtSec;
+    }
+    target.lastTurnTsMs = nowMs;
   }
 
-  let wrote1hCount = 0;
-  let ratioSum = 0;
-  for (const s of win) {
-    if (s.wrote1h) wrote1hCount++;
-    ratioSum += s.hitRatio;
+  const prevPrompt = target.prevPromptTokens;
+  let cacheable: number;
+  if (prevPrompt === undefined) {
+    if (cacheReadTokens === 0 || totalInputTokens < CACHE_BREAKER_COLD_MIN_TOKENS) {
+      target.prevPromptTokens = totalInputTokens;
+      return;
+    }
+    // Mid-session warm entry: prior prefix already existed.
+    cacheable = totalInputTokens;
+  } else {
+    if (prevPrompt < CACHE_BREAKER_COLD_MIN_TOKENS && cacheReadTokens === 0) {
+      target.prevPromptTokens = totalInputTokens;
+      return;
+    }
+    cacheable = Math.min(prevPrompt, totalInputTokens);
   }
-  const meanHitRatio = win.length > 0 ? ratioSum / win.length : 1;
-  if (wrote1hCount >= CACHE_BREAKER_TRIGGER_WROTE_1H && meanHitRatio < CACHE_BREAKER_TRIGGER_MEAN_RATIO) {
-    target.circuitBreakerTurnsLeft = CACHE_BREAKER_OPEN_TURNS;
+
+  const rho = Math.min(1, Math.max(0, cacheReadTokens / Math.max(1, cacheable)));
+  const loss = 1 - rho;
+  const wasted = loss * cacheable;
+  target.ewmaHitRatio = target.ewmaHitRatio === undefined ? rho : 0.75 * target.ewmaHitRatio + 0.25 * rho;
+
+  const state: 0 | 1 | 2 =
+    target.breakerState ?? ((target.circuitBreakerTurnsLeft ?? 0) > 0 ? 1 : 0);
+  let tripCount = target.breakerTripCount ?? 0;
+
+  if (state === 0) {
+    const cusum = Math.max(0, (target.cusum ?? 0) + (loss - CACHE_BREAKER_CUSUM_DRIFT));
+    const x =
+      loss *
+      Math.min(2.5, wasted / 8000) *
+      Math.max(0.25, (writeRate - readRate) / 1.15);
+    const ewmaRegret = CACHE_BREAKER_REGRET_DECAY * (target.ewmaRegret ?? 0) + x;
+    if (cusum >= CACHE_BREAKER_CUSUM_ALARM || ewmaRegret >= CACHE_BREAKER_REGRET_ALARM) {
+      tripCount = Math.min(4, tripCount + 1);
+      const turnsLeft = Math.min(CACHE_BREAKER_MAX_TURNS, 4 << (tripCount - 1));
+      target.breakerState = 1;
+      target.breakerTripCount = tripCount;
+      target.breakerTurnsLeft = turnsLeft;
+      target.circuitBreakerTurnsLeft = turnsLeft;
+      target.cusum = 0;
+      target.ewmaRegret = 0;
+      target.cleanStreak = 0;
+    } else {
+      target.breakerState = 0;
+      target.cusum = cusum;
+      target.ewmaRegret = ewmaRegret;
+    }
+  } else if (state === 1) {
+    const curTurns = target.breakerTurnsLeft ?? target.circuitBreakerTurnsLeft ?? 0;
+    const turnsLeft = Math.max(0, curTurns - 1);
+    const cleanStreak = loss <= 0.05 ? (target.cleanStreak ?? 0) + 1 : 0;
+    if (turnsLeft <= 0 || cleanStreak >= 2) {
+      target.breakerState = 2;
+      target.breakerTurnsLeft = 0;
+      target.circuitBreakerTurnsLeft = 0;
+      target.cleanStreak = 0;
+      target.cusum = 0;
+      target.ewmaRegret = 0;
+    } else {
+      target.breakerState = 1;
+      target.breakerTurnsLeft = turnsLeft;
+      target.circuitBreakerTurnsLeft = turnsLeft;
+      target.cleanStreak = cleanStreak;
+    }
+  } else {
+    if (loss > 0.20) {
+      tripCount = Math.min(4, tripCount + 1);
+      const turnsLeft = Math.min(CACHE_BREAKER_MAX_TURNS, 4 << (tripCount - 1));
+      target.breakerState = 1;
+      target.breakerTripCount = tripCount;
+      target.breakerTurnsLeft = turnsLeft;
+      target.circuitBreakerTurnsLeft = turnsLeft;
+      target.cusum = 0;
+      target.ewmaRegret = 0;
+      target.cleanStreak = 0;
+    } else if (loss <= 0.08) {
+      const cleanStreak = (target.cleanStreak ?? 0) + 1;
+      if (cleanStreak >= 2) {
+        target.breakerState = 0;
+        target.breakerTripCount = Math.max(0, tripCount - 1);
+        target.breakerTurnsLeft = 0;
+        target.circuitBreakerTurnsLeft = 0;
+        target.cleanStreak = 0;
+        target.cusum = 0;
+        target.ewmaRegret = 0;
+      } else {
+        target.breakerState = 2;
+        target.cleanStreak = cleanStreak;
+      }
+    } else {
+      target.breakerState = 2;
+      target.cleanStreak = 0;
+    }
   }
+
+  target.prevPromptTokens = totalInputTokens;
 }
 
 /**
- * Record a turn's rolling cache hit ratio and 1h-write flag to detect repeated
- * mid-prefix 1h cache busts and open a 10-turn mutation circuit breaker.
+ * Record a turn's prompt-cache health via CUSUM + cost-weighted regret FSM
+ * to detect genuine mid-prefix cache busts without false-tripping on healthy
+ * growing 1h sessions.
  */
 export function noteRollingCacheHealth(
   sessionKey: string | undefined,
   usage: {
     cacheReadTokens?: number;
     cacheCreate1hTokens?: number;
+    cacheCreate5mTokens?: number;
     totalInputTokens?: number;
+    writeRate?: number;
+    readRate?: number;
+    nowMs?: number;
   },
   opts?: SessionLivenessScopeOpts,
 ): void {
   if (!sessionKey) return;
-  const cacheRead = Math.max(0, usage.cacheReadTokens ?? 0);
-  const wrote1hTok = Math.max(0, usage.cacheCreate1hTokens ?? 0);
-  const totalIn = Math.max(0, usage.totalInputTokens ?? 0);
-  const denom = totalIn > 0 ? Math.max(totalIn, cacheRead) : cacheRead + wrote1hTok;
-  if (denom <= 0) return;
+  if (usage.totalInputTokens !== undefined && (!Number.isFinite(usage.totalInputTokens) || usage.totalInputTokens <= 0)) {
+    return;
+  }
+  const cacheReadTokens = Math.max(0, usage.cacheReadTokens ?? 0);
+  const cc1h = Math.max(0, usage.cacheCreate1hTokens ?? 0);
+  const cc5m = Math.max(0, usage.cacheCreate5mTokens ?? 0);
+  const rawTotal = Math.max(0, usage.totalInputTokens ?? 0);
+  const totalInputTokens = rawTotal > 0 ? Math.max(rawTotal, cacheReadTokens) : cacheReadTokens + cc1h + cc5m;
+  if (totalInputTokens <= 0) return;
 
-  const hitRatio = Math.min(1, Math.max(0, cacheRead / denom));
-  const wrote1h = wrote1hTok > 0;
+  const writeRate =
+    usage.writeRate !== undefined && Number.isFinite(usage.writeRate) && usage.writeRate >= 0
+      ? usage.writeRate
+      : cc1h > 0
+        ? 2.0
+        : 1.25;
+  const readRate =
+    usage.readRate !== undefined && Number.isFinite(usage.readRate) && usage.readRate >= 0
+      ? usage.readRate
+      : 0.10;
+  const nowMs = usage.nowMs ?? opts?.nowMs ?? Date.now();
+
+  const sample: NormalizedCacheHealthSample = {
+    cacheReadTokens,
+    totalInputTokens,
+    writeRate,
+    readRate,
+    nowMs,
+  };
+
   const rec = touch(sessionKey);
-  const nowMs = opts?.nowMs ?? Date.now();
   if (rec.lastSeenMs <= 0) rec.lastSeenMs = nowMs;
 
   const scope = resolveScopeKey(opts);
@@ -1018,19 +1221,31 @@ export function noteRollingCacheHealth(
     }
     const scoped = getOrCreateScopeRecord(rec, scope);
     if (scoped.lastSeenMs <= 0) scoped.lastSeenMs = nowMs;
-    applyRollingCacheHealthToTarget(scoped, hitRatio, wrote1h);
+    applyRollingCacheHealthToTarget(scoped, sample);
     if (rec.primaryScope === scope || (!rec.primaryScope && !isAuxiliaryScope(scope))) {
-      applyRollingCacheHealthToTarget(rec, hitRatio, wrote1h);
+      applyRollingCacheHealthToTarget(rec, sample);
     }
     scheduleSave();
     return;
   }
 
-  applyRollingCacheHealthToTarget(rec, hitRatio, wrote1h);
+  applyRollingCacheHealthToTarget(rec, sample);
   if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
-    applyRollingCacheHealthToTarget(rec.livenessScopes[rec.primaryScope]!, hitRatio, wrote1h);
+    applyRollingCacheHealthToTarget(rec.livenessScopes[rec.primaryScope]!, sample);
   }
   scheduleSave();
+}
+
+/**
+ * Non-mutating read of the cache circuit breaker FSM state (`'closed' | 'open' | 'half_open'`).
+ * Unknown sessions return `'closed'`.
+ */
+export function getCacheCircuitBreakerState(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): CacheCircuitBreakerState {
+  const target = readScopedTarget(sessionKey, opts);
+  return target ? resolveBreakerState(target) : 'closed';
 }
 
 /**
@@ -1041,57 +1256,33 @@ export function isCacheCircuitBreakerOpen(
   sessionKey: string | undefined,
   opts?: SessionLivenessScopeOpts,
 ): boolean {
-  if (!sessionKey) return false;
-  const rec = sessions.get(sessionKey);
-  if (!rec) return false;
-  const scope = resolveScopeKey(opts);
-  if (scope) {
-    const scoped = rec.livenessScopes?.[scope];
-    if (scoped) return (scoped.circuitBreakerTurnsLeft ?? 0) > 0;
-    if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
-      return false;
-    }
-  }
-  return (rec.circuitBreakerTurnsLeft ?? 0) > 0;
+  return getCacheCircuitBreakerState(sessionKey, opts) === 'open';
 }
 
 /**
- * Decrement one turn from an active cache overhead circuit breaker. Returns true
- * if the breaker was open when consumed, false otherwise.
+ * Non-mutating read of smoothed EWMA cache hit ratio and inter-turn interval (seconds)
+ * for `(sessionKey, opts)`.
+ */
+export function getSessionCacheHealthSignals(
+  sessionKey: string | undefined,
+  opts?: SessionLivenessScopeOpts,
+): { ewmaHitRatio: number; ewmaInterTurnSec: number } {
+  const target = readScopedTarget(sessionKey, opts);
+  return {
+    ewmaHitRatio: target?.ewmaHitRatio ?? 1,
+    ewmaInterTurnSec: target?.ewmaInterTurnSec ?? 0,
+  };
+}
+
+/**
+ * Compatibility helper: reports whether the cache overhead circuit breaker is open
+ * without double-decrementing (turns are advanced once per response in {@link noteRollingCacheHealth}).
  */
 export function consumeCacheCircuitBreakerTurn(
   sessionKey: string | undefined,
   opts?: SessionLivenessScopeOpts,
 ): boolean {
-  if (!sessionKey) return false;
-  const rec = sessions.get(sessionKey);
-  if (!rec) return false;
-  const scope = resolveScopeKey(opts);
-  const consumeTarget = (target: ScopedLivenessRecord): boolean => {
-    const left = target.circuitBreakerTurnsLeft ?? 0;
-    if (left <= 0) return false;
-    target.circuitBreakerTurnsLeft = left - 1;
-    return true;
-  };
-  let wasOpen = false;
-  if (scope) {
-    const scoped = rec.livenessScopes?.[scope];
-    if (scoped) {
-      wasOpen = consumeTarget(scoped);
-      if (rec.primaryScope === scope) consumeTarget(rec);
-    } else if (isAuxiliaryScope(scope) && rec.primaryScope && rec.primaryScope !== scope) {
-      return false;
-    } else {
-      wasOpen = consumeTarget(rec);
-    }
-  } else {
-    wasOpen = consumeTarget(rec);
-    if (rec.primaryScope && rec.livenessScopes?.[rec.primaryScope]) {
-      consumeTarget(rec.livenessScopes[rec.primaryScope]!);
-    }
-  }
-  if (wasOpen) scheduleSave();
-  return wasOpen;
+  return isCacheCircuitBreakerOpen(sessionKey, opts);
 }
 
 /**

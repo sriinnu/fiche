@@ -46,6 +46,7 @@ import {
 } from './upstream-hosts.js';
 import { shouldImageModel } from './reader-tier.js';
 import { resolveTextHygieneMode } from './text-hygiene.js';
+import { resolvePriceRates } from './pricing.js';
 
 export {
   parseTrustAdjacentToolRounds,
@@ -2821,10 +2822,18 @@ let responseContentType: string | undefined;
           } catch {
             requestByteLimit = undefined;
           }
-          if ((r.info.compressed || r.body !== bridgeBody) && requestByteLimit !== undefined) {
-            if (r.body.byteLength > requestByteLimit) {
+          if (
+            r.info.sizeLimitOutcome === 'rejected' ||
+            ((r.info.compressed || r.body !== bridgeBody) && requestByteLimit !== undefined)
+          ) {
+            if (
+              r.info.sizeLimitOutcome === 'rejected' ||
+              (requestByteLimit !== undefined && r.body.byteLength > requestByteLimit)
+            ) {
               r.info.sizeLimitOutcome = 'rejected';
-              const message = `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`;
+              const message = requestByteLimit !== undefined
+                ? `fiche serialized request exceeds model limit (${r.body.byteLength} > ${requestByteLimit} bytes)`
+                : 'fiche serialized request exceeds model limit';
               fireWait(413, r.info, message);
               const error = isMessages
                 ? { type: 'error', error: { type: 'request_too_large', message } }
@@ -3255,16 +3264,28 @@ let responseContentType: string | undefined;
             : (usage.cache_creation_input_tokens ?? usage.cache_write_tokens),
           requestModel ? { model: requestModel } : undefined,
         );
-        if (!bridgedGptMessages && !bridgedChatMessages) {
-          const cr = usage.cache_read_input_tokens ?? usage.cached_tokens ?? 0;
-          const cc = usage.cache_creation_input_tokens ?? usage.cache_write_tokens ?? 0;
-          const cc1h = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
-          const inp = usage.input_tokens ?? 0;
-          const isInclusive = isOpenAIChatWire || isOpenAIResponsesWire || isGoogle;
-          const totalIn = isInclusive ? Math.max(inp, cr) : inp + cc + cr;
+        const cr = usage.cache_read_input_tokens ?? usage.cached_tokens ?? 0;
+        const cc = usage.cache_creation_input_tokens ?? usage.cache_write_tokens ?? 0;
+        const cc1h = usage.cache_creation?.ephemeral_1h_input_tokens ?? 0;
+        const cc5m = usage.cache_creation?.ephemeral_5m_input_tokens ?? Math.max(0, cc - cc1h);
+        const inp = usage.input_tokens ?? 0;
+        const isInclusive = isOpenAIChatWire || isOpenAIResponsesWire || isGoogle;
+        const totalIn = isInclusive ? Math.max(inp, cr) : inp + cc + cr;
+        if (totalIn > 0) {
+          const rates = resolvePriceRates(requestModel, {
+            promptTokens: totalIn,
+            ttlSec: cc1h > 0 ? 3600 : 300,
+          });
           noteRollingCacheHealth(
             sessionKey,
-            { cacheReadTokens: cr, cacheCreate1hTokens: cc1h, totalInputTokens: totalIn },
+            {
+              cacheReadTokens: cr,
+              cacheCreate1hTokens: cc1h,
+              cacheCreate5mTokens: cc5m,
+              totalInputTokens: totalIn,
+              writeRate: rates.write,
+              readRate: rates.read,
+            },
             requestModel ? { model: requestModel } : undefined,
           );
         }

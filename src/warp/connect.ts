@@ -121,6 +121,8 @@ export interface WarpHandlers {
   handleAbsoluteForm: (req: IncomingMessage, res: ServerResponse) => void;
   /** Attach as the server's 'upgrade' listener for WebSocket upgrades. */
   handleUpgrade: (req: IncomingMessage, socket: Socket, head: Buffer) => void;
+  /** Tear down pooled HTTP/HTTPS agents owned by this handler instance. */
+  destroy?: () => void;
 }
 
 /**
@@ -194,22 +196,35 @@ function pipeSockets(a: Socket, b: Socket): void {
   b.on('close', () => a.destroy());
 }
 
+/** Strip brackets from an IPv6 URL hostname (e.g. `[::1]` -> `::1`). */
+function stripIpv6Brackets(hostname: string): string {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+}
+
 /**
  * Every request the agent makes crosses this hop. Node's global agents default
  * to keepAlive:false, so without these each call pays a fresh TCP handshake —
  * plus a full TLS handshake to the real host on the passthrough path.
  */
-const httpAgent = new HttpAgent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
-const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+const activeWarpAgentDestroyers = new Set<() => void>();
 
-/** Tear down pooled sockets on warp exit so no keep-alive sockets linger. */
+/** Tear down pooled sockets across active warp handlers on exit so no keep-alive sockets linger. */
 export function destroyWarpAgents(): void {
-  httpAgent.destroy();
-  httpsAgent.destroy();
+  for (const destroy of [...activeWarpAgentDestroyers]) {
+    destroy();
+  }
 }
 
 export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const { ca, onDivert } = options;
+  const httpAgent = new HttpAgent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+  const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+  const destroy = (): void => {
+    activeWarpAgentDestroyers.delete(destroy);
+    httpAgent.destroy();
+    httpsAgent.destroy();
+  };
+  activeWarpAgentDestroyers.add(destroy);
   const getRoutes = (): readonly Route[] =>
     typeof options.routes === 'function' ? options.routes() : options.routes;
   const isSelfLoop = (host: string, portNum: number, socketLocalPort?: number): boolean => {
@@ -267,9 +282,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
 
-    const expectedHost = normalizedOrigin.hostname.startsWith('[') && normalizedOrigin.hostname.endsWith(']')
-      ? normalizedOrigin.hostname.slice(1, -1)
-      : normalizedOrigin.hostname;
+    const expectedHost = stripIpv6Brackets(normalizedOrigin.hostname);
     const expectedPort =
       normalizedOrigin.port || (normalizedOrigin.protocol === 'https:' ? '443' : '80');
     if (!hostHeaderMatches(req.headers.host, expectedHost, expectedPort)) {
@@ -288,9 +301,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
     if (divertTarget) {
-      const divHost = divertTarget.hostname.startsWith('[') && divertTarget.hostname.endsWith(']')
-        ? divertTarget.hostname.slice(1, -1)
-        : divertTarget.hostname;
+      const divHost = stripIpv6Brackets(divertTarget.hostname);
       const divPort = Number(divertTarget.port || (divertTarget.protocol === 'https:' ? 443 : 80));
       if (isSelfLoop(divHost, divPort, req.socket?.localPort)) {
         if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -363,10 +374,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
 
     const sendToTarget = (target: URL, allowFailOpen: boolean, isDivert: boolean): void => {
       const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
-      const hostname =
-        target.hostname.startsWith('[') && target.hostname.endsWith(']')
-          ? target.hostname.slice(1, -1)
-          : target.hostname;
+      const hostname = stripIpv6Brackets(target.hostname);
       const outHeaders = forwardHeaders(req.headers, authoritativeHost);
       if (isDivert && options.warpAuthToken) {
         outHeaders['x-fiche-warp-auth'] = options.warpAuthToken;
@@ -551,7 +559,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       try {
         const parsedTarget = new URL(req.url!);
         isHttps = parsedTarget.protocol === 'https:' || parsedTarget.protocol === 'wss:';
-        host = parsedTarget.hostname;
+        host = stripIpv6Brackets(parsedTarget.hostname);
         port = parsedTarget.port || (isHttps ? '443' : '80');
         upstreamReqUrl = `${parsedTarget.pathname}${parsedTarget.search}` || '/';
       } catch {
@@ -775,5 +783,5 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     forward(req, res, hostPort, target.pathname + target.search, target.origin);
   };
 
-  return { handleConnect, handleAbsoluteForm, handleUpgrade };
+  return { handleConnect, handleAbsoluteForm, handleUpgrade, destroy };
 }

@@ -10,6 +10,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { MmuPersistenceAdapter } from './core/context-mmu.js';
 
+const warnedUnsafeMmuDirs = new Set<string>();
+
 export type MmuCliParseResult =
   | { readonly ok: true; readonly help: true }
   | {
@@ -148,9 +150,13 @@ export function fileMmuPersistenceStore(
         } else {
           const st = fs.lstatSync(dir);
           if (!st.isDirectory() || (process.platform !== 'win32' && (st.mode & 0o077) !== 0)) {
-            console.error(
-              `[fiche] error: refusing to persist MMU pages to ${filePath}; directory ${dir} has unsafe mode ${(st.mode & 0o777).toString(8)} (expected 700)`,
-            );
+            const resolvedDir = path.resolve(dir);
+            if (!warnedUnsafeMmuDirs.has(resolvedDir)) {
+              warnedUnsafeMmuDirs.add(resolvedDir);
+              console.error(
+                `[fiche] error: refusing to persist MMU pages to ${filePath}; directory ${dir} has unsafe mode ${(st.mode & 0o777).toString(8)} (expected 700)`,
+              );
+            }
             return;
           }
         }

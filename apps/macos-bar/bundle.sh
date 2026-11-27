@@ -9,7 +9,7 @@
 #   ./bundle.sh --unsigned    # skip code signing (for split CI build jobs)
 #
 # Optional env overrides:
-#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.19.0)
+#   CFBundleShortVersionString  (defaults to version from ../../package.json, or 0.20.0)
 #   CFBundleVersion             (defaults to apps/macos-bar/BUILD_NUMBER, or 1)
 #   SWIFTPM_ARGS                (extra flags passed to swift build, e.g. --disable-sandbox)
 
@@ -53,7 +53,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-DEFAULT_VERSION="0.19.0"
+DEFAULT_VERSION="0.20.0"
 if [[ -f "${REPO_ROOT}/package.json" ]]; then
   PARSED_VER="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "${REPO_ROOT}/package.json" | head -n 1 || true)"
   if [[ -n "${PARSED_VER}" ]]; then
@@ -84,15 +84,21 @@ if [[ ! "${BUILD_VERSION}" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
+HOST_ARCH="$(uname -m)"
+ARCH_ARGS=()
+if [[ " ${SWIFTPM_ARGS:-} " != *" --arch "* ]] && [[ " ${SWIFTPM_ARGS:-} " != *" --arch="* ]]; then
+  ARCH_ARGS=(--arch "${HOST_ARCH}")
+fi
+
 echo "==> Building ${APP_NAME} (${SHORT_VERSION}, build ${BUILD_VERSION}) in release mode..."
 # shellcheck disable=SC2086
-swift build -c release --arch arm64 --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-}
+swift build -c release ${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"} --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-}
 
-BINARY_PATH="${SCRIPT_DIR}/.build/arm64-apple-macosx/release/${APP_NAME}"
+BINARY_PATH="${SCRIPT_DIR}/.build/${HOST_ARCH}-apple-macosx/release/${APP_NAME}"
 if [[ ! -x "${BINARY_PATH}" ]]; then
-  # Fallback for custom --scratch-path overrides in SWIFTPM_ARGS
+  # Fallback for custom --scratch-path or --arch overrides in SWIFTPM_ARGS
   # shellcheck disable=SC2086
-  BIN_DIR="$(swift build -c release --arch arm64 --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-} --show-bin-path)"
+  BIN_DIR="$(swift build -c release ${ARCH_ARGS[@]+"${ARCH_ARGS[@]}"} --package-path "${SCRIPT_DIR}" ${SWIFTPM_ARGS:-} --show-bin-path)"
   BINARY_PATH="${BIN_DIR}/${APP_NAME}"
 fi
 if [[ ! -x "${BINARY_PATH}" ]]; then

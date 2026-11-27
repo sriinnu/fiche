@@ -87,6 +87,26 @@ private final class LockedDataBox: @unchecked Sendable {
     }
 }
 
+private final class ZdotdirProbeCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cachedByShell: [String: String?] = [:]
+
+    func get(_ shellPath: String) -> (hit: Bool, value: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let entry = cachedByShell[shellPath] {
+            return (true, entry)
+        }
+        return (false, nil)
+    }
+
+    func set(_ shellPath: String, value: String?) {
+        lock.lock()
+        cachedByShell[shellPath] = value
+        lock.unlock()
+    }
+}
+
 // MARK: - DaemonController
 
 @MainActor
@@ -197,6 +217,16 @@ final class DaemonController: ObservableObject {
     private var discoveryGeneration: Int = 0
     private var koshaGeneration: Int = 0
     private var isUpdatingShellAutoWrap: Bool = false
+    private var confirmedAllowedModels: [String] = []
+    private var confirmedProviders: [ProviderDescriptor] = ProviderDescriptor.fallbackDefaults
+    private var confirmedPlugins: [PluginDescriptor] = []
+    private var pendingModelMutations: Int = 0
+    private var pendingProviderMutations: Int = 0
+    private var pendingPluginMutations: Int = 0
+    private var pendingCompressionMutations: Int = 0
+    private var pendingCompressionTarget: Bool?
+
+    nonisolated private static let zdotdirProbeCache = ZdotdirProbeCache()
 
     private static let maxTransientTimeoutsBeforeOffline = 3
 
@@ -248,14 +278,16 @@ final class DaemonController: ObservableObject {
         self.phase = .live
         self.isLoginAgentInstalled = true
         self.allowedModels = ["gemini-4-argon-high", "claude-fable-5", "gpt-6.2-astra", "claude-opus-5-5", "deepseek", "kimi", "glm", "grok"]
+        self.confirmedAllowedModels = self.allowedModels
         self.providers = ProviderDescriptor.fallbackDefaults
+        self.confirmedProviders = self.providers
 
         let decoder = JSONDecoder()
         let healthJSON = """
         {
           "ok": true,
           "name": "fiche",
-          "version": "0.19.0",
+          "version": "0.20.0",
           "pid": 17130,
           "host": "127.0.0.1",
           "port": 47821,
@@ -408,6 +440,7 @@ final class DaemonController: ObservableObject {
             PluginDescriptor(id: "skill:tokmeter", name: "tokmeter", description: "External token meter inspection extension.", kind: .skill, source: "skill", enabled: true, mutable: true),
         ]
         self.isShellAutoWrapInstalled = true
+        self.confirmedPlugins = self.plugins
         self.hasCompletedAgentDiscovery = true
         self.discoveredDesktopApps = [
             DiscoveredDesktopApp(id: "Antigravity", name: "Antigravity", displayName: "Antigravity", bundlePath: "/Applications/Antigravity.app", isElectron: true, attachmentState: .attached, attachedPIDs: [4101], directPIDs: []),
@@ -669,7 +702,10 @@ final class DaemonController: ObservableObject {
             consecutivePollTimeouts = 0
             health = h
             if let models = h.allowedModels {
-                allowedModels = models
+                confirmedAllowedModels = models
+                if pendingModelMutations == 0 {
+                    allowedModels = models
+                }
             }
             daemonError = nil
         case .httpError(let status, _) where status == 404:
@@ -736,7 +772,10 @@ final class DaemonController: ObservableObject {
             stats = s
             anyReachable = true
             if let models = s.allowedModels {
-                allowedModels = models
+                confirmedAllowedModels = models
+                if pendingModelMutations == 0 {
+                    allowedModels = models
+                }
             }
         case .httpError, .timedOut, .unreachable:
             break
@@ -765,27 +804,39 @@ final class DaemonController: ObservableObject {
         }
 
         if case .ok(let m) = modelsRes {
-            allowedModels = m.allowedModels
+            confirmedAllowedModels = m.allowedModels
+            if pendingModelMutations == 0 {
+                allowedModels = m.allowedModels
+            }
             if !m.catalog.isEmpty {
                 modelCatalog = m.catalog
             }
         }
 
         if case .ok(let p) = providersRes, !p.providers.isEmpty {
-            providers = p.providers
+            confirmedProviders = p.providers
+            if pendingProviderMutations == 0 {
+                providers = p.providers
+            }
         } else if let enabledIDs = health?.enabledProviders {
             let enabledSet = Set(enabledIDs)
-            providers = providers.map { item in
+            confirmedProviders = confirmedProviders.map { item in
                 var copy = item
                 copy.enabled = enabledSet.contains(item.id)
                 return copy
+            }
+            if pendingProviderMutations == 0 {
+                providers = confirmedProviders
             }
         }
 
         switch pluginsRes {
         case .ok(let p):
             pluginsEndpointSupported = true
-            plugins = p.items
+            confirmedPlugins = p.items
+            if pendingPluginMutations == 0 {
+                plugins = p.items
+            }
             pluginsDir = p.pluginsDir
         case .httpError(let status, _) where status == 404:
             pluginsEndpointSupported = false
@@ -805,8 +856,10 @@ final class DaemonController: ObservableObject {
             calibratedProfiles = []
         }
 
-        let enabled = health?.compressionEnabled ?? stats?.compressionEnabled ?? true
-        phase = enabled ? .live : .paused
+        if pendingCompressionMutations == 0 {
+            let enabled = health?.compressionEnabled ?? stats?.compressionEnabled ?? true
+            phase = enabled ? .live : .paused
+        }
         lastUpdatedAt = Date()
         daemonError = nil
         return .reachable
@@ -1072,28 +1125,60 @@ final class DaemonController: ObservableObject {
     }
 
     func toggleCompression() {
-        let nextEnabled = !compressionEnabled
+        let baseEnabled = pendingCompressionTarget ?? compressionEnabled
+        let nextEnabled = !baseEnabled
+        pendingCompressionTarget = nextEnabled
+        guard !isPreview else { return }
+        pendingCompressionMutations += 1
         Task { [weak self] in
-            await self?.setCompression(enabled: nextEnabled)
+            await self?.performCompressionMutation(enabled: nextEnabled, trackedPending: true)
         }
     }
 
     func setCompression(enabled: Bool) async {
+        pendingCompressionTarget = enabled
+        guard !isPreview else { return }
+        pendingCompressionMutations += 1
+        await performCompressionMutation(enabled: enabled, trackedPending: true)
+    }
+
+    private func performCompressionMutation(enabled: Bool, trackedPending: Bool) async {
+        var finalized = false
+        defer {
+            if trackedPending && !finalized {
+                pendingCompressionMutations = max(0, pendingCompressionMutations - 1)
+                if pendingCompressionMutations == 0 {
+                    pendingCompressionTarget = nil
+                }
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
             self.actionError = nil
             struct Body: Encodable { let enabled: Bool }
             let res: HTTPResult<CompressionToggleResponse> = await self.postJSON(path: "/api/compression", body: Body(enabled: enabled))
+            if trackedPending && !finalized {
+                finalized = true
+                self.pendingCompressionMutations = max(0, self.pendingCompressionMutations - 1)
+                if self.pendingCompressionMutations == 0 {
+                    self.pendingCompressionTarget = nil
+                }
+            }
             switch res {
             case .ok(let payload):
                 self.consecutivePollTimeouts = 0
-                self.phase = payload.compressionEnabled ? .live : .paused
-                self.daemonError = nil
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingCompressionMutations == 0 {
+                    self.phase = payload.compressionEnabled ? .live : .paused
+                    self.daemonError = nil
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, let msg):
                 self.actionError = "Compression toggle failed (\(status)): \(msg)"
+                if self.pendingCompressionMutations == 0 {
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .timedOut(let reason):
                 self.consecutivePollTimeouts += 1
                 if (self.phase == .live || self.phase == .paused) && self.consecutivePollTimeouts < Self.maxTransientTimeoutsBeforeOffline {
@@ -1121,7 +1206,6 @@ final class DaemonController: ObservableObject {
     }
 
     func toggleProvider(id: String, on: Bool) {
-        let wasEnabled = providers.first(where: { $0.id == id })?.enabled ?? !on
         providers = providers.map { item in
             guard item.id == id else { return item }
             var copy = item
@@ -1129,12 +1213,19 @@ final class DaemonController: ObservableObject {
             return copy
         }
         guard !isPreview else { return }
+        pendingProviderMutations += 1
         Task { [weak self] in
-            await self?.setProvider(id: id, on: on, previousEnabled: wasEnabled)
+            await self?.setProvider(id: id, on: on)
         }
     }
 
-    private func setProvider(id: String, on: Bool, previousEnabled: Bool) async {
+    private func setProvider(id: String, on: Bool) async {
+        var finalized = false
+        defer {
+            if !finalized {
+                pendingProviderMutations = max(0, pendingProviderMutations - 1)
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
@@ -1147,38 +1238,47 @@ final class DaemonController: ObservableObject {
                 path: "/api/providers",
                 body: ProviderToggleBody(provider: id, on: on)
             )
+            finalized = true
+            self.pendingProviderMutations = max(0, self.pendingProviderMutations - 1)
             switch res {
             case .ok(let payload):
                 if !payload.providers.isEmpty {
-                    self.providers = payload.providers
+                    self.confirmedProviders = payload.providers
                 }
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingProviderMutations == 0 {
+                    if !payload.providers.isEmpty {
+                        self.providers = payload.providers
+                    }
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, let msg):
-                self.providers = self.providers.map { item in
-                    guard item.id == id else { return item }
-                    var copy = item
-                    copy.enabled = previousEnabled
-                    return copy
-                }
                 self.actionError = "Provider update failed (\(status)): \(msg)"
-                self.showTransientNotice("Reverted provider update (HTTP \(status))")
-                await self.pollOnce(forceRefresh: true)
-            case .timedOut(let reason), .unreachable(let reason):
-                self.providers = self.providers.map { item in
-                    guard item.id == id else { return item }
-                    var copy = item
-                    copy.enabled = previousEnabled
-                    return copy
+                if self.pendingProviderMutations == 0 {
+                    self.providers = self.confirmedProviders
+                    self.showTransientNotice("Reverted provider update (HTTP \(status))")
+                    await self.pollOnce(forceRefresh: true)
                 }
+            case .timedOut(let reason), .unreachable(let reason):
                 self.actionError = "Daemon unreachable: \(reason)"
-                self.showTransientNotice("Reverted provider update — daemon unreachable")
+                if self.pendingProviderMutations == 0 {
+                    self.providers = self.confirmedProviders
+                    self.showTransientNotice("Reverted provider update — daemon unreachable")
+                    await self.pollOnce(forceRefresh: true)
+                }
             }
         }
     }
 
     func setProviders(_ ids: [String]) async {
         guard !isPreview else { return }
+        pendingProviderMutations += 1
+        var finalized = false
+        defer {
+            if !finalized {
+                pendingProviderMutations = max(0, pendingProviderMutations - 1)
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
@@ -1188,35 +1288,55 @@ final class DaemonController: ObservableObject {
                 path: "/api/providers",
                 body: ProvidersListBody(providers: ids)
             )
+            finalized = true
+            self.pendingProviderMutations = max(0, self.pendingProviderMutations - 1)
             switch res {
             case .ok(let payload):
                 if !payload.providers.isEmpty {
-                    self.providers = payload.providers
+                    self.confirmedProviders = payload.providers
                 }
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingProviderMutations == 0 {
+                    if !payload.providers.isEmpty {
+                        self.providers = payload.providers
+                    }
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, let msg):
                 self.actionError = "Provider scope update failed (\(status)): \(msg)"
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingProviderMutations == 0 {
+                    self.providers = self.confirmedProviders
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .timedOut(let reason), .unreachable(let reason):
                 self.actionError = "Daemon unreachable: \(reason)"
-                self.showTransientNotice("Provider scope update failed — daemon unreachable")
+                if self.pendingProviderMutations == 0 {
+                    self.providers = self.confirmedProviders
+                    self.showTransientNotice("Provider scope update failed — daemon unreachable")
+                    await self.pollOnce(forceRefresh: true)
+                }
             }
         }
     }
 
     func toggleModel(model: String, on: Bool) {
-        let wasAllowed = allowedModels.contains(model)
         var nextSet = Set(allowedModels)
         if on { nextSet.insert(model) } else { nextSet.remove(model) }
         allowedModels = Array(nextSet).sorted()
         guard !isPreview else { return }
+        pendingModelMutations += 1
         Task { [weak self] in
-            await self?.setModel(model: model, on: on, wasAllowed: wasAllowed)
+            await self?.setModel(model: model, on: on)
         }
     }
 
-    private func setModel(model: String, on: Bool, wasAllowed: Bool) async {
+    private func setModel(model: String, on: Bool) async {
+        var finalized = false
+        defer {
+            if !finalized {
+                pendingModelMutations = max(0, pendingModelMutations - 1)
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
@@ -1226,71 +1346,119 @@ final class DaemonController: ObservableObject {
                 let on: Bool
             }
 
-            @MainActor func revertSingleModel() {
-                var set = Set(self.allowedModels)
-                if wasAllowed { set.insert(model) } else { set.remove(model) }
-                self.allowedModels = Array(set).sorted()
-            }
-
             let res: HTTPResult<ModelsResponse> = await self.postJSON(path: "/api/models", body: ToggleBody(model: model, on: on))
             switch res {
             case .ok(let payload):
+                finalized = true
+                self.pendingModelMutations = max(0, self.pendingModelMutations - 1)
                 if !payload.allowedModels.isEmpty || on == false {
-                    self.allowedModels = payload.allowedModels
+                    self.confirmedAllowedModels = payload.allowedModels
                 }
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingModelMutations == 0 {
+                    self.allowedModels = self.confirmedAllowedModels
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, _) where status == 404:
                 // Back-compat fallback for daemons with /fragments/models only
                 let fallback: HTTPResult<Data> = await self.postJSONRaw(path: "/fragments/models", body: ToggleBody(model: model, on: on))
+                finalized = true
+                self.pendingModelMutations = max(0, self.pendingModelMutations - 1)
                 switch fallback {
                 case .ok:
-                    self.actionError = nil
-                    await self.pollOnce(forceRefresh: true)
+                    var updated = Set(self.confirmedAllowedModels)
+                    if on { updated.insert(model) } else { updated.remove(model) }
+                    self.confirmedAllowedModels = Array(updated).sorted()
+                    if self.pendingModelMutations == 0 {
+                        self.allowedModels = self.confirmedAllowedModels
+                        self.actionError = nil
+                        await self.pollOnce(forceRefresh: true)
+                    }
                 case .httpError(let fbStatus, let fbMsg):
-                    revertSingleModel()
                     self.actionError = "Model update failed (\(fbStatus)): \(fbMsg)"
-                    self.showTransientNotice("Reverted model update (HTTP \(fbStatus))")
+                    if self.pendingModelMutations == 0 {
+                        self.allowedModels = self.confirmedAllowedModels
+                        self.showTransientNotice("Reverted model update (HTTP \(fbStatus))")
+                        await self.pollOnce(forceRefresh: true)
+                    }
                 case .timedOut(let reason), .unreachable(let reason):
-                    revertSingleModel()
                     self.actionError = "Daemon unreachable: \(reason)"
-                    self.showTransientNotice("Reverted model update — daemon unreachable")
+                    if self.pendingModelMutations == 0 {
+                        self.allowedModels = self.confirmedAllowedModels
+                        self.showTransientNotice("Reverted model update — daemon unreachable")
+                        await self.pollOnce(forceRefresh: true)
+                    }
                 }
             case .httpError(let status, let msg):
-                revertSingleModel()
+                finalized = true
+                self.pendingModelMutations = max(0, self.pendingModelMutations - 1)
                 self.actionError = "Model update failed (\(status)): \(msg)"
-                self.showTransientNotice("Reverted model update (HTTP \(status))")
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingModelMutations == 0 {
+                    self.allowedModels = self.confirmedAllowedModels
+                    self.showTransientNotice("Reverted model update (HTTP \(status))")
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .timedOut(let reason), .unreachable(let reason):
-                revertSingleModel()
+                finalized = true
+                self.pendingModelMutations = max(0, self.pendingModelMutations - 1)
                 self.actionError = "Daemon unreachable: \(reason)"
-                self.showTransientNotice("Reverted model update — daemon unreachable")
+                if self.pendingModelMutations == 0 {
+                    self.allowedModels = self.confirmedAllowedModels
+                    self.showTransientNotice("Reverted model update — daemon unreachable")
+                    await self.pollOnce(forceRefresh: true)
+                }
             }
         }
     }
 
     func setModels(_ models: [String], rollbackTo previousModels: [String]? = nil) async {
         guard !isPreview else { return }
+        pendingModelMutations += 1
+        await performSetModels(models, rollbackTo: previousModels, trackedPending: true)
+    }
+
+    private func performSetModels(_ models: [String], rollbackTo previousModels: [String]?, trackedPending: Bool) async {
+        var finalized = false
+        defer {
+            if trackedPending && !finalized {
+                pendingModelMutations = max(0, pendingModelMutations - 1)
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
             self.actionError = nil
             struct ListBody: Encodable { let models: [String] }
-            let fallbackModels = previousModels ?? self.allowedModels
+            let fallbackModels = self.confirmedAllowedModels.isEmpty
+                ? (previousModels ?? self.allowedModels)
+                : self.confirmedAllowedModels
             let res: HTTPResult<ModelsResponse> = await self.postJSON(path: "/api/models", body: ListBody(models: models))
+            if trackedPending && !finalized {
+                finalized = true
+                self.pendingModelMutations = max(0, self.pendingModelMutations - 1)
+            }
             switch res {
             case .ok(let payload):
-                self.allowedModels = payload.allowedModels
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                self.confirmedAllowedModels = payload.allowedModels
+                if self.pendingModelMutations == 0 {
+                    self.allowedModels = payload.allowedModels
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, let msg):
-                self.allowedModels = fallbackModels
                 self.actionError = "Model scope update failed (\(status)): \(msg)"
-                self.showTransientNotice("Reverted model scope (HTTP \(status))")
+                if self.pendingModelMutations == 0 {
+                    self.allowedModels = fallbackModels
+                    self.showTransientNotice("Reverted model scope (HTTP \(status))")
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .timedOut(let reason), .unreachable(let reason):
-                self.allowedModels = fallbackModels
                 self.actionError = "Daemon unreachable: \(reason)"
-                self.showTransientNotice("Reverted model scope — daemon unreachable")
+                if self.pendingModelMutations == 0 {
+                    self.allowedModels = fallbackModels
+                    self.showTransientNotice("Reverted model scope — daemon unreachable")
+                    await self.pollOnce(forceRefresh: true)
+                }
             }
         }
     }
@@ -1424,6 +1592,7 @@ final class DaemonController: ObservableObject {
 
         pollGeneration &+= 1
         allowedModels = decoded.models
+        confirmedAllowedModels = decoded.models
         let delivery = decoded.synced ? " (live + config)" : (decoded.saved ? " (saved to config)" : "")
         let summary: String
         if decoded.added.isEmpty {
@@ -1470,17 +1639,18 @@ final class DaemonController: ObservableObject {
     }
 
     func disableAllThirdPartyModels() {
-        let previous = allowedModels
+        let previous = confirmedAllowedModels.isEmpty ? allowedModels : confirmedAllowedModels
         let filtered = allowedModels.filter { !Self.isThirdPartyModel($0) }
         allowedModels = filtered
         guard !isPreview else { return }
+        pendingModelMutations += 1
         Task { [weak self] in
-            await self?.setModels(filtered, rollbackTo: previous)
+            await self?.performSetModels(filtered, rollbackTo: previous, trackedPending: true)
         }
     }
 
     func enableAllThirdPartyModels() {
-        let previous = allowedModels
+        let previous = confirmedAllowedModels.isEmpty ? allowedModels : confirmedAllowedModels
         var seen = Set(allowedModels)
         var merged = allowedModels
         for id in catalogThirdPartyModels where !seen.contains(id) {
@@ -1489,17 +1659,18 @@ final class DaemonController: ObservableObject {
         }
         allowedModels = merged
         guard !isPreview else { return }
+        pendingModelMutations += 1
         Task { [weak self] in
-            await self?.setModels(merged, rollbackTo: previous)
+            await self?.performSetModels(merged, rollbackTo: previous, trackedPending: true)
         }
     }
 
     func togglePlugin(id: String, enabled: Bool) {
-        let wasEnabled = plugins.first(where: { $0.id == id })?.enabled ?? !enabled
         plugins = plugins.map { $0.id == id ? $0.withEnabled(enabled) : $0 }
         guard !isPreview else { return }
+        pendingPluginMutations += 1
         Task { [weak self] in
-            await self?.setPlugin(id: id, enabled: enabled, previousEnabled: wasEnabled)
+            await self?.setPlugin(id: id, enabled: enabled)
         }
     }
 
@@ -1532,15 +1703,21 @@ final class DaemonController: ObservableObject {
     }
 
     func setAllThirdPartyPlugins(enabled: Bool) {
-        let previous = plugins
         plugins = plugins.map { Self.isThirdPartyPlugin($0) ? $0.withEnabled(enabled) : $0 }
         guard !isPreview else { return }
+        pendingPluginMutations += 1
         Task { [weak self] in
-            await self?.postThirdPartyPlugins(enabled: enabled, rollbackTo: previous)
+            await self?.postThirdPartyPlugins(enabled: enabled)
         }
     }
 
-    private func postThirdPartyPlugins(enabled: Bool, rollbackTo previousPlugins: [PluginDescriptor]) async {
+    private func postThirdPartyPlugins(enabled: Bool) async {
+        var finalized = false
+        defer {
+            if !finalized {
+                pendingPluginMutations = max(0, pendingPluginMutations - 1)
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
@@ -1554,18 +1731,28 @@ final class DaemonController: ObservableObject {
                 path: "/api/plugins",
                 body: ScopeBody(scope: "third-party", enabled: enabled)
             )
+            finalized = true
+            self.pendingPluginMutations = max(0, self.pendingPluginMutations - 1)
             switch res {
             case .ok:
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                self.confirmedPlugins = self.confirmedPlugins.map { Self.isThirdPartyPlugin($0) ? $0.withEnabled(enabled) : $0 }
+                if self.pendingPluginMutations == 0 {
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, let msg):
-                self.plugins = previousPlugins
                 self.actionError = "3rd-party plugin update failed (\(status)): \(msg)"
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingPluginMutations == 0 {
+                    self.plugins = self.confirmedPlugins
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .timedOut(let reason), .unreachable(let reason):
-                self.plugins = previousPlugins
                 self.actionError = "Daemon unreachable: \(reason)"
-                self.showTransientNotice("Reverted plugin update — daemon unreachable")
+                if self.pendingPluginMutations == 0 {
+                    self.plugins = self.confirmedPlugins
+                    self.showTransientNotice("Reverted plugin update — daemon unreachable")
+                    await self.pollOnce(forceRefresh: true)
+                }
             }
         }
     }
@@ -2179,15 +2366,34 @@ final class DaemonController: ObservableObject {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if rawZdot?.isEmpty != false {
                 let zshExe = isExecutableRegularFile(shellPath) ? shellPath : "/bin/zsh"
-                let probe = await runProcessAsync(
-                    executable: zshExe,
-                    arguments: ["-lc", "printf %s \"$ZDOTDIR\""],
-                    timeoutSeconds: 3
-                )
-                if probe.exitCode == 0 {
-                    let probed = probe.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !probed.isEmpty {
-                        rawZdot = probed
+                let cached = zdotdirProbeCache.get(zshExe)
+                if cached.hit {
+                    rawZdot = cached.value
+                } else {
+                    let marker = "__FICHE_ZDOT__"
+                    let probe = await runProcessAsync(
+                        executable: zshExe,
+                        arguments: ["-lc", "printf '\(marker)%s\(marker)' \"$ZDOTDIR\""],
+                        timeoutSeconds: 3
+                    )
+                    if probe.exitCode == 0 {
+                        var extracted: String?
+                        if let endRange = probe.stdout.range(of: marker, options: .backwards),
+                           let startRange = probe.stdout.range(
+                               of: marker,
+                               options: .backwards,
+                               range: probe.stdout.startIndex..<endRange.lowerBound
+                           ),
+                           startRange.upperBound <= endRange.lowerBound
+                        {
+                            let candidate = String(probe.stdout[startRange.upperBound..<endRange.lowerBound])
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !candidate.isEmpty {
+                                extracted = candidate
+                            }
+                        }
+                        zdotdirProbeCache.set(zshExe, value: extracted)
+                        rawZdot = extracted
                     }
                 }
             }
@@ -2203,11 +2409,18 @@ final class DaemonController: ObservableObject {
                 let cleanExpanded = expanded.hasSuffix("/") && expanded.count > 1
                     ? String(expanded.dropLast())
                     : expanded
-                let cleanZdot = zdot.hasSuffix("/") && zdot.count > 1
-                    ? String(zdot.dropLast())
-                    : zdot
-                let display = cleanExpanded == home ? "~/.zshrc" : "\(cleanZdot)/.zshrc"
-                return ShellRCInfo(kind: .zsh, url: URL(fileURLWithPath: "\(cleanExpanded)/.zshrc"), displayName: display)
+                var isDir: ObjCBool = false
+                if cleanExpanded.hasPrefix("/"),
+                   !hasControlChars(cleanExpanded),
+                   fm.fileExists(atPath: cleanExpanded, isDirectory: &isDir),
+                   isDir.boolValue
+                {
+                    let cleanZdot = zdot.hasSuffix("/") && zdot.count > 1
+                        ? String(zdot.dropLast())
+                        : zdot
+                    let display = cleanExpanded == home ? "~/.zshrc" : "\(cleanZdot)/.zshrc"
+                    return ShellRCInfo(kind: .zsh, url: URL(fileURLWithPath: "\(cleanExpanded)/.zshrc"), displayName: display)
+                }
             }
             return ShellRCInfo(kind: .zsh, url: URL(fileURLWithPath: "\(home)/.zshrc"), displayName: "~/.zshrc")
         }
@@ -2579,8 +2792,12 @@ final class DaemonController: ObservableObject {
                     }
                     let errText = String(data: errState.buffer, encoding: .utf8)?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    let isQuickHandoffWarning = status == 0 && !errText.isEmpty
-                        && (elapsed < 5.0 || errText.contains("[fiche] warp: warning:"))
+                    let lowerErr = errText.lowercased()
+                    let hasExplicitWarningOrError =
+                        errText.contains("[fiche] warp: warning:")
+                        || errText.contains("[fiche] warp: error:")
+                        || lowerErr.contains("failed")
+                    let isQuickHandoffWarning = status == 0 && !errText.isEmpty && hasExplicitWarningOrError
                     Task { @MainActor in
                         guard let ctrl = controllerRef.controller else { return }
                         if status != 0 && elapsed < 5.0 {
@@ -2619,7 +2836,13 @@ final class DaemonController: ObservableObject {
         }
     }
 
-    private func setPlugin(id: String, enabled: Bool, previousEnabled: Bool) async {
+    private func setPlugin(id: String, enabled: Bool) async {
+        var finalized = false
+        defer {
+            if !finalized {
+                pendingPluginMutations = max(0, pendingPluginMutations - 1)
+            }
+        }
         await enqueueMutation { [weak self] in
             guard let self else { return }
             self.pollGeneration &+= 1
@@ -2629,23 +2852,29 @@ final class DaemonController: ObservableObject {
                 let enabled: Bool
             }
 
-            @MainActor func revertSinglePlugin() {
-                self.plugins = self.plugins.map { $0.id == id ? $0.withEnabled(previousEnabled) : $0 }
-            }
-
             let res: HTTPResult<Data> = await self.postJSONRaw(path: "/api/plugins", body: PluginBody(id: id, enabled: enabled))
+            finalized = true
+            self.pendingPluginMutations = max(0, self.pendingPluginMutations - 1)
             switch res {
             case .ok:
-                self.actionError = nil
-                await self.pollOnce(forceRefresh: true)
+                self.confirmedPlugins = self.confirmedPlugins.map { $0.id == id ? $0.withEnabled(enabled) : $0 }
+                if self.pendingPluginMutations == 0 {
+                    self.actionError = nil
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .httpError(let status, let msg):
-                revertSinglePlugin()
                 self.actionError = "Plugin toggle failed (\(status)): \(msg)"
-                await self.pollOnce(forceRefresh: true)
+                if self.pendingPluginMutations == 0 {
+                    self.plugins = self.confirmedPlugins
+                    await self.pollOnce(forceRefresh: true)
+                }
             case .timedOut(let reason), .unreachable(let reason):
-                revertSinglePlugin()
                 self.actionError = "Daemon unreachable: \(reason)"
-                self.showTransientNotice("Reverted plugin toggle — daemon unreachable")
+                if self.pendingPluginMutations == 0 {
+                    self.plugins = self.confirmedPlugins
+                    self.showTransientNotice("Reverted plugin toggle — daemon unreachable")
+                    await self.pollOnce(forceRefresh: true)
+                }
             }
         }
     }

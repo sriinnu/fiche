@@ -128,15 +128,15 @@ function computeTurnSnapshotWithCache(
   rateCache?: Map<string, CachedModelRates>,
   warmthState?: TurnWarmthState,
 ): TurnSavingsSnapshot {
-  const isGoogle =
-    ev.accounting_provider === 'google' ||
-    (typeof ev.path === 'string' &&
-      (ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent')));
-  const isOpenAI =
-    ev.accounting_provider === 'openai' ||
-    (!isGoogle &&
-      typeof ev.path === 'string' &&
-      (ev.path.includes('responses') || ev.path.includes('chat/completions')));
+  const pathIsOpenAI =
+    typeof ev.path === 'string' &&
+    (ev.path.includes('responses') || ev.path.includes('chat/completions'));
+  const isOpenAI = ev.accounting_provider ? ev.accounting_provider === 'openai' : pathIsOpenAI;
+  const isGoogle = ev.accounting_provider
+    ? ev.accounting_provider === 'google'
+    : typeof ev.path === 'string' &&
+      !pathIsOpenAI &&
+      (ev.path.includes('google-ai-studio') || ev.path.toLowerCase().includes('generatecontent'));
   const isInclusiveUsage =
     isOpenAI ||
     isGoogle ||
@@ -234,7 +234,7 @@ function computeTurnSnapshotWithCache(
     if (warmthState && inputTokens > 0) {
       warmthState.openai = {
         ts: completionSec,
-        cachedOrPrefixTokens: cachedTokens > 0 ? cachedTokens : (oPrev?.cachedOrPrefixTokens ?? 0),
+        cachedOrPrefixTokens: cachedTokens > 0 ? cachedTokens : 0,
         prefixSha: ev.system_sha8 ?? oPrev?.prefixSha,
         pxPrefixSha: pxSha ?? oPrev?.pxPrefixSha,
         model: ev.model ?? oPrev?.model,
@@ -282,7 +282,7 @@ function computeTurnSnapshotWithCache(
     if (warmthState && inputTokens > 0) {
       warmthState.google = {
         ts: completionSec,
-        cachedTokens: cachedTokens > 0 ? cachedTokens : (gPrev?.cachedTokens ?? 0),
+        cachedTokens: cachedTokens > 0 ? cachedTokens : 0,
         prefixSha: ev.system_sha8 ?? gPrev?.prefixSha,
         pxPrefixSha: pxSha ?? gPrev?.pxPrefixSha,
         model: ev.model ?? gPrev?.model,

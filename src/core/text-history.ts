@@ -60,6 +60,10 @@ export interface TextEpochPlanArgs {
   readonly lsmMinLargeBlockTokens?: number;
   /** When true, only replay already-sealed sticky epochs without sealing new candidates. */
   readonly stickyOnly?: boolean;
+  readonly earliestNewInvalidationMsg?: number;
+  readonly circuitBreakerState?: 'closed' | 'open' | 'half_open';
+  readonly ewmaInterTurnSec?: number;
+  readonly ewmaHitRatio?: number;
   readonly onPageOut?: (block: TextEpochBlock, raw: string, digest: string) => string | undefined;
 }
 
@@ -69,6 +73,7 @@ export interface TextEpochPlanResult {
   readonly compactedBlocks: number;
   readonly savedChars: number;
   readonly savedTokens: number;
+  readonly earliestNewInvalidationMsg?: number;
   readonly cliffAvoided?: { at: number; multiplier: number; savedUsd: number };
 }
 
@@ -78,11 +83,21 @@ const digestCache = new Map<string, string>();
 let digestCacheChars = 0;
 
 const LINE_NUM_PREFIX_RE = /^(\s*\d{1,7}(?:\t|→|\s*[|\u2502](?:\s|$)))/;
+const LINE_NUM_VAL_RE = /^\s*(\d{1,7})(?:\t|→|\s*[|\u2502](?:\s|$))/;
 const DIFF_HEADER_RE = /^(?:diff --git |@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@|--- [^\n]+|\+\+\+ [^\n]+)/;
 const LOG_CRITICAL_RE =
   /\b(?:error|err|warn|warning|fail|failed|failure|fatal|panic|exception|traceback|assertion|assert|denied|forbidden|timeout|timed out|refused|oom|killed|segfault|abort|aborted|passed|skipped|summary|exit[_ ]?code(?:[=:\s]+[1-9]\d*)?|returned [1-9]\d*|[A-Za-z_]\w*(?:Error|Exception|Fault|Failure)|ECONNREFUSED|ENOENT|ETIMEDOUT|EACCES|EPERM|EADDRINUSE|EPIPE|EISDIR|ENOSPC)\b|\b(?:status[=:\s]+|HTTP\/\d(?:\.\d)?["'\s]+)[45]\d\d\b|(?:^\s*(?:at\s+\S+\s*\(|Caused by:|File "|Traceback \(most recent call last\)))/i;
+const L1_FAIL_SIGNAL_RE =
+  /\b(?:FAIL(?:ED)?|AssertionError|TypeError|SyntaxError|ReferenceError|ERR_[A-Z0-9_]+|exit[_ ]?code[:=\s]+[1-9]\d*|returned [1-9]\d*|[1-9]\d*\s+failed)\b|^\s*(?:×\s+\S|at\s+\S+\s*\(|Caused by:|File\s+"[^"\n]+",\s+line\s+\d+|Traceback \(most recent call last\))/im;
 const CODE_DECL_RE =
   /^\s*(?:export\s+(?:default\s+)?(?:async\s+)?|pub(?:\([^)]*\))?\s+(?:async\s+)?|async\s+|static\s+|private\s+|protected\s+|public\s+)?(?:function|class|interface|type|enum|struct|trait|impl|fn|func|def|mod|namespace|module)\b|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?(?:\([^)]*\)|\w+)\s*=>|^\s*(?:import|from\s+\S+\s+import|package|use\s+|#include)\b/;
+const IMPORT_LINE_RE = /^\s*(?:import\b|from\s+\S+\s+import\b|use\s+[^;]+;|#include\s*[<"])/;
+const EXPORT_OR_PUB_CONST_RE = /^\s*(?:export\s+(?:const|let|var)\s+|pub(?:\([^)]*\))?\s+const\s+|pub(?:\([^)]*\))?\s+static\s+)/;
+const TYPE_CONTAINER_RE = /^\s*(?:export\s+(?:default\s+)?|pub(?:\([^)]*\))?\s+)?(?:interface|type\s+\w+\s*=\s*\{|struct|enum)\b/;
+const CLASS_IMPL_HEADER_RE = /^\s*(?:export\s+(?:default\s+)?|abstract\s+|pub(?:\([^)]*\))?\s+)?(?:class|trait|impl|protocol|actor)\b/;
+const DEPTH1_METHOD_RE = /^\s*(?:(?:async|static|private|protected|public|readonly|override|pub(?:\([^)]*\))?|fn|func|def|get|set)\s+)*[A-Za-z_$][\w$]*\s*(?:<[^>\n]{0,60}>)?\s*\(/;
+const THROW_PANIC_RE = /\b(?:throw\s+|raise\s+|panic!\s*\()/;
+const CONTROL_KW_RE = /^\s*(?:if|else|for|while|switch|catch|with|return|match)\b/;
 
 const TOKEN_CACHE_MAX = 2048;
 const tokenCountCache = new Map<string, number>();
@@ -205,6 +220,449 @@ function looksLikeDiff(text: string, lines: readonly string[]): boolean {
   return plusMinus >= 4 && text.includes('@@');
 }
 
+function extractJsonSummary(text: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+
+  const ERROR_LEAF_KEY_RE = /^(?:error|err|message|reason|detail|status|code|failures|errors)$/i;
+  const errorLeaves: string[] = [];
+  const collectErrors = (val: unknown, path: string, depth: number): void => {
+    if (errorLeaves.length >= 8 || depth > 5 || !val || typeof val !== 'object') return;
+    if (Array.isArray(val)) {
+      const cap = Math.min(val.length, 16);
+      for (let i = 0; i < cap; i++) {
+        collectErrors(val[i], `${path}[${i}]`, depth + 1);
+      }
+      return;
+    }
+    for (const [k, v] of Object.entries(val as Record<string, unknown>)) {
+      if (errorLeaves.length >= 8) break;
+      const p = path ? `${path}.${k}` : k;
+      if (ERROR_LEAF_KEY_RE.test(k) && v !== null && v !== undefined && typeof v !== 'object') {
+        const s = String(v).slice(0, 100);
+        if (s && s !== 'ok' && s !== '200' && s !== '0' && s !== 'true') {
+          errorLeaves.push(`${p}=${JSON.stringify(s)}`);
+        }
+      } else if (v && typeof v === 'object') {
+        collectErrors(v, p, depth + 1);
+      }
+    }
+  };
+  collectErrors(parsed, '', 0);
+
+  const summarizeVal = (v: unknown): string => {
+    if (v === null) return 'null';
+    if (typeof v !== 'object') return JSON.stringify(v).slice(0, 60);
+    if (Array.isArray(v)) return `Array(${v.length})`;
+    return `{${Object.keys(v as Record<string, unknown>).length} keys}`;
+  };
+
+  const parts: string[] = [];
+  if (Array.isArray(parsed)) {
+    parts.push(`root: Array(${parsed.length})`);
+    const sampleIdx = parsed.length <= 3 ? parsed.map((_, i) => i) : [0, 1, parsed.length - 1];
+    for (const idx of sampleIdx) {
+      if (idx < parsed.length) parts.push(`  [${idx}]: ${JSON.stringify(parsed[idx]).slice(0, 140)}`);
+    }
+  } else {
+    const entries = Object.entries(parsed as Record<string, unknown>);
+    const cap = Math.min(entries.length, 24);
+    for (let i = 0; i < cap; i++) {
+      const [k, v] = entries[i]!;
+      parts.push(`  ${k}: ${summarizeVal(v)}`);
+    }
+    if (entries.length > cap) {
+      parts.push(`  ... (+${entries.length - cap} more top-level keys)`);
+    }
+  }
+  if (errorLeaves.length > 0) {
+    parts.push(`errors/status: ${errorLeaves.join(', ')}`);
+  }
+  return parts.join('\n');
+}
+
+function formatProportionalDiffDigest(lines: readonly string[]): { lines: string[]; omitted: number } {
+  interface DiffSection {
+    headerLines: string[];
+    deltaIndices: number[];
+    fileLabel: string;
+  }
+  const sections: DiffSection[] = [];
+  let cur: DiffSection | null = null;
+  const ensureSection = (label = 'diff'): DiffSection => {
+    if (!cur) {
+      cur = { headerLines: [], deltaIndices: [], fileLabel: label };
+      sections.push(cur);
+    }
+    return cur;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i]!;
+    if (l.startsWith('diff --git ')) {
+      cur = { headerLines: [l], deltaIndices: [], fileLabel: l.slice(11).trim() };
+      sections.push(cur);
+    } else if (DIFF_HEADER_RE.test(l)) {
+      ensureSection().headerLines.push(l);
+    } else if (/^[+-]/.test(l)) {
+      ensureSection().deltaIndices.push(i);
+    }
+  }
+
+  if (sections.length === 0) return { lines: [], omitted: 0 };
+
+  const TOTAL_BUDGET = 80;
+  const minPerSection = Math.min(4, Math.max(1, Math.floor(TOTAL_BUDGET / sections.length)));
+  const alloc = sections.map((s) => Math.min(s.deltaIndices.length, minPerSection));
+  let used = alloc.reduce((a, b) => a + b, 0);
+  let remaining = Math.max(0, TOTAL_BUDGET - used);
+
+  // Proportional allocation with slack water-filling across file sections.
+  if (remaining > 0) {
+    const unsatisfied = sections
+      .map((s, idx) => ({ idx, rem: s.deltaIndices.length - alloc[idx]! }))
+      .filter((x) => x.rem > 0);
+    const totalRem = unsatisfied.reduce((sum, x) => sum + x.rem, 0);
+    if (totalRem > 0) {
+      for (const x of unsatisfied) {
+        const share = Math.min(x.rem, Math.floor((remaining * x.rem) / totalRem));
+        alloc[x.idx]! += share;
+        used += share;
+      }
+      let slack = Math.max(0, TOTAL_BUDGET - used);
+      for (const x of unsatisfied) {
+        if (slack <= 0) break;
+        const canAdd = Math.min(slack, sections[x.idx]!.deltaIndices.length - alloc[x.idx]!);
+        if (canAdd > 0) {
+          alloc[x.idx]! += canAdd;
+          slack -= canAdd;
+        }
+      }
+    }
+  }
+
+  const out: string[] = [];
+  let omitted = 0;
+  for (let sIdx = 0; sIdx < sections.length; sIdx++) {
+    omitted += sections[sIdx]!.deltaIndices.length - alloc[sIdx]!;
+  }
+  let sectionIdx = -1;
+  let keptInSec = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i]!;
+    if (l.startsWith('diff --git ')) {
+      if (sectionIdx >= 0) {
+        const secOmitted = sections[sectionIdx]!.deltaIndices.length - keptInSec;
+        if (secOmitted > 0) out.push(`... (${secOmitted} extra +/- lines omitted in ${sections[sectionIdx]!.fileLabel}) ...`);
+      }
+      sectionIdx++;
+      keptInSec = 0;
+      out.push(l);
+    } else if (DIFF_HEADER_RE.test(l)) {
+      if (sectionIdx < 0) sectionIdx = 0;
+      out.push(l);
+    } else if (/^[+-]/.test(l)) {
+      if (sectionIdx < 0) sectionIdx = 0;
+      if (keptInSec < (alloc[sectionIdx] ?? 0)) {
+        out.push(l);
+        keptInSec++;
+      }
+    }
+  }
+  if (sectionIdx >= 0) {
+    const secOmitted = sections[sectionIdx]!.deltaIndices.length - keptInSec;
+    if (secOmitted > 0) out.push(`... (${secOmitted} extra +/- lines omitted in ${sections[sectionIdx]!.fileLabel}) ...`);
+  }
+  return { lines: out, omitted };
+}
+
+function buildCodeSkeletonDigest(lines: readonly string[]): { bodyLines: string[]; keptCount: number } {
+  const n = lines.length;
+  const stripped = lines.map(stripLineNumPrefix);
+  const lineNumbers = lines.map((l, idx) => {
+    const m = LINE_NUM_VAL_RE.exec(l);
+    return m ? Number.parseInt(m[1]!, 10) : idx + 1;
+  });
+
+  // Lexical scope state across lines: string/comment tracking, {}, (), [] depth, Python indent.
+  let inBlockComment = false;
+  let braceDepth = 0;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let pythonMode = false;
+
+  interface BlockInfo {
+    kind: 'class' | 'type' | 'fn';
+    headerLineIdx: number;
+    targetBraceDepth: number;
+    pythonIndent: number;
+    isPython: boolean;
+    keptFields: number;
+    keptThrows: number;
+    endLineIdx: number;
+  }
+  const stack: BlockInfo[] = [];
+  const keepIdx = new Set<number>();
+  const bodySpanNote = new Map<number, string>();
+  const importCollapsed = new Map<number, { endIdx: number; summary: string }>();
+
+  for (let i = 0; i < Math.min(4, n); i++) keepIdx.add(i);
+  for (let i = Math.max(0, n - 4); i < n; i++) keepIdx.add(i);
+
+  let importRunStart = -1;
+  let importRunEnd = -1;
+  const importNames: string[] = [];
+  const flushImportRun = (): void => {
+    if (importRunStart >= 0 && importRunEnd > importRunStart) {
+      const startNum = lineNumbers[importRunStart]!;
+      const endNum = lineNumbers[importRunEnd]!;
+      const names = [...new Set(importNames)].slice(0, 8).join(', ');
+      importCollapsed.set(importRunStart, {
+        endIdx: importRunEnd,
+        summary: `imports [L${startNum}-L${endNum}] (${importRunEnd - importRunStart + 1} lines)${names ? `: ${names}` : ''}`,
+      });
+    } else if (importRunStart >= 0) {
+      keepIdx.add(importRunStart);
+    }
+    importRunStart = -1;
+    importRunEnd = -1;
+    importNames.length = 0;
+  };
+
+  let pendingSigBlock: BlockInfo | null = null;
+  let sigLinesRemaining = 0;
+  let keptConsts = 0;
+
+  const indentOf = (s: string): number => {
+    let w = 0;
+    for (let k = 0; k < s.length; k++) {
+      const c = s.charCodeAt(k);
+      if (c === 32) w++;
+      else if (c === 9) w += 4;
+      else break;
+    }
+    return w;
+  };
+
+  for (let i = 0; i < n; i++) {
+    const rawLine = stripped[i]!;
+    const trimmed = rawLine.trim();
+    const indent = indentOf(rawLine);
+
+    if (!pythonMode && (/^\s*(?:async\s+)?def\s+\w+\s*\(/.test(rawLine) || /^\s*class\s+\w+[^:]*:\s*$/.test(rawLine))) {
+      pythonMode = true;
+    }
+
+    // Close Python indent-scoped blocks when dedenting.
+    if (trimmed.length > 0 && !trimmed.startsWith('#')) {
+      while (stack.length > 0) {
+        const top = stack[stack.length - 1]!;
+        if (!top.isPython || indent > top.pythonIndent) break;
+        stack.pop();
+        top.endLineIdx = Math.max(top.headerLineIdx, i - 1);
+        if (top.kind === 'fn' && top.endLineIdx > top.headerLineIdx) {
+          bodySpanNote.set(top.headerLineIdx, `[L${lineNumbers[top.headerLineIdx]!}-L${lineNumbers[top.endLineIdx]!}]`);
+        }
+      }
+    }
+
+    // Collapse contiguous import runs at depth 0.
+    if (braceDepth === 0 && parenDepth === 0 && !inBlockComment && IMPORT_LINE_RE.test(rawLine)) {
+      if (importRunStart < 0) importRunStart = i;
+      importRunEnd = i;
+      const modMatch = /from\s+['"]?([^'"\s;]+)['"]?|import\s+['"]?([^'"\s;]+)['"]?|use\s+([^;]+);|#include\s*[<"]([^>"]+)[>"]/.exec(trimmed);
+      const modName = (modMatch?.[1] ?? modMatch?.[2] ?? modMatch?.[3] ?? modMatch?.[4] ?? '').trim();
+      if (modName && importNames.length < 12) importNames.push(modName);
+      continue;
+    } else if (importRunStart >= 0 && trimmed === '') {
+      // Allow single blank lines inside import block only if next non-blank line is also an import.
+      let nextNonBlank = i + 1;
+      while (nextNonBlank < n && stripped[nextNonBlank]!.trim() === '') nextNonBlank++;
+      if (nextNonBlank < n && IMPORT_LINE_RE.test(stripped[nextNonBlank]!)) {
+        importRunEnd = i;
+        continue;
+      }
+      flushImportRun();
+    } else if (importRunStart >= 0) {
+      flushImportRun();
+    }
+
+    const depthBefore = braceDepth;
+    const parenBefore = parenDepth;
+
+    // Scan string/comment/delimiter state on this line in O(L).
+    let openBraces = 0;
+    let closeBraces = 0;
+    let quote = 0;
+    let escaped = false;
+    for (let j = 0; j < rawLine.length; j++) {
+      const c = rawLine.charCodeAt(j);
+      const next = j + 1 < rawLine.length ? rawLine.charCodeAt(j + 1) : 0;
+      if (inBlockComment) {
+        if (c === 42 && next === 47) {
+          inBlockComment = false;
+          j++;
+        }
+        continue;
+      }
+      if (quote !== 0) {
+        if (escaped) escaped = false;
+        else if (c === 92) escaped = true;
+        else if (c === quote) quote = 0;
+        continue;
+      }
+      if (c === 47 && next === 47) break;
+      if (c === 35 && (pythonMode || (j === 0 && next === 32))) break;
+      if (c === 47 && next === 42) {
+        inBlockComment = true;
+        j++;
+        continue;
+      }
+      if (c === 34 || c === 39 || c === 96) {
+        quote = c;
+        continue;
+      }
+      if (c === 123) {
+        braceDepth++;
+        openBraces++;
+      } else if (c === 125) {
+        braceDepth = Math.max(0, braceDepth - 1);
+        closeBraces++;
+      } else if (c === 40) {
+        parenDepth++;
+      } else if (c === 41) {
+        parenDepth = Math.max(0, parenDepth - 1);
+      } else if (c === 91) {
+        bracketDepth++;
+      } else if (c === 93) {
+        bracketDepth = Math.max(0, bracketDepth - 1);
+      }
+    }
+
+    const topScope = stack.length > 0 ? stack[stack.length - 1] : undefined;
+    if (sigLinesRemaining > 0 && pendingSigBlock) {
+      keepIdx.add(i);
+      if (openBraces > 0 || parenDepth === 0 || (pendingSigBlock.isPython && /:\s*(?:#.*)?$/.test(trimmed))) {
+        sigLinesRemaining = 0;
+        if (!pendingSigBlock.isPython && braceDepth > pendingSigBlock.targetBraceDepth) {
+          stack.push(pendingSigBlock);
+          pendingSigBlock = null;
+        } else if (pendingSigBlock.isPython) {
+          stack.push(pendingSigBlock);
+          pendingSigBlock = null;
+        } else if (parenDepth === 0) {
+          pendingSigBlock = null;
+        }
+      } else {
+        sigLinesRemaining--;
+      }
+    } else if (!inBlockComment && trimmed.length > 0 && !trimmed.startsWith('//') && !trimmed.startsWith('/*')) {
+      const inClassScope = topScope?.kind === 'class' && depthBefore === topScope.targetBraceDepth + 1;
+      const isCodeDecl = CODE_DECL_RE.test(rawLine);
+      const isConstDecl = !isCodeDecl && depthBefore === 0 && EXPORT_OR_PUB_CONST_RE.test(rawLine);
+      const isDecl =
+        (depthBefore === 0 && (isCodeDecl || (isConstDecl && keptConsts < 12))) ||
+        (inClassScope &&
+          !CONTROL_KW_RE.test(rawLine) &&
+          (isCodeDecl || DEPTH1_METHOD_RE.test(rawLine)));
+
+      if (isDecl && parenBefore === 0 && bracketDepth === 0) {
+        if (isConstDecl) keptConsts++;
+        keepIdx.add(i);
+        const kind: BlockInfo['kind'] = CLASS_IMPL_HEADER_RE.test(rawLine)
+          ? 'class'
+          : TYPE_CONTAINER_RE.test(rawLine)
+            ? 'type'
+            : 'fn';
+        const isPyBlock = pythonMode && /^\s*(?:async\s+)?def\b|^\s*class\b/.test(rawLine);
+        const info: BlockInfo = {
+          kind,
+          headerLineIdx: i,
+          targetBraceDepth: depthBefore,
+          pythonIndent: indent,
+          isPython: isPyBlock,
+          keptFields: 0,
+          keptThrows: 0,
+          endLineIdx: i,
+        };
+        if (isPyBlock) {
+          if (parenDepth > 0 || !/:\s*(?:#.*)?$/.test(trimmed)) {
+            pendingSigBlock = info;
+            sigLinesRemaining = 6;
+          } else {
+            stack.push(info);
+          }
+        } else if (braceDepth > depthBefore) {
+          stack.push(info);
+        } else if (parenDepth > 0 || (!trimmed.endsWith(';') && !rawLine.includes('{'))) {
+          pendingSigBlock = info;
+          sigLinesRemaining = 6;
+        }
+      } else if (topScope?.kind === 'type' && depthBefore === topScope.targetBraceDepth + 1) {
+        if (topScope.keptFields < 8 && !trimmed.startsWith('}')) {
+          keepIdx.add(i);
+          topScope.keptFields++;
+        }
+      } else if (topScope?.kind === 'fn' && THROW_PANIC_RE.test(rawLine)) {
+        if (topScope.keptThrows < 4) {
+          keepIdx.add(i);
+          topScope.keptThrows++;
+        }
+      }
+    }
+
+    if (closeBraces > 0) {
+      while (stack.length > 0) {
+        const top = stack[stack.length - 1]!;
+        if (top.isPython || braceDepth > top.targetBraceDepth) break;
+        stack.pop();
+        top.endLineIdx = i;
+        if (top.kind === 'fn' && i > top.headerLineIdx) {
+          bodySpanNote.set(top.headerLineIdx, `[L${lineNumbers[top.headerLineIdx]!}-L${lineNumbers[i]!}]`);
+        }
+        keepIdx.add(i);
+      }
+    }
+  }
+  flushImportRun();
+  for (const open of stack) {
+    if (open.kind === 'fn' && n - 1 > open.headerLineIdx) {
+      bodySpanNote.set(open.headerLineIdx, `[L${lineNumbers[open.headerLineIdx]!}-L${lineNumbers[n - 1]!}]`);
+    }
+  }
+
+  const bodyLines: string[] = [];
+  let keptCount = 0;
+  let prevEmitted = -1;
+  for (let i = 0; i < n; i++) {
+    const imp = importCollapsed.get(i);
+    if (imp) {
+      if (prevEmitted >= 0 && i > prevEmitted + 1) {
+        bodyLines.push(`  ... (${i - prevEmitted - 1} lines omitted) ...`);
+      }
+      bodyLines.push(imp.summary);
+      keptCount++;
+      prevEmitted = imp.endIdx;
+      i = imp.endIdx;
+      continue;
+    }
+    if (!keepIdx.has(i)) continue;
+    if (prevEmitted >= 0 && i > prevEmitted + 1) {
+      bodyLines.push(`  ... (${i - prevEmitted - 1} lines omitted) ...`);
+    }
+    const span = bodySpanNote.get(i);
+    bodyLines.push(span ? `${lines[i]!} // ${span}` : lines[i]!);
+    keptCount++;
+    prevEmitted = i;
+  }
+  return { bodyLines, keptCount };
+}
+
 /**
  * Deterministic extractive structural digest for aged tool outputs.
  */
@@ -239,10 +697,21 @@ export function extractStructuralDigest(text: string, refId = 'prior'): string {
   };
 
   const lines = text.split('\n');
-  const sheet = factSheetText(text, 'compact');
-  const appendSheet = (body: string) => store(sheet ? `${body}\n${sheet}` : body);
+  const appendSheet = (body: string) => {
+    const sheet = factSheetText(text, { format: 'compact', coveredText: body, dropCovered: true });
+    return store(sheet ? `${body}\n${sheet}` : body);
+  };
 
   if (text.startsWith('@toon ') || looksLikeJsonPayload(text)) {
+    if (!text.startsWith('@toon ')) {
+      const jsonSummary = extractJsonSummary(text);
+      if (jsonSummary !== null) {
+        const body = `[fiche epoch-digest ${refId}: JSON summary (${lines.length} lines, ${text.length} chars)]\n${jsonSummary}`;
+        if (body.length < text.length) {
+          return appendSheet(body);
+        }
+      }
+    }
     if (lines.length === 1 && text.length > 1000) {
       const body = [
         `[fiche epoch-digest ${refId}: structured data (1 line, ${text.length} chars); head/tail + identifiers preserved]`,
@@ -263,46 +732,15 @@ export function extractStructuralDigest(text: string, refId = 'prior'): string {
   }
 
   if (looksLikeDiff(text, lines)) {
-    const kept: string[] = [];
-    let deltaCount = 0;
-    let omitted = 0;
-    for (const l of lines) {
-      if (DIFF_HEADER_RE.test(l)) {
-        kept.push(l);
-      } else if (/^[+-]/.test(l)) {
-        if (deltaCount < 80) {
-          kept.push(l);
-          deltaCount++;
-        } else {
-          omitted++;
-        }
-      }
-    }
-    const summary = `[fiche epoch-digest ${refId}: unified diff (${lines.length} lines${omitted > 0 ? `, ${omitted} extra +/- lines omitted` : ''})]`;
-    return appendSheet([summary, ...kept].join('\n'));
+    const diffRes = formatProportionalDiffDigest(lines);
+    const summary = `[fiche epoch-digest ${refId}: unified diff (${lines.length} lines${diffRes.omitted > 0 ? `, ${diffRes.omitted} extra +/- lines omitted` : ''})]`;
+    return appendSheet([summary, ...diffRes.lines].join('\n'));
   }
 
   if (looksLikeCodeOrLineNumbered(lines)) {
-    const keepIdx = new Set<number>();
-    for (let i = 0; i < Math.min(4, lines.length); i++) keepIdx.add(i);
-    for (let i = Math.max(0, lines.length - 4); i < lines.length; i++) keepIdx.add(i);
-    for (let i = 0; i < lines.length; i++) {
-      if (CODE_DECL_RE.test(stripLineNumPrefix(lines[i]!))) {
-        keepIdx.add(i);
-      }
-    }
-    const sorted = [...keepIdx].sort((a, b) => a - b);
-    const bodyLines: string[] = [];
-    let prev = -1;
-    for (const idx of sorted) {
-      if (prev >= 0 && idx > prev + 1) {
-        bodyLines.push(`  ... (${idx - prev - 1} lines omitted) ...`);
-      }
-      bodyLines.push(lines[idx]!);
-      prev = idx;
-    }
-    const header = `[fiche epoch-digest ${refId}: code skeleton (${lines.length} lines -> ${sorted.length} signature/boundary lines); re-read if full body needed]`;
-    return appendSheet([header, ...bodyLines].join('\n'));
+    const skel = buildCodeSkeletonDigest(lines);
+    const header = `[fiche epoch-digest ${refId}: code skeleton (${lines.length} lines -> ${skel.keptCount} signature/boundary lines); re-read if full body needed]`;
+    return appendSheet([header, ...skel.bodyLines].join('\n'));
   }
 
   // Logs / CLI / search / prose
@@ -430,7 +868,9 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     args.sessionKey,
     args.model ? { model: args.model } : undefined,
   );
-  const stickyOnly = args.stickyOnly === true || circuitBreakerOpen;
+  const breakerState = args.circuitBreakerState ?? (circuitBreakerOpen ? 'open' : 'closed');
+  const stickyOnly = args.stickyOnly === true || breakerState === 'open';
+  let earliestNewInvalidationMsg = args.earliestNewInvalidationMsg;
 
   if (lsmActive && args.sessionCacheCold === true) {
     // L2 Cold-Cache Repack: partition all eligible blocks behind cutoffL1, flushing trailing remainder.
@@ -489,12 +929,21 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
 
     // L1 Early Large-Block Compaction behind cutoffL1 (before waiting keepTailMessages = 6 turns).
     // Strictly 1-block `[item]` epochs so crossing cutoffMsg into L0 never splits a sticky key.
+    // Defer unsealed blocks carrying failure signals so imminent green checkpoints fold in Stage 3b.
+    // Evaluate unsealed L1 blocks newest-first so same-turn upstream L1 blocks see compacted downstream sizes.
     if (lsmActive && cutoffL1 > 1) {
+      const unsealedL1: Candidate[] = [];
       for (const item of l1ZoneBlocks) {
         if (!item) continue;
-        if ((!stickyOnly && item.rawTokens >= lsmMinLargeTokens) || isKeySticky(`${keyPrefix}${item.sig}`)) {
+        const itemSticky = isKeySticky(`${keyPrefix}${item.sig}`);
+        if (itemSticky) {
           sealedList.push([item]);
+        } else if (!stickyOnly && item.rawTokens >= lsmMinLargeTokens && !L1_FAIL_SIGNAL_RE.test(item.raw)) {
+          unsealedL1.push(item);
         }
+      }
+      for (let i = unsealedL1.length - 1; i >= 0; i--) {
+        sealedList.push([unsealedL1[i]!]);
       }
     }
   }
@@ -549,6 +998,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     const epochDigestTokens = proposals.reduce((sum, p) => sum + p.digestTokPaired, 0);
     if (!alreadySealed && epochDigestTokens >= epochRawTokens * 0.55) continue;
 
+    const epochFirstMsg = epoch[0]!.block.msgIndex;
     const epochLastBlock = epoch[epoch.length - 1]!.block;
     const epochLastMsg = epochLastBlock.msgIndex;
     const epochLastBlockIdx = epochLastBlock.blockIndex ?? 0;
@@ -573,9 +1023,13 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
       ? resolvePriceRates(args.model, { promptTokens: 0, ttlSec: effectiveTtlSec })
       : rates;
 
+    const coalescedInWave =
+      !alreadySealed &&
+      earliestNewInvalidationMsg !== undefined &&
+      epochFirstMsg > earliestNewInvalidationMsg;
     let downstreamCachedTokens = 0;
     let midPrefixDownstreamTokens = 0;
-    if (!coldRepack) {
+    if (!coldRepack && !coalescedInWave) {
       let blockSum = 0;
       for (const b of args.blocks) {
         if (b.msgIndex > epochLastMsg && b.msgIndex <= horizonEndMsg) {
@@ -587,7 +1041,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
         }
       }
       let msgSum = 0;
-      if (hasBreakpoints && args.msgTotalTokens && args.msgTotalTokens.length > 0) {
+      if ((hasBreakpoints || isAutoCacheOpenAI) && args.msgTotalTokens && args.msgTotalTokens.length > 0) {
         const limit = Math.min(args.msgTotalTokens.length - 1, horizonEndMsg);
         for (let m = epochLastMsg + 1; m <= limit; m++) {
           msgSum += args.msgTotalTokens[m] ?? 0;
@@ -598,16 +1052,18 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
         midPrefixDownstreamTokens = downstreamCachedTokens;
       }
     }
+    if (!alreadySealed && breakerState === 'half_open' && downstreamCachedTokens > 0) continue;
 
     const effectiveWriteRate = isAutoCacheOpenAI
       ? Math.min(epochRates.write, 1)
       : epochRates.write;
     const savedTok = epochRawTokens - epochDigestTokens;
     const savedPerRead = savedTok * epochRates.read;
-    const transitionCost =
-      epochDigestTokens * effectiveWriteRate -
-      epochRawTokens * epochRates.read +
-      downstreamCachedTokens * (effectiveWriteRate - epochRates.read);
+    const transitionCost = coalescedInWave
+      ? (epochDigestTokens - epochRawTokens) * effectiveWriteRate
+      : epochDigestTokens * effectiveWriteRate -
+        epochRawTokens * epochRates.read +
+        downstreamCachedTokens * (effectiveWriteRate - epochRates.read);
     const paybackReads =
       savedPerRead > 0 ? Math.ceil(Math.max(0, transitionCost) / savedPerRead) : Infinity;
 
@@ -625,15 +1081,33 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     });
 
     const turnsObserved = Math.max(1, Math.floor(args.totalMessages / 2));
+    const frontierOnly =
+      downstreamCachedTokens > 0 &&
+      midPrefixDownstreamTokens === 0 &&
+      !hasBreakpoints &&
+      !(effectiveTtlSec !== undefined && effectiveTtlSec >= 3600);
     const cliffWins = Boolean(cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) || stickyCliffActive;
-    const effectiveMaxPayback =
+    let effectiveMaxPayback =
       args.maxPaybackReads !== undefined
         ? maxPayback
         : computeHorizonPaybackLimit({
             turnsObserved,
             baseMaxPayback: maxPayback,
-            downstreamCachedTokens: midPrefixDownstreamTokens,
+            downstreamCachedTokens,
+            frontierOnly,
+            ttlSec: effectiveTtlSec,
+            ewmaInterTurnSec: args.ewmaInterTurnSec,
+            ewmaHitRatio: args.ewmaHitRatio,
+            writeRate: effectiveWriteRate,
           });
+    if (
+      args.maxPaybackReads === undefined &&
+      effectiveTtlSec !== undefined &&
+      effectiveTtlSec >= 3600 &&
+      downstreamCachedTokens > 0
+    ) {
+      effectiveMaxPayback = Math.min(effectiveMaxPayback, 8);
+    }
     if (!alreadySealed && paybackReads > effectiveMaxPayback && !cliffWins) continue;
 
     let epochSavedChars = 0;
@@ -650,6 +1124,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
             : estimateTokenPair(p.item.raw, replacement)[1];
         if (repTok >= p.rawTokPaired) continue;
         p.item.block.setText(replacement);
+        blockTokensByBlock.set(p.item.block, repTok);
         compactedBlocks++;
         compactedItems.push(p.item);
         epochSavedChars += p.item.raw.length - replacement.length;
@@ -661,6 +1136,12 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
       totalSavedChars += epochSavedChars;
       totalSavedTokens += epochSavedTok;
       runningPrompt = Math.max(0, runningPrompt - epochSavedTok);
+      if (!alreadySealed) {
+        earliestNewInvalidationMsg =
+          earliestNewInvalidationMsg === undefined
+            ? epochFirstMsg
+            : Math.min(earliestNewInvalidationMsg, epochFirstMsg);
+      }
       addStickySealed(stickyKey);
       if (coldRepack) {
         // Also pin per-block keys so crossing cutoffMsg after L2 -> Warm never tears an epoch.
@@ -691,6 +1172,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     compactedBlocks,
     savedChars: totalSavedChars,
     savedTokens: totalSavedTokens,
+    ...(earliestNewInvalidationMsg !== undefined ? { earliestNewInvalidationMsg } : {}),
     ...(cliffAvoided ? { cliffAvoided } : {}),
   };
 }

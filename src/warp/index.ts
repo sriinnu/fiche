@@ -37,7 +37,7 @@ import { basename, join } from 'node:path';
 
 import { CertificateAuthority } from './ca.js';
 import { buildWarpAppArgs, type ResolvedMacApp } from './app-launch.js';
-import { createWarpHandlers, destroyWarpAgents } from './connect.js';
+import { createWarpHandlers } from './connect.js';
 import { isRunnable } from './resolve.js';
 import { parseRoute, routeDestination, type Route } from './route.js';
 import { readBrandEnv } from '../core/env.js';
@@ -546,6 +546,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     proxy.on('connection', (socket) => socket.setNoDelay(true));
     proxy.on('connect', handlers.handleConnect);
     proxy.on('upgrade', handlers.handleUpgrade);
+    proxy.once('close', () => handlers.destroy?.());
 
     const spawnChild = (cmd: string[], proxyUrl: string): void => {
       const env = { ...process.env };
@@ -604,7 +605,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
             providersPollTimer = undefined;
           }
           try { proxy.close(); } catch { /* ignore */ }
-          destroyWarpAgents();
+          handlers.destroy?.();
         },
         launchedAt,
       );
@@ -695,7 +696,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
     } else {
       console.error(`[fiche] warp exec → ${augmentWrappedCommand(command).join(' ')}`);
     }
-    if (verboseBanner || !process.stdout.isTTY) {
+    if (verboseBanner || Boolean(process.stderr.isTTY)) {
       const activeSet = new Set<ProviderId>(activeProviders);
       const thirdPartyIds = new Set(
         PROVIDER_CATALOG.filter((p) => p.tier === 'third-party').map((p) => p.id),

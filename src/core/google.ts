@@ -28,12 +28,19 @@ import {
   type OpticalMode,
   type TransformInfo,
 } from './transform.js';
-import { noteHistoryRequest, sessionAnchorText } from './session-state.js';
+import {
+  getCacheCircuitBreakerState,
+  hasStage2SealKey,
+  noteHistoryRequest,
+  recordStage2SealKey,
+  sessionAnchorText,
+} from './session-state.js';
 import {
   prepareImagedRenderText,
   droppedCodepointsTop,
   schemaAnnotationLines,
   buildLiveRequestGuard,
+  splitLeadingOpenAIAuthorityText,
   CHAT_HEADER,
   HISTORY_TRANSCRIPT_INTRO,
   HISTORY_TRANSCRIPT_OUTRO,
@@ -46,9 +53,10 @@ import { stripSchemaDescriptions } from './schema-strip.js';
 import { relocateGooglePins } from './pin.js';
 import { compactPreview, verbatimTaskText } from './history.js';
 import { extractFaultSignalSnippet } from './context-mmu.js';
-import { gateRatesFor, priceMode, resolvePriceRates } from './pricing.js';
+import { evaluateCliffAvoidance, gateRatesFor, priceMode, resolvePriceRates } from './pricing.js';
 import {
   applyGoogleTextHygiene,
+  buildOpticalToolSealKey,
   isTextHygieneActive,
   resolveTextHygieneMode,
   type TextHygieneMode,
@@ -156,6 +164,89 @@ interface GoogleHistoryPlan {
   collapsedTurns: number;
   droppedChars: number;
   droppedCodepoints: Map<number, number>;
+  cliffAvoided?: { at: number; multiplier: number; savedUsd: number };
+}
+
+const GOOGLE_CLIFF_STICKY_MAX = 512;
+const googleCliffSticky = new Map<string, number>();
+
+function getGoogleCliffSticky(key: string): number | undefined {
+  const hit = googleCliffSticky.get(key);
+  if (hit !== undefined) {
+    googleCliffSticky.delete(key);
+    googleCliffSticky.set(key, hit);
+  }
+  return hit;
+}
+
+function recordGoogleCliffSticky(key: string, cliffAt: number): void {
+  if (googleCliffSticky.has(key)) {
+    googleCliffSticky.delete(key);
+  } else if (googleCliffSticky.size >= GOOGLE_CLIFF_STICKY_MAX) {
+    const oldest = googleCliffSticky.keys().next().value;
+    if (oldest !== undefined) googleCliffSticky.delete(oldest);
+  }
+  googleCliffSticky.set(key, cliffAt);
+}
+
+function evalAndRecordGoogleCliff(
+  modelName: string,
+  stickyKey: string,
+  args: {
+    promptTokensBefore: number;
+    collapsedBaselineTokens: number;
+    collapsedActualTokens: number;
+    downstreamCachedTokens: number;
+    expectedOutputTokens?: number;
+  },
+): { at: number; multiplier: number; savedUsd: number } | undefined {
+  if (priceMode() !== 'kosha') return undefined;
+  const {
+    promptTokensBefore,
+    collapsedBaselineTokens,
+    collapsedActualTokens,
+    downstreamCachedTokens,
+    expectedOutputTokens,
+  } = args;
+  if (!(collapsedActualTokens < collapsedBaselineTokens) || promptTokensBefore <= collapsedBaselineTokens) {
+    return undefined;
+  }
+  const stickyCliffAt = getGoogleCliffSticky(stickyKey);
+  if (stickyCliffAt !== undefined && promptTokensBefore > stickyCliffAt) {
+    const evalSticky = evaluateCliffAvoidance(modelName, {
+      promptTokensBefore,
+      promptTokensAfter: Math.max(0, promptTokensBefore - (collapsedBaselineTokens - collapsedActualTokens)),
+      collapsedBaselineTokens,
+      collapsedActualTokens,
+      downstreamCachedTokens: Math.max(0, downstreamCachedTokens),
+      expectedOutputTokens,
+    });
+    if (evalSticky?.crossesCliff && evalSticky.netSingleTurnUsd > 0) {
+      return {
+        at: evalSticky.cliffAt,
+        multiplier: evalSticky.multiplier,
+        savedUsd: evalSticky.netSingleTurnUsd,
+      };
+    }
+    return { at: stickyCliffAt, multiplier: 2, savedUsd: 0 };
+  }
+  const cliff = evaluateCliffAvoidance(modelName, {
+    promptTokensBefore,
+    promptTokensAfter: Math.max(0, promptTokensBefore - (collapsedBaselineTokens - collapsedActualTokens)),
+    collapsedBaselineTokens,
+    collapsedActualTokens,
+    downstreamCachedTokens: Math.max(0, downstreamCachedTokens),
+    expectedOutputTokens,
+  });
+  if (cliff?.crossesCliff && cliff.netSingleTurnUsd > 0) {
+    recordGoogleCliffSticky(stickyKey, cliff.cliffAt);
+    return {
+      at: cliff.cliffAt,
+      multiplier: cliff.multiplier,
+      savedUsd: cliff.netSingleTurnUsd,
+    };
+  }
+  return undefined;
 }
 
 function countGoogleInlineImageBytes(req: GoogleGenerateContentRequest): number {
@@ -530,6 +621,9 @@ async function compressGoogleToolResults(
     minToolResultChars?: number;
     maxImagesPerToolResult?: number;
     reflow?: boolean;
+    sessionKey?: string;
+    breakerState?: 'closed' | 'open' | 'half_open';
+    slabCoveredText?: string;
   },
 ): Promise<GoogleToolResultPlan> {
   const empty = (): GoogleToolResultPlan => ({
@@ -548,6 +642,8 @@ async function compressGoogleToolResults(
   const profile = resolveGeminiProfile(modelName);
   const minChars = Math.max(0, options.minToolResultChars ?? 4500);
   const perResultCap = Math.max(1, options.maxImagesPerToolResult ?? 10);
+  const breakerState = options.breakerState ?? 'closed';
+  const sessionKey = options.sessionKey;
   const allImages: RenderedImage[] = [];
   const imageSources: string[] = [];
   const bucketChars: GoogleToolResultPlan['bucketChars'] = {};
@@ -559,14 +655,16 @@ async function compressGoogleToolResults(
   let changed = false;
 
   const rewrittenContents: GoogleContent[] = [];
-  for (const content of contents) {
+  for (let cIdx = 0; cIdx < contents.length; cIdx++) {
+    const content = contents[cIdx]!;
     if (!Array.isArray(content.parts)) {
       rewrittenContents.push(content);
       continue;
     }
     let contentChanged = false;
     const rewrittenParts: GooglePart[] = [];
-    for (const rawPart of content.parts) {
+    for (let pIdx = 0; pIdx < content.parts.length; pIdx++) {
+      const rawPart = content.parts[pIdx]!;
       const part = record(rawPart) as GooglePart | null;
       const response = part?.functionResponse;
       const responseBody = record(response?.response);
@@ -586,6 +684,18 @@ async function compressGoogleToolResults(
       if (isExactTextTool(name)) {
         rewrittenParts.push(rawPart);
         continue;
+      }
+      const sealKey = buildOpticalToolSealKey(`g_${cIdx}_${pIdx}_${name}`, raw);
+      const alreadySealed = Boolean(sessionKey && hasStage2SealKey(sessionKey, sealKey));
+      if (!alreadySealed) {
+        if (breakerState === 'open') {
+          rewrittenParts.push(rawPart);
+          continue;
+        }
+        if (breakerState === 'half_open' && cIdx < contents.length - 1) {
+          rewrittenParts.push(rawPart);
+          continue;
+        }
       }
       const compact = compactSlabWhitespace(raw);
       const safe = neutralizeSentinel(compact);
@@ -617,7 +727,9 @@ async function compressGoogleToolResults(
         (sum, image) => sum + geminiVisionTokens(modelName, image.width, image.height),
         0,
       );
-      const sheet = factSheetText(raw, profile.factSheetFormat);
+      const sheet = options.slabCoveredText
+        ? factSheetText(raw, { format: profile.factSheetFormat, coveredText: options.slabCoveredText, dropCovered: true })
+        : factSheetText(raw, profile.factSheetFormat);
       const pointer = `The completed ${name} tool result is rendered in the attached image part(s).` +
         (sheet ? `\n${sheet}` : '');
       const textTokens = googleTextTokens(raw);
@@ -635,6 +747,7 @@ async function compressGoogleToolResults(
           parts: images.map(imagePart),
         },
       });
+      if (sessionKey) recordStage2SealKey(sessionKey, sealKey);
       contentChanged = true;
       changed = true;
       allImages.push(...images);
@@ -697,6 +810,12 @@ async function planGoogleHistory(
   contents: GoogleContent[],
   modelName: string,
   reflowEnabled: boolean,
+  cliffCtx?: {
+    estPromptTokens?: number;
+    expectedOutputTokens?: number;
+    sessionKey?: string;
+    slabCoveredText?: string;
+  },
 ): Promise<GoogleHistoryPlan | null> {
   const profile = resolveGeminiProfile(modelName);
   const units = contents.map(googleHistoryUnit);
@@ -735,29 +854,80 @@ async function planGoogleHistory(
   const intro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_INTRO : HISTORY_TRANSCRIPT_INTRO;
   const outro = compactFraming ? COMPACT_HISTORY_TRANSCRIPT_OUTRO : HISTORY_TRANSCRIPT_OUTRO;
   const framingOverheadTokens = googleTextTokens(`${intro}\n\n${outro}`);
+  let remainingPromptTokens = cliffCtx?.estPromptTokens ?? eligibleTokens;
+  let cliffAvoided: { at: number; multiplier: number; savedUsd: number } | undefined;
   const segmentPaysBack = (segBaselineTokens: number, segCollapsedTokens: number): boolean => {
     if (segCollapsedTokens >= segBaselineTokens) return false;
     const savedPerRead = (segBaselineTokens - segCollapsedTokens) * rates.read;
     if (!(savedPerRead > 0)) return false;
     const transitionCost = segCollapsedTokens * rates.write - segBaselineTokens * rates.read;
     const paybackReads = Math.ceil(Math.max(0, transitionCost) / savedPerRead);
-    return paybackReads <= maxPaybackReads;
+    if (paybackReads <= maxPaybackReads) {
+      remainingPromptTokens = Math.max(0, remainingPromptTokens - (segBaselineTokens - segCollapsedTokens));
+      return true;
+    }
+    const cliff = evalAndRecordGoogleCliff(
+      modelName,
+      `${modelName}\0${cliffCtx?.sessionKey ?? ''}\0google_hist`,
+      {
+        promptTokensBefore: Math.max(segBaselineTokens, remainingPromptTokens),
+        collapsedBaselineTokens: segBaselineTokens,
+        collapsedActualTokens: segCollapsedTokens,
+        downstreamCachedTokens: Math.max(0, remainingPromptTokens - segBaselineTokens),
+        expectedOutputTokens: cliffCtx?.expectedOutputTokens,
+      },
+    );
+    if (cliff) {
+      if (!cliffAvoided) cliffAvoided = cliff;
+      remainingPromptTokens = Math.max(0, remainingPromptTokens - (segBaselineTokens - segCollapsedTokens));
+      return true;
+    }
+    return false;
   };
 
+  const pageChars = maxCharsPerImg;
   while (cursor < selected.length && images.length < profile.history.maxImages) {
     const remaining = profile.history.maxImages - images.length;
-    let targetEnd = -1;
+    let lastClosedUnderCap = -1;
+    let firstClosedOvershoot = -1;
+    let reachedPageCap = false;
     let accruedChars = 0;
     for (let i = cursor; i < selected.length; i++) {
-      accruedChars += selected[i]!.text.length + 2;
-      if (i + 1 >= cursor + minChunkTurns && accruedChars >= READABLE_CHARS_PER_IMAGE) {
+      const nextChars = accruedChars + (accruedChars > 0 ? 2 : 0) + selected[i]!.text.length;
+      if (nextChars < pageChars) {
+        accruedChars = nextChars;
+        if (i + 1 >= cursor + minChunkTurns) {
+          const closed = googleClosedBoundary(selected, cursor, i + 1) + 1;
+          if (closed > cursor) lastClosedUnderCap = closed;
+        }
+        continue;
+      }
+      reachedPageCap = true;
+      if (nextChars === pageChars) {
         const closed = googleClosedBoundary(selected, cursor, i + 1) + 1;
         if (closed > cursor) {
-          targetEnd = closed;
+          lastClosedUnderCap = closed;
           break;
         }
+        accruedChars = nextChars;
+        continue;
+      }
+      // Next turn would overshoot pageChars: seal at the largest closed prefix <= pageChars.
+      if (lastClosedUnderCap <= cursor && i > cursor) {
+        const preClosed = googleClosedBoundary(selected, cursor, i) + 1;
+        if (preClosed > cursor) lastClosedUnderCap = preClosed;
+      }
+      if (lastClosedUnderCap > cursor) break;
+      // Single turn / atomic open-close round alone exceeds pageChars: fall back to single overshoot.
+      const closed = googleClosedBoundary(selected, cursor, i + 1) + 1;
+      if (closed > cursor) {
+        firstClosedOvershoot = closed;
+        break;
       }
     }
+    const targetEnd = reachedPageCap
+      ? (lastClosedUnderCap > cursor ? lastClosedUnderCap : firstClosedOvershoot)
+      : -1;
     if (targetEnd <= cursor) break;
     let candidateEnd = googleClosedBoundary(selected, cursor, targetEnd) + 1;
     let accepted = false;
@@ -783,7 +953,10 @@ async function planGoogleHistory(
         profile.maxHeightPx,
       );
       if (chunkImages.length > 0 && chunkImages.length <= remaining) {
-        const segSheet = prepareFactSheet(chunkText, profile.factSheetFormat)(coveredTokens);
+        const renderSegSheet = prepareFactSheet(chunkText, profile.factSheetFormat);
+        const segSheet = cliffCtx?.slabCoveredText && coveredTokens.size === 0
+          ? renderSegSheet(cliffCtx.slabCoveredText, true)
+          : renderSegSheet(coveredTokens);
         const segImageTokens = chunkImages.reduce(
           (sum, image) => sum + geminiVisionTokens(modelName, image.width, image.height),
           0,
@@ -911,6 +1084,7 @@ async function planGoogleHistory(
   const nativeTokens = googleTextTokens(
     [segNativeText, pinnedUserText].filter(Boolean).join('\n\n'),
   );
+  remainingPromptTokens = cliffCtx?.estPromptTokens ?? baselineTokens;
   if (!segmentPaysBack(baselineTokens, imageTokens + nativeTokens)) return null;
   const droppedCodepoints = new Map<number, number>();
   let droppedChars = 0;
@@ -934,6 +1108,7 @@ async function planGoogleHistory(
     collapsedTurns: admitted.length,
     droppedChars,
     droppedCodepoints,
+    ...(cliffAvoided ? { cliffAvoided } : {}),
   };
 }
 
@@ -1166,6 +1341,9 @@ export async function transformGoogleGenerateContent(
     options.stageToggles?.optical !== false;
 
   const textHygieneActive = isTextHygieneActive(options.textHygiene);
+  const breakerState = resolvedSessionKey
+    ? getCacheCircuitBreakerState(resolvedSessionKey, { model: modelName })
+    : 'closed';
   let hygieneStats: WireHygieneStats | undefined;
   const runGoogleHygiene = (hygieneOpts: {
     deep: boolean;
@@ -1191,6 +1369,7 @@ export async function transformGoogleGenerateContent(
       sessionKey: resolvedSessionKey,
       firstUserText: firstUser,
       sessionCacheCold: sessionState.cold,
+      circuitBreakerState: breakerState,
       liveTailTexts: hygieneOpts.deep ? extractGoogleLiveTailTexts(req.contents) : undefined,
       appendTailHydration: hygieneOpts.deep ? (blk) => appendGoogleTailHydration(req, blk) : undefined,
     });
@@ -1276,7 +1455,15 @@ export async function transformGoogleGenerateContent(
     : rewriteGoogleTools(req.tools);
   if (toolRewrite.docs) info.toolDocsChars = toolRewrite.docs.length;
   const authorityText = systemTexts.join('\n\n');
-  const combinedRaw = [authorityText, toolRewrite.docs].filter(Boolean).join('\n\n');
+  const authoritySplit = splitLeadingOpenAIAuthorityText(authorityText);
+  const staticAuthorityText = authoritySplit.staticText;
+  const dynamicAuthorityText = authoritySplit.dynamicText;
+  if (dynamicAuthorityText) {
+    info.staticChars = staticAuthorityText.length;
+    info.dynamicChars += dynamicAuthorityText.length;
+    info.dynamicBlockCount += Math.max(1, authoritySplit.blockCount);
+  }
+  const combinedRaw = [staticAuthorityText, toolRewrite.docs].filter(Boolean).join('\n\n');
   info.origChars = combinedRaw.length;
 
   const profile = resolveGeminiProfile(modelName);
@@ -1329,10 +1516,12 @@ export async function transformGoogleGenerateContent(
     renderedText = prepareImagedRenderText(header + combined, options.reflow !== false);
 
     const maxCols = options.cols ?? profile.stripCols;
-    const cols = Math.min(
-      shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
-      profile.stripCols,
-    );
+    const cols = profile.vision.regime === 'flat'
+      ? Math.min(maxCols, profile.stripCols)
+      : Math.min(
+          shrinkColsToContent(renderedText, maxCols, profile.style.markerScale, profile.style.font),
+          profile.stripCols,
+        );
 
     staticImages = await renderTextToPngs(renderedText, cols, profile.style, profile.maxHeightPx);
     imageTokens = staticImages.reduce(
@@ -1341,14 +1530,30 @@ export async function transformGoogleGenerateContent(
     );
     textTokens = Math.max(
       1,
-      googleTextTokens(authorityText)
+      googleTextTokens(staticAuthorityText)
         + Math.max(0, toolRewrite.originalTokens - toolRewrite.rewrittenTokens),
     );
     fsText = factSheetText(combinedRaw, profile.factSheetFormat);
     const nativeText = SYSTEM_POINTER + (fsText ?? '');
     nativeInjectedTokens = Math.ceil(nativeText.length / 3.5);
 
-    const slabProfitable = imageTokens + nativeInjectedTokens < textTokens;
+    const slabActualTokens = imageTokens + nativeInjectedTokens;
+    let slabProfitable = slabActualTokens < textTokens;
+    const slabCliff = evalAndRecordGoogleCliff(
+      modelName,
+      `${modelName}\0${resolvedSessionKey ?? info.firstUserSha8 ?? ''}\0google_slab`,
+      {
+        promptTokensBefore: Math.max(textTokens, estPromptTokens),
+        collapsedBaselineTokens: textTokens,
+        collapsedActualTokens: slabActualTokens,
+        downstreamCachedTokens: Math.max(0, estPromptTokens - textTokens),
+        expectedOutputTokens: options.expectedOutputTokens,
+      },
+    );
+    if (slabCliff) {
+      if (!slabProfitable) slabProfitable = true;
+      info.cliffAvoided = slabCliff;
+    }
     info.gateEval = {
       site: 'slab',
       imageTokens,
@@ -1383,12 +1588,18 @@ export async function transformGoogleGenerateContent(
     }
   }
 
-  const historyPlan = options.collapseHistory === false || hybridTextMmu
+  const historyPlan = options.collapseHistory === false || hybridTextMmu || breakerState !== 'closed'
     ? null
     : await planGoogleHistory(
         originalContents,
         modelName,
         options.reflow !== false,
+        {
+          estPromptTokens,
+          expectedOutputTokens: options.expectedOutputTokens,
+          sessionKey: resolvedSessionKey ?? info.firstUserSha8,
+          slabCoveredText: hasStaticCompression ? combinedRaw : undefined,
+        },
       );
   let contents = originalContents;
   if (historyPlan) {
@@ -1445,7 +1656,12 @@ export async function transformGoogleGenerateContent(
         droppedChars: 0,
         droppedCodepoints: new Map<number, number>(),
       }
-    : await compressGoogleToolResults(contents, modelName, options);
+    : await compressGoogleToolResults(contents, modelName, {
+        ...options,
+        sessionKey: resolvedSessionKey,
+        breakerState,
+        slabCoveredText: hasStaticCompression ? combinedRaw : undefined,
+      });
   contents = toolResultPlan.contents;
 
   const hasHistoryCompression = !!historyPlan && historyPlan.images.length > 0;
@@ -1467,16 +1683,20 @@ export async function transformGoogleGenerateContent(
 
   if (hasStaticCompression) {
     // Static context goes first in the first user turn, matching the Anthropic path.
+    // Relocate any volatile systemInstruction XML islands right after the slab images.
+    const slabAndVolatileParts: GooglePart[] = dynamicAuthorityText
+      ? [...imageParts, { text: dynamicAuthorityText }]
+      : imageParts;
     if (contents.length > 0 && contents[0] && contents[0].role === 'user') {
       const firstTurn = contents[0];
       contents[0] = {
         ...firstTurn,
-        parts: [...imageParts, ...(firstTurn.parts || [])],
+        parts: [...slabAndVolatileParts, ...(firstTurn.parts || [])],
       };
     } else {
       contents.unshift({
         role: 'user',
-        parts: imageParts,
+        parts: slabAndVolatileParts,
       });
     }
   }
@@ -1545,6 +1765,9 @@ export async function transformGoogleGenerateContent(
       info.collapsedChars = historyPlan.text.length;
       info.collapsedImages = historyPlan.images.length;
       info.historyReason = 'collapsed';
+      if (historyPlan.cliffAvoided && !info.cliffAvoided) {
+        info.cliffAvoided = historyPlan.cliffAvoided;
+      }
       totalDroppedChars += historyPlan.droppedChars;
       for (const [codepoint, count] of historyPlan.droppedCodepoints) {
         mergedDroppedCodepoints.set(codepoint, (mergedDroppedCodepoints.get(codepoint) ?? 0) + count);

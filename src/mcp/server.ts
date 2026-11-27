@@ -22,7 +22,7 @@ declare const __FICHE_VERSION__: string | undefined;
 
 export const MCP_PROTOCOL = '2025-03-26';
 export const SERVER_NAME = 'fiche-mcp';
-export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.19.0';
+export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.20.0';
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -425,7 +425,9 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const port = resolveDaemonPort();
     const qs = sessionKey ? `?sessionKey=${encodeURIComponent(sessionKey)}` : '';
     try {
+      const controlToken = readExistingControlToken();
       const res = await fetch(`http://127.0.0.1:${port}/api/mmu/stats${qs}`, {
+        ...(controlToken ? { headers: { 'x-fiche-control-token': controlToken } } : {}),
         signal: AbortSignal.timeout(250),
       });
       const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;

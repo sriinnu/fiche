@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import { createServer as createNodeHttpServer } from 'node:http';
 import * as os from 'node:os';
@@ -148,9 +149,11 @@ describe('1. Cross-Session Tenant Isolation & OpenAI Session Anchoring', () => {
       refId: 'src/a.ts',
       rawText: 'export function alphaHandler() { return "INTERNAL_KEY_ALPHA"; }',
     });
-    const dash = new DashboardState();
+    const controlToken = crypto.randomBytes(16).toString('hex');
+    const dash = new DashboardState(undefined, undefined, undefined, { controlToken });
 
-    // Unscoped /api/mmu/stats omits raw factTokens; scoped /api/mmu/stats retains them.
+    // Unauthenticated unscoped /api/mmu/stats omits tenant page listings (`pages: []`, `scoped: false`);
+    // authorized unscoped or explicit sessionKey queries return `pages` without exposing other sessions.
     const unscopedStats = await dispatchDashboard(
       dash,
       dashboardPath('/api/mmu/stats')!,
@@ -162,8 +165,29 @@ describe('1. Cross-Session Tenant Isolation & OpenAI Session Anchoring', () => {
     expect(unscopedStats?.status).toBe(200);
     expect(unscopedStats?.headers.get('cache-control')).toBe('no-store');
     expect(unscopedStats?.headers.get('x-content-type-options')).toBe('nosniff');
-    const unscopedBody = (await unscopedStats!.json()) as { pages: Array<Record<string, unknown>> };
-    expect(unscopedBody.pages[0]).not.toHaveProperty('factTokens');
+    const unscopedBody = (await unscopedStats!.json()) as {
+      scoped?: boolean;
+      pages: Array<Record<string, unknown>>;
+    };
+    expect(unscopedBody.scoped).toBe(false);
+    expect(unscopedBody.pages).toEqual([]);
+
+    const authUnscopedStats = await dispatchDashboard(
+      dash,
+      dashboardPath('/api/mmu/stats')!,
+      'GET',
+      new URL('http://127.0.0.1:47821/api/mmu/stats'),
+      47821,
+      async () => '',
+      { headers: { 'x-fiche-control-token': controlToken } },
+    );
+    expect(authUnscopedStats?.status).toBe(200);
+    const authUnscopedBody = (await authUnscopedStats!.json()) as {
+      scoped?: boolean;
+      pages: Array<Record<string, unknown>>;
+    };
+    expect(authUnscopedBody.scoped).toBe(true);
+    expect(authUnscopedBody.pages[0]).toBeDefined();
 
     const scopedStats = await dispatchDashboard(
       dash,
