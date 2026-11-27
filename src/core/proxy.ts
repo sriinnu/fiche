@@ -2316,9 +2316,13 @@ let responseContentType: string | undefined;
     // `x-fiche-bypass: 1` (or legacy `x-inkling-bypass: 1`) via ANTHROPIC_CUSTOM_HEADERS
     // to have its traffic forwarded byte-for-byte untouched.
     const bypassHeader = req.headers.get('x-fiche-bypass') ?? req.headers.get('x-inkling-bypass');
-    const bypass = bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim());
+    const dsCompactHeader = req.headers.get('x-deepseek-harness-compact');
+    const bypass =
+      (bypassHeader !== null && !/^(?:0|false|off|no)$/i.test(bypassHeader.trim()))
+      || (dsCompactHeader !== null && !/^(?:0|false|off|no)$/i.test(dsCompactHeader.trim()));
     const ficheSessionRaw = (req.headers.get('x-fiche-session-id') ?? req.headers.get('x-inkling-session-id'))?.trim() ?? null;
     const ccSessionRaw = req.headers.get('x-claude-code-session-id')?.trim() ?? null;
+    const dshSessionRaw = req.headers.get('x-deepseek-harness-session-id')?.trim() ?? null;
     const validatedFicheSessionId =
       ficheSessionRaw !== null && /^[A-Za-z0-9._:-]{4,128}$/.test(ficheSessionRaw)
         ? ficheSessionRaw
@@ -2327,13 +2331,19 @@ let responseContentType: string | undefined;
       ccSessionRaw !== null && /^[A-Za-z0-9_-]{8,128}$/.test(ccSessionRaw)
         ? ccSessionRaw
         : undefined;
-    const validatedClientSessionId = validatedFicheSessionId ?? validatedCcSessionId;
-    const validatedClientSessionSource: 'fiche-header' | 'claude-code-header' | undefined =
+    const validatedDshSessionId =
+      dshSessionRaw !== null && /^[A-Za-z0-9._:-]{4,128}$/.test(dshSessionRaw)
+        ? dshSessionRaw
+        : undefined;
+    const validatedClientSessionId = validatedFicheSessionId ?? validatedCcSessionId ?? validatedDshSessionId;
+    const validatedClientSessionSource: 'fiche-header' | 'claude-code-header' | 'deepseek-harness-header' | undefined =
       validatedFicheSessionId
         ? 'fiche-header'
         : validatedCcSessionId
           ? 'claude-code-header'
-          : undefined;
+          : validatedDshSessionId
+            ? 'deepseek-harness-header'
+            : undefined;
     const registry = config.upstreamRegistry ?? DEFAULT_UPSTREAM_REGISTRY;
     const rawProviders = typeof config.enabledProviders === 'function'
       ? config.enabledProviders()

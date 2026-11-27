@@ -566,6 +566,7 @@ export function createWarpRuntime(options: WarpRuntimeOptions): WarpRuntime {
       const mergedNoProxy = mergeNoProxy(rawNoProxy || undefined, explicitLoopbackHosts);
       env.NO_PROXY = mergedNoProxy;
       env.no_proxy = mergedNoProxy;
+      env.NODE_USE_ENV_PROXY = '1';
       // Trust is scoped to this child; nothing is added to the system keychain.
       // Which variable actually works depends on the agent's runtime, and the
       // answer is not stable: the macOS `claude` is a native Mach-O binary, not a

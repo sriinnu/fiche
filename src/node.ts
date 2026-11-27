@@ -797,7 +797,7 @@ function resolvedCliVersion(): string {
       : typeof __INKLING_VERSION__ === 'string'
         ? __INKLING_VERSION__
         : undefined;
-  return injected ?? process.env.npm_package_version ?? '0.20.0';
+  return injected ?? process.env.npm_package_version ?? '0.20.1';
 }
 
 function printVersion(): void {
@@ -1967,7 +1967,9 @@ function detectLocalProviderSignals(): Map<ProviderId, string[]> {
     { id: 'anthropic', clis: ['claude'], apps: ['Claude'] },
     { id: 'openai', clis: ['codex'], apps: ['ChatGPT'] },
     { id: 'google', clis: ['gemini', 'agy'], apps: ['Antigravity'] },
-    { id: 'kimi', clis: ['kimi'], apps: [] },
+    { id: 'deepseek', clis: [], apps: ['DeepSeek Harness'] },
+    { id: 'kimi', clis: ['kimi'], apps: ['Kimi Code'] },
+    { id: 'minimax', clis: [], apps: ['MiniMax Code'] },
   ];
   for (const c of checks) {
     for (const cli of c.clis) {

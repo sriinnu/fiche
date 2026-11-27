@@ -159,7 +159,7 @@ export interface TrackEvent {
   system_sha8?: string;
   first_user_sha8?: string;
   session_key?: string;
-  session_key_source?: 'fiche-header' | 'claude-code-header' | 'anchor';
+  session_key_source?: 'fiche-header' | 'claude-code-header' | 'deepseek-harness-header' | 'anchor';
 
   // From Anthropic/OpenAI Usage:
   input_tokens?: number;

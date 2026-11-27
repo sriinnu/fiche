@@ -20,7 +20,7 @@ import { computeHorizonPaybackLimit, fnv64Hex } from './context-mmu.js';
 import { factSheetText } from './factsheet.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
 import { resetGlobalPrefixTape } from './prefix-tape.js';
-import { evaluateCliffAvoidance, isAutoCacheOpenAIModel, priceMode, resolvePriceRates } from './pricing.js';
+import { evaluateCliffAvoidance, isImplicitAutoCacheModel, priceMode, resolvePriceRates } from './pricing.js';
 import { hasSealedEpochKey, isCacheCircuitBreakerOpen, recordSealedEpochKey } from './session-state.js';
 
 export interface CacheBreakpointMarker {
@@ -778,10 +778,10 @@ function isAlreadyCompactedMarker(raw: string): boolean {
 
 export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanResult {
   const keepTail = args.keepTailMessages ?? 6;
-  const isAutoCacheOpenAI =
+  const isImplicitAutoCache =
     !(args.cacheBreakpoints && args.cacheBreakpoints.length > 0) &&
     args.ttlSec === undefined &&
-    isAutoCacheOpenAIModel(args.model);
+    isImplicitAutoCacheModel(args.model);
   const epochTarget = args.epochTokenTarget ?? 4_000;
   const maxPayback = args.maxPaybackReads ?? 12;
   const lsmActive =
@@ -1041,7 +1041,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
         }
       }
       let msgSum = 0;
-      if ((hasBreakpoints || isAutoCacheOpenAI) && args.msgTotalTokens && args.msgTotalTokens.length > 0) {
+      if ((hasBreakpoints || isImplicitAutoCache) && args.msgTotalTokens && args.msgTotalTokens.length > 0) {
         const limit = Math.min(args.msgTotalTokens.length - 1, horizonEndMsg);
         for (let m = epochLastMsg + 1; m <= limit; m++) {
           msgSum += args.msgTotalTokens[m] ?? 0;
@@ -1054,7 +1054,7 @@ export function planAndApplyTextEpochs(args: TextEpochPlanArgs): TextEpochPlanRe
     }
     if (!alreadySealed && breakerState === 'half_open' && downstreamCachedTokens > 0) continue;
 
-    const effectiveWriteRate = isAutoCacheOpenAI
+    const effectiveWriteRate = isImplicitAutoCache
       ? Math.min(epochRates.write, 1)
       : epochRates.write;
     const savedTok = epochRawTokens - epochDigestTokens;

@@ -40,7 +40,7 @@ import {
   type BaselineWarmthPrev,
 } from './core/baseline.js';
 import { sessionAnchorText } from './core/session-state.js';
-import { anthropicReadRate, priceMode, resolvePriceRates } from './core/pricing.js';
+import { anthropicReadRate, anthropicWriteRate5m, priceMode, resolvePriceRates } from './core/pricing.js';
 import {
   computeOpenAIActualInputEff,
   computeOpenAISessionBaselineInputEff,
@@ -333,6 +333,8 @@ export async function aggregateSessions(
         ev.cache_prefix_tools_sha8,
         { pxPrefixSha: ev.cache_prefix_sha8, model: ev.model },
       );
+      const readRate = anthropicReadRate(ev.model);
+      const writeRate = anthropicWriteRate5m(ev.model);
       const baselineEff = computeBaselineInputEffWithCacheTier(
         baseline,
         cacheable,
@@ -343,9 +345,10 @@ export async function aggregateSessions(
         prevCacheable,
         cc1h,
         cc5m,
-        anthropicReadRate(ev.model),
+        readRate,
+        writeRate,
       );
-      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, anthropicReadRate(ev.model));
+      const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate, writeRate);
       const tokensSaved = baselineEff - actualEff;
       s.tokensSavedEst += Math.round(tokensSaved);
       s.charsSaved += Math.round(tokensSaved * 4);
@@ -357,6 +360,7 @@ export async function aggregateSessions(
     ) {
       const hygieneTok = ev.text_hygiene_saved_tokens ?? 0;
       const readRate = anthropicReadRate(ev.model);
+      const writeRate = anthropicWriteRate5m(ev.model);
       const prev = warmth.get(id);
       const { warm, prevCacheable } = deriveBaselineWarmth(
         prev,
@@ -370,12 +374,12 @@ export async function aggregateSessions(
       );
       let tokensSaved: number;
       if (warm && cr === 0) {
-        const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate);
+        const actualEff = computeActualInputEffWithCacheTier(inp, cc, cr, cc1h, cc5m, readRate, writeRate);
         const unproxiedRaw = inp + cc + hygieneTok;
         const reusedTarget = prevCacheable > 0 ? prevCacheable : (prev?.observedCachedTokens ?? 0);
         if (reusedTarget > 0) {
           const reused = Math.min(unproxiedRaw, reusedTarget);
-          const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          const createRate = cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRate) : 1.0;
           const baselineEff = reused * readRate + (unproxiedRaw - reused) * createRate;
           tokensSaved = baselineEff - actualEff;
         } else {
@@ -384,7 +388,7 @@ export async function aggregateSessions(
       } else {
         const deltaWeight = cr > 0
           ? readRate
-          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : 1.25) : 1.0;
+          : cc > 0 ? (cc1h > 0 && cc1h >= cc ? 2.0 : writeRate) : 1.0;
         tokensSaved = hygieneTok * deltaWeight;
       }
       s.tokensSavedEst += Math.round(tokensSaved);

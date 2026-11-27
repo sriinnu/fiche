@@ -14,18 +14,23 @@ export const CACHE_READ_RATE = 0.1;
  * in that case. The text counterfactual uses the same observed tier mix as
  * the transformed request because inkling relocates, rather than invents, the
  * caller's cache-control markers. */
-function cacheCreateRate(cc: number, cc5m?: number, cc1h?: number): number {
-  if (!(cc > 0)) return CACHE_CREATE_RATE;
+function cacheCreateRate(
+  cc: number,
+  cc5m?: number,
+  cc1h?: number,
+  baseWriteRate: number = CACHE_CREATE_RATE,
+): number {
+  if (!(cc > 0)) return baseWriteRate;
   const splitReported = cc5m !== undefined || cc1h !== undefined;
-  if (!splitReported) return CACHE_CREATE_RATE;
+  if (!splitReported) return baseWriteRate;
   const fiveMinute = Math.max(0, cc5m ?? 0);
   const oneHour = Math.max(0, cc1h ?? 0);
   const splitTotal = fiveMinute + oneHour;
-  if (!(splitTotal > 0)) return CACHE_CREATE_RATE;
+  if (!(splitTotal > 0)) return baseWriteRate;
   // The API contract says splitTotal === cc. Normalize malformed/mismatched
   // payloads to the aggregate so accounting never invents extra write tokens.
   return (
-    fiveMinute * CACHE_CREATE_RATE + oneHour * CACHE_CREATE_1H_RATE
+    fiveMinute * baseWriteRate + oneHour * CACHE_CREATE_1H_RATE
   ) / splitTotal;
 }
 
@@ -202,17 +207,18 @@ export function computeBaselineInputEffWithCacheTier(
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
   readRate: number = CACHE_READ_RATE,
+  baseWriteRate: number = CACHE_CREATE_RATE,
 ): number {
   if (baseline <= 0) return 0;
   // Probe miss: can't split prefix from tail, so credit nothing (same as actual).
   if (baselineCacheable <= 0) {
     return computeActualInputEffWithCacheTier(
-      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens, readRate,
+      inputTokens, cc, cr, cacheCreate1hTokens, cacheCreate5mTokens, readRate, baseWriteRate,
     );
   }
   const cacheable = Math.min(baselineCacheable, baseline);
   const coldTail = baseline - cacheable;
-  const createRate = cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens);
+  const createRate = cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens, baseWriteRate);
   if (warm) {
     // Text reads the prefix it already had cached (0.10×) and creates only the
     // growth since last turn (at the observed write-tier rate). Independent of
@@ -244,9 +250,10 @@ export function computeActualInputEffWithCacheTier(
   cacheCreate1hTokens: number,
   cacheCreate5mTokens?: number,
   readRate: number = CACHE_READ_RATE,
+  baseWriteRate: number = CACHE_CREATE_RATE,
 ): number {
   return inputTokens
-    + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens)
+    + cc * cacheCreateRate(cc, cacheCreate5mTokens, cacheCreate1hTokens, baseWriteRate)
     + cr * readRate;
 }
 
