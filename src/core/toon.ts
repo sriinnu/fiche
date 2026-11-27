@@ -111,6 +111,7 @@ function encodeCell(v: unknown): string | null {
       v === 'false' ||
       v.startsWith('~') ||
       v.startsWith('@meta ') ||
+      v.startsWith('@flat ') ||
       v.startsWith('[') ||
       v.startsWith('{') ||
       EDGE_WS_RE.test(v) ||
@@ -150,10 +151,35 @@ function decodeCell(raw: string): unknown {
 }
 
 interface TableTarget {
-  readonly arrayKey?: string;
+  readonly arrayPath?: readonly string[];
   readonly rows: Record<string, unknown>[];
   readonly siblings?: Record<string, unknown>;
-  readonly precomputedParts?: ReadonlyArray<{ key: string; json: string }>;
+  readonly baselineJson?: string;
+}
+
+function buildAncestorSiblings(
+  obj: Record<string, unknown>,
+  path: readonly string[],
+  idx: number,
+): Record<string, unknown> | undefined {
+  const out: Record<string, unknown> = {};
+  let hasAny = false;
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === undefined) continue;
+    if (k === path[idx]) {
+      if (idx + 1 < path.length && isPlainObject(v)) {
+        const childSib = buildAncestorSiblings(v, path, idx + 1);
+        if (childSib !== undefined) {
+          setOwnProp(out, k, childSib);
+          hasAny = true;
+        }
+      }
+      continue;
+    }
+    setOwnProp(out, k, v);
+    hasAny = true;
+  }
+  return hasAny ? out : undefined;
 }
 
 function selectTableTarget(parsed: unknown): TableTarget | null {
@@ -162,57 +188,53 @@ function selectTableTarget(parsed: unknown): TableTarget | null {
     return { rows: parsed };
   }
   if (!isPlainObject(parsed)) return null;
-  const entries = Object.entries(parsed);
-  let hasCandidate = false;
-  for (let i = 0; i < entries.length; i++) {
-    const v = entries[i]![1];
-    if (Array.isArray(v) && v.length >= 5 && v.every(isPlainObject)) {
-      hasCandidate = true;
-      break;
-    }
-  }
-  if (!hasCandidate) return null;
 
-  let bestKey: string | undefined;
+  let baselineJson: string;
+  try {
+    baselineJson = JSON.stringify(parsed);
+  } catch {
+    return null;
+  }
+  if (!baselineJson || baselineJson.length < 256) return null;
+
+  let bestPath: string[] | undefined;
   let bestRows: Record<string, unknown>[] | undefined;
   let bestLen = 0;
-  let totalApproxLen = 2;
-  const precomputedParts: Array<{ key: string; json: string }> = [];
 
-  for (const [k, v] of entries) {
-    let serialized: string | undefined;
-    try {
-      serialized = JSON.stringify(v);
-    } catch {
-      return null;
+  const scan = (node: Record<string, unknown>, prefix: string[], depth: number): void => {
+    for (const [k, v] of Object.entries(node)) {
+      if (v === undefined) continue;
+      if (depth > 0 && k.includes('/')) continue;
+      if (Array.isArray(v) && v.length >= 5 && v.every(isPlainObject)) {
+        // Depth > 1 paths cannot contain '/' in any segment because key= uses '/' as separator.
+        if (depth > 0 && prefix.some((seg) => seg.includes('/'))) continue;
+        let vLen = 0;
+        try {
+          vLen = JSON.stringify(v).length;
+        } catch {
+          continue;
+        }
+        if (vLen > bestLen) {
+          bestPath = [...prefix, k];
+          bestRows = v;
+          bestLen = vLen;
+        }
+      } else if (depth < 2 && isPlainObject(v) && !k.includes('/')) {
+        scan(v, [...prefix, k], depth + 1);
+      }
     }
-    if (serialized !== undefined) {
-      precomputedParts.push({ key: k, json: serialized });
-      totalApproxLen += k.length + 4 + serialized.length;
-    }
-    const vLen = serialized?.length ?? 0;
-    if (Array.isArray(v) && v.length >= 5 && v.every(isPlainObject) && vLen > bestLen) {
-      bestKey = k;
-      bestRows = v;
-      bestLen = vLen;
-    }
-  }
-  if (!bestKey || !bestRows) return null;
-  if (bestLen < totalApproxLen * 0.6) return null;
+  };
 
-  const siblings: Record<string, unknown> = {};
-  let hasSiblings = false;
-  for (const [k, v] of entries) {
-    if (k !== bestKey && v !== undefined) {
-      setOwnProp(siblings, k, v);
-      hasSiblings = true;
-    }
-  }
+  scan(parsed, [], 0);
+  if (!bestPath || !bestRows) return null;
+  if (bestLen < baselineJson.length * 0.6) return null;
+
+  const siblings = buildAncestorSiblings(parsed, bestPath, 0);
   return {
-    arrayKey: bestKey,
+    arrayPath: bestPath,
     rows: bestRows,
-    siblings: hasSiblings ? siblings : undefined,
-    precomputedParts,
+    siblings,
+    baselineJson,
   };
 }
 
@@ -231,60 +253,166 @@ function estimateTokenPair(minJson: string, toon: string): [number, number] {
   return [Math.ceil(minJson.length / 3.5), Math.ceil(toon.length / 3.5)];
 }
 
-/**
- * Losslessly encode a uniform array (or object dominated by a uniform array)
- * into `@toon` pipe-delimited columnar format. Returns null if ineligible or
- * if `@toon` does not save at least 20% tokens over minified JSON.
- * Optional `minJsonBox` receives the computed `JSON.stringify(parsed)` string so
- * callers don't serialize `parsed` twice.
- */
-export function encodeToon(parsed: unknown, minJsonBox?: { json?: string }): string | null {
-  const target = selectTableTarget(parsed);
-  if (!target) return null;
+const MAX_TOON_COLS = 48;
+const MIN_TOON_DENSITY = 0.55;
 
-  const cols: string[] = [];
-  const colSet = new Set<string>();
+interface FlattenedCol {
+  readonly colName: string;
+  readonly colPath: readonly string[];
+}
+
+function getValueAtPath(row: Record<string, unknown>, path: readonly string[]): unknown {
+  let cur: unknown = row;
+  for (let i = 0; i < path.length; i++) {
+    if (!cur || typeof cur !== 'object') return undefined;
+    const seg = path[i]!;
+    if (!Object.prototype.hasOwnProperty.call(cur, seg)) return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+function collectFlattenedColumns(rows: readonly Record<string, unknown>[]): {
+  cols: FlattenedCol[];
+  flatPrefixes: string[];
+  density: number;
+} | null {
+  let cols: FlattenedCol[] = [];
+  const topSet = new Set<string>();
   let totalFieldCount = 0;
-  for (const row of target.rows) {
+
+  for (const row of rows) {
     for (const k of Object.keys(row)) {
       if (row[k] === undefined) continue;
       totalFieldCount += 1;
-      if (!colSet.has(k)) {
-        colSet.add(k);
-        cols.push(k);
-        if (cols.length > 24) return null;
+      if (!topSet.has(k)) {
+        topSet.add(k);
+        cols.push({ colName: k, colPath: [k] });
+        if (cols.length > MAX_TOON_COLS) return null;
       }
     }
   }
-  if (cols.length < 2) return null;
-  const density = totalFieldCount / (target.rows.length * cols.length);
-  if (density < 0.75) return null;
+  if (cols.length === 0) return null;
 
-  let minJson: string;
-  const hasCustomToJson =
-    !Array.isArray(parsed) &&
-    typeof (parsed as { toJSON?: unknown } | null)?.toJSON === 'function';
-  if (target.precomputedParts && !hasCustomToJson) {
-    try {
-      minJson = `{${target.precomputedParts.map((p) => `${JSON.stringify(p.key)}:${p.json}`).join(',')}}`;
-    } catch {
-      return null;
+  const flatPrefixes: string[] = [];
+  for (let pass = 0; pass < 2; pass++) {
+    let anyFlattenedThisPass = false;
+    const nextCols: FlattenedCol[] = [];
+    const existingNames = new Set(cols.map((c) => c.colName));
+
+    for (let ci = 0; ci < cols.length; ci++) {
+      const col = cols[ci]!;
+      const lastSeg = col.colPath[col.colPath.length - 1]!;
+      if (col.colPath.length > 2 || lastSeg.includes('.') || (col.colPath.length === 1 && col.colName.includes('.'))) {
+        nextCols.push(col);
+        continue;
+      }
+
+      const subKeys: string[] = [];
+      const subKeySet = new Set<string>();
+      let canFlatten = true;
+      let presentRows = 0;
+      let subFieldCount = 0;
+
+      for (const row of rows) {
+        const val = getValueAtPath(row, col.colPath);
+        if (val === undefined) continue;
+        if (!isPlainObject(val) || typeof (val as { toJSON?: unknown }).toJSON === 'function') {
+          canFlatten = false;
+          break;
+        }
+        const ownKeys = Object.keys(val).filter((sk) => val[sk] !== undefined);
+        if (ownKeys.length === 0) {
+          canFlatten = false;
+          break;
+        }
+        presentRows += 1;
+        for (const sk of ownKeys) {
+          if (sk.includes('.')) {
+            canFlatten = false;
+            break;
+          }
+          subFieldCount += 1;
+          if (!subKeySet.has(sk)) {
+            subKeySet.add(sk);
+            subKeys.push(sk);
+          }
+        }
+        if (!canFlatten) break;
+      }
+
+      if (!canFlatten || presentRows === 0 || subKeys.length === 0) {
+        nextCols.push(col);
+        continue;
+      }
+
+      const projectedCount = nextCols.length + (cols.length - ci - 1) + subKeys.length;
+      if (projectedCount > MAX_TOON_COLS) {
+        nextCols.push(col);
+        continue;
+      }
+
+      let collision = false;
+      for (const sk of subKeys) {
+        const flatName = `${col.colName}.${sk}`;
+        if (existingNames.has(flatName)) {
+          collision = true;
+          break;
+        }
+      }
+      if (collision) {
+        nextCols.push(col);
+        continue;
+      }
+
+      const projectedFieldCount = totalFieldCount - presentRows + subFieldCount;
+      const projectedDensity = projectedFieldCount / (rows.length * projectedCount);
+      if (projectedDensity < MIN_TOON_DENSITY) {
+        nextCols.push(col);
+        continue;
+      }
+
+      existingNames.delete(col.colName);
+      for (const sk of subKeys) {
+        const flatName = `${col.colName}.${sk}`;
+        existingNames.add(flatName);
+        nextCols.push({ colName: flatName, colPath: [...col.colPath, sk] });
+      }
+      flatPrefixes.push(col.colName);
+      totalFieldCount = projectedFieldCount;
+      anyFlattenedThisPass = true;
     }
-  } else {
-    try {
-      minJson = JSON.stringify(parsed);
-    } catch {
-      return null;
-    }
+
+    cols = nextCols;
+    if (!anyFlattenedThisPass) break;
   }
-  if (minJsonBox) minJsonBox.json = minJson;
-  if (!minJson || minJson.length < 256) return null;
 
-  const encodedCols = cols.map(escapeCellText).join('|');
+  if (cols.length < 2 || cols.length > MAX_TOON_COLS) return null;
+  const density = totalFieldCount / (rows.length * cols.length);
+  if (density < MIN_TOON_DENSITY) return null;
+  return { cols, flatPrefixes, density };
+}
+
+function encodeToonTarget(
+  target: TableTarget,
+  baseline: string,
+  isJsonl: boolean,
+): string | null {
+  if (!baseline || baseline.length < 256) return null;
+  const flattened = collectFlattenedColumns(target.rows);
+  if (!flattened) return null;
+  const { cols, flatPrefixes } = flattened;
+
+  const encodedCols = cols.map((c) => escapeCellText(c.colName)).join('|');
   const headerParts = ['@toon'];
-  if (target.arrayKey !== undefined) {
+  if (isJsonl) headerParts.push('jsonl=1');
+  if (target.arrayPath !== undefined && target.arrayPath.length > 0) {
     try {
-      headerParts.push(`key=${encodeURIComponent(target.arrayKey)}`);
+      const joinedPath = target.arrayPath.join('/');
+      headerParts.push(`key=${encodeURIComponent(joinedPath)}`);
+      if (target.arrayPath.length === 1 && target.arrayPath[0]!.includes('/')) {
+        headerParts.push('depth=1');
+      }
     } catch {
       // Lone UTF-16 surrogates throw URIError in encodeURIComponent; bail cleanly to JSON.
       return null;
@@ -295,30 +423,25 @@ export function encodeToon(parsed: unknown, minJsonBox?: { json?: string }): str
 
   const lines: string[] = [headerParts.join(' ')];
   if (target.siblings !== undefined) {
-    if (target.precomputedParts && !hasCustomToJson) {
-      try {
-        const siblingParts = target.precomputedParts
-          .filter((p) => p.key !== target.arrayKey)
-          .map((p) => `${JSON.stringify(p.key)}:${p.json}`);
-        lines.push(`@meta {${siblingParts.join(',')}}`);
-      } catch {
-        return null;
-      }
-    } else {
-      try {
-        lines.push(`@meta ${JSON.stringify(target.siblings)}`);
-      } catch {
-        return null;
-      }
+    try {
+      lines.push(`@meta ${JSON.stringify(target.siblings)}`);
+    } catch {
+      return null;
+    }
+  }
+  if (flatPrefixes.length > 0) {
+    try {
+      lines.push(`@flat ${flatPrefixes.map(encodeURIComponent).join(',')}`);
+    } catch {
+      return null;
     }
   }
 
   for (const row of target.rows) {
     const cells: string[] = [];
     for (let c = 0; c < cols.length; c++) {
-      const col = cols[c]!;
-      const has = Object.prototype.hasOwnProperty.call(row, col);
-      const cell = encodeCell(has ? row[col] : undefined);
+      const val = getValueAtPath(row, cols[c]!.colPath);
+      const cell = encodeCell(val);
       if (cell === null) return null;
       cells.push(cell);
     }
@@ -326,15 +449,69 @@ export function encodeToon(parsed: unknown, minJsonBox?: { json?: string }): str
   }
 
   const toon = lines.join('\n');
-  if (toon.length >= minJson.length) return null;
-  const [jsonTokens, toonTokens] = estimateTokenPair(minJson, toon);
-  if (toonTokens > jsonTokens * 0.8) return null;
+  if (toon.length >= baseline.length) return null;
+  const [baseTokens, toonTokens] = estimateTokenPair(baseline, toon);
+  if (toonTokens > baseTokens * 0.8) return null;
   return toon;
 }
 
 /**
+ * Losslessly encode a uniform NDJSON / JSONL string (`>= 5` `{...}` lines) into
+ * `@toon jsonl=1` format when strictly token-profitable (<= 0.80x BPE tokens).
+ */
+export function encodeToonJsonl(text: string): string | null {
+  if (typeof text !== 'string' || text.length < 256 || !text.includes('\n')) return null;
+  const rawLines = text.split('\n');
+  if (rawLines.length < 5) return null;
+  const rows: Record<string, unknown>[] = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i]!;
+    if (line.length < 2 || line.charCodeAt(0) !== 123 || line.charCodeAt(line.length - 1) !== 125) {
+      return null;
+    }
+    let parsedLine: unknown;
+    try {
+      parsedLine = JSON.parse(line);
+    } catch {
+      return null;
+    }
+    if (!isPlainObject(parsedLine)) return null;
+    rows.push(parsedLine);
+  }
+  return encodeToonTarget({ rows }, text, true);
+}
+
+/**
+ * Losslessly encode a uniform array (or object dominated by a uniform array, up to depth 3,
+ * or an NDJSON/JSONL string) into `@toon` pipe-delimited columnar format. Returns null if
+ * ineligible or if `@toon` does not save at least 20% tokens over minified JSON.
+ * Optional `minJsonBox` receives the computed `JSON.stringify(parsed)` string so
+ * callers don't serialize `parsed` twice.
+ */
+export function encodeToon(parsed: unknown, minJsonBox?: { json?: string }): string | null {
+  if (typeof parsed === 'string') {
+    return encodeToonJsonl(parsed);
+  }
+  const target = selectTableTarget(parsed);
+  if (!target) return null;
+
+  let minJson: string;
+  if (target.baselineJson !== undefined) {
+    minJson = target.baselineJson;
+  } else {
+    try {
+      minJson = JSON.stringify(parsed);
+    } catch {
+      return null;
+    }
+  }
+  if (minJsonBox) minJsonBox.json = minJson;
+  return encodeToonTarget(target, minJson, false);
+}
+
+/**
  * Bijectively decode a `@toon` payload back to the exact original JavaScript
- * array or wrapper object. Throws on malformed input.
+ * array, wrapper object, or NDJSON string (`jsonl=1`). Throws on malformed input.
  */
 export function decodeToon(toon: string): unknown {
   const lines = toon.split('\n');
@@ -354,8 +531,14 @@ export function decodeToon(toon: string): unknown {
 
   let arrayKey: string | undefined;
   let expectedRows = -1;
+  let explicitDepth: number | undefined;
+  let isJsonl = false;
   for (const token of metaHeader.split(/\s+/)) {
-    if (token.startsWith('key=')) {
+    if (token === 'jsonl=1') {
+      isJsonl = true;
+    } else if (token.startsWith('depth=')) {
+      explicitDepth = Number.parseInt(token.slice(6), 10);
+    } else if (token.startsWith('key=')) {
       const rawKey = token.slice(4);
       try {
         arrayKey = decodeURIComponent(rawKey);
@@ -369,9 +552,28 @@ export function decodeToon(toon: string): unknown {
 
   let rowStartIdx = 1;
   let siblings: Record<string, unknown> | undefined;
-  if (lines[1]?.startsWith('@meta ')) {
-    siblings = JSON.parse(lines[1].slice(6)) as Record<string, unknown>;
-    rowStartIdx = 2;
+  const flatPrefixes = new Set<string>();
+  while (rowStartIdx < lines.length) {
+    const dirLine = lines[rowStartIdx]!;
+    if (dirLine.startsWith('@meta ')) {
+      siblings = JSON.parse(dirLine.slice(6)) as Record<string, unknown>;
+      rowStartIdx += 1;
+    } else if (dirLine.startsWith('@flat ')) {
+      const rawPrefixes = dirLine.slice(6).trim();
+      if (rawPrefixes) {
+        for (const p of rawPrefixes.split(/[\s,]+/)) {
+          if (!p) continue;
+          try {
+            flatPrefixes.add(decodeURIComponent(p));
+          } catch {
+            flatPrefixes.add(p);
+          }
+        }
+      }
+      rowStartIdx += 1;
+    } else {
+      break;
+    }
   }
 
   const rows: Record<string, unknown>[] = [];
@@ -385,9 +587,36 @@ export function decodeToon(toon: string): unknown {
     const obj: Record<string, unknown> = {};
     for (let c = 0; c < cols.length; c++) {
       const val = decodeCell(rawCells[c]!);
-      if (val !== undefined) {
-        setOwnProp(obj, cols[c]!, val);
+      if (val === undefined) continue;
+      const colName = cols[c]!;
+      if (flatPrefixes.size === 0) {
+        setOwnProp(obj, colName, val);
+        continue;
       }
+      let targetObj = obj;
+      let rest = colName;
+      let prefixAcc = '';
+      while (true) {
+        const dot = rest.indexOf('.');
+        if (dot <= 0) break;
+        const seg = rest.slice(0, dot);
+        const candidatePrefix = prefixAcc ? `${prefixAcc}.${seg}` : seg;
+        if (!flatPrefixes.has(candidatePrefix)) break;
+        const existingChild = Object.prototype.hasOwnProperty.call(targetObj, seg)
+          ? targetObj[seg]
+          : undefined;
+        let childObj: Record<string, unknown>;
+        if (isPlainObject(existingChild)) {
+          childObj = existingChild;
+        } else {
+          childObj = {};
+          setOwnProp(targetObj, seg, childObj);
+        }
+        targetObj = childObj;
+        prefixAcc = candidatePrefix;
+        rest = rest.slice(dot + 1);
+      }
+      setOwnProp(targetObj, rest, val);
     }
     rows.push(obj);
   }
@@ -396,6 +625,9 @@ export function decodeToon(toon: string): unknown {
     throw new Error(`Expected ${expectedRows} rows, got ${rows.length}`);
   }
 
+  if (isJsonl) {
+    return rows.map((r) => JSON.stringify(r)).join('\n');
+  }
   if (arrayKey === undefined) return rows;
   const out: Record<string, unknown> = {};
   if (siblings) {
@@ -403,6 +635,25 @@ export function decodeToon(toon: string): unknown {
       setOwnProp(out, k, v);
     }
   }
-  setOwnProp(out, arrayKey, rows);
+  const pathSegs =
+    explicitDepth === 1 || !arrayKey.includes('/')
+      ? [arrayKey]
+      : arrayKey.split('/');
+  let targetParent: Record<string, unknown> = out;
+  for (let i = 0; i < pathSegs.length - 1; i++) {
+    const seg = pathSegs[i]!;
+    const existingNext = Object.prototype.hasOwnProperty.call(targetParent, seg)
+      ? targetParent[seg]
+      : undefined;
+    let nextObj: Record<string, unknown>;
+    if (isPlainObject(existingNext)) {
+      nextObj = existingNext;
+    } else {
+      nextObj = {};
+      setOwnProp(targetParent, seg, nextObj);
+    }
+    targetParent = nextObj;
+  }
+  setOwnProp(targetParent, pathSegs[pathSegs.length - 1]!, rows);
   return out;
 }

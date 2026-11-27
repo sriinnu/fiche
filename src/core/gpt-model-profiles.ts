@@ -247,6 +247,7 @@ const GPT6_PROFILE: GptModelProfile = {
   imageDetail: 'original',
   vision: { regime: 'patch', multiplier: 1.2 },
   stripCols: 152,
+  maxHeightPx: H,
   cacheReadRate: 0.1,
   cacheWriteRate: 1.25,
   cacheBreakpoints: true,
@@ -357,15 +358,20 @@ const BUILTIN_RULES: ProfileRule[] = [
     test: (m) => /^gpt-5\.\d/.test(m),
     profile: { vision: { regime: 'patch', multiplier: 1, patchCap: 10000 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
-  // gpt-5 / gpt-5-chat-latest: tile 70/140
+  // gpt-4o / gpt-4.1 / gpt-4.5 (non-mini/nano): tile 85/170 — 100 cols (508px <= 512px, 1 tile wide) x 2048px.
+  {
+    test: (m) => /^gpt-4(?:o|\.1|\.5)(?:[-:]|$)/.test(m),
+    profile: { vision: { regime: 'tile', base: 85, perTile: 170 }, ...BASE_PRICING, stripCols: 100, maxHeightPx: 2048, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+  },
+  // gpt-5 / gpt-5-chat-latest: tile 70/140 — 100 cols (508px <= 512px, 1 tile wide) x 2048px.
   {
     test: (m) => /^gpt-5/.test(m),
-    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, ...GPT5_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'tile', base: 70, perTile: 140 }, ...GPT5_PRICING, stripCols: 100, maxHeightPx: 2048, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
-  // o1 / o3 reasoning: tile 75/150
+  // o1 / o3 reasoning: tile 75/150 — 100 cols (508px <= 512px, 1 tile wide) x 2048px.
   {
     test: (m) => /^o[13]/.test(m),
-    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, ...BASE_PRICING, stripCols: C, maxHeightPx: H, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
+    profile: { vision: { regime: 'tile', base: 75, perTile: 150 }, ...BASE_PRICING, stripCols: 100, maxHeightPx: 2048, minCompressTokens: 500, factSheetFormat: 'full', history: BASE_HISTORY, style: BASE_STYLE },
   },
 
   // Grok remains opt-in. Native 14px / 84 cols / maxH 512 is the densest best

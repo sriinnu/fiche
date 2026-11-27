@@ -155,7 +155,8 @@ describe('Track F — GPT-6 Sol, Astra, Terra & Luna Savings Upgrades', () => {
       expect(res1.info.compressed).toBe(true);
       expect(res1.info.imageCount).toBeGreaterThan(0);
       expect(res1.info.reason).toBe('hybrid_slab_optical');
-      expect(res1.info.textHygieneStages).toContain('tscg');
+      // P1-E: static pre-slab TSCG/SkillLinker are suppressed when optical slab renders instructions+tools
+      expect(res1.info.textHygieneStages).not.toContain('tscg');
       expect(res1.info.textHygieneStages).toContain('hybrid_slab_optical');
       expect(res1.info.textHygieneSavedTokens ?? 0).toBeGreaterThan(0);
 
@@ -445,6 +446,37 @@ describe('Track F — GPT-6 Sol, Astra, Terra & Luna Savings Upgrades', () => {
       },
     );
     expect(chatRes.info.compressed).toBe(true);
-    expect(chatRes.info.textHygieneStages).toContain('tscg');
+    expect(chatRes.info.reason).toBe('hybrid_slab_optical');
+    expect(chatRes.info.textHygieneStages).not.toContain('tscg');
+
+    // Text-only fallback (when optical slab is disabled) runs TSCG cleanly
+    const chatTextOnly = await transformOpenAIChatCompletions(
+      enc.encode(
+        JSON.stringify({
+          model: 'gpt-6.2-sol',
+          messages: [
+            { role: 'system', content: makeVariedInstructions('gpt-6.2-sol-chat', 90) },
+            { role: 'user', content: 'Hello' },
+          ],
+          tools: makeVerboseTools().map((t) => ({
+            type: 'function',
+            function: {
+              name: t.name,
+              description: t.description,
+              parameters: t.parameters,
+            },
+          })),
+        }),
+      ),
+      {
+        model: 'gpt-6.2-sol',
+        compress: true,
+        imageCompress: false,
+        textHygiene: 'on',
+        clientSessionId: 'sess_chat_sol_text_tscg',
+        clientSessionSource: 'fiche-header',
+      },
+    );
+    expect(chatTextOnly.info.textHygieneStages).toContain('tscg');
   });
 });

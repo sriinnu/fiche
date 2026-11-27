@@ -15,6 +15,7 @@ import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 import { isUsableAnthropicBaselineProbe } from './core/baseline.js';
 import type { TrackEvent } from './core/tracker.js';
+import { eventLogFiles } from './file-tracker.js';
 
 // ---- pure aggregator ------------------------------------------------------
 
@@ -423,20 +424,23 @@ export function renderTextReport(s: Summary): string {
 export async function aggregateEventsFile(
   file: string,
 ): Promise<{ summary: Summary; parsed: number; dropped: number } | undefined> {
-  if (!fs.existsSync(file)) return undefined;
-  const stream = fs.createReadStream(file, { encoding: 'utf8' });
-  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const files = eventLogFiles(file);
+  if (files.length === 0) return undefined;
   const summary = newSummary();
   let parsed = 0;
   let dropped = 0;
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    try {
-      const ev = JSON.parse(line) as TrackEvent;
-      fold(summary, ev);
-      parsed++;
-    } catch {
-      dropped++;
+  for (const logFile of files) {
+    const stream = fs.createReadStream(logFile, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+      try {
+        const ev = JSON.parse(line) as TrackEvent;
+        fold(summary, ev);
+        parsed++;
+      } catch {
+        dropped++;
+      }
     }
   }
   return { summary, parsed, dropped };

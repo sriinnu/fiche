@@ -22,7 +22,7 @@ declare const __FICHE_VERSION__: string | undefined;
 
 export const MCP_PROTOCOL = '2025-03-26';
 export const SERVER_NAME = 'fiche-mcp';
-export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.19.0';
+export const SERVER_VERSION = typeof __FICHE_VERSION__ !== 'undefined' ? __FICHE_VERSION__ : '0.20.0';
 /** Hard cap for one MCP message. Larger frames are rejected, not buffered. */
 export const MCP_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -153,8 +153,31 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function resolveDaemonPort(): number {
-  const envPort = Number(process.env.PORT ?? 47821);
+  const raw = process.env.FICHE_PORT?.trim() ? process.env.FICHE_PORT : process.env.PORT;
+  const envPort = Number(raw ?? 47821);
   return Number.isSafeInteger(envPort) && envPort > 0 && envPort <= 65535 ? envPort : 47821;
+}
+
+function readExistingControlToken(): string | undefined {
+  const home = os.homedir();
+  const ficheDir = path.join(home, '.fiche');
+  const legacyDir = path.join(home, '.inkling');
+  const tokenDir = fs.existsSync(ficheDir) || !fs.existsSync(legacyDir) ? ficheDir : legacyDir;
+  const tokenPath = path.join(tokenDir, 'warp-token');
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tokenPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > 256) return undefined;
+    const token = fs.readFileSync(fd, 'utf8').trim();
+    return /^[0-9a-f]{64}$/i.test(token) ? token.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
 }
 
 function parsePositiveIntArg(value: unknown, field: string): { ok: true; value: number | undefined } | { ok: false; error: string } {
@@ -353,7 +376,9 @@ async function callTool(name: string, args: Record<string, unknown>) {
     if (endParsed.value !== undefined) qs.set('endLine', String(endParsed.value));
     qs.set('maxLines', String(maxLines));
     try {
+      const controlToken = readExistingControlToken();
       const res = await fetch(`http://127.0.0.1:${port}/api/mmu/page?${qs.toString()}`, {
+        ...(controlToken ? { headers: { 'x-fiche-control-token': controlToken } } : {}),
         signal: AbortSignal.timeout(250),
       });
       const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
@@ -400,7 +425,9 @@ async function callTool(name: string, args: Record<string, unknown>) {
     const port = resolveDaemonPort();
     const qs = sessionKey ? `?sessionKey=${encodeURIComponent(sessionKey)}` : '';
     try {
+      const controlToken = readExistingControlToken();
       const res = await fetch(`http://127.0.0.1:${port}/api/mmu/stats${qs}`, {
+        ...(controlToken ? { headers: { 'x-fiche-control-token': controlToken } } : {}),
         signal: AbortSignal.timeout(250),
       });
       const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
@@ -482,7 +509,8 @@ async function callTool(name: string, args: Record<string, unknown>) {
     let daemonEngineMode: 'optical' | 'hybrid' | 'text' | undefined;
 
     const port = resolveDaemonPort();
-    const shouldQueryDaemon = !process.env.VITEST || process.env.PORT !== undefined;
+    const shouldQueryDaemon =
+      !process.env.VITEST || process.env.FICHE_PORT !== undefined || process.env.PORT !== undefined;
     let gotDaemon = false;
     if (shouldQueryDaemon) {
       try {
@@ -871,11 +899,18 @@ function loopbackHost(hostname: string): boolean {
   return host === 'localhost' || host === '127.0.0.1' || host === '::1';
 }
 
-function originAllowed(origin: string | undefined): boolean {
+function originAllowed(origin: string | undefined, host: string | undefined): boolean {
   if (origin === undefined) return true;
-  if (!origin.trim()) return false;
+  if (!origin.trim() || !hostHeaderAllowed(host)) return false;
   try {
-    return loopbackHost(new URL(origin).hostname);
+    const parsedOrigin = new URL(origin);
+    const expectedOrigin = new URL(`http://${host!.trim()}`);
+    return (
+      parsedOrigin.protocol === 'http:'
+      && expectedOrigin.protocol === 'http:'
+      && loopbackHost(parsedOrigin.hostname)
+      && parsedOrigin.origin === expectedOrigin.origin
+    );
   } catch {
     return false;
   }
@@ -899,9 +934,23 @@ export function startHttpServer(
   options: { ipv4Only?: boolean; retriesLeft?: number } = {},
 ): Promise<{ port: number; ipv6Listening: boolean; close: () => Promise<void> }> {
   const onRequest = (req: IncomingMessage, res: ServerResponse) => {
+    const rawFetchSite = req.headers['sec-fetch-site'];
+    const fetchSite = typeof rawFetchSite === 'string' ? rawFetchSite.trim().toLowerCase() : '';
+    if (
+      fetchSite === 'cross-site'
+      || fetchSite === 'same-site'
+      || fetchSite.split(',').some((s) => {
+        const tok = s.trim();
+        return tok === 'cross-site' || tok === 'same-site';
+      })
+    ) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'loopback only' }));
+      return;
+    }
     const origin = req.headers.origin;
     const host = typeof req.headers.host === 'string' ? req.headers.host : undefined;
-    if ((typeof origin === 'string' && !originAllowed(origin)) || !hostHeaderAllowed(host)) {
+    if (!hostHeaderAllowed(host) || (typeof origin === 'string' && !originAllowed(origin, host))) {
       res.writeHead(403, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: 'loopback only' }));
       return;
@@ -924,6 +973,7 @@ export function startHttpServer(
       received += chunk.length;
       if (received > MCP_MAX_BYTES) {
         rejected = true;
+        chunks.length = 0;
         // Signal `Connection: close` so keep-alive clients (e.g. Node 24 globalAgent)
         // never pool/reuse this socket, and drain without abruptly triggering EPIPE.
         res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
@@ -933,16 +983,28 @@ export function startHttpServer(
       }
       chunks.push(chunk);
     });
+    req.on('aborted', () => {
+      chunks.length = 0;
+    });
+    req.on('close', () => {
+      chunks.length = 0;
+    });
     req.on('error', () => {
+      chunks.length = 0;
       if (!res.writableEnded) res.destroy();
     });
     req.on('end', () => {
-      if (rejected) return;
+      if (rejected) {
+        chunks.length = 0;
+        return;
+      }
+      const rawBody = Buffer.concat(chunks);
+      chunks.length = 0;
       void (async () => {
         try {
           let message: unknown;
           try {
-            message = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            message = JSON.parse(rawBody.toString('utf8'));
           } catch {
             res.writeHead(400, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }));
@@ -968,6 +1030,8 @@ export function startHttpServer(
   // Listen on ::1 too, so a client that resolves localhost to IPv6 connects.
   const server = createServer(onRequest);
   const v6 = createServer(onRequest);
+  server.requestTimeout = 30_000;
+  v6.requestTimeout = 30_000;
   const closeServer = (target: Server) => new Promise<void>((done, fail) => {
     if (!target.listening) { done(); return; }
     target.close((err) => err ? fail(err) : done());

@@ -30,7 +30,7 @@ import {
 } from './context-mmu.js';
 import { getAllowedModelBases } from './applicability.js';
 import { readBrandEnv } from './env.js';
-import { createCasiIndex } from './casi-delta.js';
+import { CasiIndex, createCasiIndex } from './casi-delta.js';
 import { getGlobalPrefixTape, INITIAL_PREFIX_HASH, tapeHash64Hex } from './prefix-tape.js';
 import { gptTokenCount, hasLongUnbrokenBpeChunk } from './gpt-tokens.js';
 import { resolvePriceRates } from './pricing.js';
@@ -41,7 +41,9 @@ import {
   type ToolSchemaWire,
 } from './schema-compiler.js';
 import {
+  getCacheCircuitBreakerState,
   getPinnedSessionSkills,
+  getSessionCacheHealthSignals,
   hasStage2SealKey,
   isSessionCacheCold,
   recordStage2SealKey,
@@ -52,7 +54,7 @@ import {
   type CacheBreakpointMarker,
   type TextEpochBlock,
 } from './text-history.js';
-import { encodeToon } from './toon.js';
+import { encodeToon, encodeToonJsonl } from './toon.js';
 
 export { isFileReadToolName };
 
@@ -111,6 +113,8 @@ export interface TextHygieneOptions {
   enableSkillLinker?: boolean;
   /** Optional tail hydration callback for P2/P3 integration. */
   appendTailHydration?: (hydrationBlock: string) => void;
+  /** Optional explicit cache circuit-breaker state override ('closed' | 'open' | 'half_open'). */
+  circuitBreakerState?: 'closed' | 'open' | 'half_open';
   /** Internal slot refId hint for Context-MMU density pruning page attribution. */
   refId?: string;
 }
@@ -199,7 +203,9 @@ function hasFileLineLocation(line: string): boolean {
   return false;
 }
 const CRITICAL_LOG_KEYWORD_RE =
-  /\b(?:error|err|warn|warning|fail|failed|failure|fatal|panic|exception|traceback|assertion|assert|denied|forbidden|timeout|timed out|refused|oom|killed|segfault|abort|aborted|passed|skipped|summary|exit[_ ]?code(?:[=:\s]+[1-9]\d*)?|returned [1-9]\d*|[A-Za-z_]\w*(?:Error|Exception|Fault|Failure)|ECONNREFUSED|ENOENT|ETIMEDOUT|EACCES|EPERM|EADDRINUSE|EPIPE|EISDIR|ENOSPC)\b|\b(?:status[=:\s]+|HTTP\/\d(?:\.\d)?["'\s]+)[45]\d\d\b/i;
+  /\b(?:error|err|warn|warning|fail|failed|failure|fatal|panic|exception|traceback|assertion|assert|denied|forbidden|timeout|timed out|refused|oom|killed|segfault|abort|aborted|skipped|summary|exit[_ ]?code(?:[=:\s]+[1-9]\d*)?|returned [1-9]\d*|[A-Za-z_]\w*(?:Error|Exception|Fault|Failure)|ECONNREFUSED|ENOENT|ETIMEDOUT|EACCES|EPERM|EADDRINUSE|EPIPE|EISDIR|ENOSPC)\b|\b(?:status[=:\s]+|HTTP\/\d(?:\.\d)?["'\s]+)[45]\d\d\b/i;
+const AGGREGATE_TEST_SUMMARY_RE =
+  /\b(?:Test Files\s+\d|Tests?\s+\d|All \d+ tests? passed|\d+\s+(?:passed|failed|skipped)|0 failed)\b/i;
 
 /**
  * Resolve text-hygiene activation mode from call options and `INKLING_TEXT_HYGIENE`.
@@ -437,7 +443,7 @@ function emulateTerminal(
   };
 }
 
-/** Losslessly convert tabular JSON to `@toon` or minify pretty-printed JSON objects/arrays. */
+/** Losslessly convert tabular JSON or NDJSON/JSONL to `@toon`, or minify pretty-printed JSON objects/arrays. */
 function encodeStructuredJson(
   text: string,
   _aggressiveToon: boolean,
@@ -473,12 +479,36 @@ function encodeStructuredJson(
     if (min.length > text.length * 0.85) return null;
     return { text: min, stage: 'json' };
   } catch {
+    // JSONL/NDJSON: >= 5 `{...}` lines fail single-doc JSON.parse; try `@toon jsonl=1`.
+    if (enableToon && hasNewline && first === 123 && last === 125) {
+      const jsonlToon = encodeToonJsonl(trimmed);
+      if (jsonlToon !== null && jsonlToon.length < text.length) {
+        return { text: jsonlToon, stage: 'toon' };
+      }
+    }
     return null;
   }
 }
 
-const DIR_ENTRY_RE = /^((?:[MADRCU?!]{1,2}\s+)?)(?:\.\/)?((?:[A-Za-z0-9_@.~-]+\/)+)([A-Za-z0-9_@.~-]+\/?)$/;
-const DIR_LEAF_RE = /^((?:[MADRCU?!]{1,2}\s+)?)[A-Za-z0-9_@.~-]+\.[A-Za-z0-9]{1,12}$/;
+const DIR_ENTRY_RE = /^((?:[MADRCU?!]{1,2}\s+)?)(?:\.\/)?(\/?(?:[A-Za-z0-9_@.+~()[\]-]+\/)+)([A-Za-z0-9_@.+~()[\]-]+\/?)$/;
+const DIR_LEAF_RE = /^((?:[MADRCU?!]{1,2}\s+)?)[A-Za-z0-9_@.+~()[\]-]+\.[A-Za-z0-9]{1,12}$/;
+
+function longestCommonSlashPrefix(paths: readonly string[]): string {
+  if (paths.length === 0) return '';
+  let prefix = paths[0]!;
+  for (let i = 1; i < paths.length; i++) {
+    const p = paths[i]!;
+    let limit = Math.min(prefix.length, p.length);
+    let diffAt = 0;
+    while (diffAt < limit && prefix.charCodeAt(diffAt) === p.charCodeAt(diffAt)) {
+      diffAt++;
+    }
+    prefix = prefix.slice(0, diffAt);
+    if (!prefix) return '';
+  }
+  const lastSlash = prefix.lastIndexOf('/');
+  return lastSlash >= 0 ? prefix.slice(0, lastSlash + 1) : '';
+}
 
 /**
  * Losslessly group repetitive directory/file-tree listings (`>= 12` entries, `>= 600` chars)
@@ -514,7 +544,8 @@ function compactDirectoryListing(text: string): string | null {
       pathHits += 1;
       slashHits += 1;
       const prefix = m[1] ?? '';
-      const dir = m[2]!.replace(/\/+$/, '');
+      const rawDir = m[2]!;
+      const dir = rawDir === '/' ? '/' : rawDir.replace(/\/+$/, '');
       const leaf = m[3]!;
       parsed.push({ kind: 'dir', key: `${prefix}\0${dir}`, prefix, dir, leaf, raw: entry });
       continue;
@@ -539,26 +570,74 @@ function compactDirectoryListing(text: string): string | null {
   }
 
   const emittedGroup = new Set<string>();
-  const out: string[] = [];
+  const groupedDirs: string[] = [];
+  type OutItem =
+    | { kind: 'raw'; raw: string }
+    | { kind: 'single'; prefix: string; dir: string; leaf: string; raw: string }
+    | { kind: 'group'; prefix: string; dir: string; leaves: string[] };
+  const outItems: OutItem[] = [];
   let hasGrouped = false;
+
   for (const item of parsed) {
     if (item.kind === 'raw') {
-      out.push(item.raw);
+      outItems.push({ kind: 'raw', raw: item.raw });
       continue;
     }
     const g = groupLeaves.get(item.key)!;
     if (g.leaves.length < 2) {
-      out.push(item.raw);
+      outItems.push({ kind: 'single', prefix: item.prefix, dir: item.dir, leaf: item.leaf, raw: item.raw });
       continue;
     }
     if (emittedGroup.has(item.key)) continue;
     emittedGroup.add(item.key);
     hasGrouped = true;
-    out.push(`${g.prefix}${g.dir}/: ${g.leaves.join(', ')}`);
+    groupedDirs.push(g.dir === '/' ? '/' : `${g.dir}/`);
+    outItems.push({ kind: 'group', prefix: g.prefix, dir: g.dir, leaves: g.leaves });
   }
 
   if (!hasGrouped) return null;
-  const candidate = out.join('\n');
+  const unfactored = outItems
+    .map((it) =>
+      it.kind === 'group'
+        ? `${it.prefix}${it.dir === '/' ? '' : it.dir}/: ${it.leaves.join(', ')}`
+        : it.raw,
+    )
+    .join('\n');
+
+  let candidate = unfactored;
+  if (groupedDirs.length >= 3) {
+    const commonRoot = longestCommonSlashPrefix(groupedDirs);
+    if (commonRoot.length >= 16) {
+      const factoredLines: string[] = [`@root ${commonRoot}`];
+      for (const it of outItems) {
+        if (it.kind === 'raw') {
+          factoredLines.push(it.raw);
+          continue;
+        }
+        const fullDirSlash = it.dir === '/' ? '/' : `${it.dir}/`;
+        if (fullDirSlash.startsWith(commonRoot)) {
+          const rel = fullDirSlash.slice(commonRoot.length);
+          if (it.kind === 'group') {
+            const relLabel = rel ? rel : './';
+            factoredLines.push(`${it.prefix}${relLabel}: ${it.leaves.join(', ')}`);
+          } else {
+            factoredLines.push(`${it.prefix}${rel}${it.leaf}`);
+          }
+        } else {
+          factoredLines.push(
+            it.kind === 'group'
+              ? `${it.prefix}${it.dir === '/' ? '' : it.dir}/: ${it.leaves.join(', ')}`
+              : it.raw,
+          );
+        }
+      }
+      const factored = factoredLines.join('\n');
+      if (factored.length < unfactored.length) {
+        candidate = factored;
+      }
+    }
+  }
+
   if (text.length - candidate.length < 150 || candidate.length > text.length * 0.82) {
     return null;
   }
@@ -589,10 +668,14 @@ function drainTemplate(line: string): string {
 const LOG_ISO_TS_RE = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/;
 const LOG_CLOCK_TS_RE = /(?:^|[\s\[])\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\]|[\s,:])/;
 const LOG_LEVEL_RE = /\b(?:INFO|DEBUG|TRACE|VERBOSE|NOTICE|LOG)\b/;
+const LOG_HTTP_VERB_RE = /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/;
 const LOG_HTTP_RE = /\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\/\S*/;
-const LOG_RUNNER_RE = /^\s*(?:[✓✔]\s|(?:PASS|OK|RUN|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling|Built|Transformed|Rendered)\b|\[\d+\/\d+\]\s|·+$)|(?:\.\.\.\s*ok\s*(?:\([^)\n]+\))?$|\bok\s+\S+\s+\d+(?:\.\d+)?(?:ms|s)\s*$)/;
-const PASSING_PROGRESS_RE = /^\s*(?:[✓✔]\s|(?:PASS|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling)\b|\[\d+\/\d+\]\s|·+$)|(?:\.\.\.\s*ok\s*(?:\([^)\n]+\))?$|\bok\s+\S+\s+\d+(?:\.\d+)?(?:ms|s)\s*$)/;
-const FAIL_OR_SUMMARY_RE = /\b(?:error|err|warn|warning|fail|failed|failure|fatal|panic|exception|traceback|assertion|assert|denied|forbidden|timeout|timed out|refused|oom|killed|segfault|abort|aborted|skipped|summary|Tests?\s+\d|Test Files\s+\d)\b/i;
+const LOG_RUNNER_RE =
+  /^\s*(?:[✓✔]\s|(?:PASSED?|--- PASS:|=== RUN|OK|RUN|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling|Built|Transformed|Rendered)\b|\[\d+\/\d+\]\s|·+$)|(?:\.\.\.\s*ok\s*(?:\([^)\n]+\))?$|\bok\s+\S+\s+\d+(?:\.\d+)?(?:ms|s)\s*$)/;
+const PASSING_PROGRESS_RE =
+  /^\s*(?:[✓✔]\s|(?:PASSED?|--- PASS:|=== RUN|Compiling|Downloading|Fetching|Resolving|Checking|Installing|Building|Bundling)\b|\[\d+\/\d+\]\s|·+$)|(?:\.\.\.\s*ok\s*(?:\([^)\n]+\))?$|\bok\s+\S+\s+\d+(?:\.\d+)?(?:ms|s)\s*$)/;
+const FAIL_OR_SUMMARY_RE =
+  /\b(?:error|err|warn|warning|fail|failed|failure|fatal|panic|exception|traceback|assertion|assert|denied|forbidden|timeout|timed out|refused|oom|killed|segfault|abort|aborted|skipped|summary|Tests?\s+\d|Test Files\s+\d|All \d+ tests? passed|\d+\s+(?:passed|failed|skipped)|0 failed)\b/i;
 
 function isLogShapedLine(line: string): boolean {
   return (
@@ -607,7 +690,7 @@ function isLogShapedLine(line: string): boolean {
 function isAnchorLine(line: string, index: number, total: number): boolean {
   if (index < 5 || index >= total - 15) return true;
   if (!line.trim()) return false;
-  if (CRITICAL_LOG_KEYWORD_RE.test(line)) return true;
+  if (CRITICAL_LOG_KEYWORD_RE.test(line) || AGGREGATE_TEST_SUMMARY_RE.test(line)) return true;
   if (STACK_PREFIX_RE.test(line) || hasFileLineLocation(line)) return true;
   if (!isLogShapedLine(line)) return true;
   return false;
@@ -625,10 +708,12 @@ function isJsonWrappedFast(text: string): boolean {
 }
 
 /**
- * Drain-inspired structural log-template folder:
- *  - Preserves first/last context lines, all error/warning/test summary/stack lines.
- *  - Collapses contiguous runs (>=4) and global high-frequency boilerplate (>=12) of
- *    structurally identical template lines with explicit `[... K similar lines folded ...]`.
+ * Drain-inspired structural log-template folder with bounded Depth-2 Drain prefix tree:
+ *  - Preserves first/last context lines, all error/warning/aggregate test summary/stack lines.
+ *  - Clusters non-anchored log lines using Depth-2 Drain (`W <= 16`, `<= 16` clusters/bucket,
+ *    `sim >= 0.60`, exact log-level/HTTP-verb match).
+ *  - Collapses contiguous runs (>=4), global high-frequency clusters (>=12), and passing
+ *    test/progress runs (>=8) with explicit `[... K similar lines folded ...]`.
  */
 function foldRepetitiveLogs(text: string): string | null {
   if (text.length < 1024 || isJsonWrappedFast(text)) {
@@ -642,41 +727,98 @@ function foldRepetitiveLogs(text: string): string | null {
   const total = lines.length;
   const anchored = new Uint8Array(total);
   const templates = new Array<string>(total);
+  const clusterKeys = new Array<string>(total);
   const freq = new Map<string, number>();
+
+  interface DrainCluster {
+    readonly id: string;
+    readonly tokens: string[];
+  }
+  const drainBuckets = new Map<string, DrainCluster[]>();
+  let nextClusterId = 1;
+  const DRAIN_MAX_WIDTH = 16;
+  const DRAIN_MAX_CLUSTERS_PER_BUCKET = 16;
+  const DRAIN_SIM_THRESHOLD = 0.60;
 
   for (let i = 0; i < total; i++) {
     const line = lines[i]!;
     if (isAnchorLine(line, i, total)) {
       anchored[i] = 1;
       templates[i] = '';
+      clusterKeys[i] = '';
     } else {
       const tpl = drainTemplate(line);
       templates[i] = tpl;
-      if (tpl !== '<EMPTY>') {
-        freq.set(tpl, (freq.get(tpl) ?? 0) + 1);
+      if (tpl === '<EMPTY>') {
+        clusterKeys[i] = '<EMPTY>';
+        continue;
       }
+
+      const rawTokens = tpl.split(/\s+/);
+      const width = Math.min(rawTokens.length, DRAIN_MAX_WIDTH);
+      const tokSlice = rawTokens.slice(0, width);
+      const level = LOG_LEVEL_RE.exec(line)?.[0] ?? '';
+      const httpVerb = LOG_HTTP_VERB_RE.exec(line)?.[0] ?? '';
+      const bucketKey = `${rawTokens.length}\0${level}\0${httpVerb}\0${tokSlice[0] ?? ''}\0${tokSlice[1] ?? ''}`;
+      let bucket = drainBuckets.get(bucketKey);
+      if (!bucket) {
+        bucket = [];
+        drainBuckets.set(bucketKey, bucket);
+      }
+
+      let bestCluster: DrainCluster | undefined;
+      let bestSim = -1;
+      for (let c = 0; c < bucket.length; c++) {
+        const cl = bucket[c]!;
+        let matches = 0;
+        for (let k = 0; k < width; k++) {
+          if (cl.tokens[k] === tokSlice[k]) matches++;
+        }
+        const sim = width > 0 ? matches / width : 1;
+        if (sim >= DRAIN_SIM_THRESHOLD && sim > bestSim) {
+          bestSim = sim;
+          bestCluster = cl;
+        }
+      }
+
+      let key = tpl;
+      if (bestCluster) {
+        for (let k = 0; k < width; k++) {
+          if (bestCluster.tokens[k] !== tokSlice[k]) {
+            bestCluster.tokens[k] = '<*>';
+          }
+        }
+        key = bestCluster.id;
+      } else if (bucket.length < DRAIN_MAX_CLUSTERS_PER_BUCKET) {
+        const created: DrainCluster = { id: `D${nextClusterId++}`, tokens: tokSlice };
+        bucket.push(created);
+        key = created.id;
+      }
+
+      clusterKeys[i] = key;
+      freq.set(key, (freq.get(key) ?? 0) + 1);
     }
   }
 
   const keep = new Uint8Array(total);
   keep.fill(1);
 
-  // Pass A: contiguous runs of >= 4 identical templates (bridging blank <EMPTY> separators; keep first 2, last 1).
+  // Pass A: contiguous runs of >= 4 matching cluster keys (bridging blank <EMPTY> separators; keep first 2, last 1).
   let runStart = 0;
   while (runStart < total) {
     if (anchored[runStart] || templates[runStart] === '<EMPTY>') {
       runStart++;
       continue;
     }
-    const tpl = templates[runStart]!;
+    const cKey = clusterKeys[runStart]!;
     const runIndices: number[] = [runStart];
     let runEnd = runStart + 1;
     while (
       runEnd < total &&
       !anchored[runEnd] &&
-      (templates[runEnd] === tpl || templates[runEnd] === '<EMPTY>')
+      (clusterKeys[runEnd] === cKey || templates[runEnd] === '<EMPTY>')
     ) {
-      if (templates[runEnd] === tpl) runIndices.push(runEnd);
+      if (clusterKeys[runEnd] === cKey) runIndices.push(runEnd);
       runEnd++;
     }
     if (runIndices.length >= 4) {
@@ -689,15 +831,15 @@ function foldRepetitiveLogs(text: string): string | null {
     runStart = runIndices[runIndices.length - 1]! + 1;
   }
 
-  // Pass B: globally repetitive non-anchored templates (>= 12 times: keep first 3 + last 2).
+  // Pass B: globally repetitive non-anchored clusters (>= 12 times: keep first 3 + last 2).
   const highFreqPositions = new Map<string, number[]>();
   for (let i = 0; i < total; i++) {
-    const tpl = templates[i]!;
-    if (!tpl || tpl === '<EMPTY>' || (freq.get(tpl) ?? 0) < 12) continue;
-    let list = highFreqPositions.get(tpl);
+    const cKey = clusterKeys[i]!;
+    if (!cKey || cKey === '<EMPTY>' || (freq.get(cKey) ?? 0) < 12) continue;
+    let list = highFreqPositions.get(cKey);
     if (!list) {
       list = [];
-      highFreqPositions.set(tpl, list);
+      highFreqPositions.set(cKey, list);
     }
     list.push(i);
   }
@@ -1236,34 +1378,83 @@ const SESSION_PINNED_SKILL_STORE: PinnedSkillStore = {
   set: (sessionKey, catalogHash, skills) => setPinnedSessionSkills(sessionKey, catalogHash, skills),
 };
 
+function estimateUnknownPayloadChars(value: unknown): number {
+  if (typeof value === 'string') return value.length;
+  if (value === undefined || value === null) return 0;
+  if (typeof value !== 'object') return String(value).length;
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 function estimateMessageBlockTokens(rawBlk: unknown): number {
   if (!rawBlk || typeof rawBlk !== 'object') return 0;
   const blk = rawBlk as Record<string, unknown>;
-  if (typeof blk.text === 'string') return Math.ceil(blk.text.length / 3.5);
-  if (typeof blk.thinking === 'string') return Math.ceil(blk.thinking.length / 3.5);
-  if (typeof blk.content === 'string') return Math.ceil(blk.content.length / 3.5);
-  if (Array.isArray(blk.content)) {
-    let sum = 0;
-    for (const part of blk.content) sum += estimateMessageBlockTokens(part);
-    return sum;
+  let tokens = 0;
+  if (typeof blk.text === 'string') tokens += Math.ceil(blk.text.length / 3.5);
+  if (typeof blk.thinking === 'string') tokens += Math.ceil(blk.thinking.length / 3.5);
+  if (typeof blk.content === 'string') {
+    tokens += Math.ceil(blk.content.length / 3.5);
+  } else if (Array.isArray(blk.content)) {
+    for (const part of blk.content) tokens += estimateMessageBlockTokens(part);
+  }
+  if (typeof blk.output === 'string') {
+    tokens += Math.ceil(blk.output.length / 3.5);
+  } else if (Array.isArray(blk.output)) {
+    for (const part of blk.output) tokens += estimateMessageBlockTokens(part);
+  }
+  if (typeof blk.summary === 'string') {
+    tokens += Math.ceil(blk.summary.length / 3.5);
+  } else if (Array.isArray(blk.summary)) {
+    for (const part of blk.summary) tokens += estimateMessageBlockTokens(part);
   }
   if (blk.type === 'tool_use' && blk.input !== undefined) {
-    try {
-      return Math.ceil((JSON.stringify(blk.input)?.length ?? 0) / 3.5);
-    } catch {
-      return 0;
+    tokens += Math.ceil(estimateUnknownPayloadChars(blk.input) / 3.5);
+  } else if (blk.input !== undefined) {
+    tokens += Math.ceil(estimateUnknownPayloadChars(blk.input) / 3.5);
+  }
+  if (blk.arguments !== undefined) {
+    tokens += Math.ceil(estimateUnknownPayloadChars(blk.arguments) / 3.5);
+  }
+  if (blk.function && typeof blk.function === 'object') {
+    const fn = blk.function as { arguments?: unknown };
+    if (fn.arguments !== undefined) {
+      tokens += Math.ceil(estimateUnknownPayloadChars(fn.arguments) / 3.5);
     }
   }
-  return 0;
+  if (blk.functionCall && typeof blk.functionCall === 'object') {
+    const fc = blk.functionCall as { args?: unknown };
+    if (fc.args !== undefined) {
+      tokens += Math.ceil(estimateUnknownPayloadChars(fc.args) / 3.5);
+    }
+  }
+  if (blk.functionResponse && typeof blk.functionResponse === 'object') {
+    const fr = blk.functionResponse as { response?: unknown; parts?: unknown };
+    if (fr.response !== undefined) {
+      tokens += Math.ceil(estimateUnknownPayloadChars(fr.response) / 3.5);
+    }
+    if (Array.isArray(fr.parts)) {
+      for (const sub of fr.parts) tokens += estimateMessageBlockTokens(sub);
+    }
+  }
+  return tokens;
 }
 
 export function estimateMessageTokens(rawMsg: unknown): number {
   if (!rawMsg || typeof rawMsg !== 'object') return 0;
-  const msg = rawMsg as { content?: unknown };
-  if (typeof msg.content === 'string') return Math.ceil(msg.content.length / 3.5);
-  if (!Array.isArray(msg.content)) return 0;
-  let sum = 0;
-  for (const blk of msg.content) sum += estimateMessageBlockTokens(blk);
+  const msg = rawMsg as Record<string, unknown>;
+  let sum = estimateMessageBlockTokens(msg);
+  if (Array.isArray(msg.tool_calls)) {
+    for (const tc of msg.tool_calls) sum += estimateMessageBlockTokens(tc);
+  }
+  if (msg.function_call && typeof msg.function_call === 'object') {
+    sum += estimateMessageBlockTokens(msg.function_call);
+  }
+  if (Array.isArray(msg.parts)) {
+    for (const part of msg.parts) sum += estimateMessageBlockTokens(part);
+  }
   return sum;
 }
 
@@ -1310,6 +1501,8 @@ function stage2RewritePaybackBlocked(
   cacheBreakpoints: readonly CacheBreakpointMarker[] | undefined,
   msgTotalTokens: readonly number[] | undefined,
   totalMessages: number,
+  breakerState: 'closed' | 'open' | 'half_open' = 'closed',
+  healthSignals?: { ewmaInterTurnSec?: number; ewmaHitRatio?: number },
 ): boolean {
   const { coveringTtlSec, downstreamTokens } = coveringBreakpointInfo(
     slot.msgIndex,
@@ -1318,7 +1511,9 @@ function stage2RewritePaybackBlocked(
     msgTotalTokens,
     totalMessages,
   );
-  if (coveringTtlSec <= 0 || downstreamTokens <= 0) return false;
+  if (downstreamTokens <= 0) return false;
+  if (breakerState === 'half_open') return true;
+  if (coveringTtlSec <= 0) return false;
   const actualSavedTok = estimateTokensSaved(orig, candidate);
   if (!(actualSavedTok > 0)) return true;
   const rawTok = Math.max(actualSavedTok + 1, Math.ceil(orig.length / 3.5));
@@ -1335,6 +1530,10 @@ function stage2RewritePaybackBlocked(
     turnsObserved: Math.max(1, Math.floor(totalMessages / 2)),
     baseMaxPayback: coveringTtlSec >= 3600 ? 8 : 12,
     downstreamCachedTokens: downstreamTokens,
+    ttlSec: coveringTtlSec,
+    ewmaInterTurnSec: healthSignals?.ewmaInterTurnSec,
+    ewmaHitRatio: healthSignals?.ewmaHitRatio,
+    writeRate: rates.write,
   });
   return paybackReads > maxAllowed;
 }
@@ -1379,6 +1578,11 @@ function runWireTextEngine(args: {
   const sessionCold =
     effectiveOpts?.sessionCacheCold ??
     (sessionKey ? isSessionCacheCold(sessionKey, { model: effectiveOpts?.model }) : false);
+  const healthScope = effectiveOpts?.model ? { model: effectiveOpts.model } : undefined;
+  const healthSignals = sessionKey ? getSessionCacheHealthSignals(sessionKey, healthScope) : undefined;
+  const breakerState: 'closed' | 'open' | 'half_open' =
+    effectiveOpts?.circuitBreakerState ??
+    (sessionKey ? getCacheCircuitBreakerState(sessionKey, healthScope) : 'closed');
 
   if (effectiveOpts?.deepTextCompact) {
     if (effectiveOpts.enableSkillLinker !== false && mmuStore && effectiveOpts.firstUserText) {
@@ -1446,12 +1650,16 @@ function runWireTextEngine(args: {
   for (let i = 0; i < toolSlots.length; i++) {
     const tSlot = toolSlots[i]!;
     const cur = origToolTexts[i]!;
-    const stage2SlotSig = `${tSlot.refId}\0${cur.length}:${tapeHash64Hex(cur)}`;
+    const origHash = tapeHash64Hex(cur);
+    const stage2SlotSig = `${tSlot.refId}\0${cur.length}:${origHash}`;
     const alreadySealedStage2 = Boolean(sessionKey && hasStage2SealKey(sessionKey, stage2SlotSig));
+    if (breakerState === 'open' && !alreadySealedStage2) {
+      continue;
+    }
     const allowDensityPrune = effectiveOpts?.enableDensityPrune !== false;
     const memoKey =
       cur.length >= 64 && cur.length <= MAX_HYGIENE_BLOCK_CHARS
-        ? `${stage2PolicyKey}:${allowDensityPrune ? '1' : '0'}\0${tSlot.refId}\0${tSlot.toolName ?? ''}\0${cur.length}:${tapeHash64Hex(cur)}`
+        ? `${stage2PolicyKey}:${allowDensityPrune ? '1' : '0'}\0${tSlot.refId}\0${tSlot.toolName ?? ''}\0${cur.length}:${origHash}`
         : undefined;
     let cleaned = memoKey ? tape.getStage2(memoKey) : undefined;
     if (!cleaned) {
@@ -1470,7 +1678,7 @@ function runWireTextEngine(args: {
     if (!cleaned.changed || cleaned.text.length >= cur.length) continue;
     if (
       !alreadySealedStage2 &&
-      !sessionCold &&
+      (breakerState === 'half_open' || !sessionCold) &&
       stage2RewritePaybackBlocked(
         cur,
         cleaned.text,
@@ -1479,6 +1687,8 @@ function runWireTextEngine(args: {
         cacheBreakpoints,
         msgTotalTokens,
         totalMessages,
+        breakerState,
+        healthSignals,
       )
     ) {
       continue;
@@ -1490,11 +1700,26 @@ function runWireTextEngine(args: {
   }
 
   // Opt-in Stage 2 cleaning on bulky user payloads (>= 1500 chars, non-code/diff, XML-safe).
-  const activeUserSlots = effectiveOpts?.cleanUserPayloads === true && userSlots ? userSlots : [];
+  const activeUserSlots =
+    breakerState !== 'open' && effectiveOpts?.cleanUserPayloads === true && userSlots
+      ? userSlots
+      : [];
   const origUserTexts = activeUserSlots.map((s) => s.getText());
   const userSlotStages: string[][] = activeUserSlots.map(() => []);
   for (let i = 0; i < activeUserSlots.length; i++) {
     const uSlot = activeUserSlots[i]!;
+    if (
+      breakerState === 'half_open' &&
+      coveringBreakpointInfo(
+        uSlot.msgIndex,
+        uSlot.blockIndex ?? 0,
+        cacheBreakpoints,
+        msgTotalTokens,
+        totalMessages,
+      ).downstreamTokens > 0
+    ) {
+      continue;
+    }
     const cur = origUserTexts[i]!;
     const cleaned = cleanUserBlockPreservingXml(cur, {
       ...effectiveOpts,
@@ -1554,6 +1779,7 @@ function runWireTextEngine(args: {
       }
     : undefined;
 
+  let earliestNewInvalidationMsg: number | undefined;
   const runStage3a = (stickyOnly: boolean): void => {
     if (!canRunEpochs || !effectiveOpts) return;
     const beforeEpochTexts = toolSlots.map((s) => s.getText());
@@ -1571,8 +1797,18 @@ function runWireTextEngine(args: {
       enableLsm: lsmActive,
       lsmEditTailMessages: effectiveOpts.lsmEditTailMessages,
       stickyOnly,
+      circuitBreakerState: breakerState,
+      earliestNewInvalidationMsg,
+      ewmaInterTurnSec: healthSignals?.ewmaInterTurnSec,
+      ewmaHitRatio: healthSignals?.ewmaHitRatio,
       onPageOut: epochPageOut,
     });
+    if (epochRes.earliestNewInvalidationMsg !== undefined) {
+      earliestNewInvalidationMsg =
+        earliestNewInvalidationMsg === undefined
+          ? epochRes.earliestNewInvalidationMsg
+          : Math.min(earliestNewInvalidationMsg, epochRes.earliestNewInvalidationMsg);
+    }
     if (epochRes.changed) {
       for (let i = 0; i < toolSlots.length; i++) {
         const updated = toolSlots[i]!.getText();
@@ -1607,7 +1843,17 @@ function runWireTextEngine(args: {
       cacheBreakpoints,
       totalPromptTokens: estimateRemainingPromptTokens(),
       stickyOnly,
+      circuitBreakerState: breakerState,
+      earliestNewInvalidationMsg,
+      ewmaInterTurnSec: healthSignals?.ewmaInterTurnSec,
+      ewmaHitRatio: healthSignals?.ewmaHitRatio,
     });
+    if (markovRes.earliestNewInvalidationMsg !== undefined) {
+      earliestNewInvalidationMsg =
+        earliestNewInvalidationMsg === undefined
+          ? markovRes.earliestNewInvalidationMsg
+          : Math.min(earliestNewInvalidationMsg, markovRes.earliestNewInvalidationMsg);
+    }
     if (markovRes.changed) {
       for (let i = 0; i < toolSlots.length; i++) {
         const updated = toolSlots[i]!.getText();
@@ -1624,8 +1870,8 @@ function runWireTextEngine(args: {
   if ((canRunEpochs || canRunMarkov) && hasAnyStickyMarkovEpisode(sessionKey)) {
     for (let pass = 0; pass < 8; pass++) {
       const passBefore = toolSlots.map((s) => s.getText());
-      runStage3a(true);
       runStage3b(true);
+      runStage3a(true);
       let passChanged = false;
       for (let i = 0; i < toolSlots.length; i++) {
         if (toolSlots[i]!.getText() !== passBefore[i]!) {
@@ -1669,9 +1915,11 @@ function runWireTextEngine(args: {
     }
   }
 
-  // Now seal newly eligible Stage 3a epochs and fold newly completed Stage 3b episodes.
-  runStage3a(false);
-  runStage3b(false);
+  // Fold newly completed Stage 3b episodes FIRST so wave-coalescing informs newly eligible Stage 3a epochs.
+  if (breakerState !== 'open') {
+    runStage3b(false);
+    runStage3a(false);
+  }
 
   if (sealSessionKey && sealSigs) {
     for (let i = 0; i < toolSlots.length; i++) {
@@ -1700,8 +1948,9 @@ function runWireTextEngine(args: {
   // Stage 4: CASI cross-turn deduplication / delta / FastCDC slice encoding.
   // Never seeds compacted preCompactTexts (whose bodies are gone from the prompt),
   // and replays warm indexed bases via replayIndexedBase (128-cap, independent of seedHashes).
-  const casi = effectiveOpts?.enableCasi === false ? undefined : createCasiIndex();
-  if (casi) {
+  const casiEnabled = effectiveOpts?.enableCasi !== false;
+  let casi: CasiIndex | undefined;
+  if (casiEnabled) {
     const sortedSeeds =
       seedBlocks && seedBlocks.length > 0
         ? [...seedBlocks].sort((a, b) => a.msgIndex - b.msgIndex)
@@ -1711,7 +1960,7 @@ function runWireTextEngine(args: {
     let prefixHash = INITIAL_PREFIX_HASH;
     const deferredBases: Array<{ kind: 'seed' | 'indexed'; text: string; refId: string; msgIndex: number }> = [];
     const flushDeferredBases = (): void => {
-      if (deferredBases.length === 0) return;
+      if (!casi || deferredBases.length === 0) return;
       for (const base of deferredBases) {
         if (base.kind === 'seed') {
           casi.seedBase(base.text, base.refId, base.msgIndex);
@@ -1724,6 +1973,8 @@ function runWireTextEngine(args: {
 
     for (let i = 0; i < toolSlots.length; i++) {
       const tSlot = toolSlots[i]!;
+      const preSeedStateKey = `${seedPrefixHash}\0${prefixHash}`;
+      const preSeedDeferredCount = deferredBases.length;
       while (seedCursor < sortedSeeds.length && sortedSeeds[seedCursor]!.msgIndex < tSlot.msgIndex) {
         const seed = sortedSeeds[seedCursor++]!;
         seedPrefixHash = tape.advancePrefixHash(
@@ -1749,6 +2000,8 @@ function runWireTextEngine(args: {
         continue;
       }
 
+      const preSlotStateKey = `${seedPrefixHash}\0${prefixHash}`;
+      const preSlotDeferredCount = deferredBases.length;
       const curHash = tapeHash64Hex(cur);
       prefixHash = tape.advancePrefixHash(
         prefixHash,
@@ -1757,8 +2010,39 @@ function runWireTextEngine(args: {
       const casiKey = `${seedPrefixHash}\0${prefixHash}\0${tSlot.refId}\0${tSlot.msgIndex}\0${cur.length}:${curHash}`;
       let memo = tape.getCasiMemo(casiKey);
       if (!memo) {
+        if (breakerState === 'open') {
+          continue;
+        }
+        if (
+          breakerState === 'half_open' &&
+          coveringBreakpointInfo(
+            tSlot.msgIndex,
+            tSlot.blockIndex ?? 0,
+            cacheBreakpoints,
+            msgTotalTokens,
+            totalMessages,
+          ).downstreamTokens > 0
+        ) {
+          continue;
+        }
+        if (!casi) {
+          let snap = tape.takeCasiSnapshot<CasiIndex>(preSlotStateKey);
+          let snapConsumedCount = preSlotDeferredCount;
+          if (!(snap instanceof CasiIndex) && preSeedStateKey !== preSlotStateKey) {
+            snap = tape.takeCasiSnapshot<CasiIndex>(preSeedStateKey);
+            snapConsumedCount = preSeedDeferredCount;
+          }
+          if (snap instanceof CasiIndex) {
+            casi = snap;
+            if (snapConsumedCount > 0) {
+              deferredBases.splice(0, snapConsumedCount);
+            }
+          } else {
+            casi = createCasiIndex();
+          }
+        }
         flushDeferredBases();
-        const casiRes = casi.ingest(cur, tSlot.refId, tSlot.msgIndex);
+        const casiRes = casi.ingest(cur, tSlot.refId, tSlot.msgIndex, undefined, curHash);
         memo = {
           text: casiRes.text,
           changed: casiRes.changed,
@@ -1779,6 +2063,18 @@ function runWireTextEngine(args: {
               : 'casi_delta',
         );
       }
+    }
+    if (casi) {
+      while (seedCursor < sortedSeeds.length) {
+        const seed = sortedSeeds[seedCursor++]!;
+        seedPrefixHash = tape.advancePrefixHash(
+          seedPrefixHash,
+          `${seed.refId}\0${seed.msgIndex}\0${seed.text.length}:${tapeHash64Hex(seed.text)}`,
+        );
+        deferredBases.push({ kind: 'seed', text: seed.text, refId: seed.refId, msgIndex: seed.msgIndex });
+      }
+      flushDeferredBases();
+      tape.putCasiSnapshot(`${seedPrefixHash}\0${prefixHash}`, casi);
     }
   }
 
@@ -2042,9 +2338,21 @@ export function applyAnthropicTextHygiene(
   });
 }
 
+function resolveMarkerTtl(
+  node: { cache_control?: unknown; prompt_cache_breakpoint?: unknown },
+  defaultTtlSec: number,
+): number | undefined {
+  const ccTtl = markerTtlSeconds(node.cache_control);
+  if (ccTtl !== undefined) return ccTtl;
+  if (node.prompt_cache_breakpoint !== undefined && node.prompt_cache_breakpoint !== null && node.prompt_cache_breakpoint !== false) {
+    return defaultTtlSec;
+  }
+  return undefined;
+}
+
 /** Clean OpenAI Chat Completions `role==='tool'` (+ TSCG/CASI/ACDC when enabled) in place. */
 export function applyOpenAIChatTextHygiene(
-  req: { tools?: unknown[]; messages?: unknown[] },
+  req: { tools?: unknown[]; messages?: unknown[]; prompt_cache_retention?: unknown; prompt_cache_breakpoint?: unknown },
   opts?: TextHygieneOptions,
 ): WireHygieneStats {
   const staticSlots: StaticTextSlot[] = [];
@@ -2052,11 +2360,36 @@ export function applyOpenAIChatTextHygiene(
   const userSlots: TextEpochBlock[] = [];
   const seedBlocks: SeedBlock[] = [];
   const toolNameById = new Map<string, string>();
+  const cacheBreakpoints: CacheBreakpointMarker[] = [];
+  const defaultRetentionTtl = req.prompt_cache_retention === '24h' ? 86400 : 300;
+  if (Array.isArray(req.tools)) {
+    for (const rawTool of req.tools) {
+      if (!rawTool || typeof rawTool !== 'object') continue;
+      const ttl = resolveMarkerTtl(rawTool as { cache_control?: unknown; prompt_cache_breakpoint?: unknown }, defaultRetentionTtl);
+      if (ttl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+      }
+    }
+  }
   const messages = Array.isArray(req.messages) ? req.messages : [];
+  const msgTotalTokens: number[] = new Array<number>(messages.length).fill(0);
   for (let mIdx = 0; mIdx < messages.length; mIdx++) {
     const rawMsg = messages[mIdx];
     if (!rawMsg || typeof rawMsg !== 'object') continue;
-    const msg = rawMsg as { role?: unknown; name?: unknown; tool_call_id?: unknown; tool_calls?: unknown; content?: unknown };
+    msgTotalTokens[mIdx] = estimateMessageTokens(rawMsg);
+    const msg = rawMsg as {
+      role?: unknown;
+      name?: unknown;
+      tool_call_id?: unknown;
+      tool_calls?: unknown;
+      content?: unknown;
+      cache_control?: unknown;
+      prompt_cache_breakpoint?: unknown;
+    };
+    const msgTtl = resolveMarkerTtl(msg, defaultRetentionTtl);
+    if (msgTtl !== undefined) {
+      cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: Number.MAX_SAFE_INTEGER, ttlSec: msgTtl });
+    }
     if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
       for (let tcIdx = 0; tcIdx < msg.tool_calls.length; tcIdx++) {
         const rawTc = msg.tool_calls[tcIdx];
@@ -2085,9 +2418,14 @@ export function applyOpenAIChatTextHygiene(
           },
         });
       } else if (Array.isArray(msg.content)) {
-        for (const rawPart of msg.content) {
+        for (let pIdx = 0; pIdx < msg.content.length; pIdx++) {
+          const rawPart = msg.content[pIdx];
           if (!rawPart || typeof rawPart !== 'object') continue;
-          const part = rawPart as { type?: unknown; text?: unknown };
+          const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown; prompt_cache_breakpoint?: unknown };
+          const partTtl = resolveMarkerTtl(part, defaultRetentionTtl);
+          if (partTtl !== undefined) {
+            cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: pIdx, ttlSec: partTtl });
+          }
           if (typeof part.text === 'string' && (part.type === 'text' || part.type === 'input_text')) {
             staticSlots.push({
               get: () => part.text as string,
@@ -2104,6 +2442,7 @@ export function applyOpenAIChatTextHygiene(
       if (typeof msg.content === 'string') {
         userSlots.push({
           msgIndex: mIdx,
+          blockIndex: 0,
           refId: `user_${mIdx}`,
           getText: () => msg.content as string,
           setText: (next: string) => {
@@ -2114,10 +2453,15 @@ export function applyOpenAIChatTextHygiene(
         for (let pIdx = 0; pIdx < msg.content.length; pIdx++) {
           const rawPart = msg.content[pIdx];
           if (!rawPart || typeof rawPart !== 'object') continue;
-          const part = rawPart as { type?: unknown; text?: unknown };
+          const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown; prompt_cache_breakpoint?: unknown };
+          const partTtl = resolveMarkerTtl(part, defaultRetentionTtl);
+          if (partTtl !== undefined) {
+            cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: pIdx, ttlSec: partTtl });
+          }
           if (typeof part.text === 'string' && (part.type === 'text' || part.type === 'input_text')) {
             userSlots.push({
               msgIndex: mIdx,
+              blockIndex: pIdx,
               refId: `user_${mIdx}_${pIdx}`,
               getText: () => part.text as string,
               setText: (next: string) => {
@@ -2140,6 +2484,7 @@ export function applyOpenAIChatTextHygiene(
     if (typeof msg.content === 'string') {
       toolSlots.push({
         msgIndex: mIdx,
+        blockIndex: 0,
         refId: baseRef,
         toolName,
         getText: () => msg.content as string,
@@ -2151,10 +2496,15 @@ export function applyOpenAIChatTextHygiene(
       for (let pIdx = 0; pIdx < msg.content.length; pIdx++) {
         const rawPart = msg.content[pIdx];
         if (!rawPart || typeof rawPart !== 'object') continue;
-        const part = rawPart as { type?: unknown; text?: unknown };
+        const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown; prompt_cache_breakpoint?: unknown };
+        const partTtl = resolveMarkerTtl(part, defaultRetentionTtl);
+        if (partTtl !== undefined) {
+          cacheBreakpoints.push({ msgIndex: mIdx, blockIndex: pIdx, ttlSec: partTtl });
+        }
         if (typeof part.text === 'string' && (part.type === 'text' || part.type === 'input_text')) {
           toolSlots.push({
             msgIndex: mIdx,
+            blockIndex: pIdx,
             refId: `${baseRef}#${pIdx}`,
             toolName,
             getText: () => part.text as string,
@@ -2165,6 +2515,17 @@ export function applyOpenAIChatTextHygiene(
         }
       }
     }
+  }
+  if (
+    messages.length > 0 &&
+    ((typeof req.prompt_cache_retention === 'string' && req.prompt_cache_retention.length > 0) ||
+      (req.prompt_cache_breakpoint !== undefined && req.prompt_cache_breakpoint !== null && req.prompt_cache_breakpoint !== false))
+  ) {
+    cacheBreakpoints.push({
+      msgIndex: messages.length - 1,
+      blockIndex: Number.MAX_SAFE_INTEGER,
+      ttlSec: defaultRetentionTtl,
+    });
   }
 
   if (
@@ -2183,6 +2544,8 @@ export function applyOpenAIChatTextHygiene(
     userSlots,
     seedBlocks,
     totalMessages: messages.length,
+    msgTotalTokens,
+    cacheBreakpoints,
     rawReq: req,
     opts,
   });
@@ -2190,7 +2553,13 @@ export function applyOpenAIChatTextHygiene(
 
 /** Clean OpenAI Responses `function_call_output` / `custom_tool_call_output` (+ TSCG/CASI/ACDC when enabled) in place. */
 export function applyOpenAIResponsesTextHygiene(
-  req: { instructions?: unknown; tools?: unknown[]; input?: unknown },
+  req: {
+    instructions?: unknown;
+    tools?: unknown[];
+    input?: unknown;
+    prompt_cache_retention?: unknown;
+    prompt_cache_breakpoint?: unknown;
+  },
   opts?: TextHygieneOptions,
 ): WireHygieneStats {
   const staticSlots: StaticTextSlot[] = [];
@@ -2207,11 +2576,24 @@ export function applyOpenAIResponsesTextHygiene(
   const userSlots: TextEpochBlock[] = [];
   const seedBlocks: SeedBlock[] = [];
   const toolNameById = new Map<string, string>();
+  const cacheBreakpoints: CacheBreakpointMarker[] = [];
+  const defaultRetentionTtl = req.prompt_cache_retention === '24h' ? 86400 : 300;
+  if (Array.isArray(req.tools)) {
+    for (const rawTool of req.tools) {
+      if (!rawTool || typeof rawTool !== 'object') continue;
+      const ttl = resolveMarkerTtl(rawTool as { cache_control?: unknown; prompt_cache_breakpoint?: unknown }, defaultRetentionTtl);
+      if (ttl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+      }
+    }
+  }
   const items = Array.isArray(req.input) ? req.input : [];
+  const msgTotalTokens: number[] = new Array<number>(items.length).fill(0);
   let leadingStatic = true;
   for (let iIdx = 0; iIdx < items.length; iIdx++) {
     const rawItem = items[iIdx];
     if (!rawItem || typeof rawItem !== 'object') continue;
+    msgTotalTokens[iIdx] = estimateMessageTokens(rawItem);
     const item = rawItem as {
       type?: unknown;
       id?: unknown;
@@ -2222,7 +2604,13 @@ export function applyOpenAIResponsesTextHygiene(
       input?: unknown;
       content?: unknown;
       output?: unknown;
+      cache_control?: unknown;
+      prompt_cache_breakpoint?: unknown;
     };
+    const itemTtl = resolveMarkerTtl(item, defaultRetentionTtl);
+    if (itemTtl !== undefined) {
+      cacheBreakpoints.push({ msgIndex: iIdx, blockIndex: Number.MAX_SAFE_INTEGER, ttlSec: itemTtl });
+    }
     if (leadingStatic && (item.role === 'system' || item.role === 'developer')) {
       if (typeof item.content === 'string') {
         staticSlots.push({
@@ -2232,9 +2620,14 @@ export function applyOpenAIResponsesTextHygiene(
           },
         });
       } else if (Array.isArray(item.content)) {
-        for (const rawPart of item.content) {
+        for (let pIdx = 0; pIdx < item.content.length; pIdx++) {
+          const rawPart = item.content[pIdx];
           if (!rawPart || typeof rawPart !== 'object') continue;
-          const part = rawPart as { type?: unknown; text?: unknown };
+          const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown; prompt_cache_breakpoint?: unknown };
+          const partTtl = resolveMarkerTtl(part, defaultRetentionTtl);
+          if (partTtl !== undefined) {
+            cacheBreakpoints.push({ msgIndex: iIdx, blockIndex: pIdx, ttlSec: partTtl });
+          }
           if (typeof part.text === 'string' && (part.type === 'input_text' || part.type === 'text')) {
             staticSlots.push({
               get: () => part.text as string,
@@ -2279,6 +2672,7 @@ export function applyOpenAIResponsesTextHygiene(
       if (typeof item.content === 'string') {
         userSlots.push({
           msgIndex: iIdx,
+          blockIndex: 0,
           refId: `user_${iIdx}`,
           getText: () => item.content as string,
           setText: (next: string) => {
@@ -2289,10 +2683,15 @@ export function applyOpenAIResponsesTextHygiene(
         for (let pIdx = 0; pIdx < item.content.length; pIdx++) {
           const rawPart = item.content[pIdx];
           if (!rawPart || typeof rawPart !== 'object') continue;
-          const part = rawPart as { type?: unknown; text?: unknown };
+          const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown; prompt_cache_breakpoint?: unknown };
+          const partTtl = resolveMarkerTtl(part, defaultRetentionTtl);
+          if (partTtl !== undefined) {
+            cacheBreakpoints.push({ msgIndex: iIdx, blockIndex: pIdx, ttlSec: partTtl });
+          }
           if (typeof part.text === 'string' && (part.type === 'input_text' || part.type === 'text')) {
             userSlots.push({
               msgIndex: iIdx,
+              blockIndex: pIdx,
               refId: `user_${iIdx}_${pIdx}`,
               getText: () => part.text as string,
               setText: (next: string) => {
@@ -2310,6 +2709,7 @@ export function applyOpenAIResponsesTextHygiene(
     if (typeof item.output === 'string') {
       toolSlots.push({
         msgIndex: iIdx,
+        blockIndex: 0,
         refId: baseRef,
         toolName,
         getText: () => item.output as string,
@@ -2321,10 +2721,15 @@ export function applyOpenAIResponsesTextHygiene(
       for (let pIdx = 0; pIdx < item.output.length; pIdx++) {
         const rawPart = item.output[pIdx];
         if (!rawPart || typeof rawPart !== 'object') continue;
-        const part = rawPart as { type?: unknown; text?: unknown };
+        const part = rawPart as { type?: unknown; text?: unknown; cache_control?: unknown; prompt_cache_breakpoint?: unknown };
+        const partTtl = resolveMarkerTtl(part, defaultRetentionTtl);
+        if (partTtl !== undefined) {
+          cacheBreakpoints.push({ msgIndex: iIdx, blockIndex: pIdx, ttlSec: partTtl });
+        }
         if (typeof part.text === 'string' && (part.type === 'input_text' || part.type === 'text' || part.type === 'output_text')) {
           toolSlots.push({
             msgIndex: iIdx,
+            blockIndex: pIdx,
             refId: `${baseRef}#${pIdx}`,
             toolName,
             getText: () => part.text as string,
@@ -2335,6 +2740,17 @@ export function applyOpenAIResponsesTextHygiene(
         }
       }
     }
+  }
+  if (
+    items.length > 0 &&
+    ((typeof req.prompt_cache_retention === 'string' && req.prompt_cache_retention.length > 0) ||
+      (req.prompt_cache_breakpoint !== undefined && req.prompt_cache_breakpoint !== null && req.prompt_cache_breakpoint !== false))
+  ) {
+    cacheBreakpoints.push({
+      msgIndex: items.length - 1,
+      blockIndex: Number.MAX_SAFE_INTEGER,
+      ttlSec: defaultRetentionTtl,
+    });
   }
 
   if (
@@ -2353,6 +2769,8 @@ export function applyOpenAIResponsesTextHygiene(
     userSlots,
     seedBlocks,
     totalMessages: items.length,
+    msgTotalTokens,
+    cacheBreakpoints,
     rawReq: req,
     opts,
   });
@@ -2374,14 +2792,31 @@ const GOOGLE_RESPONSE_TEXT_KEYS = [
 
 /** Clean Google / Antigravity `functionResponse.response` & `.parts` (+ TSCG/CASI/ACDC when enabled) in place. */
 export function applyGoogleTextHygiene(
-  req: { systemInstruction?: { parts?: unknown[] }; tools?: unknown[]; contents?: unknown[] },
+  req: { systemInstruction?: { parts?: unknown[] }; tools?: unknown[]; contents?: unknown[]; cachedContent?: unknown },
   opts?: TextHygieneOptions,
 ): WireHygieneStats {
   const staticSlots: StaticTextSlot[] = [];
+  const cacheBreakpoints: CacheBreakpointMarker[] = [];
+  if (typeof req.cachedContent === 'string' && req.cachedContent.length > 0) {
+    cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: 3600 });
+  }
+  if (Array.isArray(req.tools)) {
+    for (const rawTool of req.tools) {
+      if (!rawTool || typeof rawTool !== 'object') continue;
+      const ttl = markerTtlSeconds((rawTool as { cache_control?: unknown }).cache_control);
+      if (ttl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+      }
+    }
+  }
   if (req.systemInstruction && Array.isArray(req.systemInstruction.parts)) {
     for (const rawPart of req.systemInstruction.parts) {
       if (!rawPart || typeof rawPart !== 'object') continue;
-      const part = rawPart as { text?: unknown };
+      const part = rawPart as { text?: unknown; cache_control?: unknown };
+      const ttl = markerTtlSeconds(part.cache_control);
+      if (ttl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: -1, blockIndex: 0, ttlSec: ttl });
+      }
       if (typeof part.text === 'string') {
         staticSlots.push({
           get: () => part.text as string,
@@ -2397,14 +2832,24 @@ export function applyGoogleTextHygiene(
   const userSlots: TextEpochBlock[] = [];
   const seedBlocks: SeedBlock[] = [];
   const contents = Array.isArray(req.contents) ? req.contents : [];
+  const msgTotalTokens: number[] = new Array<number>(contents.length).fill(0);
   for (let cIdx = 0; cIdx < contents.length; cIdx++) {
     const rawTurn = contents[cIdx];
     if (!rawTurn || typeof rawTurn !== 'object') continue;
-    const turn = rawTurn as { role?: unknown; parts?: unknown };
+    msgTotalTokens[cIdx] = estimateMessageTokens(rawTurn);
+    const turn = rawTurn as { role?: unknown; parts?: unknown; cache_control?: unknown };
+    const turnTtl = markerTtlSeconds(turn.cache_control);
+    if (turnTtl !== undefined) {
+      cacheBreakpoints.push({ msgIndex: cIdx, blockIndex: Number.MAX_SAFE_INTEGER, ttlSec: turnTtl });
+    }
     if (!Array.isArray(turn.parts)) continue;
     for (let pIdx = 0; pIdx < turn.parts.length; pIdx++) {
       const rawPart = turn.parts[pIdx];
       if (!rawPart || typeof rawPart !== 'object') continue;
+      const partTtl = markerTtlSeconds((rawPart as { cache_control?: unknown }).cache_control);
+      if (partTtl !== undefined) {
+        cacheBreakpoints.push({ msgIndex: cIdx, blockIndex: pIdx, ttlSec: partTtl });
+      }
       const fc = (rawPart as { functionCall?: unknown }).functionCall;
       if (fc && typeof fc === 'object') {
         const fcName = typeof (fc as { name?: unknown }).name === 'string' ? (fc as { name: string }).name : 'fn';
@@ -2417,6 +2862,7 @@ export function applyGoogleTextHygiene(
           if (typeof partObj.text === 'string') {
             userSlots.push({
               msgIndex: cIdx,
+              blockIndex: pIdx,
               refId: `user_${cIdx}_${pIdx}`,
               getText: () => partObj.text as string,
               setText: (next: string) => {
@@ -2436,6 +2882,7 @@ export function applyGoogleTextHygiene(
           if (typeof respObj[k] === 'string') {
             toolSlots.push({
               msgIndex: cIdx,
+              blockIndex: pIdx,
               refId: `${frName}@${cIdx}.${pIdx}.${k}`,
               toolName: rawFrName,
               getText: () => respObj[k] as string,
@@ -2451,10 +2898,15 @@ export function applyGoogleTextHygiene(
         for (let spIdx = 0; spIdx < frParts.length; spIdx++) {
           const rawSub = frParts[spIdx];
           if (!rawSub || typeof rawSub !== 'object') continue;
-          const sub = rawSub as { text?: unknown };
+          const sub = rawSub as { text?: unknown; cache_control?: unknown };
+          const subTtl = markerTtlSeconds(sub.cache_control);
+          if (subTtl !== undefined) {
+            cacheBreakpoints.push({ msgIndex: cIdx, blockIndex: pIdx, ttlSec: subTtl });
+          }
           if (typeof sub.text === 'string') {
             toolSlots.push({
               msgIndex: cIdx,
+              blockIndex: pIdx,
               refId: `${frName}@${cIdx}.${pIdx}.p${spIdx}`,
               toolName: rawFrName,
               getText: () => sub.text as string,
@@ -2484,6 +2936,8 @@ export function applyGoogleTextHygiene(
     userSlots,
     seedBlocks,
     totalMessages: contents.length,
+    msgTotalTokens,
+    cacheBreakpoints,
     rawReq: req,
     opts,
   });

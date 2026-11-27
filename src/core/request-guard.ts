@@ -34,11 +34,14 @@ export interface RequestGuardOptions {
   /** True when the caller presented a verified per-user loopback `x-fiche-warp-auth`
    *  secret from `fiche warp`, allowing warped desktop app Origins / Sec-Fetch-Site. */
   warpAuthenticated?: boolean;
+  /** HTTP version of the inbound request; HTTP/1.1+ requires a non-empty Host header. */
+  httpVersionMajor?: number;
+  httpVersionMinor?: number;
 }
 
 export interface RequestGuardDenial {
-  status: 403 | 421;
-  reason: 'cross_origin' | 'untrusted_host';
+  status: 400 | 403 | 421;
+  reason: 'missing_host' | 'cross_origin' | 'untrusted_host';
   message: string;
 }
 
@@ -96,6 +99,17 @@ export function guardProxyRequest(
   headers: { host?: string | null; origin?: string | null; secFetchSite?: string | null },
   options: RequestGuardOptions = {},
 ): RequestGuardDenial | null {
+  const host = hostnameOf(headers.host ?? '');
+  const requiresHost =
+    (options.httpVersionMajor === 1 && (options.httpVersionMinor ?? 0) >= 1)
+    || (options.httpVersionMajor !== undefined && options.httpVersionMajor >= 2);
+  if (requiresHost && host === '') {
+    return {
+      status: 400,
+      reason: 'missing_host',
+      message: 'fiche: HTTP/1.1+ request requires a non-empty Host header',
+    };
+  }
   const allowed = options.allowedHosts ?? [];
   if (allowed.includes('*')) return null;
   if (!options.warpAuthenticated) {
@@ -133,7 +147,6 @@ export function guardProxyRequest(
       }
     }
   }
-  const host = hostnameOf(headers.host ?? '');
   if (!isTrustedHostname(host, allowed, options.providerHosts)) {
     return {
       status: 421,

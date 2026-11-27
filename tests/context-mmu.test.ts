@@ -819,11 +819,26 @@ describe('End-to-end Wire P0-P3 + Dashboard /api/mmu/* & /api/calibration', () =
     expect(statsJson.stats.activePages).toBeGreaterThan(0);
     expect(statsJson.stats.tailHydrations).toBeGreaterThan(0);
 
-    const pageRes = await dispatchDashboard(
+    const mmuSessionKey = out1.info.sessionKey ?? out1.info.firstUserSha8 ?? '';
+    expect(mmuSessionKey.length).toBeGreaterThan(0);
+
+    const unscopedPageRes = await dispatchDashboard(
       dash,
       dashboardPath('/api/mmu/page')!,
       'GET',
       new URL('http://127.0.0.1:47821/api/mmu/page?query=verifyLedgerSignatureStrict'),
+      47821,
+      async () => '',
+    );
+    expect(unscopedPageRes?.status).toBe(400);
+
+    const pageRes = await dispatchDashboard(
+      dash,
+      dashboardPath('/api/mmu/page')!,
+      'GET',
+      new URL(
+        `http://127.0.0.1:47821/api/mmu/page?sessionKey=${encodeURIComponent(mmuSessionKey)}&query=verifyLedgerSignatureStrict`,
+      ),
       47821,
       async () => '',
     );

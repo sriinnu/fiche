@@ -149,7 +149,8 @@ export function clearFactSheetCache(): void {
  *  OCR-risk×consequence: a 70-char URL is structured and reconstructable, while a 7-char
  *  hex SHA or a port has zero redundancy and fails silently when misread. So short opaque
  *  identifiers outrank long URLs when the budget is tight. Pure + total → deterministic →
- *  cache-stable. Tiers: 0 = protect always, 1 = paths/versions/misc, 2 = URLs (cap + last). */
+ *  cache-stable. Tiers: 0 = Tier 0a opaque literals (protect always), 1 = Tier 0b
+ *  CONST_IDS/flags/camelCase, 2 = paths/versions/misc, 3 = URLs (cap + last). */
 const SHAPE_UUID = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const SHAPE_EMAIL = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$/;
 const SHAPE_IBAN = /^[A-Z]{2}\d{2}[A-Z0-9]{8,30}$/;
@@ -166,11 +167,11 @@ const SHAPE_CAMEL = /^(?:[a-z]+|[A-Z][a-z0-9]+)(?:[A-Z][a-z0-9]*)+$/; // tokenLe
 // log lines carry one on every row, so promoting them floods the top tier, and because the
 // budget fills longest-first the `req=` prefix also inflates an 8-char hex id past a 9-char
 // ticket code — evicting the rare token the sheet exists to preserve. Rarity, not shape, is
-// what makes `dur=4439` worth keeping, and tier 1 is where that trade lands correctly.
+// what makes `dur=4439` worth keeping, and tier 2 is where that trade lands correctly.
 const SHAPE_ASSIGNMENT = /^[A-Z][A-Z0-9_]{2,}=\S+$/; // ACTIVE_MANIFEST=/path
 
 /** Lower tier = higher keep-priority. Pure function of the token → deterministic. */
-function priorityTier(tok: string): 0 | 1 | 2 {
+function priorityTier(tok: string): 0 | 1 | 2 | 3 {
   if (
     SHAPE_ASSIGNMENT.test(tok) ||
     SHAPE_HEX.test(tok) ||
@@ -178,16 +179,20 @@ function priorityTier(tok: string): 0 | 1 | 2 {
     SHAPE_EMAIL.test(tok) ||
     SHAPE_IBAN.test(tok) ||
     SHAPE_CURRENCY.test(tok) ||
-    SHAPE_CONST.test(tok) ||
     SHAPE_TICKET.test(tok) ||
-    SHAPE_FLAG.test(tok) ||
-    SHAPE_NUM.test(tok) ||
-    (SHAPE_CAMEL.test(tok) && tok.length >= 8)
+    SHAPE_NUM.test(tok)
   ) {
     return 0;
   }
-  if (SHAPE_URL.test(tok)) return 2;
-  return 1;
+  if (
+    SHAPE_CONST.test(tok) ||
+    SHAPE_FLAG.test(tok) ||
+    (SHAPE_CAMEL.test(tok) && tok.length >= 8)
+  ) {
+    return 1;
+  }
+  if (SHAPE_URL.test(tok)) return 3;
+  return 2;
 }
 
 /**
@@ -333,14 +338,21 @@ function collapseAndSelectFactSheet(
   const specific = collapseSubstringsTrigram(ordered);
 
   // Phase 2 — allocate the budget by priority tier (shape, not length).
+  // Repeated non-URL Tier-0b identifiers retain Tier-0 priority so recurring
+  // symbol/class anchors are not displaced by long single-use ticket floods.
   const ranked = specific
-    .map((t) => ({ t, tier: priorityTier(t) }))
+    .map((t) => {
+      const freq = counts.get(t) ?? 1;
+      const baseTier = priorityTier(t);
+      const tier: 0 | 1 | 2 | 3 = baseTier === 1 && freq >= 2 ? 0 : baseTier;
+      return { t, tier };
+    })
     .sort((a, b) => a.tier - b.tier || b.t.length - a.t.length || (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
   const kept: FactSheetEntry[] = [];
   let urls = 0;
   for (const { t, tier } of ranked) {
     if (kept.length >= MAX_TOKENS) break;
-    if (tier === 2 && urls++ >= MAX_URLS) continue;
+    if (tier === 3 && urls++ >= MAX_URLS) continue;
     kept.push({ token: t, count: counts.get(t) ?? 1 });
   }
   return { kept, dropped: specific.length - kept.length };
@@ -464,6 +476,42 @@ const OPEN_COMPACT_COUNTS = '[Exact rendered identifiers—quote verbatim; ×N=c
 
 export type FactSheetFormat = 'full' | 'compact';
 
+export interface FactSheetOptions {
+  readonly format?: FactSheetFormat;
+  readonly coveredText?: string | ReadonlySet<string>;
+  readonly dropCovered?: boolean;
+}
+
+function findCommonDirPrefix(entries: readonly FactSheetEntry[]): string | undefined {
+  const counts = new Map<string, number>();
+  for (const e of entries) {
+    const t = e.token;
+    if (!t.includes('/') || t.includes('://') || t.includes('=') || t.startsWith('@')) continue;
+    for (let i = 15; i < t.length - 1; i++) {
+      if (t.charCodeAt(i) === 47 /* '/' */) {
+        const prefix = t.slice(0, i + 1);
+        counts.set(prefix, (counts.get(prefix) ?? 0) + 1);
+      }
+    }
+  }
+  let bestPrefix: string | undefined;
+  let bestSavings = 0;
+  for (const [prefix, count] of counts) {
+    if (count < 3) continue;
+    const savings = (count - 1) * prefix.length - 8;
+    if (
+      savings > bestSavings ||
+      (savings === bestSavings &&
+        bestPrefix !== undefined &&
+        (prefix.length > bestPrefix.length || (prefix.length === bestPrefix.length && prefix < bestPrefix)))
+    ) {
+      bestSavings = savings;
+      bestPrefix = prefix;
+    }
+  }
+  return bestSavings > 0 ? bestPrefix : undefined;
+}
+
 /** Build the one-line fact-sheet string from a pre-extracted token list. */
 export function factSheetTextFromTokens(tokens: string[]): string {
   return tokens.length > 0 ? OPEN + tokens.join(' · ') + ']' : '';
@@ -477,7 +525,24 @@ export function factSheetTextFromEntries(
 ): string {
   if (entries.length === 0) return '';
   const anyRepeat = entries.some((e) => e.count >= 2);
-  const body = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token)).join(' · ');
+  const rawTokens = entries.map((e) => (e.count >= 2 ? `${e.token} ×${e.count}` : e.token));
+  let body = rawTokens.join(' · ');
+  const commonPrefix = findCommonDirPrefix(entries);
+  if (commonPrefix !== undefined) {
+    const factoredTokens: string[] = [`root=${commonPrefix}`];
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i]!;
+      const tok =
+        !e.token.includes('://') && !e.token.includes('=') && e.token.startsWith(commonPrefix)
+          ? (e.token.slice(commonPrefix.length) || './')
+          : e.token;
+      factoredTokens.push(e.count >= 2 ? `${tok} ×${e.count}` : tok);
+    }
+    const factoredBody = factoredTokens.join(' · ');
+    if (factoredBody.length < body.length) {
+      body = factoredBody;
+    }
+  }
   const opener = format === 'compact'
     ? (anyRepeat ? OPEN_COMPACT_COUNTS : OPEN_COMPACT)
     : (anyRepeat ? OPEN_COUNTS : OPEN);
@@ -487,26 +552,37 @@ export function factSheetTextFromEntries(
 /** One-line fact-sheet string for `text`, or `''` when nothing notable was found.
  *  Single path for slab, history, and tool results: page long text so early-turn
  *  ids are not dropped by MAX_SCAN. Short text is one page (same as before). */
-export function factSheetText(text: string, format: FactSheetFormat = 'full', coveredText?: string | ReadonlySet<string>): string {
+export function factSheetText(
+  text: string,
+  formatOrOpts: FactSheetFormat | FactSheetOptions = 'full',
+  coveredText?: string | ReadonlySet<string>,
+  dropCovered = false,
+): string {
   if (!text) return '';
-  return prepareFactSheet(text, format)(coveredText);
+  const format = typeof formatOrOpts === 'object' ? (formatOrOpts.format ?? 'full') : formatOrOpts;
+  const cov = typeof formatOrOpts === 'object' ? formatOrOpts.coveredText : coveredText;
+  const drop = typeof formatOrOpts === 'object' ? (formatOrOpts.dropCovered ?? false) : dropCovered;
+  return prepareFactSheet(text, format)(cov, drop);
 }
 
 /** Extract once; coverage remains an emission-time input, never cached state. */
-export function prepareFactSheet(text: string, format: FactSheetFormat = 'full'): (coveredText?: string | ReadonlySet<string>) => string {
+export function prepareFactSheet(
+  text: string,
+  format: FactSheetFormat = 'full',
+): (coveredText?: string | ReadonlySet<string>, dropCovered?: boolean) => string {
   if (!text) return () => '';
   const entries = text.length <= FACTSHEET_PAGE_CHARS
     ? extractFactSheetEntries(text)
     : extractFactSheetEntriesAllPages(text, FACTSHEET_PAGE_CHARS).kept;
   const full = factSheetTextFromEntries(entries, format);
-  return (coveredText) => {
+  return (coveredText, dropCovered = false) => {
     if (coveredText === undefined || (typeof coveredText === 'string' ? coveredText.length === 0 : coveredText.size === 0)) return full;
     return factSheetTextFromEntries(entries.filter((entry) => {
       const covered = typeof coveredText === 'string'
         ? coveredText.includes(entry.token)
         : coveredText.has(entry.token);
       if (!covered) return true;
-      return entry.count >= 2;
+      return !dropCovered && entry.count >= 2;
     }), format);
   };
 }

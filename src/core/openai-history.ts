@@ -395,6 +395,9 @@ export async function planGptCollapse(
   } else {
     let secStart = pp;
     let acc = 0;
+    let prePinPartial: [number, number] | undefined;
+    let prePinInsertAt = -1;
+    let hasSectionAfterPin = false;
     // Track open tool-call ids so a section is only sealed at a TOOL-CLOSED point.
     // The token threshold can otherwise land between a function_call and its
     // function_call_output: the call gets imaged while the output stays a live
@@ -406,7 +409,14 @@ export async function planGptCollapse(
     const open = new Set<string>();
     for (let i = pp; i < rawEnd; i++) {
       if (i === pinIdx) {
-        if (secStart < i) sections.push([secStart, i]);
+        if (secStart < i) {
+          // Hold a sub-threshold pre-pin span rather than force-sealing it now:
+          // if nothing seals after pinIdx (e.g., interactive keepTail:1 where the
+          // latest user turn sits at rawEnd - 1), sealing a partial chunk busts
+          // the prefix cache as soon as the next turn arrives.
+          prePinPartial = [secStart, i];
+          prePinInsertAt = sections.length;
+        }
         secStart = i + 1;
         acc = 0;
         continue;
@@ -416,9 +426,13 @@ export async function planGptCollapse(
       for (const id of turns[i]!.closeIds) open.delete(id);
       if (acc >= o.sectionTokens && open.size === 0) {
         sections.push([secStart, i + 1]);
+        if (pinIdx >= pp && secStart > pinIdx) hasSectionAfterPin = true;
         secStart = i + 1;
         acc = 0;
       }
+    }
+    if (prePinPartial && hasSectionAfterPin) {
+      sections.splice(prePinInsertAt, 0, prePinPartial);
     }
     // Trailing turns [secStart, rawEnd) didn't fill a section → leave as live text.
   }
@@ -449,6 +463,20 @@ export async function planGptCollapse(
     rendered.push({ s, e, imgs: sectionImgs });
     imgCount += sectionImgs.length;
     collapseEnd = e;
+  }
+  // If maxImages stopped us right after a force-closed pre-pin partial chunk
+  // without rendering any post-pin section, drop that partial chunk so it stays
+  // cache-stable until full sectionTokens accumulate.
+  if (o.freezeChunk > 0 && pinIdx >= pp && collapseEnd === pinIdx && rendered.length > 0) {
+    const last = rendered[rendered.length - 1]!;
+    if (last.e === pinIdx) {
+      let lastTok = 0;
+      for (let i = last.s; i < last.e; i++) lastTok += gptCountTokens(turns[i]!.text);
+      if (lastTok < o.sectionTokens) {
+        rendered.pop();
+        collapseEnd = rendered.length > 0 ? rendered[rendered.length - 1]!.e : pp;
+      }
+    }
   }
   // The pin is "consumed" (emitted as text inside the synthetic) only once we have
   // collapsed PAST it. If the image cap stopped us before the pin, it survives as a

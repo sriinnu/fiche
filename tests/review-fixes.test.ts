@@ -38,7 +38,7 @@ describe('review fixes', () => {
         content: 'Summarize the architecture choices cleanly.',
       }],
     }));
-    const cleanResult = await transformAnyRequest(cleanBody, { model: 'claude-opus-5-5', wire: 'anthropic', charsPerToken: 1, minCompressChars: 1 });
+    const cleanResult = await transformAnyRequest(cleanBody, { model: 'claude-opus-5-5', wire: 'anthropic', textHygiene: 'on', charsPerToken: 1, minCompressChars: 1 });
     expect(cleanResult.report.readerTier).toBe('text');
     expect(cleanResult.report.imaged).toBe(false);
     expect(cleanResult.body).toBe(cleanBody);
@@ -54,7 +54,7 @@ describe('review fixes', () => {
         content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: repetitiveJson() }],
       }],
     }));
-    const result = await transformAnyRequest(body, { model: 'claude-opus-5-5', wire: 'anthropic', charsPerToken: 1, minCompressChars: 1 });
+    const result = await transformAnyRequest(body, { model: 'claude-opus-5-5', wire: 'anthropic', textHygiene: 'on', charsPerToken: 1, minCompressChars: 1 });
     expect(result.report.readerTier).toBe('text');
     expect(result.report.imaged).toBe(false);
     expect(result.report.textCompressed).toBe(true);

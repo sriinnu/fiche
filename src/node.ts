@@ -507,10 +507,56 @@ function setNodeThirdPartyPluginsEnabled(
   return { updatedCount, enabled, plugins: listNodeStagePlugins() };
 }
 
-function parseEnvPort(raw: string | undefined): number {
+function resolvePortEnvRaw(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const fichePort = env.FICHE_PORT?.trim();
+  if (fichePort) return fichePort;
+  return env.PORT;
+}
+
+function parseEnvPort(raw: string | undefined = resolvePortEnvRaw()): number {
   if (raw === undefined || !raw.trim()) return 47821;
-  const n = Number(raw);
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return 47821;
+  const n = Number(trimmed);
   return Number.isSafeInteger(n) && n >= 1 && n <= 65535 ? n : 47821;
+}
+
+function parseStrictPortArg(raw: string | undefined, context: string): number {
+  const trimmed = raw?.trim() ?? '';
+  if (!/^\d+$/.test(trimmed)) {
+    console.error(`[fiche] ${context}: invalid --port value "${raw ?? ''}" (expected integer 1..65535)`);
+    process.exit(2);
+  }
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 65535) {
+    console.error(`[fiche] ${context}: --port out of range "${raw ?? ''}" (expected 1..65535)`);
+    process.exit(2);
+  }
+  return n;
+}
+
+function resolveWarpTokenDir(): string {
+  const ficheHomeDir = path.join(os.homedir(), '.fiche');
+  const legacyHomeDir = path.join(os.homedir(), '.inkling');
+  return fs.existsSync(ficheHomeDir) || !fs.existsSync(legacyHomeDir) ? ficheHomeDir : legacyHomeDir;
+}
+
+function readExistingWarpToken(): string | undefined {
+  const tokenPath = path.join(resolveWarpTokenDir(), 'warp-token');
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tokenPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size <= 0 || st.size > 256) return undefined;
+    const token = fs.readFileSync(fd, 'utf8').trim();
+    return /^[0-9a-f]{64}$/i.test(token) ? token.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
 }
 
 const DEFAULT_SHUTDOWN_DRAIN_MS = 60_000;
@@ -557,7 +603,7 @@ function parseCli(argv: string[]): RuntimeConfig {
     : undefined;
   const trimmedShared = sharedUpstream?.trim() || undefined;
   return {
-    port: parseEnvPort(process.env.PORT),
+    port: parseEnvPort(resolvePortEnvRaw()),
     // Loopback by default; opt into all-interfaces exposure explicitly via HOST.
     host: process.env.HOST?.trim() || '127.0.0.1',
     upstream: process.env.ANTHROPIC_UPSTREAM?.trim() || trimmedShared || 'https://api.anthropic.com',
@@ -619,12 +665,12 @@ Usage:
                          ([stats | pages | page <id>] [--query <text>] [--session <key>] [--port P] [--json])
   fiche export [...]     render files/diff to PNG pages + cost report (see fiche export --help)
   fiche mcp [--http P]   MCP server for every agent (stdio, or Streamable HTTP)
-  fiche warp [--app <Name|Path>] [--providers <csv|all|none>] [--all-providers] [--verbose] [--route PATTERN=TARGET]... -- CMD
+  fiche warp [--app <Name|Path>] [--port <N>] [--providers <csv|all|none>] [--all-providers] [--verbose] [--route PATTERN=TARGET]... -- CMD
                         run a CLI or macOS desktop app (Cursor, Antigravity,
                         Claude, ChatGPT/Codex...) behind the proxy without a
                         custom base URL, so client-side first-party gates keep
                         working. Only opted-in providers are intercepted.
-  fiche shell-init [--wrap]
+  fiche shell-init [--wrap] [--port <N>]
                         print zsh/bash helper functions (fclaude, fcodex, fribhu,
                         fagy, fcursor, fiche-app) or transparent wrappers (--wrap).
   fiche stats [--json] [--file <p>]
@@ -632,6 +678,7 @@ Usage:
                         incl. measured savings; defaults to $FICHE_LOG
   fiche turn-report [--format cli|agy|claude-statusline|json]
                         report latest turn & session savings with zero LLM tokens
+  fiche status [--json] alias for \`fiche service status\`
   fiche service <action>
                         manage macOS launchd background daemon
                         (install | uninstall | start | stop | restart | status)
@@ -649,7 +696,8 @@ Flags:
       --version           show version
 
 Environment (legacy INKLING_* aliases are also accepted):
-  PORT                    listen port (default 47821)
+  FICHE_PORT              listen / target daemon port (default 47821; preferred over PORT)
+  PORT                    fallback listen port if FICHE_PORT is unset (default 47821)
   HOST                    interface to bind (default 127.0.0.1, loopback only).
                           Non-loopback bindings expose only the proxy API;
                           dashboard routes remain loopback-only.
@@ -749,7 +797,7 @@ function resolvedCliVersion(): string {
       : typeof __INKLING_VERSION__ === 'string'
         ? __INKLING_VERSION__
         : undefined;
-  return injected ?? process.env.npm_package_version ?? '0.19.0';
+  return injected ?? process.env.npm_package_version ?? '0.20.0';
 }
 
 function printVersion(): void {
@@ -1517,7 +1565,8 @@ function renderLaunchdPlist(opts: {
     ['FICHE_PRICES', 'kosha'],
     ['FICHE_TEXT_HYGIENE', 'on'],
   ]);
-  if (port !== 47821 || process.env.PORT?.trim()) {
+  if (port !== 47821 || process.env.FICHE_PORT?.trim() || process.env.PORT?.trim()) {
+    envMap.set('FICHE_PORT', String(port));
     envMap.set('PORT', String(port));
   }
   if (host !== '127.0.0.1' || process.env.HOST?.trim()) {
@@ -1645,7 +1694,7 @@ async function pollHealth(
 ): Promise<Record<string, unknown> | null> {
   const deadline = Date.now() + budgetMs;
   while (Date.now() < deadline) {
-    const health = await fetchHealth(port, 750);
+    const health = await fetchHealth(port, Math.min(2000, Math.max(500, deadline - Date.now())));
     if (health && (excludePid === undefined || health.pid !== excludePid)) {
       return health;
     }
@@ -1679,7 +1728,7 @@ Usage:
     return 2;
   }
 
-  const port = parseEnvPort(process.env.PORT);
+  const port = parseEnvPort(resolvePortEnvRaw());
   const host = process.env.HOST?.trim() || '127.0.0.1';
   const plistPath = resolvePlistPath(serviceLabel);
   const ficheDir = path.join(os.homedir(), '.fiche');
@@ -2330,12 +2379,12 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] === 'providers') {
-    const port = parseEnvPort(process.env.PORT);
+    const port = parseEnvPort(resolvePortEnvRaw());
     const code = await runProvidersCommand(argv.slice(1), port);
     process.exit(code);
   }
   if (argv[0] === 'models') {
-    const port = parseEnvPort(process.env.PORT);
+    const port = parseEnvPort(resolvePortEnvRaw());
     const code = await runModelsCommand(argv.slice(1), port);
     process.exit(code);
   }
@@ -2343,15 +2392,34 @@ async function main(): Promise<void> {
     const code = await runServiceCommand(argv.slice(1));
     process.exit(code);
   }
+  if (argv[0] === 'status') {
+    const code = await runServiceCommand(['status', ...argv.slice(1)]);
+    process.exit(code);
+  }
   if (argv[0] === 'shell-init') {
     const rest = argv.slice(1);
-    const wrap = rest.includes('--wrap');
-    const unknown = rest.filter((a) => a !== '--wrap');
-    if (unknown.length > 0) {
-      console.error(`[fiche] shell-init: unknown option ${unknown[0]} (supported: --wrap)`);
-      process.exit(2);
+    let wrap = false;
+    let explicitPort: number | undefined;
+    for (let i = 0; i < rest.length; i += 1) {
+      const a = rest[i]!;
+      if (a === '--wrap') {
+        wrap = true;
+      } else if (a === '-h' || a === '--help') {
+        console.log('Usage: fiche shell-init [--wrap] [--port <1..65535>]');
+        return;
+      } else if (a === '--port') {
+        const val = rest[++i];
+        explicitPort = parseStrictPortArg(val, 'shell-init');
+      } else if (a.startsWith('--port=')) {
+        explicitPort = parseStrictPortArg(a.slice('--port='.length), 'shell-init');
+      } else {
+        console.error(`[fiche] shell-init: unknown option ${a} (supported: --wrap, --port <N>)`);
+        process.exit(2);
+      }
     }
-    process.stdout.write(renderShellInitScript({ wrap }));
+    const envPort = parseEnvPort(resolvePortEnvRaw());
+    const effectivePort = explicitPort ?? (envPort !== 47821 ? envPort : undefined);
+    process.stdout.write(renderShellInitScript({ wrap, ...(effectivePort !== undefined ? { port: effectivePort } : {}) }));
     return;
   }
   if (argv[0] === 'export') {
@@ -2379,7 +2447,7 @@ async function main(): Promise<void> {
     process.exit(code); // server never starts
   }
   if (argv[0] === 'mmu') {
-    const parsed = parseMmuCliArgs(argv.slice(1), process.env.PORT);
+    const parsed = parseMmuCliArgs(argv.slice(1), resolvePortEnvRaw());
     if (!parsed.ok) {
       console.error(parsed.error);
       process.exit(parsed.exitCode);
@@ -2391,7 +2459,8 @@ async function main(): Promise<void> {
 
     const { sub, asJson, port, query: queryArg, pageId: pageIdArg, sessionKey } = parsed;
     const eventsPath = defaultEventsFilePath();
-    const mmuPath = path.join(path.dirname(eventsPath), 'mmu-pages.json');
+    const sessionStatePath = resolveSessionStateFile();
+    const mmuPath = path.join(path.dirname(sessionStatePath ?? eventsPath), 'mmu-pages.json');
     if (sub === 'page') {
       const qs = new URLSearchParams();
       if (pageIdArg) qs.set('id', pageIdArg);
@@ -2400,7 +2469,9 @@ async function main(): Promise<void> {
       let payload: unknown;
       let daemonHttpError: string | undefined;
       try {
+        const controlToken = readExistingWarpToken();
         const res = await fetch(`http://127.0.0.1:${port}/api/mmu/page?${qs.toString()}`, {
+          ...(controlToken ? { headers: { 'x-fiche-control-token': controlToken } } : {}),
           signal: AbortSignal.timeout(400),
         });
         if (res.ok) {
@@ -2470,7 +2541,9 @@ async function main(): Promise<void> {
     let statsHttpError: string | undefined;
     const statsQs = sessionKey ? `?sessionKey=${encodeURIComponent(sessionKey)}` : '';
     try {
+      const controlToken = readExistingWarpToken();
       const res = await fetch(`http://127.0.0.1:${port}/api/mmu/stats${statsQs}`, {
+        ...(controlToken ? { headers: { 'x-fiche-control-token': controlToken } } : {}),
         signal: AbortSignal.timeout(400),
       });
       if (res.ok) {
@@ -2520,11 +2593,19 @@ async function main(): Promise<void> {
     }
     process.exit(0);
   }
+  if (argv[0] !== undefined && !argv[0].startsWith('-') && argv[0] !== 'warp') {
+    console.error(`[fiche] unknown command: ${argv[0]}`);
+    console.error(
+      '[fiche] supported commands: mcp, providers, models, service, status, shell-init, export, stats, turn-report, calibrate, mmu, warp (run `fiche --help` for usage)',
+    );
+    process.exit(2);
+  }
   // `warp` runs an agent behind a CONNECT proxy and redirects its inference
   // traffic into the fiche instance already running. It starts no proxy of its own, so
   // it exits through its own branch below rather than falling through here.
   let warpCommand: string[] | undefined;
   let warpAppSpec: string | undefined;
+  let warpPortOverride: number | undefined;
   let warpProvidersSpec: string | undefined;
   let warpAllProviders = false;
   let warpVerbose = false;
@@ -2593,6 +2674,16 @@ async function main(): Promise<void> {
         warpVerbose = true;
         continue;
       }
+      if (a === '--port') {
+        const spec = warpArgv[i + 1];
+        warpPortOverride = parseStrictPortArg(spec, 'warp');
+        i += 1;
+        continue;
+      }
+      if (a.startsWith('--port=')) {
+        warpPortOverride = parseStrictPortArg(a.slice('--port='.length), 'warp');
+        continue;
+      }
       rest.push(a);
     }
     cliArgv = rest;
@@ -2630,7 +2721,7 @@ async function main(): Promise<void> {
       }
     }
     createWarpRuntime({
-      port: opts.port,
+      port: warpPortOverride ?? opts.port,
       routes: warpRoutes,
       providers: warpProviders,
       verbose: warpVerbose,
@@ -2720,33 +2811,40 @@ async function main(): Promise<void> {
   const allowPrivateDashboard = /^(1|true|yes|on)$/i.test(
     (readBrandEnv('DASHBOARD_ALLOW_PRIVATE') ?? '').trim(),
   );
-  const ficheHomeDir = path.join(os.homedir(), '.fiche');
-  const legacyHomeDir = path.join(os.homedir(), '.inkling');
-  const warpTokenDir =
-    fs.existsSync(ficheHomeDir) || !fs.existsSync(legacyHomeDir) ? ficheHomeDir : legacyHomeDir;
+  const warpTokenDir = resolveWarpTokenDir();
+  const warpTokenPath = path.join(warpTokenDir, 'warp-token');
   let cachedWarpTokenDigest: Buffer | undefined;
   let cachedWarpTokenMtimeMs = -1;
+  const primeWarpTokenCache = (): void => {
+    const expected = loadOrCreateWarpToken(warpTokenDir);
+    cachedWarpTokenDigest = crypto.createHash('sha256').update(expected, 'utf8').digest();
+    try {
+      cachedWarpTokenMtimeMs = fs.statSync(warpTokenPath).mtimeMs;
+    } catch {
+      cachedWarpTokenMtimeMs = Date.now();
+    }
+  };
+  try {
+    primeWarpTokenCache();
+  } catch {
+    // Best-effort eager init so non-warp installs still have ~/.fiche/warp-token;
+    // verifyWarpAuthHeader retries lazily if startup filesystem access failed.
+  }
   const verifyWarpAuthHeader = (presented: string | string[] | undefined): boolean => {
     if (typeof presented !== 'string') return false;
     const trimmed = presented.trim();
     if (!trimmed) return false;
-    const tokenPath = path.join(warpTokenDir, 'warp-token');
     try {
       let currentMtime = -1;
       try {
-        currentMtime = fs.statSync(tokenPath).mtimeMs;
+        currentMtime = fs.statSync(warpTokenPath).mtimeMs;
       } catch {
         currentMtime = -1;
       }
       if (!cachedWarpTokenDigest || currentMtime !== cachedWarpTokenMtimeMs) {
-        const expected = loadOrCreateWarpToken(warpTokenDir);
-        cachedWarpTokenDigest = crypto.createHash('sha256').update(expected, 'utf8').digest();
-        try {
-          cachedWarpTokenMtimeMs = fs.statSync(tokenPath).mtimeMs;
-        } catch {
-          cachedWarpTokenMtimeMs = Date.now();
-        }
+        primeWarpTokenCache();
       }
+      if (!cachedWarpTokenDigest) return false;
       const actualDigest = crypto.createHash('sha256').update(trimmed, 'utf8').digest();
       return crypto.timingSafeEqual(actualDigest, cachedWarpTokenDigest);
     } catch {
@@ -2814,7 +2912,20 @@ async function main(): Promise<void> {
         // Local dashboard routes — handled BEFORE the proxy so they never hit
         // api.anthropic.com (which would 404 them).
         const rawReqUrl = req.url ?? '/';
-        const rawHost = req.headers.host ?? 'localhost';
+        const rawHostHeader = req.headers.host;
+        const isHttp11Plus =
+          (req.httpVersionMajor === 1 && req.httpVersionMinor >= 1) || req.httpVersionMajor >= 2;
+        if (isHttp11Plus && (!rawHostHeader || !rawHostHeader.trim())) {
+          await writeWebResponse(
+            new Response(
+              JSON.stringify({ error: 'missing_host', message: 'HTTP/1.1+ request requires Host header' }),
+              { status: 400, headers: { 'content-type': 'application/json' } },
+            ),
+            res,
+          );
+          return;
+        }
+        const rawHost = rawHostHeader?.trim() || 'localhost';
         const rawHostHostname = extractHostHeaderHostname(rawHost);
         const nonOriginForm =
           rawReqUrl.startsWith('//') || !rawReqUrl.startsWith('/') || rawReqUrl.startsWith('/\\');
@@ -2862,6 +2973,10 @@ async function main(): Promise<void> {
             url,
             boundPort(),
             () => readRequestBody(req),
+            {
+              headers: req.headers,
+              controlTokenAuthorized: verifyWarpAuthHeader(req.headers['x-fiche-control-token']),
+            },
           );
           if (webRes) {
             await writeWebResponse(webRes, res);
@@ -2882,6 +2997,8 @@ async function main(): Promise<void> {
             allowedHosts,
             providerHosts: new Set(upstreamRegistry.keys()),
             warpAuthenticated: verifyWarpAuthHeader(req.headers['x-fiche-warp-auth']),
+            httpVersionMajor: req.httpVersionMajor,
+            httpVersionMinor: req.httpVersionMinor,
           },
         );
         if (denial) {
@@ -2938,6 +3055,7 @@ async function main(): Promise<void> {
         if (!res.writableEnded) res.end();
       });
   });
+  server.requestTimeout = 0;
   server.on('connection', (socket) => {
     socket.setNoDelay(true);
     connTrack.set(socket, { active: 0, completed: 0 });
@@ -3117,7 +3235,7 @@ async function main(): Promise<void> {
       Boolean(opts.sessionStateFile) && /^(1|true|yes|on)$/i.test(readBrandEnv('MMU_PERSIST') ?? '');
     if (mmuPersistEnabled) {
       try {
-        const mmuPath = path.join(path.dirname(opts.eventsFile), 'mmu-pages.json');
+        const mmuPath = path.join(path.dirname(opts.sessionStateFile!), 'mmu-pages.json');
         const mmuPages = configureMmuPersistence(
           fileMmuPersistenceStore(mmuPath, { maxFileBytes: scaledMmuFileMaxBytes(effectiveMmu.maxBytes) }),
         );
@@ -3151,6 +3269,7 @@ async function main(): Promise<void> {
         onProvidersPersist: persistProvidersToConfig,
         onShutdown: () => shutdownHandler?.('API_SHUTDOWN'),
         getActiveRequests: () => activeProxyRequests,
+        verifyControlToken: verifyWarpAuthHeader,
       },
     );
     // Seed the "recent requests" table from the JSONL log so a process restart

@@ -119,6 +119,10 @@ export interface WarpHandlers {
   handleConnect: (req: IncomingMessage, socket: Socket, head: Buffer) => void;
   /** Call from the request handler for absolute-form request targets. */
   handleAbsoluteForm: (req: IncomingMessage, res: ServerResponse) => void;
+  /** Attach as the server's 'upgrade' listener for WebSocket upgrades. */
+  handleUpgrade: (req: IncomingMessage, socket: Socket, head: Buffer) => void;
+  /** Tear down pooled HTTP/HTTPS agents owned by this handler instance. */
+  destroy?: () => void;
 }
 
 /**
@@ -192,16 +196,35 @@ function pipeSockets(a: Socket, b: Socket): void {
   b.on('close', () => a.destroy());
 }
 
+/** Strip brackets from an IPv6 URL hostname (e.g. `[::1]` -> `::1`). */
+function stripIpv6Brackets(hostname: string): string {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+}
+
 /**
  * Every request the agent makes crosses this hop. Node's global agents default
  * to keepAlive:false, so without these each call pays a fresh TCP handshake —
  * plus a full TLS handshake to the real host on the passthrough path.
  */
-const httpAgent = new HttpAgent({ keepAlive: true });
-const httpsAgent = new HttpsAgent({ keepAlive: true });
+const activeWarpAgentDestroyers = new Set<() => void>();
+
+/** Tear down pooled sockets across active warp handlers on exit so no keep-alive sockets linger. */
+export function destroyWarpAgents(): void {
+  for (const destroy of [...activeWarpAgentDestroyers]) {
+    destroy();
+  }
+}
 
 export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
   const { ca, onDivert } = options;
+  const httpAgent = new HttpAgent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+  const httpsAgent = new HttpsAgent({ keepAlive: true, maxSockets: 64, maxFreeSockets: 16, timeout: 60_000 });
+  const destroy = (): void => {
+    activeWarpAgentDestroyers.delete(destroy);
+    httpAgent.destroy();
+    httpsAgent.destroy();
+  };
+  activeWarpAgentDestroyers.add(destroy);
   const getRoutes = (): readonly Route[] =>
     typeof options.routes === 'function' ? options.routes() : options.routes;
   const isSelfLoop = (host: string, portNum: number, socketLocalPort?: number): boolean => {
@@ -259,9 +282,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
 
-    const expectedHost = normalizedOrigin.hostname.startsWith('[') && normalizedOrigin.hostname.endsWith(']')
-      ? normalizedOrigin.hostname.slice(1, -1)
-      : normalizedOrigin.hostname;
+    const expectedHost = stripIpv6Brackets(normalizedOrigin.hostname);
     const expectedPort =
       normalizedOrigin.port || (normalizedOrigin.protocol === 'https:' ? '443' : '80');
     if (!hostHeaderMatches(req.headers.host, expectedHost, expectedPort)) {
@@ -280,9 +301,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       return;
     }
     if (divertTarget) {
-      const divHost = divertTarget.hostname.startsWith('[') && divertTarget.hostname.endsWith(']')
-        ? divertTarget.hostname.slice(1, -1)
-        : divertTarget.hostname;
+      const divHost = stripIpv6Brackets(divertTarget.hostname);
       const divPort = Number(divertTarget.port || (divertTarget.protocol === 'https:' ? 443 : 80));
       if (isSelfLoop(divHost, divPort, req.socket?.localPort)) {
         if (!res.headersSent && !res.writableEnded && !res.destroyed) {
@@ -355,10 +374,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
 
     const sendToTarget = (target: URL, allowFailOpen: boolean, isDivert: boolean): void => {
       const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
-      const hostname =
-        target.hostname.startsWith('[') && target.hostname.endsWith(']')
-          ? target.hostname.slice(1, -1)
-          : target.hostname;
+      const hostname = stripIpv6Brackets(target.hostname);
       const outHeaders = forwardHeaders(req.headers, authoritativeHost);
       if (isDivert && options.warpAuthToken) {
         outHeaders['x-fiche-warp-auth'] = options.warpAuthToken;
@@ -528,21 +544,51 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
    */
   const handleUpgrade = (req: IncomingMessage, clientSocket: Socket, head: Buffer): void => {
     const bound = connectTargets.get(req.socket) ?? connectTargets.get(clientSocket);
+    if (!bound && !isLoopbackAddress(req.socket.remoteAddress)) {
+      clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+      return;
+    }
     const servername = (req.socket as TLSSocket).servername || '';
-    const { host, port } = bound ?? splitHostPort(servername || req.headers.host || '', '443');
+    const isEncrypted = Boolean(bound) || Boolean((req.socket as TLSSocket).encrypted);
+    let isHttps = isEncrypted;
+    let host = '';
+    let port = '';
+    let upstreamReqUrl = req.url ?? '/';
+
+    if (!isEncrypted && /^(https?|wss?):\/\//i.test(req.url ?? '')) {
+      try {
+        const parsedTarget = new URL(req.url!);
+        isHttps = parsedTarget.protocol === 'https:' || parsedTarget.protocol === 'wss:';
+        host = stripIpv6Brackets(parsedTarget.hostname);
+        port = parsedTarget.port || (isHttps ? '443' : '80');
+        upstreamReqUrl = `${parsedTarget.pathname}${parsedTarget.search}` || '/';
+      } catch {
+        clientSocket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+        return;
+      }
+    } else {
+      const target = bound ?? splitHostPort(servername || req.headers.host || '', isHttps ? '443' : '80');
+      host = target.host;
+      port = target.port;
+    }
+
     const portNum = parsePort(port);
     if (!host || portNum === null) {
       clientSocket.destroy();
       return;
     }
+    if (isSelfLoop(host, portNum, req.socket?.localPort)) {
+      clientSocket.end('HTTP/1.1 508 Loop Detected\r\n\r\n');
+      return;
+    }
     if (String(req.headers.upgrade ?? '').toLowerCase().includes('websocket')) {
       try {
         const hostPort = authority(host, port);
-        if (!hostHeaderMatches(req.headers.host, host, port)) {
+        if ((bound || req.headers.host) && !hostHeaderMatches(req.headers.host, host, port)) {
           clientSocket.end('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n');
           return;
         }
-        const resolved = new URL(req.url ?? '/', `https://${hostPort}`);
+        const resolved = new URL(upstreamReqUrl, `${isHttps ? 'https' : 'http'}://${hostPort}`);
         const reqPath = normalizeRoutePath(resolved.pathname);
         if (matchRoute(getRoutes(), hostPort, reqPath)) {
           const body = JSON.stringify({
@@ -565,14 +611,12 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
         return;
       }
     }
-    const upstream = tlsConnect(
-      { host, port: portNum, servername: isIP(host) !== 0 ? undefined : host },
-      () => {
+    const onUpstreamConnect = (upstream: Socket) => {
       if (clientSocket.destroyed) {
         upstream.destroy();
         return;
       }
-      const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
+      const lines = [`${req.method} ${upstreamReqUrl} HTTP/${req.httpVersion}`];
       for (const [key, value] of Object.entries(req.headers)) {
         if (PROXY_ONLY_UPGRADE_HEADERS.has(key.toLowerCase())) continue;
         for (const v of Array.isArray(value) ? value : [value]) {
@@ -582,7 +626,13 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
       upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
       if (head?.length) upstream.write(head);
       pipeSockets(clientSocket, upstream);
-    });
+    };
+    const upstream: Socket = isHttps
+      ? tlsConnect(
+          { host, port: portNum, servername: isIP(host) !== 0 ? undefined : host },
+          () => onUpstreamConnect(upstream),
+        )
+      : netConnect({ host, port: portNum }, () => onUpstreamConnect(upstream));
     upstream.on('error', () => clientSocket.destroy());
     clientSocket.on('error', () => upstream.destroy());
     clientSocket.once('close', () => {
@@ -592,6 +642,7 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
 
   // Non-listening HTTP parser fed per-CONNECT TLSSockets once TLS handshake completes.
   const decryptedServer = createHttpServer();
+  decryptedServer.requestTimeout = 0;
   decryptedServer.on('request', handleDecrypted);
   decryptedServer.on('upgrade', handleUpgrade);
   decryptedServer.on('clientError', (_err, socket) => socket.destroy());
@@ -732,5 +783,5 @@ export function createWarpHandlers(options: WarpHandlerOptions): WarpHandlers {
     forward(req, res, hostPort, target.pathname + target.search, target.origin);
   };
 
-  return { handleConnect, handleAbsoluteForm };
+  return { handleConnect, handleAbsoluteForm, handleUpgrade, destroy };
 }

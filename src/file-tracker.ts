@@ -6,6 +6,15 @@ import {
   type EventsFileCoordinator,
 } from './sessions.js';
 
+/** Return existing event log files in chronological order (`[`${eventsFile}.1`, eventsFile]`). */
+export function eventLogFiles(eventsFile: string): string[] {
+  const files: string[] = [];
+  const rotated = `${eventsFile}.1`;
+  if (fs.existsSync(rotated)) files.push(rotated);
+  if (fs.existsSync(eventsFile)) files.push(eventsFile);
+  return files;
+}
+
 /**
  * Append-only JSONL tracker with size-based rotation and prune coordination.
  * One line per request.

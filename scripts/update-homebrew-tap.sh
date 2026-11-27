@@ -152,13 +152,11 @@ cask "fichebar" do
   uninstall quit: "dev.srinivas.fichebar"
 
   zap trash: [
-    "~/.config/fiche",
-    "~/.fiche",
     "~/Library/Application Support/dev.srinivas.fichebar",
     "~/Library/Caches/dev.srinivas.fichebar",
     "~/Library/HTTPStorages/dev.srinivas.fichebar",
-    "~/Library/LaunchAgents/com.sriinnu.fiche.plist",
     "~/Library/Preferences/dev.srinivas.fichebar.plist",
+    "~/Library/Saved Application State/dev.srinivas.fichebar.savedState",
   ]
 end
 EOF

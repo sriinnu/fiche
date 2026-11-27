@@ -7,7 +7,7 @@
  * The proxy has its own per-route wiring; the MCP server and scripts use this.
  */
 import { gptTokenCount as o200kCountTokens } from './gpt-tokens.js';
-import { getAllowedModelBases, isFicheSupportedModel, isInConfiguredModelBases } from './applicability.js';
+import { isFicheSupportedModel, isInConfiguredModelBases } from './applicability.js';
 import { scrubPromptCacheBreakpoint, supportsExplicitPromptCacheBreakpoint, type PromptCacheRoute } from './codex-cache.js';
 import { transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { transformGoogleGenerateContent } from './google.js';
@@ -138,7 +138,7 @@ export async function transformAnyRequest(
   const imageTier = imageThisRequest;
   const canRunTextHygiene =
     hygieneActive &&
-    (hygieneMode === 'on' || familyInScope || getAllowedModelBases().length > 0);
+    (hygieneMode === 'on' || familyInScope);
   const shouldRun = options.compress !== false && (imageTier || canRunTextHygiene);
   let outBody = body;
   let info: TransformInfo = {

@@ -124,12 +124,12 @@ describe('PrefixMemoTape (Stage-2 LRU, Unified Seal Table, Merkle CASI Memo)', (
     expect(tape.hasAnySessionSeals('default')).toBe(true);
     expect(tape.hasAnySessionSeals('sess-b')).toBe(true);
 
-    // Per-session seal cap (2) bounds seals within sess-b
+    // Per-session seal cap (2) retains earliest seals (epoch_0 / sig2) and skips tail overflow (sig4)
     tape.setSeal('sess-b', 'sig3', { text: '[e3]', stages: ['epoch'], kind: 'epoch', rawLen: 500 });
     tape.setSeal('sess-b', 'sig4', { text: '[e4]', stages: ['epoch'], kind: 'epoch', rawLen: 500 });
-    expect(tape.getSeal('sess-b', 'sig2')).toBeUndefined();
+    expect(tape.getSeal('sess-b', 'sig2')?.text).toBe('[epoch 2]');
     expect(tape.getSeal('sess-b', 'sig3')?.text).toBe('[e3]');
-    expect(tape.getSeal('sess-b', 'sig4')?.text).toBe('[e4]');
+    expect(tape.getSeal('sess-b', 'sig4')).toBeUndefined();
 
     tape.clearSession('sess-b');
     expect(tape.hasAnySessionSeals('sess-b')).toBe(false);
@@ -150,7 +150,8 @@ describe('PrefixMemoTape (Stage-2 LRU, Unified Seal Table, Merkle CASI Memo)', (
 
     const stats = tape.getStats();
     expect(stats.casiEntries).toBe(2);
-    expect(stats.casiChars).toBe(12);
+    // Unchanged memo entries use zero-copy sentinel (0 bytes charged)
+    expect(stats.casiChars).toBe(6);
     expect(stats.casiHits).toBe(3);
     expect(stats.casiMisses).toBe(1);
 
